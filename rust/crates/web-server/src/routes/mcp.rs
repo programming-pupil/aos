@@ -1494,10 +1494,6 @@ async fn db_update_server(
         "configured"
     };
 
-    if new_transport == "stdio" {
-        validate_stdio_command(new_command.as_ref())?;
-    }
-
     let args_json = serde_json::to_string(&new_args)?;
     let env_json = serde_json::to_string(&new_env)?;
     let extra_headers_json = new_extra_headers
