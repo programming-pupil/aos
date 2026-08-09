@@ -1,0 +1,112 @@
+name: AOS Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos-intel-offline:
+    name: macOS Intel offline package
+    runs-on: macos-15-intel
+    timeout-minutes: 360
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+      - uses: astral-sh/setup-uv@v6
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+
+      - name: Verify release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(awk -F'"' '/^version =/ { print $2; exit }' rust/Cargo.toml)"
+          test "$GITHUB_REF_NAME" = "v$version"
+
+      - name: Ensure release tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v rg >/dev/null 2>&1 || brew install ripgrep
+          command -v gh >/dev/null 2>&1
+
+      - name: Build clean offline package
+        shell: bash
+        run: ./scripts/aos-package.sh --output-dir "$RUNNER_TEMP/release"
+
+      - name: Create and verify archive checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/release"
+          archive="aos-offline-${GITHUB_REF_NAME#v}-darwin-x86_64.tar.gz"
+          shasum -a 256 "$archive" > "$archive.sha256"
+          shasum -a 256 -c "$archive.sha256"
+
+      - name: Verify extracted package and clean startup
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/release/aos-offline-${GITHUB_REF_NAME#v}-darwin-x86_64.tar.gz"
+          verify_root="$RUNNER_TEMP/release-verify"
+          package="$verify_root/aos-offline-${GITHUB_REF_NAME#v}-darwin-x86_64"
+          mkdir -p "$verify_root"
+          tar -xzf "$archive" -C "$verify_root"
+
+          cd "$package"
+          shasum -a 256 -c RELEASE-MANIFEST.sha256
+          if find . -type f \( -name '.env' -o -name 'aos.db' -o -name 'aos.db-wal' -o -name 'aos.db-shm' \) -print -quit | grep -q .; then
+            echo 'release archive contains runtime data or secrets' >&2
+            exit 1
+          fi
+
+          cleanup() {
+            ./scripts/aos-stop.sh >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          ./scripts/aos-start.sh --no-build --port 39127
+          setup_state="$(curl -fsS http://127.0.0.1:39127/api/v1/setup/check)"
+          printf '%s' "$setup_state" | python3 -c 'import json,sys; state=json.load(sys.stdin); assert state == {"initialized": False, "tenant_count": 0, "user_count": 0}'
+          curl -fsS -o "$RUNNER_TEMP/release-root.html" http://127.0.0.1:39127/
+          curl -fsS -o "$RUNNER_TEMP/release-setup.html" http://127.0.0.1:39127/setup
+          grep -q '<div id="root"></div>' "$RUNNER_TEMP/release-root.html"
+          grep -q '<div id="root"></div>' "$RUNNER_TEMP/release-setup.html"
+          cleanup
+          trap - EXIT
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/release/aos-offline-${GITHUB_REF_NAME#v}-darwin-x86_64.tar.gz"
+          checksum="$archive.sha256"
+          notes="docs/releases/${GITHUB_REF_NAME}.md"
+          if [ ! -f "$notes" ]; then
+            echo "missing release notes: $notes" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            "$archive" \
+            "$checksum" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "AOS ${GITHUB_REF_NAME}" \
+            --notes-file "$notes"
