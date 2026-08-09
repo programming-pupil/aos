@@ -3963,6 +3963,7 @@ export function ChatCore({
   onAbortRef,
   sidebarWidth = 240,
   showConfigTags = true,
+  showMemoryButton = true,
   messageListProps,
   inputAreaProps,
   inputPlaceholder,
@@ -11822,7 +11823,9 @@ export function ChatCore({
             </div>
           )}
 
-          {(sessionSource === "chat" || memoryEnabled || inputToolbarExtra) && (
+          {(sessionSource === "chat" ||
+            (memoryEnabled && showMemoryButton) ||
+            inputToolbarExtra) && (
             <div
               style={{
                 display: "flex",
@@ -11897,7 +11900,7 @@ export function ChatCore({
                 </Tooltip>
               )}
 
-              {memoryEnabled && (
+              {memoryEnabled && showMemoryButton && (
                 <Tooltip
                   title={t(
                     sessionSource === "pm"

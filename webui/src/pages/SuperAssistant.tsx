@@ -55,6 +55,7 @@ export default function SuperAssistant() {
             emoji: '🤖',
           }}
           showConfigTags={true}
+          showMemoryButton={false}
           sidebarWidth={240}
           onActiveSessionChange={setActiveSessionId}
           messageListProps={{

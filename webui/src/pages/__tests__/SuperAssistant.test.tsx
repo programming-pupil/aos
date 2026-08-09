@@ -34,6 +34,7 @@ interface StubChatCoreProps {
   topBarExtra?: ReactNode;
   inputHintBar?: ReactNode;
   inputToolbarExtra?: ReactNode;
+  showMemoryButton?: boolean;
 }
 
 vi.mock('@/components/chat/ChatCore', () => ({
@@ -43,6 +44,7 @@ vi.mock('@/components/chat/ChatCore', () => ({
       <div data-testid="top-bar-extra">{props.topBarExtra}</div>
       <div data-testid="input-hint-bar">{props.inputHintBar}</div>
       <div data-testid="input-toolbar-extra">{props.inputToolbarExtra}</div>
+      <span data-testid="show-memory-button">{String(props.showMemoryButton)}</span>
       <input data-testid="unified-input" placeholder={props.inputPlaceholder} />
     </div>
   ),
@@ -87,6 +89,11 @@ describe('SuperAssistant unified shell', () => {
     const html = render();
     expect(html).not.toContain('role="switch"');
     expect(html).not.toContain('dataAttributionSwitch');
+  });
+
+  it('hides the manual memory-management button', () => {
+    const html = render();
+    expect(html).toContain('data-testid="show-memory-button">false<');
   });
 
   it('surfaces the unified-entry / auto-routing / memory affordances in the top bar', () => {

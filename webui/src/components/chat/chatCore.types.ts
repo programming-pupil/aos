@@ -165,6 +165,8 @@ export interface ChatCoreProps {
   onAbortRef?: (fn: (() => void) | null) => void;
   sidebarWidth?: number;
   showConfigTags?: boolean;
+  /** Shows the manual memory-management entry without changing memory behavior. */
+  showMemoryButton?: boolean;
   messageListProps?: React.HTMLAttributes<HTMLDivElement>;
   inputAreaProps?: React.HTMLAttributes<HTMLDivElement>;
   inputPlaceholder?: string;
