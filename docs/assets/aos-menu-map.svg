@@ -1,0 +1,123 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="640" viewBox="0 0 1800 640" role="img" aria-labelledby="title desc">
+  <title id="title">AOS core menu map</title>
+  <desc id="desc">A horizontal map of AOS Agent, research, data, engineering, integration, and system capabilities.</desc>
+  <rect width="1800" height="640" rx="24" fill="#0b0f19"/>
+  <path d="M64 96H1736" stroke="#232b3a" stroke-width="2"/>
+  <text x="64" y="50" fill="#f3f6fb" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="28" font-weight="700">AOS 核心能力地图</text>
+  <text x="64" y="78" fill="#aab5c7" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="16">Agent workspace · permissions-aware · recoverable workflows</text>
+  <g font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+    <g transform="translate(60 122)">
+      <rect width="300" height="446" rx="14" fill="#121927" stroke="#303b52"/>
+      <text x="24" y="38" fill="#a78bfa" font-size="15" font-weight="700">AGENT / 会话</text>
+      <text x="24" y="62" fill="#f3f6fb" font-size="20" font-weight="700">统一入口</text>
+      <g transform="translate(20 86)">
+        <rect width="260" height="58" rx="10" fill="#1a2233"/>
+        <rect x="16" y="15" width="28" height="28" rx="8" fill="#7137d8"/>
+        <path d="M23 29l6 6 11-13" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="58" y="36" fill="#eef2f8" font-size="17">超级助手 / Super Assistant</text>
+      </g>
+      <g transform="translate(20 156)">
+        <rect width="260" height="58" rx="10" fill="#1a2233"/>
+        <rect x="16" y="15" width="28" height="28" rx="8" fill="#7137d8"/>
+        <path d="M23 29l6 6 11-13" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="58" y="36" fill="#eef2f8" font-size="17">工作区域 / Workspace</text>
+      </g>
+      <g transform="translate(20 226)">
+        <rect width="260" height="58" rx="10" fill="#1a2233"/>
+        <rect x="16" y="15" width="28" height="28" rx="8" fill="#7137d8"/>
+        <path d="M23 29l6 6 11-13" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="58" y="36" fill="#eef2f8" font-size="17">任务中心 / Tasks</text>
+      </g>
+      <g transform="translate(20 296)">
+        <rect width="260" height="58" rx="10" fill="#1a2233"/>
+        <rect x="16" y="15" width="28" height="28" rx="8" fill="#7137d8"/>
+        <path d="M23 29l6 6 11-13" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="58" y="36" fill="#eef2f8" font-size="17">仪表盘 / Dashboard</text>
+      </g>
+    </g>
+    <g transform="translate(410 122)">
+      <rect width="300" height="446" rx="14" fill="#121927" stroke="#303b52"/>
+      <text x="24" y="38" fill="#55d6c2" font-size="15" font-weight="700">RESEARCH / DATA</text>
+      <text x="24" y="62" fill="#f3f6fb" font-size="20" font-weight="700">研究与数据</text>
+      <g transform="translate(20 86)">
+        <rect width="260" height="58" rx="10" fill="#1a2233"/>
+        <rect x="16" y="15" width="28" height="28" rx="8" fill="#147c79"/><path d="M23 29l6 6 11-13" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="58" y="36" fill="#eef2f8" font-size="17">数据探索 / NL2SQL</text>
+      </g>
+      <g transform="translate(20 156)">
+        <rect width="260" height="58" rx="10" fill="#1a2233"/><rect x="16" y="15" width="28" height="28" rx="8" fill="#147c79"/><path d="M23 29l6 6 11-13" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="58" y="36" fill="#eef2f8" font-size="17">数据接入 / Data Sources</text>
+      </g>
+      <g transform="translate(20 226)">
+        <rect width="260" height="58" rx="10" fill="#1a2233"/><rect x="16" y="15" width="28" height="28" rx="8" fill="#147c79"/><path d="M23 29l6 6 11-13" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="58" y="36" fill="#eef2f8" font-size="17">知识文库 / Knowledge</text>
+      </g>
+      <g transform="translate(20 296)">
+        <rect width="260" height="58" rx="10" fill="#1a2233"/><rect x="16" y="15" width="28" height="28" rx="8" fill="#147c79"/><path d="M23 29l6 6 11-13" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="58" y="36" fill="#eef2f8" font-size="17">质量分析 / Attribution</text>
+      </g>
+    </g>
+    <g transform="translate(760 122)">
+      <rect width="300" height="446" rx="14" fill="#121927" stroke="#303b52"/>
+      <text x="24" y="38" fill="#ff9f7a" font-size="15" font-weight="700">ENGINEERING / 研发</text>
+      <text x="24" y="62" fill="#f3f6fb" font-size="20" font-weight="700">方案与交付</text>
+      <g transform="translate(20 86)">
+        <rect width="260" height="58" rx="10" fill="#1a2233"/><rect x="16" y="15" width="28" height="28" rx="8" fill="#b45335"/><path d="M23 29l6 6 11-13" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="58" y="36" fill="#eef2f8" font-size="17">研发方案 / Design Plans</text>
+      </g>
+      <g transform="translate(20 156)">
+        <rect width="260" height="58" rx="10" fill="#1a2233"/><rect x="16" y="15" width="28" height="28" rx="8" fill="#b45335"/><path d="M23 29l6 6 11-13" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="58" y="36" fill="#eef2f8" font-size="17">代码仓库 / Repositories</text>
+      </g>
+      <g transform="translate(20 226)">
+        <rect width="260" height="58" rx="10" fill="#1a2233"/><rect x="16" y="15" width="28" height="28" rx="8" fill="#b45335"/><path d="M23 29l6 6 11-13" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="58" y="36" fill="#eef2f8" font-size="17">素材工坊 / Materials</text>
+      </g>
+      <text x="24" y="360" fill="#8e9aae" font-size="14">方案确认后再交给外部</text>
+      <text x="24" y="384" fill="#8e9aae" font-size="14">Code Agent 执行。</text>
+    </g>
+    <g transform="translate(1110 122)">
+      <rect width="300" height="446" rx="14" fill="#121927" stroke="#303b52"/>
+      <text x="24" y="38" fill="#f4c95d" font-size="15" font-weight="700">INTEGRATIONS / 扩展</text>
+      <text x="24" y="62" fill="#f3f6fb" font-size="20" font-weight="700">连接与能力</text>
+      <g transform="translate(20 86)">
+        <rect width="260" height="58" rx="10" fill="#1a2233"/><rect x="16" y="15" width="28" height="28" rx="8" fill="#a47b19"/><path d="M23 29l6 6 11-13" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="58" y="36" fill="#eef2f8" font-size="17">Bot 网关 / Bot Gateway</text>
+      </g>
+      <g transform="translate(20 156)">
+        <rect width="260" height="58" rx="10" fill="#1a2233"/><rect x="16" y="15" width="28" height="28" rx="8" fill="#a47b19"/><path d="M23 29l6 6 11-13" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="58" y="36" fill="#eef2f8" font-size="17">MCP 服务 / MCP Servers</text>
+      </g>
+      <g transform="translate(20 226)">
+        <rect width="260" height="58" rx="10" fill="#1a2233"/><rect x="16" y="15" width="28" height="28" rx="8" fill="#a47b19"/><path d="M23 29l6 6 11-13" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="58" y="36" fill="#eef2f8" font-size="17">Skill 市场 / Skills</text>
+      </g>
+      <g transform="translate(20 296)">
+        <rect width="260" height="58" rx="10" fill="#1a2233"/><rect x="16" y="15" width="28" height="28" rx="8" fill="#a47b19"/><path d="M23 29l6 6 11-13" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="58" y="36" fill="#eef2f8" font-size="17">Search / Hooks</text>
+      </g>
+    </g>
+    <g transform="translate(1460 122)">
+      <rect width="280" height="446" rx="14" fill="#121927" stroke="#303b52"/>
+      <text x="24" y="38" fill="#8db4ff" font-size="15" font-weight="700">SYSTEM / 系统</text>
+      <text x="24" y="62" fill="#f3f6fb" font-size="20" font-weight="700">治理与配置</text>
+      <g transform="translate(20 86)">
+        <rect width="240" height="58" rx="10" fill="#1a2233"/><rect x="16" y="15" width="28" height="28" rx="8" fill="#3565b8"/><path d="M23 29l6 6 11-13" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="58" y="36" fill="#eef2f8" font-size="17">治理中心 / Governance</text>
+      </g>
+      <g transform="translate(20 156)">
+        <rect width="240" height="58" rx="10" fill="#1a2233"/><rect x="16" y="15" width="28" height="28" rx="8" fill="#3565b8"/><path d="M23 29l6 6 11-13" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="58" y="36" fill="#eef2f8" font-size="17">API 密钥 / API Keys</text>
+      </g>
+      <g transform="translate(20 226)">
+        <rect width="240" height="58" rx="10" fill="#1a2233"/><rect x="16" y="15" width="28" height="28" rx="8" fill="#3565b8"/><path d="M23 29l6 6 11-13" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="58" y="36" fill="#eef2f8" font-size="17">配置管理 / Config</text>
+      </g>
+      <g transform="translate(20 296)">
+        <rect width="240" height="58" rx="10" fill="#1a2233"/><rect x="16" y="15" width="28" height="28" rx="8" fill="#3565b8"/><path d="M23 29l6 6 11-13" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="58" y="36" fill="#eef2f8" font-size="17">团队管理 / Team</text>
+      </g>
+    </g>
+  </g>
+  <text x="64" y="610" fill="#65748b" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14">菜单可按租户权限配置 · Capabilities remain subject to provider, network, and permission checks.</text>
+</svg>

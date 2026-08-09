@@ -23,12 +23,14 @@ if (-not $Version) { $Version = '0.1.0' }
 $Name = "aos-offline-$Version-windows-x86_64"
 $Temp = Join-Path ([IO.Path]::GetTempPath()) ("aos-package-" + [guid]::NewGuid())
 $Stage = Join-Path $Temp $Name
-New-Item -ItemType Directory -Force (Join-Path $Stage 'bin'), (Join-Path $Stage 'web'), (Join-Path $Stage 'scripts'), (Join-Path $Stage 'docs'), (Join-Path $Stage 'licenses'), (Join-Path $Stage 'models\fastembed') | Out-Null
+New-Item -ItemType Directory -Force (Join-Path $Stage 'bin'), (Join-Path $Stage 'web'), (Join-Path $Stage 'scripts'), (Join-Path $Stage 'docs'), (Join-Path $Stage 'docs\assets'), (Join-Path $Stage 'licenses'), (Join-Path $Stage 'models\fastembed') | Out-Null
 try {
     Copy-Item $Backend (Join-Path $Stage 'bin\web-server.exe')
     Copy-Item (Join-Path $Web '*') (Join-Path $Stage 'web') -Recurse
     foreach ($NameToCopy in @('.env.example', 'README.md', 'LICENSE', 'NOTICE.md')) { Copy-Item (Join-Path $Root $NameToCopy) $Stage }
     Copy-Item (Join-Path $Root 'licenses\*.txt') (Join-Path $Stage 'licenses')
+    Copy-Item (Join-Path $Root 'docs\assets\aos-hero.svg') (Join-Path $Stage 'docs\assets')
+    Copy-Item (Join-Path $Root 'docs\assets\aos-menu-map.svg') (Join-Path $Stage 'docs\assets')
     foreach ($Doc in @('INSTALL.md', 'OPEN_SOURCE_DEPLOYMENT.zh-CN.md', 'OPEN_SOURCE_TEST_GUIDE.zh-CN.md')) { Copy-Item (Join-Path $Root "docs\$Doc") (Join-Path $Stage 'docs') }
     foreach ($Script in @('aos-start.ps1', 'aos-stop.ps1', 'aos-upgrade.ps1', 'generate-env.ps1', 'setup-environment.ps1', 'setup-onnxruntime.ps1')) { Copy-Item (Join-Path $Root "scripts\$Script") (Join-Path $Stage 'scripts') }
     & (Join-Path $Root 'scripts\setup-onnxruntime.ps1') -Dir (Join-Path $Stage 'runtime\onnxruntime')

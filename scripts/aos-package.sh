@@ -60,7 +60,9 @@ cp "$ROOT_DIR/docs/evals/BOT_GATEWAY_COMPLETE_TEST_GUIDE.zh-CN.md" \
   "$ROOT_DIR/docs/evals/DATA_ATTRIBUTION_COMPLETE_TEST_GUIDE.zh-CN.md" \
   "$ROOT_DIR/docs/evals/NL2SQL_ADVANCED_CONFIGURATION_TEST_GUIDE.zh-CN.md" \
   "$stage/docs/evals/"
-cp "$ROOT_DIR/docs/assets/aos-hero.svg" "$stage/docs/assets/"
+cp "$ROOT_DIR/docs/assets/aos-hero.svg" \
+  "$ROOT_DIR/docs/assets/aos-menu-map.svg" \
+  "$stage/docs/assets/"
 cp "$ROOT_DIR/scripts/generate-env.sh" \
   "$ROOT_DIR/scripts/setup-environment.sh" \
   "$ROOT_DIR/scripts/aos-start.sh" \

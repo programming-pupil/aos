@@ -33,6 +33,29 @@ AOS means **Agent Operating System**: a Web-first, multi-tenant workspace for bu
 
 The project is designed to make Agent work inspectable and recoverable. It does not claim that every provider adapter or every workflow is production-ready on every platform yet.
 
+<p align="center">
+  <img src="docs/assets/aos-menu-map.svg" alt="AOS core capability map" width="100%">
+</p>
+
+The menu map is a product map, not a promise that every capability is enabled in
+every deployment. Tenant permissions, provider support, network access, and
+feature maturity are shown explicitly in the linked documentation.
+
+## Architecture at a glance
+
+    Web UI / external Bot
+            |
+            v
+       Rust WebServer  --->  SQLite platform state
+            |
+            +--> Agent runtime and recoverable sessions
+            +--> Model providers and optional web-search extensions
+            +--> Datasources, Skills, MCP, and repository adapters
+
+The platform database is SQLite and belongs to the AOS control plane. Business
+databases are configured as external NL2SQL datasources; they are not required
+to boot AOS. A single AOS process owns one local data directory.
+
 ## Try the source tree
 
 The shortest supported path for contributors is Docker:
@@ -74,6 +97,17 @@ Read the deployment guide before exposing AOS beyond localhost:
     npm run build:ci
 
 Targeted test guides cover the Bot Gateway, data attribution, NL2SQL configuration, and the progressive engineering design workflow.
+
+## Configuration boundaries
+
+- Model credentials are stored per tenant through the API Keys surface and are
+  never committed to the repository.
+- Search providers and MCP servers are optional extensions. The built-in
+  fallback path remains the default when an enhancement is not configured.
+- Skills are treated as untrusted input during installation and are subject to
+  safety checks and permission boundaries.
+- Long-running tasks persist state and events so a client reconnect can recover
+  context; external IM delivery still depends on each platform's API policy.
 
 ## Documentation
 
