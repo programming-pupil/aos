@@ -6,6 +6,40 @@ cd "$ROOT_DIR"
 
 failed=0
 
+# GitHub-hosted runners do not guarantee ripgrep. Keep this repository guard
+# self-contained so a missing optional search binary cannot masquerade as a
+# database-boundary regression.
+search_lines() {
+  local pattern="$1"
+  shift
+  if command -v rg >/dev/null 2>&1; then
+    rg -n "$pattern" "$@" --glob '!scripts/check-platform-sqlite-boundary.sh'
+  else
+    grep -R -n -E --exclude='check-platform-sqlite-boundary.sh' \
+      "$pattern" "$@"
+  fi
+}
+
+search_files() {
+  local pattern="$1"
+  shift
+  if command -v rg >/dev/null 2>&1; then
+    rg -l "$pattern" "$@"
+  else
+    grep -R -l -E "$pattern" "$@"
+  fi
+}
+
+file_contains() {
+  local pattern="$1"
+  local file="$2"
+  if command -v rg >/dev/null 2>&1; then
+    rg -q "$pattern" "$file"
+  else
+    grep -q -E "$pattern" "$file"
+  fi
+}
+
 deployment_targets=(
   docker-compose.yml
   Containerfile
@@ -21,9 +55,8 @@ deployment_targets=(
 )
 
 deployment_hits="$(
-  rg -n 'DATABASE_URL|MYSQL_ROOT_PASSWORD|AOS_RUN_MYSQL|AOS_TEST_DATABASE_URL|mysqladmin|mysqld' \
+  search_lines 'DATABASE_URL|MYSQL_ROOT_PASSWORD|AOS_RUN_MYSQL|AOS_TEST_DATABASE_URL|mysqladmin|mysqld' \
     "${deployment_targets[@]}" \
-    --glob '!scripts/check-platform-sqlite-boundary.sh' \
     2>/dev/null || true
 )"
 if [[ -n "$deployment_hits" ]]; then
@@ -33,7 +66,7 @@ if [[ -n "$deployment_hits" ]]; then
 fi
 
 mysql_type_hits="$(
-  rg -l \
+  search_files \
     'MySqlPool|MySqlConnection|MySqlRow|MySqlArguments|QueryBuilder<[^>]*MySql|Transaction<[^>]*MySql|sqlx::MySql|sqlx::mysql' \
     rust/crates 2>/dev/null || true
 )"
@@ -54,7 +87,8 @@ while IFS= read -r source_file; do
 done <<< "$mysql_type_hits"
 
 mysql_dialect_hits="$(
-  rg -n \
+  if command -v rg >/dev/null 2>&1; then
+    rg -n \
     'ON DUPLICATE KEY|INSERT IGNORE|FOR UPDATE|FROM DUAL|GET_LOCK|RELEASE_LOCK|LAST_INSERT_ID|UTC_TIMESTAMP|NOW\([0-9]*\)|CURRENT_(DATE|TIME|TIMESTAMP)\(\)|INTERVAL[[:space:]]+[A-Za-z0-9_?]+[[:space:]]+(SECOND|MINUTE|HOUR|DAY|WEEK|MONTH|YEAR)|DATE_FORMAT|TIMESTAMPDIFF|TIMESTAMPADD|INFORMATION_SCHEMA| AS SIGNED' \
     rust/crates/web-server/src \
     rust/crates/agent-gateway/src \
@@ -64,6 +98,17 @@ mysql_dialect_hits="$(
     --glob '!rust/crates/web-server/src/routes/data_sources.rs' \
     --glob '!rust/crates/web-server/src/routes/nl2sql/**' \
     2>/dev/null || true
+  else
+    grep -R -n -E \
+      --exclude-dir=nl2sql \
+      --exclude='data_sources.rs' \
+      'ON DUPLICATE KEY|INSERT IGNORE|FOR UPDATE|FROM DUAL|GET_LOCK|RELEASE_LOCK|LAST_INSERT_ID|UTC_TIMESTAMP|NOW\([0-9]*\)|CURRENT_(DATE|TIME|TIMESTAMP)\(\)|INTERVAL[[:space:]]+[A-Za-z0-9_?]+[[:space:]]+(SECOND|MINUTE|HOUR|DAY|WEEK|MONTH|YEAR)|DATE_FORMAT|TIMESTAMPDIFF|TIMESTAMPADD|INFORMATION_SCHEMA| AS SIGNED' \
+      rust/crates/web-server/src \
+      rust/crates/agent-gateway/src \
+      rust/crates/billing/src \
+      rust/crates/pm-orchestrator/src \
+      2>/dev/null || true
+  fi
 )"
 if [[ -n "$mysql_dialect_hits" ]]; then
   echo "platform source still contains a MySQL-only SQL construct:" >&2
@@ -85,27 +130,27 @@ if [[ ! -f rust/crates/web-server/sqlite-migrations/0001_baseline.sql ]]; then
   echo "missing embedded SQLite baseline migration" >&2
   failed=1
 fi
-if ! rg -q 'SqlitePool' rust/crates/web-server/src/state.rs; then
+if ! file_contains 'SqlitePool' rust/crates/web-server/src/state.rs; then
   echo "AppState no longer exposes the SQLite platform pool" >&2
   failed=1
 fi
-if ! rg -q '"sqlite"' rust/Cargo.toml || ! rg -q '"mysql"' rust/Cargo.toml; then
+if ! file_contains '"sqlite"' rust/Cargo.toml || ! file_contains '"mysql"' rust/Cargo.toml; then
   echo "SQLx must retain both SQLite platform storage and MySQL connector features" >&2
   failed=1
 fi
-if ! rg -q 'MySqlPoolOptions' rust/crates/nl2sql-core/src/datasource_pool.rs; then
+if ! file_contains 'MySqlPoolOptions' rust/crates/nl2sql-core/src/datasource_pool.rs; then
   echo "NL2SQL external MySQL pool support was removed" >&2
   failed=1
 fi
-if ! rg -q 'decode_mysql_cell' rust/crates/nl2sql-core/src/cell_decoder.rs; then
+if ! file_contains 'decode_mysql_cell' rust/crates/nl2sql-core/src/cell_decoder.rs; then
   echo "NL2SQL external MySQL result decoding was removed" >&2
   failed=1
 fi
-if ! rg -q '"mysql"' rust/crates/web-server/src/routes/data_sources.rs; then
+if ! file_contains '"mysql"' rust/crates/web-server/src/routes/data_sources.rs; then
   echo "NL2SQL MySQL datasource API support was removed" >&2
   failed=1
 fi
-if ! rg -q "value: 'mysql'" webui/src/pages/DataSources.tsx; then
+if ! file_contains "value: 'mysql'" webui/src/pages/DataSources.tsx; then
   echo "NL2SQL MySQL datasource UI support was removed" >&2
   failed=1
 fi
