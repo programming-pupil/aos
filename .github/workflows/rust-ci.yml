@@ -106,13 +106,15 @@ jobs:
             label: linux-x86_64
           - os: ubuntu-24.04-arm
             label: linux-aarch64
-          - os: macos-13
+          - os: macos-15-intel
             label: macos-x86_64
           - os: macos-14
             label: macos-aarch64
           - os: windows-latest
             label: windows-x86_64
     runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: ${{ startsWith(matrix.os, 'macos-') && '13.0' || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
