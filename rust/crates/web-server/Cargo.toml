@@ -71,7 +71,7 @@ regex = { workspace = true }
 hex = "0.4"
 urlencoding = "2"
 lettre = { version = "0.11", features = ["tokio1-native-tls", "tracing"] }
-cron = "0.12"
+cron = "0.17"
 mongodb.workspace = true
 
 [dev-dependencies]
