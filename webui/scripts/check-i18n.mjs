@@ -1,4 +1,3 @@
-import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -9,11 +8,10 @@ const localeFiles = ['zh-CN', 'en-US'].map((locale) => ({
   file: path.join(srcDir, 'locales', `${locale}.json`),
 }));
 
-const sourceFiles = execFileSync('rg', ['--files', srcDir], { encoding: 'utf8' })
-  .trim()
-  .split('\n')
-  .filter((file) => /\.(ts|tsx|js|jsx)$/.test(file))
-  .filter((file) => !file.includes('/locales/'));
+const sourceFiles = walkFiles(srcDir, (file) => {
+  const relativeParts = path.relative(srcDir, file).split(path.sep);
+  return /\.(ts|tsx|js|jsx)$/.test(file) && !relativeParts.includes('locales');
+}).sort();
 
 const keys = new Set();
 
