@@ -49,7 +49,7 @@ walkdir.workspace = true
 glob.workspace = true
 anyhow.workspace = true
 sha2.workspace = true
-hmac = "0.12"
+hmac = "0.13"
 reqwest = { workspace = true, features = ["json", "multipart"] }
 rusqlite = { workspace = true }
 parking_lot.workspace = true
