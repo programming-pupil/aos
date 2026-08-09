@@ -1,0 +1,22 @@
+{
+  "name": "aos-frontend-bug-demo",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc -b && vite build",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^5.4.21",
+    "typescript": "^5.6.3",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "vitest": "^2.1.9",
+    "@testing-library/react": "^15.0.7",
+    "jsdom": "^25.0.1"
+  },
+  "devDependencies": {}
+}

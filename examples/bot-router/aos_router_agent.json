@@ -1,0 +1,98 @@
+{
+  "name": "AOS Router Demo",
+  "description": "Unified Bot entrance for open-source smoke: routes chat, PM, RD, NL2SQL, Ops Insight, Ops Automation, WatchDog, and Super Adversarial messages.",
+  "enabled": true,
+  "default_capability": "aos_router",
+  "persona_prompt": "You are the public AOS demo bot. Keep replies concise, explain when a capability needs extra configuration, and never invent task status.",
+  "capabilities": [
+    {
+      "capability_key": "aos_router",
+      "trigger_prefixes": [],
+      "require_mention": false,
+      "fallback_when_no_prefix": true,
+      "executionMode": "sync",
+      "syncTimeoutMs": 12000,
+      "ackTimeoutMs": 2500
+    },
+    {
+      "capability_key": "watchdog",
+      "trigger_prefixes": [
+        "watchdog",
+        "看门狗"
+      ],
+      "require_mention": false,
+      "fallback_when_no_prefix": false,
+      "watchdogScope": "conversation",
+      "allowActions": [
+        "open_task",
+        "cancel_task",
+        "retry_task"
+      ],
+      "executionMode": "sync",
+      "syncTimeoutMs": 12000,
+      "ackTimeoutMs": 2500
+    },
+    {
+      "capability_key": "ai_chat",
+      "trigger_prefixes": [
+        "chat",
+        "对话"
+      ],
+      "require_mention": false,
+      "fallback_when_no_prefix": false,
+      "executionMode": "sync",
+      "syncTimeoutMs": 12000,
+      "ackTimeoutMs": 2500
+    },
+    {
+      "capability_key": "pm_assistant",
+      "trigger_prefixes": [
+        "pm",
+        "产运"
+      ],
+      "require_mention": false,
+      "fallback_when_no_prefix": false,
+      "deepAnalysis": true,
+      "executionMode": "async",
+      "ackTimeoutMs": 2500
+    },
+    {
+      "capability_key": "rd_agent",
+      "trigger_prefixes": [
+        "code",
+        "代码"
+      ],
+      "require_mention": false,
+      "fallback_when_no_prefix": false,
+      "contextDepth": "standard",
+      "shouldDeepScan": true,
+      "executionMode": "async",
+      "ackTimeoutMs": 2500
+    },
+    {
+      "capability_key": "nl2sql",
+      "trigger_prefixes": [
+        "sql",
+        "数据"
+      ],
+      "require_mention": false,
+      "fallback_when_no_prefix": false,
+      "allowExecuteSql": false,
+      "executionMode": "hybrid",
+      "ackTimeoutMs": 2500
+    },
+    {
+      "capability_key": "super_adversarial",
+      "trigger_prefixes": [
+        "debate",
+        "对抗"
+      ],
+      "require_mention": false,
+      "fallback_when_no_prefix": false,
+      "models": [],
+      "maxRounds": 3,
+      "executionMode": "async",
+      "ackTimeoutMs": 2500
+    }
+  ]
+}

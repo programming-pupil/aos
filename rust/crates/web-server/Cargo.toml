@@ -1,0 +1,86 @@
+[package]
+name = "web-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = ["full"]
+agent = []
+pm = ["agent", "dep:pm-orchestrator", "dep:pm-report"]
+nl2sql = ["dep:nl2sql-domain", "dep:nl2sql-core", "dep:fastembed"]
+rd = ["projects", "dep:rd-core"]
+bot-agents = ["pm", "dep:feishu-sdk", "dep:tokio-tungstenite", "dep:rustls"]
+projects = []
+full = ["agent", "pm", "nl2sql", "rd", "bot-agents", "projects"]
+
+[dependencies]
+agent-gateway = { path = "../agent-gateway" }
+api = { path = "../api" }
+billing = { path = "../billing" }
+pm-domain = { path = "../pm-domain" }
+pm-orchestrator = { path = "../pm-orchestrator", optional = true }
+pm-report = { path = "../pm-report", optional = true }
+nl2sql-domain = { path = "../nl2sql-domain", optional = true }
+nl2sql-core = { path = "../nl2sql-core", optional = true }
+rd-core = { path = "../rd-core", optional = true }
+runtime = { path = "../runtime" }
+tools = { path = "../tools" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+sqlx.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+jsonwebtoken.workspace = true
+bcrypt.workspace = true
+aes-gcm = { workspace = true }
+base64 = { workspace = true }
+thiserror.workspace = true
+directories.workspace = true
+walkdir.workspace = true
+glob.workspace = true
+anyhow.workspace = true
+sha2.workspace = true
+hmac = "0.12"
+reqwest = { workspace = true, features = ["json", "multipart"] }
+rusqlite = { workspace = true }
+parking_lot.workspace = true
+fs2.workspace = true
+hnsw_rs = "0.3"
+fastembed = { version = "=5.13.0", default-features = false, features = ["ort-load-dynamic"], optional = true }
+clickhouse = { version = "0.14", features = ["native-tls"] }
+trino-rust-client = "0.9"
+clap = { version = "4", features = ["derive"] }
+async-stream = "0.3"
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"], optional = true }
+feishu-sdk = { version = "0.1.2", features = ["websocket"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
+async-trait = "0.1"
+sqlparser = { version = "0.52", features = ["visitor"] }
+regex = { workspace = true }
+hex = "0.4"
+urlencoding = "2"
+lettre = { version = "0.11", features = ["tokio1-native-tls", "tracing"] }
+cron = "0.12"
+mongodb.workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[[bin]]
+name = "pm-worker"
+path = "src/bin/pm-worker.rs"
+required-features = ["pm"]
+
+[lints]
+workspace = true

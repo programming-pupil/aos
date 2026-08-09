@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8de8319a6d45870f7b5367181b0c2cefd18f0e5ac6bd417f83936d745a44c223 # shrinks to item = AgentMemoryItem { id: "", tenant_id: "", user_id: "", scope: "", app: "", session_id: None, memory_type: "", content: "", source_type: "", confidence: 9.273389477933019e254, pinned: false, enabled: false, stale_at: None, verified_at: None, metadata: None, embedding_model: None, embedding_dimensions: None, embedding_vector: None, created_at: "", updated_at: "", virtual_path: "", legacy_source: None }
+cc 907d2aa6f4690679d512e2ead90c69ab78a7f28a787ea59600a37f76f1e1fc4d # shrinks to event = RouteDecisionEvent { event: RouteDecision, target_capability: "", source: ExplicitOverride, confidence: Some(-1.1194203941314552e-214), threshold: 0.0, bypass_threshold: false, reason: None, turn_id: "", created_at: "" }

@@ -1,0 +1,65 @@
+{
+  "name": "codex-parity-contract-fixture",
+  "seed": 20260710,
+  "generatedAt": "2026-07-10T00:00:00Z",
+  "scenarios": [
+    {
+      "scenario": "chat",
+      "metricName": "contract_fixture_pass_rate",
+      "threshold": 0.99,
+      "cases": [
+        { "caseId": "chat-exact-history-recall", "spec": { "kind": "fixed", "value": 1.0 } },
+        { "caseId": "chat-attachment-reread", "spec": { "kind": "fixed", "value": 1.0 } },
+        { "caseId": "chat-cache-stable-prefix", "spec": { "kind": "fixed", "value": 1.0 } }
+      ]
+    },
+    {
+      "scenario": "web_search",
+      "metricName": "contract_fixture_pass_rate",
+      "threshold": 0.98,
+      "cases": [
+        { "caseId": "web-common-realtime-route", "spec": { "kind": "fixed", "value": 1.0 } },
+        { "caseId": "web-tool-loop-soft-degrade", "spec": { "kind": "fixed", "value": 1.0 } }
+      ]
+    },
+    {
+      "scenario": "sql_attribution",
+      "metricName": "contract_fixture_pass_rate",
+      "threshold": 0.99,
+      "cases": [
+        { "caseId": "sql-knowledge-rg-open-read", "spec": { "kind": "fixed", "value": 1.0 } },
+        { "caseId": "sql-empty-schema-knowledge", "spec": { "kind": "fixed", "value": 1.0 } },
+        { "caseId": "sql-execute-self-correct", "spec": { "kind": "fixed", "value": 1.0 } }
+      ]
+    },
+    {
+      "scenario": "deep_report",
+      "metricName": "contract_fixture_pass_rate",
+      "threshold": 0.98,
+      "cases": [
+        { "caseId": "deep-report-evidence-quality", "spec": { "kind": "fixed", "value": 1.0 } },
+        { "caseId": "deep-report-soft-degrade", "spec": { "kind": "fixed", "value": 1.0 } }
+      ]
+    },
+    {
+      "scenario": "coding_success",
+      "metricName": "contract_fixture_pass_rate",
+      "threshold": 0.98,
+      "cases": [
+        { "caseId": "coding-plan-visible", "spec": { "kind": "fixed", "value": 1.0 } },
+        { "caseId": "coding-tool-event-readable", "spec": { "kind": "fixed", "value": 1.0 } }
+      ]
+    },
+    {
+      "scenario": "zero_loss_recall",
+      "metricName": "contract_fixture_recall_rate",
+      "threshold": 0.99,
+      "cases": [
+        { "caseId": "zero-loss-pinned-fact", "spec": { "kind": "fixed", "value": 1.0 } },
+        { "caseId": "zero-loss-archive-sql", "spec": { "kind": "fixed", "value": 1.0 } },
+        { "caseId": "zero-loss-attachment-index", "spec": { "kind": "fixed", "value": 1.0 } }
+      ]
+    }
+  ],
+  "notes": "Synthetic deterministic contract fixture. Fixed values only assert harness wiring and must never be reported as measured AOS or Codex quality. Live blinded results belong in a separate versioned dataset."
+}

@@ -1,0 +1,81 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "mysql", "postgres", "sqlite", "migrate", "chrono", "uuid", "bigdecimal"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = { version = "0.8", features = ["macros", "multipart", "ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+jsonwebtoken = "9"
+bcrypt = "0.16"
+thiserror = "2"
+directories = "6"
+notify = "8"
+walkdir = "2"
+glob = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "socks"] }
+http = "1"
+bytes = "1"
+http-body-util = "0.1"
+anyhow = "1"
+sha2 = "0.10"
+regex = "1"
+scraper = "0.25"
+serde_yaml = "0.9"
+aes-gcm = "0.10"
+base64 = "0.22"
+async-stream = "0.3"
+futures-util = "0.3"
+async-trait = "0.1"
+urlencoding = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+anndists = "0.1"
+parking_lot = "0.12"
+fs2 = "0.4"
+lettre = { version = "0.11", features = ["smtp-transport", "tokio1", "tracing"] }
+proptest = "1"
+mongodb = "=3.2.5"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_panics_doc = "allow"
+missing_errors_doc = "allow"
+
+[profile.dev]
+incremental = true
+codegen-units = 256
+debug = 1
+opt-level = 0
+lto = false
+
+[profile.dev.package.sqlx-macros]
+opt-level = 0
+
+# web-server is a large crate. Inheriting the 256-unit interactive dev profile
+# makes test linking I/O-bound on typical 8-core developer machines.
+[profile.test]
+incremental = false
+codegen-units = 16
+debug = 0
+opt-level = 0
+lto = false

@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Start the open-source AOS demo with its embedded SQLite platform database.
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+DEMO_DATA_DIR="${AOS_DEMO_DATA_DIR:-$ROOT_DIR/.aos-demo-data}"
+DEMO_ENV_FILE="${AOS_DEMO_ENV_FILE:-$DEMO_DATA_DIR/.env}"
+WEB_PORT="${AOS_DEMO_WEB_PORT:-5173}"
+API_ADDR="${AOS_DEMO_API_ADDR:-0.0.0.0:3001}"
+
+usage() {
+  cat <<'USAGE'
+Usage: ./scripts/aos-demo-start.sh
+
+Starts one Rust web-server with a local aos.db and the Vite WebUI.
+
+Environment overrides:
+  AOS_DEMO_DATA_DIR=.aos-demo-data
+  AOS_DEMO_ENV_FILE=.aos-demo-data/.env
+  AOS_DEMO_WEB_PORT=5173
+  AOS_DEMO_API_ADDR=0.0.0.0:3001
+  JWT_SECRET=...
+  ENCRYPTION_KEY=...
+  TOKEN_ENCRYPTION_KEY=...
+  DEFAULT_MODEL=...
+USAGE
+}
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  usage
+  exit 0
+fi
+if [ "$#" -ne 0 ]; then
+  echo "unknown argument: $1" >&2
+  usage
+  exit 2
+fi
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "missing required command: $1" >&2
+    exit 1
+  fi
+}
+
+cleanup() {
+  if [ -n "${SERVER_PID:-}" ] && kill -0 "$SERVER_PID" >/dev/null 2>&1; then
+    kill "$SERVER_PID" >/dev/null 2>&1 || true
+  fi
+  if [ -n "${WEB_PID:-}" ] && kill -0 "$WEB_PID" >/dev/null 2>&1; then
+    kill "$WEB_PID" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+require_cmd cargo
+require_cmd npm
+require_cmd openssl
+
+mkdir -p "$DEMO_DATA_DIR"
+if [[ ! -f "$DEMO_ENV_FILE" ]]; then
+  "$ROOT_DIR/scripts/generate-env.sh" "$DEMO_ENV_FILE"
+fi
+
+read_demo_env() {
+  local key="$1"
+  awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); gsub(/^"|"$/, ""); print; exit }' "$DEMO_ENV_FILE"
+}
+
+export JWT_SECRET="${JWT_SECRET:-$(read_demo_env JWT_SECRET)}"
+export ENCRYPTION_KEY="${ENCRYPTION_KEY:-$(read_demo_env ENCRYPTION_KEY)}"
+export TOKEN_ENCRYPTION_KEY="${TOKEN_ENCRYPTION_KEY:-$(read_demo_env TOKEN_ENCRYPTION_KEY)}"
+export DEFAULT_MODEL="${DEFAULT_MODEL:-$(read_demo_env DEFAULT_MODEL)}"
+export BASE_URL="${BASE_URL:-http://localhost:${WEB_PORT}}"
+export RUST_LOG="${RUST_LOG:-web_server=info,agent_gateway=info,runtime=info,tower_http=info,billing=info}"
+
+echo "==> Starting web-server with ${DEMO_DATA_DIR}/aos.db (${API_ADDR})"
+(
+  cd "$ROOT_DIR/rust"
+  cargo run -p web-server --features full -- --addr "$API_ADDR" --data-dir "$DEMO_DATA_DIR"
+) &
+SERVER_PID="$!"
+
+echo "==> Installing WebUI dependencies if needed"
+(
+  cd "$ROOT_DIR/webui"
+  if [ ! -d node_modules ]; then
+    npm ci
+  fi
+)
+
+echo "==> Starting WebUI on http://localhost:${WEB_PORT}"
+(
+  cd "$ROOT_DIR/webui"
+  npm run dev -- --host 0.0.0.0 --port "$WEB_PORT"
+) &
+WEB_PID="$!"
+
+cat <<EOF
+
+AOS demo is starting.
+
+Open:
+  http://localhost:${WEB_PORT}
+
+First run:
+  1. Complete setup and create an admin user.
+  2. Open Dashboard.
+  3. Click one of the four Open-source Wow Demo cards.
+
+Stop:
+  Press Ctrl+C in this terminal.
+EOF
+
+wait "$SERVER_PID" "$WEB_PID"

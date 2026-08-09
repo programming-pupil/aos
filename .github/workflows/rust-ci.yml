@@ -1,0 +1,264 @@
+name: AOS CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'gaebal/**'
+      - 'omx-issue-*'
+    paths:
+      - .github/workflows/rust-ci.yml
+      - .github/scripts/check_doc_source_of_truth.py
+      - scripts/check-claw-code-parity.sh
+      - scripts/check-platform-sqlite-boundary.sh
+      - scripts/generate-env.sh
+      - scripts/*.ps1
+      - README.md
+      - USAGE.md
+      - PHILOSOPHY.md
+      - docs/**
+      - .env.example
+      - Containerfile
+      - docker-compose.yml
+      - docker/**
+      - webui/**
+      - rust/**
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/workflows/rust-ci.yml
+      - .github/scripts/check_doc_source_of_truth.py
+      - scripts/check-claw-code-parity.sh
+      - scripts/check-platform-sqlite-boundary.sh
+      - scripts/generate-env.sh
+      - scripts/*.ps1
+      - README.md
+      - USAGE.md
+      - PHILOSOPHY.md
+      - docs/**
+      - .env.example
+      - Containerfile
+      - docker-compose.yml
+      - docker/**
+      - webui/**
+      - rust/**
+  workflow_dispatch:
+
+concurrency:
+  group: rust-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: rust
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  platform-sqlite-boundary:
+    name: platform SQLite / external connector boundary
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check platform and NL2SQL database boundaries
+        run: scripts/check-platform-sqlite-boundary.sh
+
+  doc-source-of-truth:
+    name: docs source-of-truth
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Check docs and metadata for stale branding
+        run: python .github/scripts/check_doc_source_of_truth.py
+
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  release-platform-check:
+    name: release compile (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            label: linux-x86_64
+          - os: ubuntu-24.04-arm
+            label: linux-aarch64
+          - os: macos-13
+            label: macos-x86_64
+          - os: macos-14
+            label: macos-aarch64
+          - os: windows-latest
+            label: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+      - name: Check full release feature set
+        run: cargo check -p web-server --features full
+
+  test-workspace:
+    name: cargo test --workspace --all-features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+      - name: Run workspace tests
+        run: cargo test --workspace --all-features
+
+  clippy-workspace:
+    name: cargo clippy --workspace --all-features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+      - name: Run workspace clippy
+        run: >
+          cargo clippy --workspace --all-features --
+          -A clippy::all
+          -A clippy::pedantic
+          -A clippy::nursery
+          -A clippy::restriction
+          -D clippy::correctness
+          -D clippy::suspicious
+
+  runtime-parity-smoke:
+    name: runtime parity smoke
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+      - name: Clone upstream claw-code reference
+        run: git clone --depth 1 https://github.com/ultraworkers/claw-code.git /tmp/aos-claw-code-audit
+      - name: Check runtime parity guardrails
+        run: AOS_PARITY_RUN_CHECKS=1 scripts/check-claw-code-parity.sh /tmp/aos-claw-code-audit
+
+  webui-build:
+    name: webui build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: webui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Type-check Web UI
+        run: npm run typecheck
+      - name: Test Web UI
+        run: npm run test
+      - name: Check translations
+        run: npm run i18n:check
+      - name: Audit production dependencies
+        run: npm audit --omit=dev
+      - name: Build Web UI
+        run: npm run build
+
+  docker-sqlite-smoke:
+    name: docker SQLite empty-volume and restart smoke
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check deployment scripts
+        run: bash -n scripts/generate-env.sh scripts/aos-demo-start.sh
+      - name: Validate compose file
+        run: |
+          ./scripts/generate-env.sh
+          docker compose config --quiet
+      - name: Start AOS from an empty volume
+        run: docker compose up -d --build server
+      - name: Wait for the API and database
+        run: |
+          for i in {1..90}; do
+            if curl -fsS http://127.0.0.1:3001/api/v1/setup/check >/dev/null &&
+               docker compose exec -T server test -s /data/aos.db; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose logs server
+          exit 1
+      - name: Complete first-run setup
+        run: |
+          setup_status="$(curl -sS -o /tmp/aos-ci-setup.json -w '%{http_code}' \
+            -X POST \
+            -H 'content-type: application/json' \
+            --data '{"tenant_name":"AOS CI","tenant_slug":"aos-ci","admin_email":"admin@example.test","admin_name":"CI Admin","admin_password":"StrongPassword123!"}' \
+            http://127.0.0.1:3001/api/v1/setup)"
+          test "$setup_status" = "200"
+          test "$(jq -r '.token | type' /tmp/aos-ci-setup.json)" = "string"
+      - name: Restart with the existing SQLite volume
+        run: |
+          docker compose restart server
+          for i in {1..60}; do
+            if curl -fsS http://127.0.0.1:3001/api/v1/setup/check >/dev/null &&
+               docker compose exec -T server test -s /data/aos.db; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose logs server
+          exit 1
+      - name: Verify setup data survived restart
+        run: |
+          test "$(curl -fsS http://127.0.0.1:3001/api/v1/setup/check | jq -r '.initialized')" = "true"
+          login_status="$(curl -sS -o /tmp/aos-ci-login.json -w '%{http_code}' \
+            -X POST \
+            -H 'content-type: application/json' \
+            --data '{"email":"admin@example.test","password":"StrongPassword123!"}' \
+            http://127.0.0.1:3001/api/v1/auth/login)"
+          test "$login_status" = "200"
+          test "$(jq -r '.user.email' /tmp/aos-ci-login.json)" = "admin@example.test"
+      - name: Show server logs on failure
+        if: failure()
+        run: docker compose logs server
+      - name: Stop compose stack
+        if: always()
+        run: docker compose down -v

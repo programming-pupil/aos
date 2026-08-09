@@ -1,0 +1,110 @@
+# ── Build outputs ─────────────────────────────────────────────────────────────
+rust/target/
+rust/target-*/
+webui/dist/
+/dist/
+/dist-final/
+webui/node_modules/
+webui/.vite/
+*.tsbuildinfo
+
+# ── Runtime data & local state ────────────────────────────────────────────────
+.aos/
+.aos-data/
+.aos-runtime/
+.aos-data-*/
+.aos-demo-data/
+.aos-upstream-audit/
+.aos-alignment-progress.md
+.aos.json
+.claude/
+.claude.json
+.aosd-agents/
+rust/.aosd-agents/
+rust/.claude/
+.aosd-todos.json
+.clawd-todos.json
+.run/
+.searxng*/
+.sandbox-home/
+.sandbox-tmp/
+.omx/
+.clawhip/
+.claw/
+rust/.claw/
+rust/.aos*.txt
+rust/.aos*.log
+rust/test_*.txt
+rust/cd
+
+# ── Vector store & embedding databases ───────────────────────────────────────
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.ann
+embeddings.sqlite*
+
+# ── Secrets & credentials ─────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.encryption_key
+
+# ── IDE & editor ──────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+.vite/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Logs & telemetry ──────────────────────────────────────────────────────────
+*.log
+*.jsonl
+telemetry.jsonl
+status-help.txt
+!docs/evals/*.jsonl
+
+# ── Internal planning and delivery notes ─────────────────────────────────────
+.kiro/
+CLAUDE.md
+docs/plans/
+docs/operations/
+docs/AOS_VS_CODEX_GAP.md
+docs/MEMORY_COMPACTION_BASELINE.md
+docs/READABILITY_SPEC.md
+
+# ── Local test/build leftovers ───────────────────────────────────────────────
+webui/test-results/
+webui/tsc_out.txt
+rust/crates/agent-gateway/src/runtime_builder.rs:143:5
+
+# ── OS artifacts ──────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+
+# ── Temporary & archive ───────────────────────────────────────────────────────
+archive/
+tmp/
+temp/
+*.tmp
+*.bak
+*.orig
+
+# ── Test artifacts ────────────────────────────────────────────────────────────
+/coverage/
+lcov.info
+
+# ── Local config overrides (machine-specific, never commit) ───────────────────
+.aos/settings.local.json
+.claude/settings.local.json
+.claude/sessions/

@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "scenarios": [
+    {
+      "id": "fix-frontend-bug",
+      "capability": "rd_agent",
+      "entryPath": "/agent?mode=code&demo=fix-frontend-bug",
+      "assets": [
+        "examples/code-studio/frontend-bug-demo"
+      ],
+      "expected": [
+        "Code Studio opens with the demo prompt prefilled",
+        "Preview can be started with npm run dev",
+        "Console error points to zero-cost ROI handling",
+        "Agent creates a candidate Diff and test output before apply"
+      ]
+    },
+    {
+      "id": "ask-watchdog",
+      "capability": "watchdog",
+      "entryPath": "/watchdog?demo=ask-watchdog",
+      "assets": [
+        "AgentOps demo tasks seeded by /api/v1/demo/scenarios/ask-watchdog/run",
+        "examples/bot-router/aos_router_agent.json",
+        "examples/bot-router/generic_webhook_channel.json",
+        "examples/bot-router/smoke_messages.jsonl"
+      ],
+      "expected": [
+        "WatchDog sees running/stale/failed demo tasks",
+        "Task inspector shows structured events and trace",
+        "Ask WatchDog answers from structured evidence",
+        "WatchDog action commands such as cancel/detail/retry stay WatchDog-routed"
+      ]
+    }
+  ]
+}

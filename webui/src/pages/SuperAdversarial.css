@@ -1,0 +1,325 @@
+.super-adversarial {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  color: var(--text-primary);
+  background: var(--bg-void);
+  transition: grid-template-columns 180ms ease;
+}
+
+.super-adversarial__main,
+.super-adversarial__sidebar {
+  min-width: 0;
+  min-height: 0;
+}
+
+.super-adversarial__sidebar {
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+}
+
+.super-adversarial__sidebar-header {
+  padding: 14px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.super-adversarial__collapsed-tools {
+  width: 100%;
+  align-items: center;
+}
+
+.super-adversarial__thread-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px;
+}
+
+.super-adversarial__thread-item {
+  padding: 5px 0 !important;
+}
+
+.super-adversarial__thread-card {
+  width: 100%;
+  border-color: var(--border-subtle);
+  background: var(--bg-elevated);
+}
+
+.super-adversarial__thread-card.is-selected {
+  border-color: var(--accent-ai);
+  background: var(--accent-ai-subtle);
+  box-shadow: inset 3px 0 0 var(--accent-ai), var(--glow-purple-sm);
+}
+
+.super-adversarial__thread-card .ant-card-body {
+  padding: 10px;
+}
+
+.super-adversarial__thread-title {
+  margin: 8px 0 6px;
+  overflow-wrap: anywhere;
+}
+
+.super-adversarial__list-footer,
+.super-adversarial__load-older {
+  text-align: center;
+  padding: 8px 0;
+}
+
+.super-adversarial__main {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-void);
+}
+
+.super-adversarial__header {
+  flex: 0 0 auto;
+  padding: 14px 18px 10px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+}
+
+.super-adversarial__title-block {
+  min-width: 0;
+}
+
+.super-adversarial__title {
+  margin: 0 !important;
+  max-width: min(860px, 62vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.super-adversarial__title-icon {
+  color: var(--accent-ai-hover);
+}
+
+.super-adversarial__run-actions {
+  justify-content: flex-end;
+}
+
+.super-adversarial__progress {
+  margin-top: 10px;
+}
+
+.super-adversarial__stage {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 18px 24px;
+  background: var(--bg-void);
+}
+
+.super-adversarial__timeline {
+  width: 100%;
+}
+
+.super-adversarial__message {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  justify-content: flex-start;
+}
+
+.super-adversarial__message.is-user {
+  flex-direction: row-reverse;
+}
+
+.super-adversarial__bubble {
+  max-width: min(900px, 92%);
+  border-radius: 8px;
+  background: var(--bubble-assistant-bg);
+  border-color: var(--bubble-assistant-border);
+  color: var(--bubble-assistant-text);
+}
+
+.super-adversarial__bubble.is-final {
+  border-color: var(--color-success);
+  background: var(--color-success-bg);
+}
+
+.super-adversarial__bubble.is-judge {
+  border-color: rgba(210, 153, 34, 0.36);
+  background: var(--color-warning-bg);
+}
+
+.super-adversarial__bubble.is-system {
+  border-color: var(--border-default);
+  background: var(--bg-interactive);
+}
+
+.super-adversarial__bubble-content {
+  margin-bottom: 0 !important;
+  overflow-wrap: anywhere;
+  line-height: 1.7;
+  color: var(--text-primary);
+}
+
+.super-adversarial__bubble-content > span {
+  white-space: pre-wrap;
+}
+
+.super-adversarial__bubble-content .markdown-content {
+  margin: 0;
+}
+
+.super-adversarial__typing-cursor {
+  display: inline-block;
+  color: var(--bubble-cursor);
+  animation: superAdversarialCursor 1s step-end infinite;
+}
+
+@keyframes superAdversarialCursor {
+  0%,
+  48% {
+    opacity: 1;
+  }
+  49%,
+  100% {
+    opacity: 0;
+  }
+}
+
+.super-adversarial__empty-state {
+  max-width: 680px;
+  margin: 72px auto;
+  padding: 0 16px;
+  text-align: center;
+}
+
+.super-adversarial__composer {
+  flex: 0 0 auto;
+  padding: 12px 18px 16px;
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+}
+
+.super-adversarial__followup-alert {
+  margin-bottom: 10px;
+}
+
+.super-adversarial__composer-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) 150px auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.super-adversarial__form-item,
+.super-adversarial__question-item {
+  margin-bottom: 0;
+}
+
+.super-adversarial__question-item {
+  margin-top: 10px;
+}
+
+.super-adversarial__rounds-input {
+  width: 100%;
+}
+
+.super-adversarial__send-cell {
+  width: 100%;
+}
+
+.super-adversarial__between {
+  width: 100%;
+  justify-content: space-between;
+}
+
+.super-adversarial__fill {
+  width: 100%;
+}
+
+.super-adversarial__muted {
+  font-size: 12px;
+}
+
+.super-adversarial .ant-card {
+  color: var(--text-primary);
+}
+
+.super-adversarial .ant-card-body {
+  color: inherit;
+}
+
+.super-adversarial__title,
+.super-adversarial__empty-state .ant-typography:not(.ant-typography-secondary) {
+  color: var(--text-primary) !important;
+}
+
+.super-adversarial .ant-form-item-label > label,
+.super-adversarial .ant-input-show-count-suffix {
+  color: var(--text-secondary);
+}
+
+.super-adversarial .ant-typography-secondary,
+.super-adversarial__muted {
+  color: var(--text-secondary) !important;
+}
+
+.super-adversarial .ant-select-selector,
+.super-adversarial .ant-input,
+.super-adversarial .ant-input-number {
+  background: var(--bg-elevated) !important;
+  border-color: var(--border-default) !important;
+  color: var(--text-primary) !important;
+}
+
+.super-adversarial .ant-select-selection-placeholder,
+.super-adversarial .ant-input::placeholder {
+  color: var(--text-muted) !important;
+}
+
+.super-adversarial .ant-select-selection-item {
+  background: var(--accent-ai-muted) !important;
+  border-color: rgba(124, 58, 237, 0.34) !important;
+  color: var(--text-primary) !important;
+}
+
+.super-adversarial .ant-input-number-input {
+  color: var(--text-primary) !important;
+}
+
+.super-adversarial .ant-tag,
+.super-adversarial .ant-btn,
+.super-adversarial .ant-select-selector,
+.super-adversarial .ant-input,
+.super-adversarial .ant-input-number {
+  max-width: 100%;
+}
+
+@media (max-width: 900px) {
+  .super-adversarial {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+
+  .super-adversarial__sidebar {
+    display: none;
+  }
+
+  .super-adversarial__title {
+    max-width: 100%;
+    white-space: normal;
+  }
+
+  .super-adversarial__run-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .super-adversarial__composer-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .super-adversarial__stage {
+    padding: 14px;
+  }
+
+  .super-adversarial__bubble {
+    max-width: calc(100% - 42px);
+  }
+}

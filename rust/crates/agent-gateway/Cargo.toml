@@ -1,0 +1,46 @@
+[package]
+name = "agent-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Core runtime (we ONLY call public interfaces, never touch internals)
+runtime = { path = "../runtime" }
+api = { path = "../api" }
+tools = { path = "../tools" }
+plugins = { path = "../plugins" }
+
+# Web server foundation
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json.workspace = true
+sqlx = { workspace = true }
+tracing.workspace = true
+thiserror.workspace = true
+
+# HTTP / serialization
+reqwest = { workspace = true }
+url = "2"
+urlencoding = "2"
+async-stream = "0.3"
+futures-util = "0.3"
+async-trait = "0.1"
+
+# Utils
+uuid = { workspace = true }
+chrono = { workspace = true }
+walkdir = "2"
+glob = { workspace = true }
+regex = { workspace = true }
+aes-gcm = { workspace = true }
+base64 = { workspace = true }
+sha2.workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

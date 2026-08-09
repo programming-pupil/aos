@@ -1,0 +1,13 @@
+{
+  "agent_id": "<replace-with-created-agent-id>",
+  "platform": "generic_webhook",
+  "name": "Generic Webhook Router Smoke",
+  "enabled": true,
+  "inbound_mode": "webhook",
+  "inbound_secret": "aos-router-smoke",
+  "outbound_webhook_url": "http://127.0.0.1:3999/aos-bot-outbound",
+  "config_json": {
+    "purpose": "Local smoke channel for the AOS Router unified Bot entrance.",
+    "replyShape": "AOS generic outbound webhook payload"
+  }
+}

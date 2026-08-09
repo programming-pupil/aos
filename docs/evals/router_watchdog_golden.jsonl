@@ -1,0 +1,20 @@
+{"id":"router-ai-chat-weather","kind":"aos_router","input":"今天天气咋样？","expected":{"targetCapability":"ai_chat"},"notes":"General real-world question without data-source or AgentOps intent should route to AI Chat."}
+{"id":"router-pm-user-profile","kind":"aos_router","input":"印尼出海用户画像，帮我做一版策略分析","expected":{"targetCapability":"pm_assistant"},"notes":"Market, growth, operations, and user-profile analysis belongs to PM Assistant."}
+{"id":"router-rd-bugfix","kind":"aos_router","input":"修复登录超时 bug，并给我可审查 diff","expected":{"targetCapability":"rd_agent"},"notes":"Code change, bug fix, test, diff, and repository-reading requests route to RD Agent."}
+{"id":"router-nl2sql-gmv","kind":"aos_router","input":"昨天 GMV 按国家统计一下","expected":{"targetCapability":"nl2sql"},"notes":"Metric query and grouped data exploration should route to NL2SQL when bound."}
+{"id":"router-super-adversarial","kind":"aos_router","input":"这两个定价方案辩一辩，最后给裁决","expected":{"targetCapability":"super_adversarial"},"notes":"Debate, PK, and judge wording should route to Super Adversarial."}
+{"id":"router-watchdog-running","kind":"aos_router","input":"当前有哪些 agent 在运行？","expected":{"targetCapability":"watchdog"},"notes":"Agent status and active-task questions must route to WatchDog."}
+{"id":"router-watchdog-cancel","kind":"aos_router","input":"取消 1","expected":{"targetCapability":"watchdog"},"notes":"Action commands must be handled by WatchDog before default capability fallback."}
+{"id":"router-ai-chat-explain","kind":"aos_router","input":"帮我解释一下 OKR 和 KPI 的区别","expected":{"targetCapability":"ai_chat"},"notes":"General explanation with no enterprise data/source requirement."}
+{"id":"router-pm-competitor","kind":"aos_router","input":"分析一下 TikTok Shop 在东南亚的增长打法","expected":{"targetCapability":"pm_assistant"},"notes":"Competitive and market strategy request."}
+{"id":"router-rd-startup","kind":"aos_router","input":"这个仓库怎么启动？读取 README 和配置给我最短步骤","expected":{"targetCapability":"rd_agent"},"notes":"Repository understanding belongs to RD Agent."}
+{"id":"router-nl2sql-retention","kind":"aos_router","input":"看一下上周新用户 7 日留存，按渠道拆分","expected":{"targetCapability":"nl2sql"},"notes":"Analytics query should route to NL2SQL."}
+{"id":"router-watchdog-no-reply","kind":"aos_router","input":"飞书刚才派的任务为什么没回复？","expected":{"targetCapability":"watchdog"},"notes":"No-reply diagnosis is WatchDog."}
+{"id":"watchdog-active-status","kind":"watchdog_intent","input":"当前有哪些 agent 在运行？","expected":{"intent":"list_tasks","status":["queued","claimed","running","waiting_input","retrying","cancelling"],"scope":"conversation"},"notes":"Active/running wording maps to active queue/task statuses."}
+{"id":"watchdog-action-detail","kind":"watchdog_intent","input":"详情 2","expected":{"intent":"action","action":"detail","taskIndex":2},"notes":"Detail action command must be structured."}
+{"id":"watchdog-action-cancel","kind":"watchdog_intent","input":"取消 1","expected":{"intent":"action","action":"cancel","taskIndex":1},"notes":"Cancel action must never fall through to PM/RD."}
+{"id":"watchdog-action-retry","kind":"watchdog_intent","input":"重试 3","expected":{"intent":"action","action":"retry","taskIndex":3},"notes":"Retry action should create a child task at execution time."}
+{"id":"watchdog-queue-dead","kind":"watchdog_intent","input":"现在有哪些死信任务？","expected":{"intent":"queue_health","queueIntent":"dead"},"notes":"Dead-letter queue query."}
+{"id":"watchdog-stale-heartbeat","kind":"watchdog_intent","input":"哪些任务超过 10 分钟没心跳？","expected":{"intent":"stale_tasks","staleMinutes":10},"notes":"Stale task query."}
+{"id":"watchdog-capability-pm","kind":"watchdog_intent","input":"产运助手有几个在工作？","expected":{"capability":"pm_assistant","status":["queued","claimed","running","waiting_input","retrying","cancelling"]},"notes":"Capability health with active status filter."}
+{"id":"watchdog-scope-all","kind":"watchdog_intent","input":"全部任务状态","expected":{"scope":"tenant","intent":"list_tasks"},"notes":"Explicit all/tenant wording expands scope."}
