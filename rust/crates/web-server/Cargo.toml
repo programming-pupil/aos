@@ -55,7 +55,7 @@ rusqlite = { workspace = true }
 parking_lot.workspace = true
 fs2.workspace = true
 hnsw_rs = "0.3"
-fastembed = { version = "=5.13.0", default-features = false, features = ["ort-load-dynamic"], optional = true }
+fastembed = { version = "=5.17.4", default-features = false, features = ["ort-load-dynamic"], optional = true }
 clickhouse = { version = "0.14", features = ["native-tls"] }
 trino-rust-client = "0.9"
 clap = { version = "4", features = ["derive"] }
