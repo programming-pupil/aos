@@ -255,6 +255,8 @@ fn drain_bounded<R: std::io::Read>(mut reader: R) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::isolation_available;
+    #[cfg(target_os = "linux")]
+    use std::{path::Path, time::Duration};
 
     #[cfg(not(target_os = "linux"))]
     #[test]
