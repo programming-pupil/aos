@@ -80,7 +80,6 @@ docs/plans/
 docs/operations/
 docs/AOS_VS_CODEX_GAP.md
 docs/MEMORY_COMPACTION_BASELINE.md
-docs/READABILITY_SPEC.md
 
 # ── Local test/build leftovers ───────────────────────────────────────────────
 webui/test-results/

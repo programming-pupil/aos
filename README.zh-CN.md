@@ -110,6 +110,7 @@ AOS 平台自身使用 SQLite；业务数据库作为 NL2SQL 外部数据源配�
 - [Bot 网关企业配置](./docs/BOT_GATEWAY_ENTERPRISE.md)
 - [NL2SQL 设计说明](./docs/DESIGN_DATASOURCES_NL2SQL.md)
 - [研发方案设计中心](./docs/AOS_ENGINEERING_DESIGN_CENTER.zh-CN.md)
+- [输出易读性规范](./docs/READABILITY_SPEC.md)
 - [安全政策](./SECURITY.zh-CN.md)
 - [贡献指南](./CONTRIBUTING.zh-CN.md)
 

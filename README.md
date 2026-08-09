@@ -118,6 +118,7 @@ Targeted test guides cover the Bot Gateway, data attribution, NL2SQL configurati
 - [Bot Gateway enterprise setup](./docs/BOT_GATEWAY_ENTERPRISE.md)
 - [NL2SQL design](./docs/DESIGN_DATASOURCES_NL2SQL.md)
 - [Engineering design center](./docs/AOS_ENGINEERING_DESIGN_CENTER.zh-CN.md)
+- [Readability specification](./docs/READABILITY_SPEC.md)
 - [Security policy](./SECURITY.md)
 - [Contributing](./CONTRIBUTING.md)
 
