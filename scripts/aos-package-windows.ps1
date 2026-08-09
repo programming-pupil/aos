@@ -28,7 +28,7 @@ try {
     Copy-Item $Backend (Join-Path $Stage 'bin\web-server.exe')
     Copy-Item (Join-Path $Web '*') (Join-Path $Stage 'web') -Recurse
     foreach ($NameToCopy in @('.env.example', 'README.md', 'LICENSE', 'NOTICE.md')) { Copy-Item (Join-Path $Root $NameToCopy) $Stage }
-    Copy-Item (Join-Path $Root 'licenses\Qdrant-paraphrase-multilingual-MiniLM-L12-v2-onnx-Q.txt') (Join-Path $Stage 'licenses')
+    Copy-Item (Join-Path $Root 'licenses\*.txt') (Join-Path $Stage 'licenses')
     foreach ($Doc in @('INSTALL.md', 'OPEN_SOURCE_DEPLOYMENT.zh-CN.md', 'OPEN_SOURCE_TEST_GUIDE.zh-CN.md')) { Copy-Item (Join-Path $Root "docs\$Doc") (Join-Path $Stage 'docs') }
     foreach ($Script in @('aos-start.ps1', 'aos-stop.ps1', 'aos-upgrade.ps1', 'generate-env.ps1', 'setup-environment.ps1', 'setup-onnxruntime.ps1')) { Copy-Item (Join-Path $Root "scripts\$Script") (Join-Path $Stage 'scripts') }
     & (Join-Path $Root 'scripts\setup-onnxruntime.ps1') -Dir (Join-Path $Stage 'runtime\onnxruntime')

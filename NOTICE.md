@@ -4,8 +4,12 @@ AOS is maintained as a Web-first AI operations workspace.
 
 AOS was initially bootstrapped from the MIT-licensed source distribution at
 https://github.com/ultraworkers/claw-code. The AOS application has since been
-substantially reorganized and extended. Any applicable upstream copyright and
-permission notices are preserved in `LICENSE`.
+substantially reorganized and extended. The applicable upstream copyright and
+permission notice is preserved in `licenses/claw-code-MIT.txt`.
+
+The AOS application is distributed under Apache License 2.0. The upstream MIT
+license applies to the portions identified above; these licenses are compatible
+when the required attribution and notices are retained.
 
 The AOS Web UI, Bot Gateway, operations workflows, NL2SQL integrations, materials studio, governance surfaces, configuration management, and related application-layer changes are maintained by the AOS contributors.
 

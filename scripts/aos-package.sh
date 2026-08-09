@@ -50,7 +50,7 @@ cp "$BACKEND_BIN" "$stage/bin/web-server"
 cp -R "$WEB_DIR"/. "$stage/web/"
 cp "$ROOT_DIR/.env.example" "$stage/.env.example"
 cp "$ROOT_DIR/README.md" "$ROOT_DIR/README.zh-CN.md" "$ROOT_DIR/LICENSE" "$ROOT_DIR/NOTICE.md" "$stage/"
-cp "$ROOT_DIR/licenses/Qdrant-paraphrase-multilingual-MiniLM-L12-v2-onnx-Q.txt" "$stage/licenses/"
+cp "$ROOT_DIR"/licenses/*.txt "$stage/licenses/"
 cp "$ROOT_DIR/docs/INSTALL.md" \
   "$ROOT_DIR/docs/OPEN_SOURCE_DEPLOYMENT.zh-CN.md" \
   "$ROOT_DIR/docs/AOS_ENGINEERING_DESIGN_CENTER.zh-CN.md" \

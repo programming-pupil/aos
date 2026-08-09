@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="520" viewBox="0 0 1600 520" role="img" aria-labelledby="title desc">
-  <title id="title">AOS - Autonomous Operations System</title>
-  <desc id="desc">AOS is a recoverable Agent OS for research, data, code, and mobile operations.</desc>
+  <title id="title">AOS - Agent Operating System</title>
+  <desc id="desc">AOS is a recoverable Agent OS for research, data, and mobile operations.</desc>
   <rect width="1600" height="520" rx="20" fill="#f8fafc"/>
   <path d="M64 72H1536" stroke="#d8dee8" stroke-width="2"/>
   <path d="M64 448H1536" stroke="#d8dee8" stroke-width="2"/>
@@ -14,8 +14,8 @@
   </g>
   <g font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" fill="#102a43">
     <text x="430" y="236" font-size="126" font-weight="750" letter-spacing="8">AOS</text>
-    <text x="438" y="300" font-size="28" font-weight="650" letter-spacing="5" fill="#e35d4f">AUTONOMOUS OPERATIONS SYSTEM</text>
-    <text x="438" y="360" font-size="30" fill="#526579">A recoverable Agent OS for research, data, code, and mobile operations.</text>
+    <text x="438" y="300" font-size="28" font-weight="650" letter-spacing="5" fill="#e35d4f">AGENT OPERATING SYSTEM</text>
+    <text x="438" y="360" font-size="30" fill="#526579">A recoverable Agent OS for research, data, and mobile operations.</text>
   </g>
   <g fill="none" stroke="#b8c7d9" stroke-width="3" opacity="0.8">
     <path d="M1250 164l86 54-38 92-102-8z"/>
