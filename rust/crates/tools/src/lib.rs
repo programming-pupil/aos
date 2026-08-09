@@ -4862,6 +4862,14 @@ fn weather_location_candidates(query: &str) -> Vec<String> {
             push(cjk_chars[cjk_chars.len() - length..].iter().collect());
         }
     }
+    // Composite Chinese place names are often written as province/city + district
+    // without separators. Geocoders may index either component but not the joined
+    // form, so retain bounded administrative-prefix fallbacks as well.
+    for length in [2_usize, 3, 4, 6, 8] {
+        if cjk_chars.len() > length && cjk_chars.len().saturating_sub(length) >= 2 {
+            push(cjk_chars[..length].iter().collect());
+        }
+    }
     candidates.truncate(6);
     candidates
 }
@@ -11684,7 +11692,7 @@ mod tests {
     fn weather_search_extracts_location_without_binding_to_a_specific_city() {
         assert_eq!(
             super::weather_location_candidates("北京海淀天气预报 今天 明天"),
-            vec!["北京海淀", "海淀"]
+            vec!["北京海淀", "海淀", "北京"]
         );
         assert_eq!(
             super::weather_location_candidates("New York weather forecast tomorrow"),

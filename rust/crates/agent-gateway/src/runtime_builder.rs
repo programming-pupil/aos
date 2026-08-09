@@ -999,9 +999,9 @@ impl GatewayApiClient {
                     && !(block_mcp_search_tools && is_mcp_search_like_tool(tool))
             });
         }
-        // Native provider search is an additional model request parameter. It must not
-        // change the explicit AOS tool surface: WebSearch/WebFetch and search MCP tools
-        // remain available when the provider ignores or cannot satisfy native search.
+        // A provider-native search request is consumed as a one-shot answer. Do not let
+        // it stop at an AOS web tool call that cannot be executed inside that provider
+        // request. The non-native retry rebuilds the complete explicit tool surface.
         defs = apply_native_search_explicit_tool_policy(defs, native_search_primary_request);
         defs
     }
@@ -1409,9 +1409,29 @@ fn is_mcp_search_like_tool(tool: &ToolDefinition) -> bool {
 
 fn apply_native_search_explicit_tool_policy(
     tools: Vec<ToolDefinition>,
-    _native_search_primary_request: bool,
+    native_search_primary_request: bool,
 ) -> Vec<ToolDefinition> {
+    if !native_search_primary_request {
+        return tools;
+    }
     tools
+        .into_iter()
+        .filter(|tool| !is_native_search_conflicting_explicit_tool(tool))
+        .collect()
+}
+
+fn is_native_search_conflicting_explicit_tool(tool: &ToolDefinition) -> bool {
+    let compact_name = tool
+        .name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    matches!(
+        compact_name.as_str(),
+        "toolsearch" | "listmcpresources" | "readmcpresource" | "listmcpresourcetemplates"
+    ) || is_web_lookup_tool_name(&tool.name)
+        || is_mcp_search_like_tool(tool)
 }
 
 fn is_web_lookup_tool_name(tool_name: &str) -> bool {
@@ -11737,7 +11757,7 @@ mod tests {
     }
 
     #[test]
-    fn native_primary_request_preserves_explicit_search_tools() {
+    fn native_primary_request_defers_explicit_search_tools_to_fallback() {
         let web_mcp_tool = ToolDefinition {
             name: "mcp__browser__open_url".to_string(),
             description: Some("Fetch and browse a public URL".to_string()),
@@ -11758,28 +11778,39 @@ mod tests {
             description: Some("Fetch a URL".to_string()),
             input_schema: serde_json::json!({"type": "object"}),
         };
+        let tool_search = ToolDefinition {
+            name: "ToolSearch".to_string(),
+            description: Some("Discover deferred tools".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
 
-        let expected = vec![
-            web_mcp_tool.name.clone(),
-            local_mcp_tool.name.clone(),
-            builtin_web_search.name.clone(),
-            builtin_web_fetch.name.clone(),
+        let tools = vec![
+            web_mcp_tool.clone(),
+            local_mcp_tool.clone(),
+            builtin_web_search.clone(),
+            builtin_web_fetch.clone(),
+            tool_search.clone(),
         ];
-        for native_search_enabled in [false, true] {
-            let retained = apply_native_search_explicit_tool_policy(
-                vec![
-                    web_mcp_tool.clone(),
-                    local_mcp_tool.clone(),
-                    builtin_web_search.clone(),
-                    builtin_web_fetch.clone(),
-                ],
-                native_search_enabled,
-            )
+        let fallback = apply_native_search_explicit_tool_policy(tools.clone(), false)
             .into_iter()
             .map(|tool| tool.name)
             .collect::<Vec<_>>();
-            assert_eq!(retained, expected);
-        }
+        assert_eq!(
+            fallback,
+            vec![
+                web_mcp_tool.name,
+                local_mcp_tool.name.clone(),
+                builtin_web_search.name,
+                builtin_web_fetch.name,
+                tool_search.name,
+            ]
+        );
+
+        let native = apply_native_search_explicit_tool_policy(tools, true)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert_eq!(native, vec![local_mcp_tool.name]);
     }
 
     #[test]
