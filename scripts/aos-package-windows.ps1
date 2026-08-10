@@ -51,9 +51,18 @@ try {
     $ModelCache = Join-Path $Root '.aos-runtime\models\fastembed'
     & (Join-Path $Root 'scripts\download-local-embedding.ps1') -Dir $ModelCache
     Copy-Item (Join-Path $ModelCache '*') (Join-Path $Stage 'models\fastembed') -Recurse -Force
-    $env:ORT_DYLIB_PATH = Join-Path $Stage 'runtime\onnxruntime\lib\onnxruntime.dll'
-    & $Backend --warm-local-embedding (Join-Path $Stage 'models\fastembed')
-    if ($LASTEXITCODE -ne 0) { throw 'Local embedding model warm-up failed.' }
+    $OrtLib = Join-Path $Stage 'runtime\onnxruntime\lib'
+    $PreviousOrtDylibPath = $env:ORT_DYLIB_PATH
+    $PreviousPath = $env:Path
+    try {
+        $env:ORT_DYLIB_PATH = Join-Path $OrtLib 'onnxruntime.dll'
+        $env:Path = "$OrtLib;$PreviousPath"
+        & $Backend --warm-local-embedding (Join-Path $Stage 'models\fastembed')
+        if ($LASTEXITCODE -ne 0) { throw 'Local embedding model warm-up failed.' }
+    } finally {
+        $env:ORT_DYLIB_PATH = $PreviousOrtDylibPath
+        $env:Path = $PreviousPath
+    }
     $Snapshot = Join-Path $Stage 'models\fastembed\models--Qdrant--paraphrase-multilingual-MiniLM-L12-v2-onnx-Q\snapshots\faf4aa4225822f3bc6376869cb1164e8e3feedd0'
     $ModelHashes = [ordered]@{
         'model_optimized.onnx' = '634d0f66c29dc934c8fa72b8a4fe91dd4d420a22f1d82a241058d4316e659a99'
