@@ -30,8 +30,9 @@ if (-not $SkipBuild) {
 $Backend = Join-Path $Root 'rust\target\release\web-server.exe'
 $Web = Join-Path $Root 'webui\dist'
 if (-not (Test-Path $Backend) -or -not (Test-Path (Join-Path $Web 'index.html'))) { throw 'Release artifacts are missing.' }
-$Version = ((Select-String (Join-Path $Root 'rust\Cargo.toml') '^version\s*=\s*"([^"]+)"').Matches.Groups[1].Value | Select-Object -First 1)
-if (-not $Version) { $Version = '0.1.0' }
+$VersionMatch = Select-String -Path (Join-Path $Root 'rust\Cargo.toml') -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+if (-not $VersionMatch -or $VersionMatch.Matches.Count -eq 0) { throw 'Unable to read the AOS workspace version from rust\Cargo.toml.' }
+$Version = $VersionMatch.Matches[0].Groups[1].Value
 $Name = "aos-offline-$Version-windows-x86_64"
 $Temp = Join-Path ([IO.Path]::GetTempPath()) ("aos-package-" + [guid]::NewGuid())
 $Stage = Join-Path $Temp $Name
