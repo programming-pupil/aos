@@ -137,16 +137,19 @@ mkdir -p "$OUTPUT_DIR"
 archive="$OUTPUT_DIR/$package_name.tar.gz"
 tar -C "$temporary_root" -czf "$archive" "$package_name"
 
-if tar -tzf "$archive" | rg -q '(^|/)([.]env$|aos[.]db|aos[.]db-wal|aos[.]db-shm|[.]claw/|[.]run/)'; then
+archive_listing="$temporary_root/archive-contents.txt"
+tar -tzf "$archive" > "$archive_listing"
+
+if rg -q '(^|/)([.]env$|aos[.]db|aos[.]db-wal|aos[.]db-shm|[.]claw/|[.]run/)' "$archive_listing"; then
   echo "package validation failed: runtime data or secrets were included" >&2
   exit 1
 fi
 
-if ! tar -tzf "$archive" | rg -q '/models/fastembed/.+'; then
+if ! rg -q '/models/fastembed/.+' "$archive_listing"; then
   echo "package validation failed: built-in embedding model was not included" >&2
   exit 1
 fi
-if ! tar -tzf "$archive" | rg -q '/runtime/onnxruntime/lib/libonnxruntime[.]'; then
+if ! rg -q '/runtime/onnxruntime/lib/libonnxruntime[.]' "$archive_listing"; then
   echo "package validation failed: ONNX Runtime was not included" >&2
   exit 1
 fi

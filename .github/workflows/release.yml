@@ -31,7 +31,7 @@ permissions:
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
 
 jobs:
   prepare:
@@ -91,6 +91,8 @@ jobs:
           cache: npm
           cache-dependency-path: webui/package-lock.json
       - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust -> target
@@ -121,9 +123,30 @@ jobs:
             fi
           fi
 
-      - name: Build clean offline package
+      - name: Build release backend
         shell: bash
-        run: ./scripts/aos-package.sh --output-dir "$RUNNER_TEMP/release"
+        working-directory: rust
+        run: cargo build -p web-server --release --features full
+
+      - name: Build and test WebUI
+        shell: bash
+        working-directory: webui
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build:ci
+          npm test
+
+      - name: Verify SQLite release smoke and platform boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path rust/Cargo.toml -p web-server --features full sqlite_tenant_defaults_seed_without_duplicates
+          ./scripts/check-platform-sqlite-boundary.sh
+
+      - name: Assemble clean offline package
+        shell: bash
+        run: ./scripts/aos-package.sh --skip-build --output-dir "$RUNNER_TEMP/release"
 
       - name: Create and verify archive checksum
         shell: bash
@@ -195,6 +218,8 @@ jobs:
         with:
           python-version: '3.12'
       - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust -> target
@@ -210,9 +235,34 @@ jobs:
           if (-not (Get-Command rg -ErrorAction SilentlyContinue)) { choco install ripgrep -y --no-progress }
           if (-not (Get-Command rg -ErrorAction SilentlyContinue)) { throw 'ripgrep is required.' }
 
-      - name: Build clean offline package
+      - name: Build release backend
         shell: pwsh
-        run: .\scripts\aos-package-windows.ps1 -OutputDir "$env:RUNNER_TEMP\release"
+        working-directory: rust
+        run: |
+          cargo build -p web-server --release --features full
+          if ($LASTEXITCODE -ne 0) { throw 'Rust release build failed.' }
+
+      - name: Build and test WebUI
+        shell: pwsh
+        working-directory: webui
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'WebUI dependency installation failed.' }
+          npm run build:ci
+          if ($LASTEXITCODE -ne 0) { throw 'WebUI build failed.' }
+          npm test
+          if ($LASTEXITCODE -ne 0) { throw 'WebUI tests failed.' }
+
+      - name: Verify SQLite release smoke
+        shell: pwsh
+        working-directory: rust
+        run: |
+          cargo test -p web-server --features full sqlite_tenant_defaults_seed_without_duplicates
+          if ($LASTEXITCODE -ne 0) { throw 'SQLite release smoke test failed.' }
+
+      - name: Assemble clean offline package
+        shell: pwsh
+        run: .\scripts\aos-package-windows.ps1 -SkipBuild -OutputDir "$env:RUNNER_TEMP\release"
 
       - name: Create and verify archive checksum
         shell: pwsh

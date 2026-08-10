@@ -5,9 +5,10 @@ $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 if (-not $Dir) { $Dir = Join-Path $Root '.aos-runtime\onnxruntime' }
 $Version = '1.23.2'
 $Dll = Join-Path $Dir 'lib\onnxruntime.dll'
+$ProvidersDll = Join-Path $Dir 'lib\onnxruntime_providers_shared.dll'
 $VersionFile = Join-Path $Dir 'VERSION_NUMBER'
 $InstalledVersion = if (Test-Path $VersionFile -PathType Leaf) { (Get-Content $VersionFile -Raw).Trim() } else { '' }
-if ((Test-Path $Dll -PathType Leaf) -and $InstalledVersion -eq $Version) { Write-Host "ONNX Runtime is ready: $Dll"; exit 0 }
+if ((Test-Path $Dll -PathType Leaf) -and (Test-Path $ProvidersDll -PathType Leaf) -and $InstalledVersion -eq $Version) { Write-Host "ONNX Runtime is ready: $Dll"; exit 0 }
 if (Test-Path $Dll -PathType Leaf) { Write-Host "Replacing ONNX Runtime $InstalledVersion with $Version" }
 if (-not [Environment]::Is64BitOperatingSystem) { throw 'AOS Offline for Windows requires 64-bit Windows.' }
 
@@ -25,6 +26,7 @@ try {
     $Source = Join-Path $Temp "onnxruntime-win-x64-$Version"
     New-Item -ItemType Directory -Force (Join-Path $Dir 'lib') | Out-Null
     Copy-Item (Join-Path $Source 'lib\onnxruntime.dll') $Dll
+    Copy-Item (Join-Path $Source 'lib\onnxruntime_providers_shared.dll') $ProvidersDll
     foreach ($Name in @('LICENSE', 'README.md', 'ThirdPartyNotices.txt', 'VERSION_NUMBER')) {
         $File = Join-Path $Source $Name
         if (Test-Path $File) { Copy-Item $File (Join-Path $Dir $Name) }
@@ -32,7 +34,7 @@ try {
 } finally {
     Remove-Item $Temp -Recurse -Force -ErrorAction SilentlyContinue
 }
-if (-not (Test-Path $Dll)) { throw 'ONNX Runtime installation failed.' }
+if (-not (Test-Path $Dll) -or -not (Test-Path $ProvidersDll)) { throw 'ONNX Runtime installation failed: required DLLs are missing.' }
 $InstalledVersion = if (Test-Path $VersionFile -PathType Leaf) { (Get-Content $VersionFile -Raw).Trim() } else { '' }
 if ($InstalledVersion -ne $Version) { throw "ONNX Runtime installation reported version $InstalledVersion; expected $Version." }
 Write-Host "ONNX Runtime is ready: $Dll"

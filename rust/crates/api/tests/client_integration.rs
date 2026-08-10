@@ -80,9 +80,10 @@ async fn send_message_posts_json_and_parses_response() {
         request.headers.get("anthropic-version").map(String::as_str),
         Some("2023-06-01")
     );
+    let expected_user_agent = format!("claude-code/{}", env!("CARGO_PKG_VERSION"));
     assert_eq!(
         request.headers.get("user-agent").map(String::as_str),
-        Some("claude-code/0.1.0")
+        Some(expected_user_agent.as_str())
     );
     assert_eq!(
         request.headers.get("anthropic-beta").map(String::as_str),

@@ -65,9 +65,10 @@ foreach ($Entry in $ModelHashes.GetEnumerator()) {
 }
 $OrtRoot = if ($Release) { Join-Path $Root 'runtime\onnxruntime' } else { Join-Path $Root '.aos-runtime\onnxruntime' }
 $OrtDll = Join-Path $OrtRoot 'lib\onnxruntime.dll'
-if (-not (Test-Path $OrtDll)) {
+$OrtProvidersDll = Join-Path $OrtRoot 'lib\onnxruntime_providers_shared.dll'
+if (-not (Test-Path $OrtDll) -or -not (Test-Path $OrtProvidersDll)) {
     if ($Release) {
-        throw 'AOS Offline package is incomplete: ONNX Runtime DLL is missing. Runtime downloads are disabled.'
+        throw 'AOS Offline package is incomplete: required ONNX Runtime DLLs are missing. Runtime downloads are disabled.'
     }
     & (Join-Path $Root 'scripts\setup-onnxruntime.ps1') -Dir $OrtRoot
 }
