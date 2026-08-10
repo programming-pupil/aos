@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/programming-pupil/aos/actions/workflows/rust-ci.yml"><img src="https://github.com/programming-pupil/aos/actions/workflows/rust-ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/npm-v0.1.0-CB3837?logo=npm&logoColor=white" alt="npm version 0.1.0">
+  <a href="https://github.com/programming-pupil/aos/releases/latest"><img src="https://img.shields.io/github/v/release/programming-pupil/aos?display_name=tag&sort=semver&logo=github" alt="latest release"></a>
   <img src="https://img.shields.io/badge/Node.js-%3E%3D20.19%20%7C%7C%20%3E%3D22.12-339933?logo=nodedotjs&logoColor=white" alt="Node.js >=20.19 or >=22.12">
   <img src="https://img.shields.io/badge/License-Apache--2.0-0b8f55?logo=opensourceinitiative&logoColor=white" alt="Apache-2.0 License">
   <img src="https://img.shields.io/badge/Discord-community%20coming%20soon-5865F2?logo=discord&logoColor=white" alt="Discord community coming soon">

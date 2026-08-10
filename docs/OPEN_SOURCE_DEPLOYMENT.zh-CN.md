@@ -378,7 +378,7 @@ Stack Exchange；天气问题还会使用 Open-Meteo 的地理编码、当前天
 输出示例：
 
 ```text
-dist/aos-offline-0.1.0-darwin-x86_64.tar.gz
+dist/aos-offline-<version>-darwin-x86_64.tar.gz
 ```
 
 发布包与构建机器的操作系统和 CPU 架构一致，包含：
@@ -400,8 +400,8 @@ dist/aos-offline-0.1.0-darwin-x86_64.tar.gz
 解压后直接执行：
 
 ```bash
-tar -xzf aos-offline-0.1.0-<os>-<arch>.tar.gz
-cd aos-offline-0.1.0-<os>-<arch>
+tar -xzf aos-offline-<version>-<os>-<arch>.tar.gz
+cd aos-offline-<version>-<os>-<arch>
 ./scripts/setup-environment.sh --check
 ./scripts/aos-start.sh
 ```
@@ -412,8 +412,8 @@ Windows x64 必须在 Windows 上构建：
 
 ```powershell
 .\scripts\aos-package-windows.ps1
-Expand-Archive .\dist\aos-offline-0.1.0-windows-x86_64.zip .\release
-cd .\release\aos-offline-0.1.0-windows-x86_64
+Expand-Archive .\dist\aos-offline-<version>-windows-x86_64.zip .\release
+cd .\release\aos-offline-<version>-windows-x86_64
 .\scripts\setup-environment.ps1
 .\scripts\aos-start.ps1
 ```

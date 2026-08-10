@@ -13,7 +13,19 @@ if (-not $SkipBuild) {
     Push-Location (Join-Path $Root 'rust')
     try { cargo build -p web-server --release --features full; if ($LASTEXITCODE -ne 0) { throw 'Rust release build failed.' } } finally { Pop-Location }
     Push-Location (Join-Path $Root 'webui')
-    try { npm ci; npm run build:ci; if ($LASTEXITCODE -ne 0) { throw 'WebUI build failed.' } } finally { Pop-Location }
+    try {
+        npm ci
+        if ($LASTEXITCODE -ne 0) { throw 'WebUI dependency installation failed.' }
+        npm run build:ci
+        if ($LASTEXITCODE -ne 0) { throw 'WebUI build failed.' }
+        npm test
+        if ($LASTEXITCODE -ne 0) { throw 'WebUI tests failed.' }
+    } finally { Pop-Location }
+    Push-Location (Join-Path $Root 'rust')
+    try {
+        cargo test -p web-server --features full sqlite_tenant_defaults_seed_without_duplicates
+        if ($LASTEXITCODE -ne 0) { throw 'SQLite release smoke test failed.' }
+    } finally { Pop-Location }
 }
 $Backend = Join-Path $Root 'rust\target\release\web-server.exe'
 $Web = Join-Path $Root 'webui\dist'
@@ -27,11 +39,13 @@ New-Item -ItemType Directory -Force (Join-Path $Stage 'bin'), (Join-Path $Stage 
 try {
     Copy-Item $Backend (Join-Path $Stage 'bin\web-server.exe')
     Copy-Item (Join-Path $Web '*') (Join-Path $Stage 'web') -Recurse
-    foreach ($NameToCopy in @('.env.example', 'README.md', 'LICENSE', 'NOTICE.md')) { Copy-Item (Join-Path $Root $NameToCopy) $Stage }
+    foreach ($NameToCopy in @('.env.example', 'README.md', 'README.zh-CN.md', 'LICENSE', 'NOTICE.md')) { Copy-Item (Join-Path $Root $NameToCopy) $Stage }
     Copy-Item (Join-Path $Root 'licenses\*.txt') (Join-Path $Stage 'licenses')
     Copy-Item (Join-Path $Root 'docs\assets\aos-hero.svg') (Join-Path $Stage 'docs\assets')
     Copy-Item (Join-Path $Root 'docs\assets\aos-menu-map.svg') (Join-Path $Stage 'docs\assets')
-    foreach ($Doc in @('INSTALL.md', 'OPEN_SOURCE_DEPLOYMENT.zh-CN.md', 'OPEN_SOURCE_TEST_GUIDE.zh-CN.md')) { Copy-Item (Join-Path $Root "docs\$Doc") (Join-Path $Stage 'docs') }
+    foreach ($Doc in @('INSTALL.md', 'OPEN_SOURCE_DEPLOYMENT.zh-CN.md', 'AOS_ENGINEERING_DESIGN_CENTER.zh-CN.md', 'OPEN_SOURCE_TEST_GUIDE.zh-CN.md')) { Copy-Item (Join-Path $Root "docs\$Doc") (Join-Path $Stage 'docs') }
+    New-Item -ItemType Directory -Force (Join-Path $Stage 'docs\evals') | Out-Null
+    foreach ($Doc in @('BOT_GATEWAY_COMPLETE_TEST_GUIDE.zh-CN.md', 'DATA_ATTRIBUTION_COMPLETE_TEST_GUIDE.zh-CN.md', 'NL2SQL_ADVANCED_CONFIGURATION_TEST_GUIDE.zh-CN.md')) { Copy-Item (Join-Path $Root "docs\evals\$Doc") (Join-Path $Stage 'docs\evals') }
     foreach ($Script in @('aos-start.ps1', 'aos-stop.ps1', 'aos-upgrade.ps1', 'generate-env.ps1', 'setup-environment.ps1', 'setup-onnxruntime.ps1')) { Copy-Item (Join-Path $Root "scripts\$Script") (Join-Path $Stage 'scripts') }
     & (Join-Path $Root 'scripts\setup-onnxruntime.ps1') -Dir (Join-Path $Stage 'runtime\onnxruntime')
     $ModelCache = Join-Path $Root '.aos-runtime\models\fastembed'
@@ -63,6 +77,7 @@ try {
         (Join-Path $Stage 'licenses'),
         (Join-Path $Stage '.env.example'),
         (Join-Path $Stage 'README.md'),
+        (Join-Path $Stage 'README.zh-CN.md'),
         (Join-Path $Stage 'LICENSE'),
         (Join-Path $Stage 'NOTICE.md')
     )

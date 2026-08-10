@@ -45,7 +45,7 @@ $RollbackRoot = Join-Path $BackupRoot 'release'
 $FailedRoot = Join-Path $BackupRoot 'failed-new-release'
 New-Item -ItemType Directory -Force $RollbackRoot, $FailedRoot | Out-Null
 $DataArchive = Join-Path $BackupRoot 'data-before-upgrade.zip'
-$Assets = @('bin', 'web', 'runtime', 'models', 'scripts', 'docs', 'licenses', 'examples', '.env.example', 'README.md', 'LICENSE', 'NOTICE.md', 'RELEASE-MANIFEST.sha256')
+$Assets = @('bin', 'web', 'runtime', 'models', 'scripts', 'docs', 'licenses', 'examples', '.env.example', 'README.md', 'README.zh-CN.md', 'LICENSE', 'NOTICE.md', 'RELEASE-MANIFEST.sha256')
 $RollbackRequired = $false
 
 function Start-Aos([string]$Root) {

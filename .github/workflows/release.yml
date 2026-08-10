@@ -1,24 +1,87 @@
 name: AOS Release
 
 on:
+  workflow_dispatch:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
+    paths:
+      - .github/workflows/release.yml
+      - scripts/aos-package.sh
+      - scripts/aos-package-windows.ps1
+      - scripts/aos-start.sh
+      - scripts/aos-start.ps1
+      - scripts/aos-stop.sh
+      - scripts/aos-stop.ps1
+      - scripts/setup-environment.sh
+      - scripts/setup-environment.ps1
+      - scripts/setup-onnxruntime.sh
+      - scripts/setup-onnxruntime.ps1
+      - scripts/download-local-embedding.sh
+      - scripts/download-local-embedding.ps1
+      - install.sh
+      - rust/**
+      - webui/**
+      - docs/releases/**
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  macos-intel-offline:
-    name: macOS Intel offline package
-    runs-on: macos-15-intel
+  prepare:
+    name: Validate release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify version and release notes
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(awk -F'"' '/^version =/ { print $2; exit }' rust/Cargo.toml)"
+          test -n "$version"
+          test -f "docs/releases/v$version.md"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            test "$GITHUB_REF_NAME" = "v$version"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  unix-offline:
+    name: ${{ matrix.label }} offline package
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            label: Linux x86_64
+            artifact: linux-x86_64
+            package_platform: linux-x86_64
+          - os: ubuntu-24.04-arm
+            label: Linux ARM64
+            artifact: linux-aarch64
+            package_platform: linux-aarch64
+          - os: macos-15-intel
+            label: macOS Intel
+            artifact: darwin-x86_64
+            package_platform: darwin-x86_64
+          - os: macos-15
+            label: macOS Apple Silicon
+            artifact: darwin-arm64
+            package_platform: darwin-arm64
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 360
     env:
-      MACOSX_DEPLOYMENT_TARGET: '13.0'
+      MACOSX_DEPLOYMENT_TARGET: ${{ startsWith(matrix.os, 'macos-') && '13.0' || '' }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -32,19 +95,31 @@ jobs:
         with:
           workspaces: rust -> target
 
-      - name: Verify release version
+      - name: Verify release platform
         shell: bash
         run: |
           set -euo pipefail
-          version="$(awk -F'"' '/^version =/ { print $2; exit }' rust/Cargo.toml)"
-          test "$GITHUB_REF_NAME" = "v$version"
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) actual=linux-x86_64 ;;
+            Linux-aarch64|Linux-arm64) actual=linux-aarch64 ;;
+            Darwin-x86_64) actual=darwin-x86_64 ;;
+            Darwin-arm64) actual=darwin-arm64 ;;
+            *) echo "unsupported release runner: $(uname -s) $(uname -m)" >&2; exit 1 ;;
+          esac
+          test "$actual" = "${{ matrix.package_platform }}"
 
       - name: Ensure release tools
         shell: bash
         run: |
           set -euo pipefail
-          command -v rg >/dev/null 2>&1 || brew install ripgrep
-          command -v gh >/dev/null 2>&1
+          if ! command -v rg >/dev/null 2>&1; then
+            if [ "$(uname -s)" = Darwin ]; then
+              brew install ripgrep
+            else
+              sudo apt-get update
+              sudo apt-get install -y ripgrep
+            fi
+          fi
 
       - name: Build clean offline package
         shell: bash
@@ -55,7 +130,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/release"
-          archive="aos-offline-${GITHUB_REF_NAME#v}-darwin-x86_64.tar.gz"
+          archive="aos-offline-$RELEASE_VERSION-${{ matrix.package_platform }}.tar.gz"
           shasum -a 256 "$archive" > "$archive.sha256"
           shasum -a 256 -c "$archive.sha256"
 
@@ -63,9 +138,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          archive="$RUNNER_TEMP/release/aos-offline-${GITHUB_REF_NAME#v}-darwin-x86_64.tar.gz"
+          package_name="aos-offline-$RELEASE_VERSION-${{ matrix.package_platform }}"
+          archive="$RUNNER_TEMP/release/$package_name.tar.gz"
           verify_root="$RUNNER_TEMP/release-verify"
-          package="$verify_root/aos-offline-${GITHUB_REF_NAME#v}-darwin-x86_64"
+          package="$verify_root/$package_name"
           mkdir -p "$verify_root"
           tar -xzf "$archive" -C "$verify_root"
 
@@ -90,22 +166,159 @@ jobs:
           cleanup
           trap - EXIT
 
+      - name: Upload verified package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.artifact }}
+          path: |
+            ${{ runner.temp }}/release/*.tar.gz
+            ${{ runner.temp }}/release/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-offline:
+    name: Windows x86_64 offline package
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v6
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+
+      - name: Verify release platform
+        shell: pwsh
+        run: |
+          if (-not [Environment]::Is64BitOperatingSystem -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Windows x86_64 runner is required.' }
+
+      - name: Ensure release tools
+        shell: pwsh
+        run: |
+          if (-not (Get-Command rg -ErrorAction SilentlyContinue)) { choco install ripgrep -y --no-progress }
+          if (-not (Get-Command rg -ErrorAction SilentlyContinue)) { throw 'ripgrep is required.' }
+
+      - name: Build clean offline package
+        shell: pwsh
+        run: .\scripts\aos-package-windows.ps1 -OutputDir "$env:RUNNER_TEMP\release"
+
+      - name: Create and verify archive checksum
+        shell: pwsh
+        run: |
+          $Archive = Join-Path $env:RUNNER_TEMP "release\aos-offline-$($env:RELEASE_VERSION)-windows-x86_64.zip"
+          $Hash = (Get-FileHash $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$Hash  $([IO.Path]::GetFileName($Archive))" | Set-Content "$Archive.sha256" -Encoding ascii
+          $Expected = ((Get-Content "$Archive.sha256" -Raw) -split '\s+')[0]
+          if ((Get-FileHash $Archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $Expected) { throw 'Archive checksum verification failed.' }
+
+      - name: Verify extracted package and clean startup
+        shell: pwsh
+        run: |
+          $PackageName = "aos-offline-$($env:RELEASE_VERSION)-windows-x86_64"
+          $Archive = Join-Path $env:RUNNER_TEMP "release\$PackageName.zip"
+          $VerifyRoot = Join-Path $env:RUNNER_TEMP 'release-verify'
+          Expand-Archive $Archive $VerifyRoot -Force
+          $Package = Join-Path $VerifyRoot $PackageName
+
+          foreach ($Line in Get-Content (Join-Path $Package 'RELEASE-MANIFEST.sha256')) {
+            if (-not $Line.Trim()) { continue }
+            $Parts = $Line -split '\s{2}', 2
+            if ($Parts.Count -ne 2) { throw "Invalid manifest line: $Line" }
+            $Path = Join-Path $Package ($Parts[1] -replace '/', '\')
+            if (-not (Test-Path $Path -PathType Leaf)) { throw "Release file is missing: $($Parts[1])" }
+            if ((Get-FileHash $Path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $Parts[0].ToLowerInvariant()) { throw "Checksum mismatch: $($Parts[1])" }
+          }
+          $Forbidden = Get-ChildItem $Package -Recurse -Force | Where-Object { $_.Name -match '^(\.env|aos\.db|aos\.db-wal|aos\.db-shm)$' -or $_.FullName -match '[\\/](\.run|\.aos-data)[\\/]' }
+          if ($Forbidden) { throw 'Release archive contains runtime data or secrets.' }
+
+          try {
+            & (Join-Path $Package 'scripts\aos-start.ps1') -Port 39127
+            $Setup = Invoke-RestMethod 'http://127.0.0.1:39127/api/v1/setup/check' -TimeoutSec 10
+            if ($Setup.initialized -ne $false -or $Setup.tenant_count -ne 0 -or $Setup.user_count -ne 0) { throw 'Clean-start setup state is invalid.' }
+            $RootHtml = (Invoke-WebRequest 'http://127.0.0.1:39127/' -UseBasicParsing -TimeoutSec 10).Content
+            $SetupHtml = (Invoke-WebRequest 'http://127.0.0.1:39127/setup' -UseBasicParsing -TimeoutSec 10).Content
+            if ($RootHtml -notmatch '<div id="root"></div>' -or $SetupHtml -notmatch '<div id="root"></div>') { throw 'WebUI route verification failed.' }
+          } finally {
+            & (Join-Path $Package 'scripts\aos-stop.ps1')
+          }
+
+      - name: Upload verified package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x86_64
+          path: |
+            ${{ runner.temp }}/release/*.zip
+            ${{ runner.temp }}/release/*.zip.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish verified multi-platform release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - prepare
+      - unix-offline
+      - windows-offline
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download verified packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: Verify complete release set
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          cd release
+          expected=(
+            "aos-offline-$version-linux-x86_64.tar.gz"
+            "aos-offline-$version-linux-aarch64.tar.gz"
+            "aos-offline-$version-darwin-x86_64.tar.gz"
+            "aos-offline-$version-darwin-arm64.tar.gz"
+            "aos-offline-$version-windows-x86_64.zip"
+          )
+          for archive in "${expected[@]}"; do
+            test -f "$archive"
+            test -f "$archive.sha256"
+            shasum -a 256 -c "$archive.sha256"
+          done
+          test "$(find . -maxdepth 1 -type f \( -name 'aos-offline-*.tar.gz' -o -name 'aos-offline-*.tar.gz.sha256' -o -name 'aos-offline-*.zip' -o -name 'aos-offline-*.zip.sha256' \) | wc -l | tr -d ' ')" = 10
+          printf '%s\n' "${expected[@]}" | while IFS= read -r archive; do
+            shasum -a 256 "$archive"
+          done > SHA256SUMS
+          test "$(wc -l < SHA256SUMS | tr -d ' ')" = 5
+          ls -lh
+
       - name: Publish GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          archive="$RUNNER_TEMP/release/aos-offline-${GITHUB_REF_NAME#v}-darwin-x86_64.tar.gz"
-          checksum="$archive.sha256"
           notes="docs/releases/${GITHUB_REF_NAME}.md"
-          if [ ! -f "$notes" ]; then
-            echo "missing release notes: $notes" >&2
-            exit 1
-          fi
+          test -f "$notes"
           gh release create "$GITHUB_REF_NAME" \
-            "$archive" \
-            "$checksum" \
+            release/aos-offline-* \
+            release/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --title "AOS ${GITHUB_REF_NAME}" \

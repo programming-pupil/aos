@@ -8,6 +8,7 @@ on:
       - 'omx-issue-*'
     paths:
       - .github/workflows/rust-ci.yml
+      - .github/workflows/release.yml
       - .github/scripts/check_doc_source_of_truth.py
       - scripts/check-claw-code-parity.sh
       - scripts/check-platform-sqlite-boundary.sh
@@ -28,6 +29,7 @@ on:
       - main
     paths:
       - .github/workflows/rust-ci.yml
+      - .github/workflows/release.yml
       - .github/scripts/check_doc_source_of_truth.py
       - scripts/check-claw-code-parity.sh
       - scripts/check-platform-sqlite-boundary.sh
@@ -108,7 +110,7 @@ jobs:
             label: linux-aarch64
           - os: macos-15-intel
             label: macos-x86_64
-          - os: macos-14
+          - os: macos-15
             label: macos-aarch64
           - os: windows-latest
             label: windows-x86_64

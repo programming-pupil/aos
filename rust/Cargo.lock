@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "agent-gateway"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "api",
@@ -188,11 +188,11 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "aos-contract-tests"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "reqwest 0.12.28",
  "runtime",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "billing"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "commands"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "plugins",
  "runtime",
@@ -1408,7 +1408,7 @@ dependencies = [
 
 [[package]]
 name = "eval-harness"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proptest",
  "reqwest 0.12.28",
@@ -3027,7 +3027,7 @@ dependencies = [
 
 [[package]]
 name = "nl2sql-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3052,7 +3052,7 @@ dependencies = [
 
 [[package]]
 name = "nl2sql-domain"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "regex",
@@ -3487,7 +3487,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "plugins"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3495,7 +3495,7 @@ dependencies = [
 
 [[package]]
 name = "pm-domain"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "regex",
  "serde",
@@ -3504,7 +3504,7 @@ dependencies = [
 
 [[package]]
 name = "pm-orchestrator"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "pm-domain",
  "runtime",
@@ -3517,7 +3517,7 @@ dependencies = [
 
 [[package]]
 name = "pm-report"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hex",
  "pm-domain",
@@ -3856,7 +3856,7 @@ dependencies = [
 
 [[package]]
 name = "rd-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "regex",
  "serde",
@@ -4066,7 +4066,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5055,7 +5055,7 @@ checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
 name = "telemetry"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5364,7 +5364,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "api",
  "async-trait",
@@ -5915,7 +5915,7 @@ dependencies = [
 
 [[package]]
 name = "web-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "agent-gateway",
