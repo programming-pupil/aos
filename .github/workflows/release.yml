@@ -21,6 +21,8 @@ on:
       - scripts/setup-onnxruntime.ps1
       - scripts/download-local-embedding.sh
       - scripts/download-local-embedding.ps1
+      - scripts/verify-release-assets.sh
+      - scripts/test-release-assets.sh
       - install.sh
       - rust/**
       - webui/**
@@ -53,6 +55,9 @@ jobs:
             test "$GITHUB_REF_NAME" = "v$version"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Verify release checksum portability
+        shell: bash
+        run: ./scripts/test-release-assets.sh
 
   unix-offline:
     name: ${{ matrix.label }} offline package
@@ -269,7 +274,8 @@ jobs:
         run: |
           $Archive = Join-Path $env:RUNNER_TEMP "release\aos-offline-$($env:RELEASE_VERSION)-windows-x86_64.zip"
           $Hash = (Get-FileHash $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$Hash  $([IO.Path]::GetFileName($Archive))" | Set-Content "$Archive.sha256" -Encoding ascii
+          $ChecksumLine = "$Hash  $([IO.Path]::GetFileName($Archive))`n"
+          [IO.File]::WriteAllText("$Archive.sha256", $ChecksumLine, [Text.Encoding]::ASCII)
           $Expected = ((Get-Content "$Archive.sha256" -Raw) -split '\s+')[0]
           if ((Get-FileHash $Archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $Expected) { throw 'Archive checksum verification failed.' }
 
@@ -338,25 +344,8 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ needs.prepare.outputs.version }}"
-          cd release
-          expected=(
-            "aos-offline-$version-linux-x86_64.tar.gz"
-            "aos-offline-$version-linux-aarch64.tar.gz"
-            "aos-offline-$version-darwin-x86_64.tar.gz"
-            "aos-offline-$version-darwin-arm64.tar.gz"
-            "aos-offline-$version-windows-x86_64.zip"
-          )
-          for archive in "${expected[@]}"; do
-            test -f "$archive"
-            test -f "$archive.sha256"
-            shasum -a 256 -c "$archive.sha256"
-          done
-          test "$(find . -maxdepth 1 -type f \( -name 'aos-offline-*.tar.gz' -o -name 'aos-offline-*.tar.gz.sha256' -o -name 'aos-offline-*.zip' -o -name 'aos-offline-*.zip.sha256' \) | wc -l | tr -d ' ')" = 10
-          printf '%s\n' "${expected[@]}" | while IFS= read -r archive; do
-            shasum -a 256 "$archive"
-          done > SHA256SUMS
-          test "$(wc -l < SHA256SUMS | tr -d ' ')" = 5
-          ls -lh
+          ./scripts/verify-release-assets.sh release "$version"
+          ls -lh release
 
       - name: Publish GitHub Release
         shell: bash
