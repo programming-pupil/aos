@@ -43,8 +43,70 @@ function observationFromEvent(
 function statusColor(status: string): string {
   if (status === "completed") return "success";
   if (status === "failed" || status === "cancelled") return "error";
+  if (
+    status === "partial" ||
+    status === "no_data" ||
+    status === "clarification_needed"
+  ) return "warning";
   if (status === "running") return "processing";
   return "default";
+}
+
+export function isAttributionTaskTerminalStatus(status: string): boolean {
+  return [
+    "completed",
+    "clarification_needed",
+    "no_data",
+    "partial",
+    "failed",
+    "cancelled",
+  ].includes(status.toLowerCase());
+}
+
+function attributionEventKey(event: AttributionTaskEvent): string {
+  return [
+    event.task_id,
+    event.status,
+    event.stage ?? "",
+    event.message ?? "",
+    event.elapsed_ms,
+    event.step_index ?? "",
+    event.observation?.stepId ?? "",
+  ].join(":");
+}
+
+function appendAttributionEvent(
+  current: AttributionTaskEvent[],
+  event: AttributionTaskEvent,
+): AttributionTaskEvent[] {
+  const key = attributionEventKey(event);
+  if (current.some((item) => attributionEventKey(item) === key)) return current;
+  // A complete attribution normally emits fewer than 100 events. The larger
+  // cap keeps observations from early steps available even when each NL2SQL
+  // branch emits detailed schema/generation/repair progress.
+  return [...current, event].slice(-512);
+}
+
+function statusFromAttributionEvent(
+  taskId: string,
+  event: AttributionTaskEvent,
+  previous: AttributionTaskStatusResponse | null,
+): AttributionTaskStatusResponse {
+  return {
+    ...(previous ?? { taskId, status: event.status, elapsedMs: event.elapsed_ms }),
+    taskId,
+    status: event.status,
+    stage: event.stage,
+    message: event.message,
+    elapsedMs: event.elapsed_ms,
+    stageElapsedMs: event.stage_elapsed_ms,
+    progressPercent: event.progress_percent,
+    stepIndex: event.step_index,
+    stepTotal: event.step_total,
+    observation: event.observation,
+    response: event.response ?? previous?.response,
+    error: event.error ?? previous?.error,
+  };
 }
 
 function reportMarkdown(
@@ -226,40 +288,13 @@ function AttributionAuditPanelImpl({
       abort = streamNl2sqlAttributionTask(taskId, {
         onEvent: (event) => {
           if (disposed) return;
-          setEvents((previous) => [...previous, event].slice(-120));
-          if (event.response || event.status === "completed" || event.status === "failed" || event.status === "cancelled") {
-            setStatus((previous) => ({
-              ...(previous ?? { taskId, status: event.status, elapsedMs: event.elapsed_ms }),
-              taskId,
-              status: event.status,
-              stage: event.stage,
-              message: event.message,
-              elapsedMs: event.elapsed_ms,
-              stageElapsedMs: event.stage_elapsed_ms,
-              progressPercent: event.progress_percent,
-              stepIndex: event.step_index,
-              stepTotal: event.step_total,
-              observation: event.observation,
-              response: event.response,
-              error: event.error,
-            }));
-          }
+          setEvents((previous) => appendAttributionEvent(previous, event));
+          setStatus((previous) => statusFromAttributionEvent(taskId, event, previous));
         },
         onDone: (event) => {
           if (disposed) return;
-          setEvents((previous) => [...previous, event].slice(-120));
-          setStatus((previous) => ({
-            ...(previous ?? { taskId, status: event.status, elapsedMs: event.elapsed_ms }),
-            taskId,
-            status: event.status,
-            stage: event.stage,
-            message: event.message,
-            elapsedMs: event.elapsed_ms,
-            stageElapsedMs: event.stage_elapsed_ms,
-            progressPercent: event.progress_percent,
-            response: event.response,
-            error: event.error,
-          }));
+          setEvents((previous) => appendAttributionEvent(previous, event));
+          setStatus((previous) => statusFromAttributionEvent(taskId, event, previous));
         },
         onError: (reason) => {
           if (!disposed) setError(reason);
@@ -269,9 +304,11 @@ function AttributionAuditPanelImpl({
     void nl2sqlApi.getAttributionTaskStatus(taskId).then((next) => {
       if (disposed) return;
       setStatus(next);
-      if (live || ["queued", "running"].includes(next.status)) {
-        attachStream();
-      }
+      // The server durably replays attribution progress, including completed
+      // and failed tasks. Always attach once so a refreshed historical session
+      // restores every executed observation instead of showing only the final
+      // snapshot (or the last failed step).
+      attachStream();
     }).catch((reason) => {
       if (disposed) return;
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -302,6 +339,7 @@ function AttributionAuditPanelImpl({
   }, [events]);
   const currentStatus = status?.status ?? events.at(-1)?.status ?? "queued";
   const running = ["queued", "running"].includes(currentStatus);
+  const taskError = status?.error ?? error;
 
   return (
     <div style={{ marginTop: 8, border: "1px solid var(--border-subtle)", borderRadius: 8, overflow: "hidden", background: "var(--bg-elevated)" }}>
@@ -316,11 +354,11 @@ function AttributionAuditPanelImpl({
             <Space size={[6, 4]} wrap>
               <Text strong>{t("chat.attributionAuditTitle", "数据归因执行记录")}</Text>
               <Tag color={statusColor(currentStatus)}>{currentStatus}</Tag>
-              {response?.observations?.length ? <Tag>{`${response.observations.length} steps`}</Tag> : null}
+              {observations.length ? <Tag>{`${observations.length} steps`}</Tag> : null}
             </Space>
           ),
-          children: error && observations.length === 0 ? (
-            <Text type="danger">{error}</Text>
+          children: taskError && observations.length === 0 ? (
+            <Text type="danger">{taskError}</Text>
           ) : (
             <div style={{ display: "grid", gap: 10 }}>
               {timeline.length > 0 ? (
@@ -345,7 +383,7 @@ function AttributionAuditPanelImpl({
                   })}
                 </AttributionMarkdownDetail>
               ) : null}
-              {error ? <Text type="danger">{error}</Text> : null}
+              {taskError ? <Text type="danger">{taskError}</Text> : null}
             </div>
           ),
         }]}

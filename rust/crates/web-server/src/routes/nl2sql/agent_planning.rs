@@ -194,6 +194,7 @@ Rules:
 - MySQL/TiDB QUERY steps: do NOT use WITH RECURSIVE or recursive CTE/date-spine generation; many TiDB/MySQL deployments reject it. Prefer aggregating directly from fact-table dates. If a small fixed date list is unavoidable, use a non-recursive derived table with UNION ALL constants.
 - MySQL/TiDB QUERY steps: prefer simple subqueries/derived tables over CTE-heavy SQL. Avoid LAG/FIRST_VALUE/LAST_VALUE unless clearly supported; compute yesterday/baseline comparisons with self-joins or conditional aggregation when possible.
 - Presto/Trino QUERY steps may use CTEs, but must follow the exact catalog.schema.table names shown in the datasource schema.
+- Datasource metadata can be partial even when query access works. When a current SQL Knowledge example supplies an exact table, column, or join absent from the cached schema, preserve that evidence-backed identifier and let execution/correction validate it; never invent identifiers.
 - MERGE steps: use InnerJoin for JOINs, LeftJoin when you want to preserve left rows, UnionAll for concatenation
 - Each QUERY step's outputName must be unique and used as inputName in subsequent MERGE steps
 - Keep maxRows reasonable (default 10000) to bound memory usage

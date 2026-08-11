@@ -374,6 +374,8 @@ export const queryKeys = {
         [...BASE.nl2sql, 'sqlKnowledge', 'search', params ?? {}] as const,
       file: (fileId: string, params?: { startLine?: number; endLine?: number }) =>
         [...BASE.nl2sql, 'sqlKnowledge', 'file', fileId, params ?? {}] as const,
+      importTasks: (spaceId?: string | null) =>
+        [...BASE.nl2sql, 'sqlKnowledge', 'importTasks', spaceId ?? 'none'] as const,
     },
     // P3-1: Analytics
     analytics: {

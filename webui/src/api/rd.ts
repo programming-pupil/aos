@@ -75,9 +75,11 @@ export const rdApi = {
 
   syncRepository: (id: string) =>
     client.post<{
-      synced: boolean;
-      clonePath: string;
-      indexedFileCount: number;
+      accepted: boolean;
+      status: string;
+      synced?: boolean;
+      clonePath?: string;
+      indexedFileCount?: number;
       symbolCount?: number;
       importCount?: number;
       detection?: {
@@ -272,7 +274,7 @@ export const rdApi = {
   listSpecs: () =>
     client.get<RdSpec[]>('/rd/specs').then((r) => r.data),
 
-  createSpec: (data: { repositoryId?: string; title?: string; prompt: string; model?: string; mode?: string }) =>
+  createSpec: (data: { repositoryId?: string; repositoryIds?: string[]; title?: string; prompt: string; model?: string; mode?: string }) =>
     client.post<RdSpec>('/rd/specs', data).then((r) => r.data),
 
   getSpec: (id: string) =>
@@ -286,6 +288,9 @@ export const rdApi = {
     acceptanceMd?: string;
     taskItems?: RdSpec['taskItems'];
   }) => client.patch<RdSpec>(`/rd/specs/${encodeURIComponent(id)}`, data).then((r) => r.data),
+
+  deleteSpec: (id: string) =>
+    client.delete<{ deleted: boolean }>(`/rd/specs/${encodeURIComponent(id)}`).then((r) => r.data),
 
   specEvents: (id: string) =>
     client.get<RdSpecEvent[]>(`/rd/specs/${encodeURIComponent(id)}/events`).then((r) => r.data),

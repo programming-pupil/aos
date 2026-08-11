@@ -116,6 +116,7 @@ import {
   isNl2sqlAttributionTaskId,
   isPmResearchTaskId,
 } from "./specialistTaskIds";
+import { shouldShowLegacyPmQueue } from "./superAssistantExecutionUi";
 import {
   IsolatedComposerTextarea,
   type IsolatedComposerTextareaHandle,
@@ -11966,7 +11967,7 @@ export function ChatCore({
             </div>
           )}
 
-          {sessionSource === "pm" && (
+          {shouldShowLegacyPmQueue(sessionSource, superAssistantEndpoint) && (
             <PmTaskQueuePanel
               t={t}
               queue={pmPromptQueue}

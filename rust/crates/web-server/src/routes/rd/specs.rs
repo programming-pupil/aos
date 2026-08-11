@@ -13,6 +13,7 @@ const RD_PLAN_AGENT_NAME: &str = "AOS Code Studio Plan";
 #[serde(rename_all = "camelCase")]
 pub(super) struct RdSpecCreateRequest {
     repository_id: Option<String>,
+    repository_ids: Option<Vec<String>>,
     title: Option<String>,
     prompt: String,
     model: Option<String>,
@@ -35,6 +36,7 @@ pub(super) struct RdSpecUpdateRequest {
 pub(super) struct RdSpecDto {
     id: String,
     repository_id: Option<String>,
+    repository_ids: Vec<String>,
     title: String,
     prompt: String,
     requirements_md: Option<String>,
@@ -171,19 +173,26 @@ pub(super) async fn create_spec(
         .unwrap_or_else(|| derive_title(&req.prompt));
     let id = uuid::Uuid::new_v4().to_string();
     let mode = req.mode.unwrap_or_else(|| "plan".to_string());
+    let repository_ids =
+        normalize_repository_ids(req.repository_ids.as_deref(), req.repository_id.as_deref());
+    for repository_id in &repository_ids {
+        ensure_repository_exists(&state, &claims, repository_id).await?;
+    }
+    let primary_repository_id = repository_ids.first().cloned();
     sqlx::query(
         r"
         INSERT INTO rd_specs
-            (id, tenant_id, user_id, repository_id, title, prompt, status, mode,
+            (id, tenant_id, user_id, repository_id, repository_ids_json, title, prompt, status, mode,
              current_stage, spec_version, design_version, tasks_version, model,
              stage_status_json)
-        VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, 'spec', 0, 0, 0, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, 'spec', 0, 0, 0, ?, ?)
         ",
     )
     .bind(&id)
     .bind(&claims.tenant_id)
     .bind(&claims.sub)
-    .bind(&req.repository_id)
+    .bind(&primary_repository_id)
+    .bind(json_to_string(&json!(repository_ids))?)
     .bind(&title)
     .bind(req.prompt.trim())
     .bind(&mode)
@@ -319,14 +328,114 @@ pub(super) async fn update_spec(
         .map(Json)
 }
 
+pub(super) async fn delete_spec(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(spec_id): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    let spec = get_spec_row(&state.db, &claims.tenant_id, &claims.sub, &spec_id).await?;
+    if matches!(spec.status.as_str(), "queued" | "running") {
+        return Err(AppError::ValidationError(
+            "running plans must finish or fail before deletion".to_string(),
+        ));
+    }
+
+    let mut tx = state.db.begin().await?;
+    if let Some(agent_task_id) = spec.linked_agent_task_id.as_deref() {
+        sqlx::query::<sqlx::Sqlite>(
+            "UPDATE agent_tasks SET archived = 1, updated_at = CURRENT_TIMESTAMP \
+             WHERE tenant_id = ? AND id = ?",
+        )
+        .bind(&claims.tenant_id)
+        .bind(agent_task_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let deleted = sqlx::query::<sqlx::Sqlite>(
+        "DELETE FROM rd_specs WHERE id = ? AND tenant_id = ? AND user_id = ?",
+    )
+    .bind(&spec_id)
+    .bind(&claims.tenant_id)
+    .bind(&claims.sub)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    if deleted.rows_affected() != 1 {
+        return Err(AppError::NotFound("rd spec not found".to_string()));
+    }
+    Ok(Json(json!({ "deleted": true })))
+}
+
 pub(super) async fn generate_spec(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     AxumPath(spec_id): AxumPath<String>,
 ) -> Result<Json<RdSpecDto>, AppError> {
-    generate_spec_inner(&state, &claims, &spec_id, None)
+    queue_spec_generation(&state, &claims, &spec_id, None).await?;
+    get_spec_row(&state.db, &claims.tenant_id, &claims.sub, &spec_id)
         .await
         .map(Json)
+}
+
+async fn queue_spec_generation(
+    state: &AppState,
+    claims: &Claims,
+    spec_id: &str,
+    model: Option<String>,
+) -> Result<(), AppError> {
+    let spec = get_spec_row(&state.db, &claims.tenant_id, &claims.sub, spec_id).await?;
+    if matches!(spec.status.as_str(), "queued" | "running") {
+        return Err(AppError::ValidationError(
+            "another plan stage is already running".to_string(),
+        ));
+    }
+    mark_spec_stage_running(state, claims, spec_id, STAGE_SPEC).await?;
+    record_spec_event(
+        &state.db,
+        &claims.tenant_id,
+        spec_id,
+        "spec.queued",
+        Some(STAGE_SPEC),
+        Some("queued"),
+        "核心设计重新生成任务已进入后台队列",
+        None,
+    )
+    .await?;
+
+    let worker_state = state.clone();
+    let worker_claims = claims.clone();
+    let worker_id = spec_id.to_string();
+    tokio::spawn(async move {
+        if let Err(error) =
+            generate_spec_inner(&worker_state, &worker_claims, &worker_id, model.as_deref()).await
+        {
+            let safe_error = runtime::protect_sensitive_text(
+                &error.to_string(),
+                runtime::configured_data_protection_mode(),
+            )
+            .value
+            .chars()
+            .take(2_000)
+            .collect::<String>();
+            tracing::error!(
+                spec_id = %worker_id,
+                error = %safe_error,
+                "background core design regeneration failed"
+            );
+            let _ = sqlx::query(
+                "UPDATE rd_specs SET status = 'failed', last_error = ?, stage_status_json = ?, \
+                 updated_at = CURRENT_TIMESTAMP WHERE id = ? AND tenant_id = ? AND user_id = ?",
+            )
+            .bind(&safe_error)
+            .bind(json!({"spec": "failed"}).to_string())
+            .bind(&worker_id)
+            .bind(&worker_claims.tenant_id)
+            .bind(&worker_claims.sub)
+            .execute(&worker_state.db)
+            .await;
+        }
+    });
+    Ok(())
 }
 
 pub(super) async fn approve_spec(
@@ -344,7 +453,8 @@ pub(super) async fn generate_design(
     Extension(claims): Extension<Claims>,
     AxumPath(spec_id): AxumPath<String>,
 ) -> Result<Json<RdSpecDto>, AppError> {
-    generate_design_inner(&state, &claims, &spec_id)
+    queue_plan_stage_generation(&state, &claims, &spec_id, STAGE_DESIGN).await?;
+    get_spec_row(&state.db, &claims.tenant_id, &claims.sub, &spec_id)
         .await
         .map(Json)
 }
@@ -364,9 +474,93 @@ pub(super) async fn generate_tasks(
     Extension(claims): Extension<Claims>,
     AxumPath(spec_id): AxumPath<String>,
 ) -> Result<Json<RdSpecDto>, AppError> {
-    generate_tasks_inner(&state, &claims, &spec_id)
+    queue_plan_stage_generation(&state, &claims, &spec_id, STAGE_TASKS).await?;
+    get_spec_row(&state.db, &claims.tenant_id, &claims.sub, &spec_id)
         .await
         .map(Json)
+}
+
+async fn queue_plan_stage_generation(
+    state: &AppState,
+    claims: &Claims,
+    spec_id: &str,
+    stage: &'static str,
+) -> Result<(), AppError> {
+    let spec = get_spec_row(&state.db, &claims.tenant_id, &claims.sub, spec_id).await?;
+    if matches!(spec.status.as_str(), "queued" | "running") {
+        return Err(AppError::ValidationError(
+            "another plan stage is already running".to_string(),
+        ));
+    }
+    match stage {
+        STAGE_DESIGN if spec.approved_requirements_at.is_none() => {
+            return Err(AppError::ValidationError(
+                "requirements must be approved before design".to_string(),
+            ));
+        }
+        STAGE_TASKS if spec.approved_design_at.is_none() => {
+            return Err(AppError::ValidationError(
+                "design must be approved before tasks".to_string(),
+            ));
+        }
+        STAGE_DESIGN | STAGE_TASKS => {}
+        _ => {
+            return Err(AppError::ValidationError(
+                "unsupported background plan stage".to_string(),
+            ));
+        }
+    }
+
+    mark_spec_stage_running(state, claims, spec_id, stage).await?;
+    record_spec_event(
+        &state.db,
+        &claims.tenant_id,
+        spec_id,
+        &format!("{stage}.queued"),
+        Some(stage),
+        Some("queued"),
+        "阶段生成任务已进入后台队列",
+        None,
+    )
+    .await?;
+
+    let worker_state = state.clone();
+    let worker_claims = claims.clone();
+    let worker_id = spec_id.to_string();
+    tokio::spawn(async move {
+        let result = match stage {
+            STAGE_DESIGN => generate_design_inner(&worker_state, &worker_claims, &worker_id).await,
+            STAGE_TASKS => generate_tasks_inner(&worker_state, &worker_claims, &worker_id).await,
+            _ => unreachable!("validated background plan stage"),
+        };
+        if let Err(error) = result {
+            let safe_error = runtime::protect_sensitive_text(
+                &error.to_string(),
+                runtime::configured_data_protection_mode(),
+            )
+            .value
+            .chars()
+            .take(2_000)
+            .collect::<String>();
+            tracing::error!(
+                spec_id = %worker_id,
+                stage,
+                error = %safe_error,
+                "background plan stage generation failed"
+            );
+            let _ = sqlx::query(
+                "UPDATE rd_specs SET status = 'failed', last_error = ?, updated_at = CURRENT_TIMESTAMP \
+                 WHERE id = ? AND tenant_id = ? AND user_id = ?",
+            )
+            .bind(&safe_error)
+            .bind(&worker_id)
+            .bind(&worker_claims.tenant_id)
+            .bind(&worker_claims.sub)
+            .execute(&worker_state.db)
+            .await;
+        }
+    });
+    Ok(())
 }
 
 pub(super) async fn approve_tasks(
@@ -492,6 +686,7 @@ pub(super) async fn final_report_spec(
     refresh_plan_task_statuses(&state.db, &claims.tenant_id, &claims.sub, &spec_id).await?;
     let spec = get_spec_row(&state.db, &claims.tenant_id, &claims.sub, &spec_id).await?;
     let agent_task_id = ensure_plan_agent_task_for_spec(&state, &claims, &spec).await?;
+    mark_spec_stage_running(&state, &claims, &spec_id, STAGE_FINAL).await?;
     record_plan_agent_event(
         &state,
         &claims.tenant_id,
@@ -534,24 +729,15 @@ pub(super) async fn final_report_spec(
                 &error,
             )
             .await?;
-            sqlx::query(
-                "UPDATE rd_specs SET status = 'failed', last_error = ?, stage_status_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND tenant_id = ? AND user_id = ?",
-            )
-            .bind(error.to_string())
-            .bind(json_to_string(&json!({"spec": "failed"}))?)
-            .bind(&spec_id)
-            .bind(&claims.tenant_id)
-            .bind(&claims.sub)
-            .execute(&state.db)
-            .await?;
+            mark_spec_stage_failed(&state, &claims, &spec_id, STAGE_FINAL, &error).await?;
             record_spec_event(
                 &state.db,
                 &claims.tenant_id,
                 &spec_id,
                 "spec.failed",
-                Some(STAGE_SPEC),
+                Some(STAGE_FINAL),
                 Some("failed"),
-                "规格文档生成失败",
+                "最终交付报告生成失败",
                 Some(json!({ "error": error.to_string() })),
             )
             .await?;
@@ -559,7 +745,15 @@ pub(super) async fn final_report_spec(
         }
     };
     let parsed = parse_json_object(&completion.text);
-    let final_report = string_json_field(&parsed, "finalReportMd").unwrap_or(completion.text);
+    let final_report = sanitize_plan_stage_output(
+        &state,
+        &claims,
+        &spec_id,
+        STAGE_FINAL,
+        string_json_field(&parsed, "finalReportMd"),
+        &completion.text,
+    )
+    .await?;
     let implementation_summary = json!({
         "finalReportMd": final_report,
         "model": completion.model,
@@ -671,11 +865,20 @@ async fn generate_spec_inner(
                 &error,
             )
             .await?;
+            mark_spec_stage_failed(state, claims, spec_id, STAGE_SPEC, &error).await?;
             return Err(error);
         }
     };
     let parsed = parse_json_object(&completion.text);
-    let requirements = string_json_field(&parsed, "requirementsMd").unwrap_or(completion.text);
+    let requirements = sanitize_plan_stage_output(
+        state,
+        claims,
+        spec_id,
+        STAGE_SPEC,
+        string_json_field(&parsed, "requirementsMd"),
+        &completion.text,
+    )
+    .await?;
     let acceptance = string_json_field(&parsed, "acceptanceMd").unwrap_or_default();
     sqlx::query(
         r"
@@ -732,6 +935,7 @@ async fn generate_design_inner(
             "requirements must be approved before design".to_string(),
         ));
     }
+    mark_spec_stage_running(state, claims, spec_id, STAGE_DESIGN).await?;
     record_plan_agent_event(
         state,
         &claims.tenant_id,
@@ -770,16 +974,25 @@ async fn generate_design_inner(
                 &error,
             )
             .await?;
+            mark_spec_stage_failed(state, claims, spec_id, STAGE_DESIGN, &error).await?;
             return Err(error);
         }
     };
     let parsed = parse_json_object(&completion.text);
-    let design = string_json_field(&parsed, "designMd").unwrap_or(completion.text);
+    let design = sanitize_plan_stage_output(
+        state,
+        claims,
+        spec_id,
+        STAGE_DESIGN,
+        string_json_field(&parsed, "designMd"),
+        &completion.text,
+    )
+    .await?;
     sqlx::query(
         r"
         UPDATE rd_specs
         SET design_md = ?, current_stage = 'design', design_version = design_version + 1,
-            model = ?, last_error = NULL, stage_status_json = ?, updated_at = CURRENT_TIMESTAMP
+            status = 'draft', model = ?, last_error = NULL, stage_status_json = ?, updated_at = CURRENT_TIMESTAMP
         WHERE id = ? AND tenant_id = ? AND user_id = ?
         ",
     )
@@ -830,6 +1043,7 @@ async fn generate_tasks_inner(
             "design must be approved before tasks".to_string(),
         ));
     }
+    mark_spec_stage_running(state, claims, spec_id, STAGE_TASKS).await?;
     record_plan_agent_event(
         state,
         &claims.tenant_id,
@@ -869,11 +1083,20 @@ async fn generate_tasks_inner(
                 &error,
             )
             .await?;
+            mark_spec_stage_failed(state, claims, spec_id, STAGE_TASKS, &error).await?;
             return Err(error);
         }
     };
     let parsed = parse_json_object(&completion.text);
-    let tasks_md = string_json_field(&parsed, "tasksMd").unwrap_or(completion.text);
+    let tasks_md = sanitize_plan_stage_output(
+        state,
+        claims,
+        spec_id,
+        STAGE_TASKS,
+        string_json_field(&parsed, "tasksMd"),
+        &completion.text,
+    )
+    .await?;
     let task_items = parse_task_items(parsed.get("taskItems")).unwrap_or_else(|| {
         vec![RdSpecTaskItemDto {
             id: "task-1".to_string(),
@@ -888,7 +1111,7 @@ async fn generate_tasks_inner(
     sqlx::query(
         r"
         UPDATE rd_specs
-        SET tasks_md = ?, task_items_json = ?, current_stage = 'tasks',
+        SET tasks_md = ?, task_items_json = ?, current_stage = 'tasks', status = 'draft',
             tasks_version = tasks_version + 1, model = ?, last_error = NULL,
             stage_status_json = ?, updated_at = CURRENT_TIMESTAMP
         WHERE id = ? AND tenant_id = ? AND user_id = ?
@@ -1024,17 +1247,97 @@ async fn approve_stage(
     get_spec_row(&state.db, &claims.tenant_id, &claims.sub, spec_id).await
 }
 
+async fn mark_spec_stage_running(
+    state: &AppState,
+    claims: &Claims,
+    spec_id: &str,
+    stage: &str,
+) -> Result<(), AppError> {
+    let mut stage_status = serde_json::Map::new();
+    stage_status.insert(stage.to_string(), Value::String("running".to_string()));
+    sqlx::query(
+        "UPDATE rd_specs SET status = 'running', current_stage = ?, last_error = NULL, stage_status_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND tenant_id = ? AND user_id = ?",
+    )
+    .bind(stage)
+    .bind(json_to_string(&Value::Object(stage_status))?)
+    .bind(spec_id)
+    .bind(&claims.tenant_id)
+    .bind(&claims.sub)
+    .execute(&state.db)
+    .await?;
+    Ok(())
+}
+
+async fn mark_spec_stage_failed(
+    state: &AppState,
+    claims: &Claims,
+    spec_id: &str,
+    stage: &str,
+    error: &AppError,
+) -> Result<(), AppError> {
+    let safe_error = runtime::protect_sensitive_text(
+        &error.to_string(),
+        runtime::configured_data_protection_mode(),
+    )
+    .value;
+    let safe_error = safe_error.chars().take(2_000).collect::<String>();
+    let mut stage_status = serde_json::Map::new();
+    stage_status.insert(stage.to_string(), Value::String("failed".to_string()));
+    sqlx::query(
+        "UPDATE rd_specs SET status = 'failed', current_stage = ?, last_error = ?, stage_status_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND tenant_id = ? AND user_id = ?",
+    )
+    .bind(stage)
+    .bind(safe_error)
+    .bind(json_to_string(&Value::Object(stage_status))?)
+    .bind(spec_id)
+    .bind(&claims.tenant_id)
+    .bind(&claims.sub)
+    .execute(&state.db)
+    .await?;
+    Ok(())
+}
+
 async fn repository_context_for_spec(
     state: &AppState,
     claims: &Claims,
     spec: &RdSpecDto,
 ) -> String {
-    match spec.repository_id.as_deref() {
-        Some(repo_id) => build_repository_context(state, claims, repo_id)
-            .await
-            .unwrap_or_default(),
-        None => String::new(),
+    if spec.repository_ids.is_empty() {
+        return String::new();
     }
+    let per_repository_budget =
+        (RD_INLINE_CONTEXT_BUDGET_BYTES / spec.repository_ids.len()).max(12_000);
+    let mut sections = Vec::new();
+    for repository_id in &spec.repository_ids {
+        let name = state
+            .gitlab_manager()
+            .get_project(&claims.tenant_id, &claims.sub, repository_id)
+            .await
+            .map(|project| project.name)
+            .unwrap_or_else(|_| repository_id.clone());
+        match build_repository_context_for_prompt(
+            state,
+            claims,
+            repository_id,
+            &spec.prompt,
+            per_repository_budget,
+            RdContextProfile::FocusedAsk,
+            None,
+        )
+        .await
+        {
+            Ok(context) if !context.trim().is_empty() => sections.push(format!(
+                "## 仓库：{name}（repository_id={repository_id}）\n{context}"
+            )),
+            Ok(_) => sections.push(format!(
+                "## 仓库：{name}（repository_id={repository_id}）\n仓库已选择，但当前没有可用的代码上下文。"
+            )),
+            Err(error) => sections.push(format!(
+                "## 仓库：{name}（repository_id={repository_id}）\n读取仓库上下文失败：{error}。不要假装已检查代码。"
+            )),
+        }
+    }
+    sections.join("\n\n")
 }
 
 async fn ensure_plan_agent_task_for_existing_spec(
@@ -1232,7 +1535,7 @@ async fn get_spec_row(
 fn spec_select_sql(where_sql: &str) -> String {
     format!(
         r#"
-        SELECT id, repository_id, title, prompt, requirements_md, design_md, tasks_md,
+        SELECT id, repository_id, repository_ids_json, title, prompt, requirements_md, design_md, tasks_md,
                acceptance_md, status,
                COALESCE(mode, 'plan') AS mode,
                COALESCE(current_stage, 'spec') AS current_stage,
@@ -1257,9 +1560,17 @@ fn spec_select_sql(where_sql: &str) -> String {
 
 fn row_to_spec(row: &sqlx::sqlite::SqliteRow) -> RdSpecDto {
     let task_items_json: Option<String> = row.get("task_items_json");
+    let repository_id: Option<String> = row.get("repository_id");
+    let repository_ids_json: Option<String> = row.get("repository_ids_json");
+    let repository_ids = repository_ids_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .filter(|ids| !ids.is_empty())
+        .unwrap_or_else(|| repository_id.clone().into_iter().collect());
     RdSpecDto {
         id: row.get("id"),
-        repository_id: row.get("repository_id"),
+        repository_id,
+        repository_ids,
         title: row.get("title"),
         prompt: row.get("prompt"),
         requirements_md: row.get("requirements_md"),
@@ -1287,6 +1598,22 @@ fn row_to_spec(row: &sqlx::sqlite::SqliteRow) -> RdSpecDto {
     }
 }
 
+fn normalize_repository_ids(ids: Option<&[String]>, primary: Option<&str>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for value in ids
+        .into_iter()
+        .flatten()
+        .map(String::as_str)
+        .chain(primary.into_iter())
+    {
+        let value = value.trim();
+        if !value.is_empty() && !normalized.iter().any(|existing| existing == value) {
+            normalized.push(value.to_string());
+        }
+    }
+    normalized
+}
+
 fn parse_json_object(text: &str) -> Value {
     let trimmed = text.trim();
     if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
@@ -1308,6 +1635,69 @@ fn string_json_field(value: &Value, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn sanitize_plan_markdown(
+    structured_value: Option<String>,
+    fallback: &str,
+    stage: &str,
+) -> Result<String, AppError> {
+    let raw = structured_value.unwrap_or_else(|| fallback.to_string());
+    let sanitized = strip_provider_tool_protocol(&raw);
+    if sanitized.trim().is_empty() {
+        return Err(AppError::ValidationError(format!(
+            "model returned no usable {stage} document; retry this stage"
+        )));
+    }
+    Ok(sanitized)
+}
+
+async fn sanitize_plan_stage_output(
+    state: &AppState,
+    claims: &Claims,
+    spec_id: &str,
+    stage: &str,
+    structured_value: Option<String>,
+    fallback: &str,
+) -> Result<String, AppError> {
+    match sanitize_plan_markdown(structured_value, fallback, stage) {
+        Ok(document) => Ok(document),
+        Err(error) => {
+            mark_spec_stage_failed(state, claims, spec_id, stage, &error).await?;
+            Err(error)
+        }
+    }
+}
+
+fn strip_provider_tool_protocol(text: &str) -> String {
+    const OPENING_MARKERS: &[&str] = &["<|DSML|", "<tool_calls>", "<tool_call>", "<function="];
+    const CLOSING_MARKERS: &[&str] = &[
+        "</tool_calls>",
+        "</tool_call>",
+        "</function>",
+        "</invoke>",
+        "<|DSML|/invoke>",
+        "<|DSML|/function>",
+    ];
+    if !OPENING_MARKERS.iter().any(|marker| text.contains(marker)) {
+        return text.trim().to_string();
+    }
+    let mut output = Vec::new();
+    let mut in_protocol = false;
+    for line in text.lines() {
+        if in_protocol {
+            if CLOSING_MARKERS.iter().any(|marker| line.contains(marker)) {
+                in_protocol = false;
+            }
+            continue;
+        }
+        if OPENING_MARKERS.iter().any(|marker| line.contains(marker)) {
+            in_protocol = !CLOSING_MARKERS.iter().any(|marker| line.contains(marker));
+            continue;
+        }
+        output.push(line);
+    }
+    output.join("\n").trim().to_string()
 }
 
 fn parse_task_items(value: Option<&Value>) -> Option<Vec<RdSpecTaskItemDto>> {
@@ -1772,4 +2162,31 @@ fn parse_json_opt(raw: Option<String>) -> Option<Value> {
 
 fn json_to_string(value: &Value) -> Result<String, AppError> {
     serde_json::to_string(value).map_err(AppError::Json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_repository_ids, strip_provider_tool_protocol};
+
+    #[test]
+    fn repository_selection_is_deduplicated_and_keeps_primary_first() {
+        let selected = vec![
+            "repo-b".to_string(),
+            "repo-a".to_string(),
+            "repo-b".to_string(),
+        ];
+        assert_eq!(
+            normalize_repository_ids(Some(&selected), Some("repo-a")),
+            vec!["repo-b", "repo-a"]
+        );
+    }
+
+    #[test]
+    fn provider_dsml_tool_protocol_never_enters_plan_markdown() {
+        let raw = "需求正文\n<|DSML|tool_calls><|DSML|invoke name=\"Bash\">\n<|DSML|parameter name=\"command\">rg secret</|DSML|parameter>\n<|DSML|/invoke>\n后续正文";
+        let sanitized = strip_provider_tool_protocol(raw);
+        assert_eq!(sanitized, "需求正文\n后续正文");
+        assert!(!sanitized.contains("DSML"));
+        assert!(!sanitized.contains("tool_calls"));
+    }
 }

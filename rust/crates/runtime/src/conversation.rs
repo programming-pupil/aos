@@ -98,6 +98,11 @@ pub trait ApiClient: Send + Sync {
         true
     }
 
+    /// Removes a repeatedly failing tool from subsequent model iterations in
+    /// the current turn. Clients that expose dynamic tool schemas should hide
+    /// the tool immediately; the runtime also enforces the block locally.
+    fn block_tool_for_turn(&mut self, _tool_name: &str) {}
+
     async fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError>;
 
     async fn stream_with_reporter(
@@ -195,6 +200,8 @@ struct TurnAccumulator {
     prompt_cache_events: Vec<PromptCacheEvent>,
     iterations: usize,
     auto_compaction: Option<AutoCompactionEvent>,
+    repeated_tool_failures: BTreeMap<String, usize>,
+    failure_blocked_tools: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -965,6 +972,17 @@ where
             }
             let mut system_prompt = self.system_prompt.clone();
             system_prompt.extend(iteration_instruction);
+            if !accumulator.failure_blocked_tools.is_empty() {
+                system_prompt.push(format!(
+                    "The server disabled these tools for the rest of this turn after repeated identical failures: {}. Do not retry them or turn their error text into a new user request. Return to the original latest user request, use other available evidence or tools when useful, and provide the best honest answer you can.",
+                    accumulator
+                        .failure_blocked_tools
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
             let request = ApiRequest {
                 system_prompt,
                 messages: request_messages,
@@ -1051,6 +1069,8 @@ where
             for (tool_use_id, tool_name, input) in pending_tool_uses {
                 let tool_call_allowed = self.api_client.is_tool_call_allowed(&tool_name)
                     || stale_tool_alias_is_allowed(&self.api_client, &tool_name);
+                let tool_call_allowed =
+                    tool_call_allowed && !accumulator.failure_blocked_tools.contains(&tool_name);
                 let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
                 let effective_input = pre_hook_result
                     .updated_input()
@@ -1123,6 +1143,11 @@ where
                         reporter,
                     ) {
                         PreparedToolExecution::Completed(result_message) => {
+                            self.observe_repeated_tool_failure(
+                                &mut accumulator,
+                                prepared,
+                                &result_message,
+                            );
                             self.session
                                 .push_message(result_message.clone())
                                 .map_err(|error| {
@@ -1172,6 +1197,7 @@ where
                     });
                     let result_message =
                         self.finalize_allowed_tool_use(prepared, execution, reporter);
+                    self.observe_repeated_tool_failure(&mut accumulator, prepared, &result_message);
                     self.session
                         .push_message(result_message.clone())
                         .map_err(|error| {
@@ -1629,6 +1655,38 @@ where
             output,
             is_error,
         )
+    }
+
+    fn observe_repeated_tool_failure(
+        &mut self,
+        accumulator: &mut TurnAccumulator,
+        prepared: &PreparedToolUse,
+        result_message: &ConversationMessage,
+    ) {
+        let Some((tool_name, output, true)) = message_tool_result(result_message) else {
+            return;
+        };
+        let signature = format!("{tool_name}:{}", stable_context_hash(output));
+        let count = accumulator
+            .repeated_tool_failures
+            .entry(signature)
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
+        if *count < 2
+            || !accumulator
+                .failure_blocked_tools
+                .insert(tool_name.to_string())
+        {
+            return;
+        }
+        self.api_client.block_tool_for_turn(tool_name);
+        self.record_runtime_warning(
+            "repeated_tool_failure_circuit_opened",
+            &format!(
+                "tool {tool_name} returned the same failure repeatedly; disabled for the remainder of this turn (latest input hash={})",
+                stable_context_hash(&prepared.effective_input)
+            ),
+        );
     }
 
     fn record_runtime_warning(&self, name: &str, message: &str) {
@@ -4268,6 +4326,83 @@ mod tests {
 
         assert_eq!(executions.load(Ordering::SeqCst), 1);
         assert_eq!(summary.iterations, 3);
+    }
+
+    #[tokio::test]
+    async fn repeated_identical_tool_failures_open_a_turn_local_circuit() {
+        struct RepeatedFailureApi {
+            calls: usize,
+            circuit_instruction_seen: bool,
+            blocked_tools: BTreeSet<String>,
+        }
+
+        #[::async_trait::async_trait]
+        impl ApiClient for RepeatedFailureApi {
+            fn block_tool_for_turn(&mut self, tool_name: &str) {
+                self.blocked_tools.insert(tool_name.to_string());
+            }
+
+            fn is_tool_call_allowed(&self, tool_name: &str) -> bool {
+                !self.blocked_tools.contains(tool_name)
+            }
+
+            async fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                if self.calls <= 2 {
+                    return Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: format!("memory-{}", self.calls),
+                            name: "memory_list".to_string(),
+                            input: "{}".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                self.circuit_instruction_seen = request.system_prompt.iter().any(|section| {
+                    section.contains("disabled these tools")
+                        && section.contains("memory_list")
+                        && section.contains("original latest user request")
+                });
+                Ok(vec![
+                    AssistantEvent::TextDelta("answering the original request".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            RepeatedFailureApi {
+                calls: 0,
+                circuit_instruction_seen: false,
+                blocked_tools: BTreeSet::new(),
+            },
+            StaticToolExecutor::new().register("memory_list", |_input| {
+                Err(ToolError::new("near UNION: syntax error"))
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("用 skill 查一下昨天的 ROI", None, ())
+            .await
+            .expect("repeated tool failure must degrade to synthesis");
+
+        assert_eq!(summary.iterations, 3);
+        assert!(runtime.api_client_mut().circuit_instruction_seen);
+        assert_eq!(
+            summary
+                .tool_results
+                .iter()
+                .filter_map(message_tool_result)
+                .filter(|(_, _, is_error)| *is_error)
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]

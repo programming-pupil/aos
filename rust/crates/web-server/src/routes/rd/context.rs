@@ -19,8 +19,8 @@ pub(super) use planner::{
 };
 mod repository;
 pub(super) use repository::{
-    build_repository_context, build_repository_context_for_prompt,
-    build_repository_runtime_context_hint, rd_normalize_repo_relative_path,
+    build_repository_context_for_prompt, build_repository_runtime_context_hint,
+    rd_normalize_repo_relative_path,
 };
 mod semantic;
 pub(super) use semantic::{

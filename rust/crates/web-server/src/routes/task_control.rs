@@ -5715,13 +5715,13 @@ mod tests {
         .fetch_one(&db)
         .await
         .expect("count SQLite baseline tables");
-        assert_eq!(table_count, 163);
+        assert_eq!(table_count, 164);
 
         let migration_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
             .fetch_one(&db)
             .await
             .expect("read SQLx migration ledger");
-        assert_eq!(migration_count, 13);
+        assert_eq!(migration_count, 16);
 
         let important_indexes: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name IN (

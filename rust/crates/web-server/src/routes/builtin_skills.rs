@@ -273,6 +273,7 @@ const LEGACY_PLAN_GENERATE_SPEC: &str = r#"你是 AOS Code Studio 的 Plan Mode 
 - requirementsMd 写清目标、用户场景、功能边界、非目标和关键约束。
 - acceptanceMd 写成可验证验收标准。
 - 如果信息不足，在 requirementsMd 中列出需要确认的问题，但仍给出可推进的初版。
+- 仓库上下文按“仓库”分段时，requirementsMd 必须列出各服务的职责、协作边界和待核实项；不得把一个仓库的证据归到另一个仓库。
 
 用户需求：
 {{requirement}}
@@ -292,6 +293,8 @@ const LEGACY_PLAN_GENERATE_DESIGN: &str = r#"你是 AOS Code Studio 的 Plan Mod
 要求：
 - designMd 包含架构方案、受影响模块、数据/API变化、执行流程、风险与测试策略。
 - 必须结合仓库上下文，不要泛泛而谈。
+- 按仓库分别列出实际受影响文件、符号/入口和证据；跨服务调用必须说明请求方向、契约、兼容策略和发布顺序。
+- 仓库上下文明确缺失、读取失败或未同步时，必须在 designMd 标记证据缺口，不得虚构文件路径、接口或已检查代码。
 - 对不确定项明确标注。
 
 用户原始需求：
@@ -328,6 +331,7 @@ const LEGACY_PLAN_GENERATE_TASKS: &str = r#"你是 AOS Code Studio 的 Plan Mode
 - taskItems 必须有稳定 id，按实现顺序排列。
 - 每个任务只覆盖一个明确改动目标。
 - acceptance 写成该任务完成后的检查点。
+- 每个跨服务任务必须注明目标仓库和依赖任务；tasksMd 需要给出跨仓库的集成、联调、兼容与回滚检查点。
 
 用户原始需求：
 {{requirement}}

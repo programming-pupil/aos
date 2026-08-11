@@ -78,9 +78,9 @@ impl AttributionDepth {
 
     fn agent_max_steps(self) -> usize {
         match self {
-            Self::Fast => 4,
-            Self::Standard => 6,
-            Self::Deep => 8,
+            Self::Fast => 2,
+            Self::Standard => 3,
+            Self::Deep => 4,
         }
     }
 }
@@ -102,15 +102,77 @@ fn attribution_query_concurrency() -> usize {
 }
 
 fn attribution_total_budget(depth: AttributionDepth) -> Duration {
-    match depth {
-        AttributionDepth::Fast => Duration::from_secs(3 * 60),
-        AttributionDepth::Standard => Duration::from_secs(6 * 60),
-        AttributionDepth::Deep => Duration::from_secs(8 * 60),
-    }
+    let (env_name, default_secs) = match depth {
+        AttributionDepth::Fast => ("NL2SQL_ATTRIBUTION_FAST_TIMEOUT_SECS", 3 * 60),
+        AttributionDepth::Standard => ("NL2SQL_ATTRIBUTION_STANDARD_TIMEOUT_SECS", 6 * 60),
+        AttributionDepth::Deep => ("NL2SQL_ATTRIBUTION_DEEP_TIMEOUT_SECS", 8 * 60),
+    };
+    Duration::from_secs(
+        env::var(env_name)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value >= 60)
+            .unwrap_or(default_secs),
+    )
 }
 
 fn remaining_attribution_budget(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
+}
+
+fn attribution_planning_budget() -> Duration {
+    Duration::from_secs(
+        env::var("NL2SQL_ATTRIBUTION_PLANNING_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value >= 10)
+            .unwrap_or(45),
+    )
+}
+
+fn attribution_step_budget(depth: AttributionDepth) -> Duration {
+    let default_secs = match depth {
+        AttributionDepth::Fast => 75,
+        AttributionDepth::Standard => 120,
+        AttributionDepth::Deep => 150,
+    };
+    Duration::from_secs(
+        env::var("NL2SQL_ATTRIBUTION_STEP_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value >= 30)
+            .unwrap_or(default_secs),
+    )
+}
+
+fn attribution_synthesis_reserve() -> Duration {
+    Duration::from_secs(
+        env::var("NL2SQL_ATTRIBUTION_SYNTHESIS_RESERVE_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value >= 20)
+            .unwrap_or(55),
+    )
+}
+
+fn bounded_phase_deadline(overall_deadline: Instant, budget: Duration) -> Instant {
+    overall_deadline.min(Instant::now() + budget)
+}
+
+fn attribution_execution_deadline(overall_deadline: Instant) -> Instant {
+    overall_deadline
+        .checked_sub(attribution_synthesis_reserve())
+        .unwrap_or(overall_deadline)
+}
+
+fn attribution_helper_model_budget() -> Duration {
+    Duration::from_secs(
+        env::var("NL2SQL_ATTRIBUTION_HELPER_MODEL_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value >= 10)
+            .unwrap_or(45),
+    )
 }
 
 fn max_evidence_card_rows() -> usize {
@@ -404,7 +466,7 @@ pub struct AttributionAnalyzeResponse {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) struct AttributionTaskEvent {
     pub task_id: String,
@@ -641,11 +703,11 @@ impl AttributionTaskManager {
         step_index: Option<usize>,
         step_total: Option<usize>,
         observation: Option<AttributionObservation>,
-    ) {
+    ) -> Option<AttributionTaskEvent> {
         let mut guard = self.inner.lock().await;
         if let Some(rec) = guard.get_mut(task_id) {
             if rec.done || rec.cancel_requested {
-                return;
+                return None;
             }
             let now_elapsed = rec.created_at.elapsed().as_millis() as u64;
             let stage_elapsed = now_elapsed.saturating_sub(rec.last_event.elapsed_ms);
@@ -667,8 +729,10 @@ impl AttributionTaskManager {
             rec.events.push(evt.clone());
             drop(guard);
             let tx = self.ensure_sender(task_id).await;
-            let _ = tx.send(evt);
+            let _ = tx.send(evt.clone());
+            return Some(evt);
         }
+        None
     }
 
     async fn publish_completed(&self, task_id: &str, response: AttributionAnalyzeResponse) {
@@ -683,12 +747,19 @@ impl AttributionTaskManager {
                 "failed"
             } else if response.clarification_question.is_some() {
                 "clarification_needed"
+            } else if matches!(
+                response.status.as_str(),
+                "completed" | "partial" | "no_data"
+            ) {
+                response.status.as_str()
             } else {
                 "completed"
             };
             let message = match status {
                 "clarification_needed" => "需要补充关键信息",
                 "failed" => "数据归因失败",
+                "partial" => "数据归因已基于现有证据完成",
+                "no_data" => "数据归因未取得可用数据",
                 _ => "数据归因完成",
             };
             let evt = AttributionTaskEvent {
@@ -1331,6 +1402,82 @@ async fn persist_attribution_task_completed(
     }
 }
 
+async fn persist_attribution_progress_event(
+    db: &sqlx::SqlitePool,
+    claims: &Claims,
+    event: &AttributionTaskEvent,
+) {
+    let event_json = match serde_json::to_string(event) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                task_id = %event.task_id,
+                error = %error,
+                "failed to serialize data-attribution progress event"
+            );
+            return;
+        }
+    };
+    if let Err(error) = sqlx::query::<sqlx::Sqlite>(
+        "UPDATE nl2sql_attribution_tasks
+         SET progress_events_json = json_insert(
+               CASE WHEN json_valid(progress_events_json) THEN progress_events_json ELSE '[]' END,
+               '$[#]', json(?)),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE tenant_id = ? AND user_id = ? AND task_id = ?",
+    )
+    .bind(event_json)
+    .bind(&claims.tenant_id)
+    .bind(&claims.sub)
+    .bind(&event.task_id)
+    .execute(db)
+    .await
+    {
+        tracing::warn!(
+            task_id = %event.task_id,
+            tenant_id = %claims.tenant_id,
+            user_id = %claims.sub,
+            error = %error,
+            "failed to persist data-attribution progress event"
+        );
+    }
+}
+
+async fn load_persisted_attribution_progress_events(
+    db: &sqlx::SqlitePool,
+    claims: &Claims,
+    task_id: &str,
+) -> Vec<AttributionTaskEvent> {
+    let raw = sqlx::query_scalar::<sqlx::Sqlite, Option<String>>(
+        "SELECT CAST(progress_events_json AS TEXT)
+         FROM nl2sql_attribution_tasks
+         WHERE task_id = ? AND tenant_id = ? AND user_id = ? LIMIT 1",
+    )
+    .bind(task_id)
+    .bind(&claims.tenant_id)
+    .bind(&claims.sub)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .flatten();
+    raw.and_then(|value| serde_json::from_str::<Vec<AttributionTaskEvent>>(&value).ok())
+        .unwrap_or_default()
+}
+
+pub(crate) async fn recover_interrupted_attribution_tasks(db: &sqlx::SqlitePool) -> Result<u64> {
+    let result = sqlx::query::<sqlx::Sqlite>(
+        "UPDATE nl2sql_attribution_tasks
+         SET status = 'failed',
+             error = COALESCE(error, 'AOS restarted before this attribution task completed; completed progress remains available for review and the task can be retried.'),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE status IN ('queued', 'running') AND cancel_requested = 0",
+    )
+    .execute(db)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 async fn persist_attribution_task_heartbeat(
     db: &sqlx::SqlitePool,
     claims: &Claims,
@@ -1749,6 +1896,12 @@ async fn start_attribution_task_inner(
         }
         return Err(error);
     }
+    if let Some(initial_event) = manager
+        .snapshot(&task_id, &claims.tenant_id, &claims.sub)
+        .await
+    {
+        persist_attribution_progress_event(&state.db, &claims, &initial_event).await;
+    }
 
     let state_clone = state.clone();
     let claims_clone = claims.clone();
@@ -1768,17 +1921,18 @@ async fn start_attribution_task_inner(
             )
             .await;
         }
-        manager2
-            .publish_stage_progress(
-                &task_id_clone,
-                "understand",
-                "正在理解归因问题和需要澄清的信息",
-                Some(8),
-                None,
-                None,
-                None,
-            )
-            .await;
+        publish(
+            &state_clone,
+            &claims_clone,
+            &task_id_clone,
+            "understand",
+            "正在理解归因问题和需要澄清的信息",
+            Some(8),
+            None,
+            None,
+            None,
+        )
+        .await;
         let request_conversation_id = req.conversation_id.clone();
         let archive_question = req.question.clone();
         let archive_had_shared_context = req
@@ -2128,6 +2282,7 @@ fn attribution_status_is_terminal(status: &str) -> bool {
 }
 
 pub(crate) async fn stream_attribution_task_events(
+    State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     Path(task_id): Path<String>,
 ) -> Result<
@@ -2136,14 +2291,25 @@ pub(crate) async fn stream_attribution_task_events(
     >,
 > {
     let manager = task_manager().clone();
-    let mut rx = manager
+    let mut live_rx = manager
         .subscribe(&task_id, &claims.tenant_id, &claims.sub)
-        .await
-        .ok_or_else(|| AppError::NotFound("attribution task not found".to_string()))?;
-    let history = manager
+        .await;
+    let memory_history = manager
         .history(&task_id, &claims.tenant_id, &claims.sub)
         .await
         .unwrap_or_default();
+    let history = if memory_history.is_empty() {
+        load_persisted_attribution_progress_events(&state.db, &claims, &task_id).await
+    } else {
+        memory_history
+    };
+    if history.is_empty()
+        && persisted_attribution_task_snapshot(&state, &claims, &task_id)
+            .await
+            .is_none()
+    {
+        return Err(AppError::NotFound("attribution task not found".to_string()));
+    }
 
     let stream = async_stream::stream! {
         let history_terminal = history
@@ -2158,13 +2324,35 @@ pub(crate) async fn stream_attribution_task_events(
             return;
         }
 
-        while let Ok(evt) = rx.recv().await {
-            let payload = serde_json::to_string(&evt).unwrap_or_else(|_| "{}".to_string());
-            let terminal = attribution_status_is_terminal(evt.status.as_str());
-            yield Ok(Event::default().event("task_event").data(payload));
-            if terminal {
-                break;
+        if let Some(rx) = live_rx.as_mut() {
+            while let Ok(evt) = rx.recv().await {
+                let payload = serde_json::to_string(&evt).unwrap_or_else(|_| "{}".to_string());
+                let terminal = attribution_status_is_terminal(evt.status.as_str());
+                yield Ok(Event::default().event("task_event").data(payload));
+                if terminal {
+                    break;
+                }
             }
+        } else if let Some(snapshot) = persisted_attribution_task_snapshot(&state, &claims, &task_id).await {
+            let payload = serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string());
+            yield Ok(Event::default().event("task_event").data(payload));
+        } else {
+            let missing = AttributionTaskEvent {
+                task_id: task_id.clone(),
+                status: "failed".to_string(),
+                stage: Some("failed".to_string()),
+                message: Some("数据归因任务记录不存在".to_string()),
+                elapsed_ms: 0,
+                stage_elapsed_ms: None,
+                progress_percent: Some(100),
+                step_index: None,
+                step_total: None,
+                observation: None,
+                response: None,
+                error: Some("attribution task not found".to_string()),
+            };
+            let payload = serde_json::to_string(&missing).unwrap_or_else(|_| "{}".to_string());
+            yield Ok(Event::default().event("task_event").data(payload));
         }
     };
 
@@ -2423,6 +2611,21 @@ fn should_run_diagnostic_loop(observations: &[AttributionObservation]) -> bool {
     !core_evidence_complete
 }
 
+fn clarification_after_completed_steps(
+    candidates: &[(String, String)],
+    observations: &[AttributionObservation],
+) -> Option<String> {
+    let has_success = observations
+        .iter()
+        .any(AttributionObservation::execution_succeeded);
+    candidates
+        .iter()
+        .find(|(step_id, _)| {
+            matches!(step_id.as_str(), "main_metric" | "metric_decomposition") || !has_success
+        })
+        .map(|(_, question)| question.clone())
+}
+
 fn observation_digests(observations: &[AttributionObservation]) -> Vec<ObservationDigest> {
     let row_limit = max_diagnostic_digest_rows();
     let col_limit = max_evidence_card_columns();
@@ -2663,6 +2866,8 @@ async fn run_diagnostic_loop(
             break;
         }
         publish(
+            state,
+            claims,
             task_id,
             "diagnose",
             &format!("正在判断第 {round} 轮是否还需要继续下钻"),
@@ -2730,6 +2935,8 @@ async fn run_diagnostic_loop(
             }
             let step_index = idx + 1;
             publish(
+                state,
+                claims,
                 task_id,
                 "diagnose",
                 &format!(
@@ -2764,6 +2971,8 @@ async fn run_diagnostic_loop(
                 )
             };
             publish(
+                state,
+                claims,
                 task_id,
                 "diagnose",
                 &summary,
@@ -2789,6 +2998,7 @@ fn cancelled_attribution_response(
     observations: Vec<AttributionObservation>,
 ) -> AttributionAnalyzeResponse {
     let evidence_health = AttributionEvidenceHealth::from_observations(&observations);
+    let evidence_cards = build_evidence_cards(&observations);
     AttributionAnalyzeResponse {
         status: "cancelled".to_string(),
         question: question.to_string(),
@@ -2799,7 +3009,7 @@ fn cancelled_attribution_response(
         plan,
         observations,
         evidence_health,
-        evidence_cards: Vec::new(),
+        evidence_cards,
         total_execution_ms: start.elapsed().as_millis() as u64,
         error: None,
     }
@@ -2858,6 +3068,8 @@ async fn analyze_attribution(
 
     if let Some(previous) = previous_context.as_ref() {
         publish(
+            state,
+            claims,
             task_id,
             "synthesize",
             "正在判断是否可以直接复用上一轮证据回答追问",
@@ -2892,6 +3104,8 @@ async fn analyze_attribution(
                 let observations = previous.response.observations.clone();
                 let evidence_health = AttributionEvidenceHealth::from_observations(&observations);
                 publish(
+                    state,
+                    claims,
                     task_id,
                     "synthesize",
                     "已复用上一轮证据生成追问回答",
@@ -2943,6 +3157,8 @@ async fn analyze_attribution(
     };
 
     publish(
+        state,
+        claims,
         task_id,
         "plan",
         "正在生成归因分析路径",
@@ -2953,7 +3169,7 @@ async fn analyze_attribution(
     )
     .await;
     let plan = match tokio::time::timeout(
-        remaining_attribution_budget(deadline),
+        remaining_attribution_budget(deadline).min(attribution_planning_budget()),
         build_attribution_plan(
             state,
             claims,
@@ -3018,8 +3234,99 @@ async fn analyze_attribution(
 
     let mut observations = Vec::new();
     let total_steps = steps.len();
-    let completed_steps = Arc::new(AtomicUsize::new(0));
-    let mut completed = stream::iter(steps.into_iter().enumerate().map(|(idx, step)| {
+    let execution_deadline = attribution_execution_deadline(deadline);
+    let mut indexed_steps = steps.into_iter().enumerate().collect::<Vec<_>>();
+
+    // Establish the requested metric and comparison first. Running every
+    // expensive branch at once used to waste the full task budget when the
+    // metric itself needed one clarification, and all branches then surfaced
+    // the same deadline error. Auxiliary evidence remains concurrent after the
+    // core query has proved executable.
+    if let Some(core_index) = indexed_steps
+        .iter()
+        .position(|(_, step)| step.id == "main_metric")
+    {
+        let (idx, step) = indexed_steps.remove(core_index);
+        let step_index = idx + 1;
+        publish(
+            state,
+            claims,
+            task_id,
+            "execute",
+            &format!(
+                "正在执行归因查询 {}/{}：{}",
+                step_index, total_steps, step.title
+            ),
+            Some(execute_progress_percent(0, total_steps)),
+            Some(step_index),
+            Some(total_steps),
+            None,
+        )
+        .await;
+        let step_deadline =
+            bounded_phase_deadline(execution_deadline, attribution_step_budget(depth));
+        let observation = execute_attribution_step(
+            state,
+            claims,
+            &execution_req,
+            &conversation_id,
+            &step,
+            depth,
+            task_id,
+            Some(step_index),
+            Some(total_steps),
+            step_deadline,
+        )
+        .await;
+        let step_summary = if observation.error.is_some() {
+            format!(
+                "归因查询 {}/{} 未成功，正在判断是否需要补充口径：{}",
+                step_index, total_steps, step.title
+            )
+        } else {
+            format!(
+                "已完成归因查询 {}/{}：{}，返回 {} 行",
+                step_index, total_steps, step.title, observation.row_count
+            )
+        };
+        publish(
+            state,
+            claims,
+            task_id,
+            "execute",
+            &step_summary,
+            Some(execute_progress_percent(1, total_steps)),
+            Some(step_index),
+            Some(total_steps),
+            Some(observation.clone()),
+        )
+        .await;
+        let core_clarification = observation
+            .error
+            .as_deref()
+            .and_then(extract_clarification_from_error);
+        observations.push(observation);
+        if let Some(question) = core_clarification {
+            let evidence_health = AttributionEvidenceHealth::from_observations(&observations);
+            return Ok(AttributionAnalyzeResponse {
+                status: "clarification_needed".to_string(),
+                question: req.question,
+                depth: depth.label().to_string(),
+                conversation_id: Some(conversation_id),
+                clarification_question: Some(question),
+                report: None,
+                plan: Some(plan),
+                observations,
+                evidence_health,
+                evidence_cards: Vec::new(),
+                total_execution_ms: start.elapsed().as_millis() as u64,
+                error: None,
+            });
+        }
+    }
+
+    let completed_steps = Arc::new(AtomicUsize::new(observations.len()));
+    let mut completed = stream::iter(indexed_steps.into_iter().map(|(idx, step)| {
         let completed_steps = Arc::clone(&completed_steps);
         let execution_req = &execution_req;
         let conversation_id = &conversation_id;
@@ -3028,14 +3335,16 @@ async fn analyze_attribution(
             // `buffer_unordered` starts queued futures as earlier steps finish.
             // Re-check cancellation here so a stopped attribution turn cannot
             // launch another model/SQL request from the pending queue.
-            if task_manager().is_cancelled(task_id).await || Instant::now() >= deadline {
+            if task_manager().is_cancelled(task_id).await || Instant::now() >= execution_deadline {
                 return (
                     idx,
                     step.clone(),
-                    cancelled_attribution_observation(&step, conversation_id),
+                    deadline_attribution_observation(&step, conversation_id),
                 );
             }
             publish(
+                state,
+                claims,
                 task_id,
                 "execute",
                 &format!(
@@ -3048,6 +3357,8 @@ async fn analyze_attribution(
                 None,
             )
             .await;
+            let step_deadline =
+                bounded_phase_deadline(execution_deadline, attribution_step_budget(depth));
             let observation = execute_attribution_step(
                 state,
                 claims,
@@ -3058,7 +3369,7 @@ async fn analyze_attribution(
                 task_id,
                 Some(step_index),
                 Some(total_steps),
-                deadline,
+                step_deadline,
             )
             .await;
             let completed_count = completed_steps.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3074,6 +3385,8 @@ async fn analyze_attribution(
                 )
             };
             publish(
+                state,
+                claims,
                 task_id,
                 "execute",
                 &step_summary,
@@ -3107,31 +3420,35 @@ async fn analyze_attribution(
         ));
     }
 
+    let mut clarification_candidates = Vec::new();
     for (_, step, observation) in completed {
         let clarification = observation
             .error
             .as_deref()
             .and_then(extract_clarification_from_error);
-        observations.push(observation);
-        let is_core_step = matches!(step.id.as_str(), "main_metric" | "metric_decomposition");
-        let has_success = observations.iter().any(|o| o.error.is_none());
-        if let Some(question) = clarification.filter(|_| is_core_step || !has_success) {
-            let evidence_health = AttributionEvidenceHealth::from_observations(&observations);
-            return Ok(AttributionAnalyzeResponse {
-                status: "clarification_needed".to_string(),
-                question: req.question,
-                depth: depth.label().to_string(),
-                conversation_id: Some(conversation_id),
-                clarification_question: Some(question),
-                report: None,
-                plan: Some(plan),
-                observations,
-                evidence_health,
-                evidence_cards: Vec::new(),
-                total_execution_ms: start.elapsed().as_millis() as u64,
-                error: None,
-            });
+        if let Some(question) = clarification {
+            clarification_candidates.push((step.id.clone(), question));
         }
+        observations.push(observation);
+    }
+    if let Some(question) =
+        clarification_after_completed_steps(&clarification_candidates, &observations)
+    {
+        let evidence_health = AttributionEvidenceHealth::from_observations(&observations);
+        return Ok(AttributionAnalyzeResponse {
+            status: "clarification_needed".to_string(),
+            question: req.question,
+            depth: depth.label().to_string(),
+            conversation_id: Some(conversation_id),
+            clarification_question: Some(question),
+            report: None,
+            plan: Some(plan),
+            evidence_cards: build_evidence_cards(&observations),
+            observations,
+            evidence_health,
+            total_execution_ms: start.elapsed().as_millis() as u64,
+            error: None,
+        });
     }
 
     run_diagnostic_loop(
@@ -3143,7 +3460,7 @@ async fn analyze_attribution(
         task_id,
         &mut plan,
         &mut observations,
-        deadline,
+        execution_deadline,
     )
     .await;
     if task_manager().is_cancelled(task_id).await {
@@ -3158,6 +3475,8 @@ async fn analyze_attribution(
     }
 
     publish(
+        state,
+        claims,
         task_id,
         "synthesize",
         "正在把查询结果整理成老板可读的根因结论",
@@ -3230,6 +3549,8 @@ fn execute_progress_percent(completed_or_started_steps: usize, total_steps: usiz
 }
 
 async fn publish(
+    state: &AppState,
+    claims: &Claims,
     task_id: &str,
     stage: &str,
     message: &str,
@@ -3238,7 +3559,7 @@ async fn publish(
     step_total: Option<usize>,
     observation: Option<AttributionObservation>,
 ) {
-    task_manager()
+    if let Some(event) = task_manager()
         .publish_stage_progress(
             task_id,
             stage,
@@ -3248,7 +3569,10 @@ async fn publish(
             step_total,
             observation,
         )
-        .await;
+        .await
+    {
+        persist_attribution_progress_event(&state.db, claims, &event).await;
+    }
 }
 
 async fn execute_attribution_step(
@@ -3281,10 +3605,14 @@ async fn execute_attribution_step(
     // attribution worker only exposed its final observation, which looked like
     // a frozen task during schema loading, SQL generation, and execution.
     let task_id_for_stage = task_id.to_string();
+    let state_for_stage = state.clone();
+    let claims_for_stage = claims.clone();
     let stage_prefix = format!("execute_{}", attribution_stage_component(&step.id));
     let step_title = step.title.clone();
     let stage_emitter = Arc::new(move |signal: AgentStageSignal| {
         let task_id = task_id_for_stage.clone();
+        let state = state_for_stage.clone();
+        let claims = claims_for_stage.clone();
         let stage = format!(
             "{stage_prefix}_{}",
             attribution_stage_component(&signal.stage)
@@ -3292,6 +3620,8 @@ async fn execute_attribution_step(
         let message = format!("{}：{}", step_title, signal.message);
         tokio::spawn(async move {
             publish(
+                &state,
+                &claims,
                 &task_id,
                 &stage,
                 &message,
@@ -3322,7 +3652,8 @@ async fn execute_attribution_step(
     let Some(response) = response else {
         let mut observation = cancelled_attribution_observation(step, conversation_id);
         if !task_manager().is_cancelled(task_id).await {
-            observation.error = Some("attribution total deadline reached".to_string());
+            observation.error =
+                Some("本步骤超过单步执行预算；系统已停止该分支并保留其它已完成证据。".to_string());
         }
         observation.elapsed_ms = start.elapsed().as_millis() as u64;
         return observation;
@@ -3437,6 +3768,16 @@ fn cancelled_attribution_observation(
         error: Some("cancelled".to_string()),
         elapsed_ms: 0,
     }
+}
+
+fn deadline_attribution_observation(
+    step: &AttributionPlanStep,
+    conversation_id: &str,
+) -> AttributionObservation {
+    let mut observation = cancelled_attribution_observation(step, conversation_id);
+    observation.error =
+        Some("本步骤未在归因查询预算内启动；系统已保留其它已完成证据并进入总结。".to_string());
+    observation
 }
 
 async fn load_agent_result_snapshot(
@@ -3809,9 +4150,14 @@ async fn call_llm_text(
             use_max_completion_tokens: None,
             extra_body: None,
         };
-        let response = match chat_cfg.client.send_message(&request).await {
-            Ok(response) => response,
-            Err(error) => {
+        let response = match tokio::time::timeout(
+            attribution_helper_model_budget(),
+            chat_cfg.client.send_message(&request),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
                 tracing::warn!(
                     tenant_id = %claims.tenant_id,
                     user_id = %claims.sub,
@@ -3823,6 +4169,23 @@ async fn call_llm_text(
                     "data-attribution helper model call failed; trying next candidate"
                 );
                 last_error = Some(anyhow::anyhow!("LLM call failed: {error}"));
+                continue;
+            }
+            Err(_) => {
+                let timeout_secs = attribution_helper_model_budget().as_secs();
+                tracing::warn!(
+                    tenant_id = %claims.tenant_id,
+                    user_id = %claims.sub,
+                    candidate_index = candidate_index + 1,
+                    total_candidates,
+                    provider = %chat_cfg.provider,
+                    model = %chat_cfg.model,
+                    timeout_secs,
+                    "data-attribution helper model timed out; trying next candidate"
+                );
+                last_error = Some(anyhow::anyhow!(
+                    "LLM helper timed out after {timeout_secs}s"
+                ));
                 continue;
             }
         };
@@ -4268,6 +4631,97 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn attribution_progress_events_round_trip_through_sqlite() {
+        let db = crate::test_sqlite_pool().await;
+        let claims = Claims::new(
+            "user-progress",
+            "progress@example.com",
+            "admin",
+            "tenant-progress",
+        );
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO nl2sql_attribution_tasks
+             (task_id, tenant_id, user_id, conversation_id, question, status)
+             VALUES ('task-progress', 'tenant-progress', 'user-progress', 'conversation-progress', 'why', 'running')",
+        )
+        .execute(&db)
+        .await
+        .expect("insert attribution task fixture");
+        let event = AttributionTaskEvent {
+            task_id: "task-progress".to_string(),
+            status: "running".to_string(),
+            stage: Some("execute".to_string()),
+            message: Some("step completed".to_string()),
+            elapsed_ms: 42,
+            stage_elapsed_ms: Some(20),
+            progress_percent: Some(50),
+            step_index: Some(1),
+            step_total: Some(2),
+            observation: Some(AttributionObservation {
+                step_id: "main_metric".to_string(),
+                title: "main".to_string(),
+                purpose: "compare".to_string(),
+                question: "compare metric".to_string(),
+                datasource_ids: vec!["ds-1".to_string()],
+                time_context: None,
+                query_id: Some("query-1".to_string()),
+                conversation_id: Some("conversation-progress".to_string()),
+                columns: vec!["metric".to_string()],
+                rows: vec![serde_json::json!({"metric": 1})],
+                row_count: 1,
+                sampled: false,
+                sqls: vec!["SELECT 1 AS metric".to_string()],
+                used_references: Vec::new(),
+                error: None,
+                elapsed_ms: 40,
+            }),
+            response: None,
+            error: None,
+        };
+
+        persist_attribution_progress_event(&db, &claims, &event).await;
+        let restored =
+            load_persisted_attribution_progress_events(&db, &claims, "task-progress").await;
+
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].stage.as_deref(), Some("execute"));
+        assert_eq!(
+            restored[0]
+                .observation
+                .as_ref()
+                .map(|observation| observation.step_id.as_str()),
+            Some("main_metric")
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_attribution_recovery_keeps_durable_progress() {
+        let db = crate::test_sqlite_pool().await;
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO nl2sql_attribution_tasks
+             (task_id, tenant_id, user_id, conversation_id, question, status, progress_events_json)
+             VALUES ('task-interrupted', 'tenant-1', 'user-1', 'conversation-1', 'why', 'running', '[{\"stage\":\"execute\"}]')",
+        )
+        .execute(&db)
+        .await
+        .expect("insert interrupted attribution fixture");
+
+        assert_eq!(recover_interrupted_attribution_tasks(&db).await.unwrap(), 1);
+        let row = sqlx::query::<sqlx::Sqlite>(
+            "SELECT status, error, progress_events_json FROM nl2sql_attribution_tasks WHERE task_id = 'task-interrupted'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("load recovered attribution task");
+        assert_eq!(row.get::<String, _>("status"), "failed");
+        assert!(row.get::<String, _>("error").contains("restarted"));
+        assert_eq!(
+            row.get::<String, _>("progress_events_json"),
+            "[{\"stage\":\"execute\"}]"
+        );
+    }
+
     #[test]
     fn extracts_json_from_markdown_noise() {
         let text = "```json\n{\"title\":\"x\"}\n```";
@@ -4479,6 +4933,49 @@ mod tests {
             Some("Which baseline?")
         );
         assert!(extract_clarification_from_error("query failed").is_none());
+    }
+
+    #[test]
+    fn clarification_is_decided_after_all_completed_steps_are_preserved() {
+        let failed_observation = |step_id: &str| AttributionObservation {
+            step_id: step_id.to_string(),
+            title: step_id.to_string(),
+            purpose: "test".to_string(),
+            question: "test".to_string(),
+            datasource_ids: Vec::new(),
+            time_context: None,
+            query_id: None,
+            conversation_id: None,
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            sampled: false,
+            sqls: Vec::new(),
+            used_references: Vec::new(),
+            error: Some("needs input".to_string()),
+            elapsed_ms: 1,
+        };
+        let observations = vec![
+            failed_observation("metric_decomposition"),
+            failed_observation("dimension_drilldown"),
+            failed_observation("funnel_or_quality"),
+        ];
+        let candidates = vec![
+            (
+                "metric_decomposition".to_string(),
+                "补充指标口径".to_string(),
+            ),
+            (
+                "dimension_drilldown".to_string(),
+                "补充分组维度".to_string(),
+            ),
+        ];
+
+        assert_eq!(
+            clarification_after_completed_steps(&candidates, &observations).as_deref(),
+            Some("补充指标口径")
+        );
+        assert_eq!(observations.len(), 3);
     }
 
     #[test]

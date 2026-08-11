@@ -18,12 +18,13 @@ use crate::state::AppState;
 
 use super::{
     build_agent_planning_prompt, correct_sql, cross_join, decode_mysql_cell, decode_pg_cell,
-    extract_schema_tables_and_fks, full_outer_join, generate_sql, hash_join,
-    load_cross_domain_clusters_summary, matched_metric_names, max_operational_retry_attempts,
-    max_self_correct_attempts, parse_metric_aliases, parse_multi_step_plan, right_join,
-    should_enable_qu, union_all, union_distinct, validate_data_source_access,
-    CrossDatasourceRelation, DatasourceSchemaInfo, ForeignKeyPrompt, MetricMatchCandidate,
-    ReferencePromptSnippet, ReferenceUsageDto, SelfCorrectContext, SqlExecErrorKind,
+    discover_knowledge_schema_tables, extract_schema_tables_and_fks, full_outer_join, generate_sql,
+    hash_join, load_cross_domain_clusters_summary, matched_metric_names,
+    max_operational_retry_attempts, max_self_correct_attempts, parse_metric_aliases,
+    parse_multi_step_plan, right_join, should_enable_qu, union_all, union_distinct,
+    validate_data_source_access, CrossDatasourceRelation, DatasourceSchemaInfo, ForeignKeyPrompt,
+    MetricMatchCandidate, ReferencePromptSnippet, ReferenceUsageDto, SelfCorrectContext,
+    SqlExecErrorKind,
 };
 
 fn max_agent_steps() -> usize {
@@ -1752,7 +1753,7 @@ impl Nl2SqlAgent {
             "正在按数据探索链路检索 SQL 知识库和 Schema",
         );
 
-        let schema_tables = super::enrich_schema_with_semantics(
+        let mut schema_tables = super::enrich_schema_with_semantics(
             &self.state.db,
             &schema.datasource_id,
             schema.tables.clone(),
@@ -1766,7 +1767,7 @@ impl Nl2SqlAgent {
             );
             schema.tables.clone()
         });
-        let schema_tables = match crate::nl2sql::routing::resolve_business_domains(
+        schema_tables = match crate::nl2sql::routing::resolve_business_domains(
             &self.state.db,
             Some(&schema.datasource_id),
         )
@@ -1881,6 +1882,58 @@ impl Nl2SqlAgent {
                     datasource_id = %schema.datasource_id,
                     "single datasource agent empty-schema SQL knowledge fallback failed"
                 ),
+            }
+        }
+
+        let auto_opened_sql_files = super::auto_open_relevant_sql_knowledge_files(
+            &self.state,
+            claims,
+            &schema.datasource_id,
+            question,
+            &reference_snippets,
+        )
+        .await;
+        if !auto_opened_sql_files.is_empty() {
+            reference_snippets = super::merge_reference_snippets(
+                &auto_opened_sql_files,
+                reference_snippets,
+                super::sql_knowledge_prompt_max_snippets(),
+            );
+            super::agent_async::emit_agent_stage("load_context", "已打开命中的完整 SQL 文件上下文");
+        }
+
+        let hydrated = discover_knowledge_schema_tables(
+            &self.state,
+            &schema.datasource_id,
+            &schema.db_type,
+            &schema.config,
+            &schema_tables,
+            &reference_snippets,
+        )
+        .await;
+        if hydrated.as_array().is_some_and(|tables| !tables.is_empty()) {
+            super::agent_async::emit_agent_stage(
+                "load_schema",
+                "已按 SQL 知识库命中的表按需确认 Schema",
+            );
+            schema_tables = super::merge_schema_tables(&schema_tables, &hydrated);
+            if let Ok(domains) = crate::nl2sql::routing::resolve_business_domains(
+                &self.state.db,
+                Some(&schema.datasource_id),
+            )
+            .await
+            {
+                let strict_match = super::strict_domain_tables_for_question(
+                    &domains,
+                    &schema.datasource_id,
+                    question,
+                );
+                if !strict_match.allowed_tables.is_empty() {
+                    schema_tables = super::filter_schema_tables_by_allowlist(
+                        &schema_tables,
+                        &strict_match.allowed_tables,
+                    );
+                }
             }
         }
 

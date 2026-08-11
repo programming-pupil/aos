@@ -12,23 +12,6 @@ pub(in crate::routes::rd) use dependency_graph::rd_normalize_repo_relative_path;
 use observability::maybe_record_rd_retrieval_evidence;
 use retrieval::build_repository_retrieval_context;
 
-pub(in crate::routes::rd) async fn build_repository_context(
-    state: &AppState,
-    claims: &Claims,
-    repository_id: &str,
-) -> Result<String, AppError> {
-    build_repository_context_for_prompt(
-        state,
-        claims,
-        repository_id,
-        "",
-        RD_INLINE_CONTEXT_BUDGET_BYTES,
-        RdContextProfile::FocusedAsk,
-        None,
-    )
-    .await
-}
-
 pub(in crate::routes::rd) async fn build_repository_context_for_prompt(
     state: &AppState,
     claims: &Claims,

@@ -2949,6 +2949,10 @@ impl ApiClient for GatewayApiClient {
                 .any(|definition| definition.name == tool_name)
     }
 
+    fn block_tool_for_turn(&mut self, tool_name: &str) {
+        self.scoped_blocked_tools.insert(tool_name.to_string());
+    }
+
     fn prepare_model_iteration(
         &mut self,
         _iteration: usize,
@@ -7315,15 +7319,8 @@ async fn gateway_list_unified_memory_items(
         // hundreds of large embedding rows before it could apply LIMIT.
         let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
             r#"
-            SELECT memory.id, memory.tenant_id, memory.user_id, memory.scope, memory.app,
-                   memory.session_id, memory.memory_type, memory.content, memory.source_type,
-                   CAST(memory.confidence AS DOUBLE) AS confidence, memory.pinned, memory.enabled,
-                   memory.embedding_model, memory.embedding_json,
-                   CAST(memory.updated_at AS TEXT) AS updated_at
-            FROM (
-              SELECT candidates.id, candidates.pinned, candidates.updated_at
-              FROM (
-                (SELECT id, pinned, updated_at FROM agent_memory_items WHERE tenant_id = "#,
+            WITH session_candidates AS (
+              SELECT id, pinned, updated_at FROM agent_memory_items WHERE tenant_id = "#,
         );
         query
             .push_bind(&context.tenant_id)
@@ -7346,7 +7343,11 @@ async fn gateway_list_unified_memory_items(
         query
             .push(" ORDER BY pinned DESC, updated_at DESC, id DESC LIMIT ")
             .push_bind(db_limit)
-            .push(") UNION ALL (SELECT id, pinned, updated_at FROM agent_memory_items WHERE tenant_id = ")
+            .push(
+                r#"
+            ), global_candidates AS (
+              SELECT id, pinned, updated_at FROM agent_memory_items WHERE tenant_id = "#,
+            )
             .push_bind(&context.tenant_id)
             .push(" AND user_id = ")
             .push_bind(&context.user_id)
@@ -7367,15 +7368,24 @@ async fn gateway_list_unified_memory_items(
             .push(" ORDER BY pinned DESC, updated_at DESC, id DESC LIMIT ")
             .push_bind(db_limit)
             .push(
-                r#")
-              ) AS candidates
-              ORDER BY candidates.pinned DESC, candidates.updated_at DESC, candidates.id DESC
+                r#"
+            ), ranked AS (
+              SELECT id, pinned, updated_at FROM session_candidates
+              UNION ALL
+              SELECT id, pinned, updated_at FROM global_candidates
+              ORDER BY pinned DESC, updated_at DESC, id DESC
               LIMIT "#,
             )
             .push_bind(db_limit)
             .push(
                 r#"
-            ) AS ranked
+            )
+            SELECT memory.id, memory.tenant_id, memory.user_id, memory.scope, memory.app,
+                   memory.session_id, memory.memory_type, memory.content, memory.source_type,
+                   CAST(memory.confidence AS DOUBLE) AS confidence, memory.pinned, memory.enabled,
+                   memory.embedding_model, memory.embedding_json,
+                   CAST(memory.updated_at AS TEXT) AS updated_at
+            FROM ranked
             INNER JOIN agent_memory_items AS memory ON memory.id = ranked.id
             ORDER BY ranked.pinned DESC, ranked.updated_at DESC, ranked.id DESC
             "#,
@@ -10675,6 +10685,104 @@ mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::path::PathBuf;
+
+    async fn gateway_memory_test_context() -> GatewayMemoryContext {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect memory database");
+        sqlx::query(
+            r#"
+            CREATE TABLE agent_memory_items (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                app TEXT NOT NULL,
+                session_id TEXT,
+                memory_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                pinned INTEGER NOT NULL,
+                enabled INTEGER NOT NULL,
+                embedding_model TEXT,
+                embedding_json TEXT,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .expect("create gateway memory table");
+        for (id, session_id, scope, pinned, updated_at) in [
+            (
+                "session",
+                Some("session-test"),
+                "session",
+                0_i64,
+                "2026-08-10 02:00:00",
+            ),
+            ("global", None, "global", 1_i64, "2026-08-10 01:00:00"),
+            (
+                "other",
+                Some("other-session"),
+                "session",
+                1_i64,
+                "2026-08-10 03:00:00",
+            ),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO agent_memory_items (
+                    id, tenant_id, user_id, scope, app, session_id, memory_type, content,
+                    source_type, confidence, pinned, enabled, updated_at
+                ) VALUES (?, 'tenant-test', 'user-test', ?, 'chat', ?, 'note', ?, 'manual', 1.0, ?, 1, ?)
+                "#,
+            )
+            .bind(id)
+            .bind(scope)
+            .bind(session_id)
+            .bind(format!("memory {id}"))
+            .bind(pinned)
+            .bind(updated_at)
+            .execute(&db)
+            .await
+            .expect("insert gateway memory fixture");
+        }
+        GatewayMemoryContext {
+            db,
+            tenant_id: "tenant-test".to_string(),
+            user_id: "user-test".to_string(),
+            session_id: "session-test".to_string(),
+            app: "chat".to_string(),
+            session_path: PathBuf::from("/tmp/aos-gateway-memory-test.jsonl"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_unified_memory_list_combines_current_session_and_global_rows() {
+        let context = gateway_memory_test_context().await;
+        let items = gateway_list_unified_memory_items(
+            &context,
+            None,
+            Some("chat"),
+            Some("session-test"),
+            false,
+            10,
+        )
+        .await
+        .expect("list gateway unified memory");
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["global", "session"]
+        );
+    }
 
     #[test]
     fn workspace_thread_panic_is_returned_as_a_tool_error() {

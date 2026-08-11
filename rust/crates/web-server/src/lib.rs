@@ -153,13 +153,21 @@ mod sqlite_baseline_tests {
         .fetch_one(&pool)
         .await
         .expect("count API key model profile column");
+        let rd_spec_repository_ids_column_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('rd_specs')
+             WHERE name = 'repository_ids_json'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count Plan Mode repository selection column");
 
-        assert_eq!(migration_count, 13);
+        assert_eq!(migration_count, 16);
         assert_eq!(setup_lock_count, 1);
         assert_eq!(repository_auto_sync_column_count, 4);
         assert_eq!(agent_market_source_column_count, 2);
         assert_eq!(model_profile_table_count, 1);
         assert_eq!(api_key_profile_column_count, 1);
+        assert_eq!(rd_spec_repository_ids_column_count, 1);
         pool.close().await;
     }
 
@@ -963,6 +971,8 @@ pub async fn serve_with_options(
 
     let config_registry = Arc::new(agent_gateway::TenantConfigRegistry::new(state.db.clone()));
     state.config_registry = Some(config_registry.clone());
+    #[cfg(feature = "nl2sql")]
+    routes::nl2sql::reference::start_sql_knowledge_import_worker(state.clone());
 
     #[cfg(feature = "agent")]
     {
@@ -1040,6 +1050,21 @@ pub async fn serve_with_options(
     #[cfg(feature = "pm")]
     let (pm_scheduler_shutdown, pm_scheduler_handle) =
         routes::pm_scheduler::start_periodic_pm_scheduler(state.clone());
+    #[cfg(feature = "rd")]
+    if let Err(error) = routes::rd::recover_interrupted_plan_generations(&state.db).await {
+        tracing::warn!(%error, "failed to recover interrupted RD plan generation states");
+    }
+    #[cfg(feature = "nl2sql")]
+    match routes::nl2sql::attribution::recover_interrupted_attribution_tasks(&state.db).await {
+        Ok(count) if count > 0 => tracing::warn!(
+            count,
+            "archived interrupted data-attribution tasks while preserving durable progress"
+        ),
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%error, "failed to recover interrupted data-attribution tasks")
+        }
+    }
     #[cfg(feature = "rd")]
     let (rd_repository_scheduler_shutdown, rd_repository_scheduler_handle) =
         routes::rd::start_periodic_repository_sync(state.clone());

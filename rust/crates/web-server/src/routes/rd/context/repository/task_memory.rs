@@ -22,10 +22,10 @@ pub(super) async fn augment_repository_retrieval_with_task_memory(
 
     let rows = sqlx::query(
         "SELECT id, mode, status, title,
-                LEFT(prompt, 3000) AS prompt_text,
-                LEFT(COALESCE(plan_md, ''), 2200) AS plan_text,
-                LEFT(COALESCE(answer_md, ''), 2600) AS answer_text,
-                LEFT(COALESCE(review_md, ''), 1600) AS review_text,
+                substr(prompt, 1, 3000) AS prompt_text,
+                substr(COALESCE(plan_md, ''), 1, 2200) AS plan_text,
+                substr(COALESCE(answer_md, ''), 1, 2600) AS answer_text,
+                substr(COALESCE(review_md, ''), 1, 1600) AS review_text,
                 CAST(created_at AS TEXT) AS created_at
          FROM rd_tasks
          WHERE tenant_id = ? AND user_id = ? AND repository_id = ?

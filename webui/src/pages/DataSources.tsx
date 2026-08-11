@@ -1535,26 +1535,26 @@ function DataSourcesContent() {
       const newDs = await dataSourcesApi.create(values as Parameters<typeof dataSourcesApi.create>[0]);
       return newDs;
     },
-    onSuccess: async (newDs: DataSourceInfo) => {
+    onSuccess: (newDs: DataSourceInfo) => {
       message.success(t('common.operateSuccess'));
       qc.invalidateQueries({ queryKey: queryKeys.dataSources.all() });
       setModalOpen(false);
       setEditDs(null);
       form.resetFields();
       // Auto-discover schema for the newly created data source
-      try {
-        const result = await dataSourcesApi.discoverSchema(newDs.id) as {
+      void dataSourcesApi.discoverSchema(newDs.id).then((result) => {
+        const discovery = result as {
           refresh_task_id?: string | null;
         };
-        const taskId = result?.refresh_task_id ?? null;
+        const taskId = discovery?.refresh_task_id ?? null;
         if (taskId) {
           setDiscoverProgressModal({ dataSourceId: newDs.id, taskId });
         } else {
           message.info(t('datasources.schemaDiscovered'));
         }
-      } catch (err) {
+      }).catch((err: unknown) => {
         message.warning(err instanceof ApiError ? err.message : t('datasources.autoDiscoverFailed'));
-      }
+      });
     },
     onError: (err: unknown) => {
       if (err instanceof ApiError) message.error(err.message);
@@ -1562,30 +1562,30 @@ function DataSourcesContent() {
   });
 
   const updateMutation = useMutation({
-    mutationFn: async ({ id, ...data }: { id: string; data: Record<string, unknown> }) => {
+    mutationFn: async ({ id, data }: { id: string; data: Record<string, unknown> }) => {
       return dataSourcesApi.update(id, data as Parameters<typeof dataSourcesApi.update>[1]);
     },
-    onSuccess: async (updatedDs: DataSourceInfo) => {
+    onSuccess: (updatedDs: DataSourceInfo) => {
       message.success(t('common.operateSuccess'));
       qc.invalidateQueries({ queryKey: queryKeys.dataSources.all() });
       setModalOpen(false);
       setEditDs(null);
       form.resetFields();
       // Auto-discover schema if the connection config changed
-      try {
-        const result = await dataSourcesApi.discoverSchema(updatedDs.id) as {
+      void dataSourcesApi.discoverSchema(updatedDs.id).then((result) => {
+        const discovery = result as {
           refresh_task_id?: string | null;
         };
-        const taskId = result?.refresh_task_id ?? null;
+        const taskId = discovery?.refresh_task_id ?? null;
         if (taskId) {
           setDiscoverProgressModal({ dataSourceId: updatedDs.id, taskId });
         }
-      } catch (err) {
+      }).catch((err: unknown) => {
         message.warning(err instanceof ApiError ? err.message : t('datasources.autoDiscoverFailed'));
-      }
+      });
     },
     onError: (err: unknown) => {
-      if (err instanceof ApiError) message.error(err.message);
+      message.error(err instanceof ApiError ? err.message : t('common.operationFailed'));
     },
   });
 

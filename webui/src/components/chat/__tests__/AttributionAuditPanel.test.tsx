@@ -2,6 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import {
   AttributionMarkdownDetail,
+  isAttributionTaskTerminalStatus,
   normalizeAttributionMarkdown,
 } from "../AttributionAuditPanel";
 
@@ -39,5 +40,20 @@ describe("AttributionAuditPanel", () => {
     expect(html).toContain("<h2");
     expect(html).toContain("<table");
     expect(html).not.toContain("||---|---:||");
+  });
+
+  it("treats every durable attribution outcome as terminal", () => {
+    for (const status of [
+      "completed",
+      "clarification_needed",
+      "no_data",
+      "partial",
+      "failed",
+      "cancelled",
+    ]) {
+      expect(isAttributionTaskTerminalStatus(status)).toBe(true);
+    }
+    expect(isAttributionTaskTerminalStatus("running")).toBe(false);
+    expect(isAttributionTaskTerminalStatus("queued")).toBe(false);
   });
 });

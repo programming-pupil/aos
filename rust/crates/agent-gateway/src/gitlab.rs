@@ -81,6 +81,31 @@ pub struct GitlabProjectManager {
     http_client: reqwest::Client,
 }
 
+fn parse_sqlite_utc_datetime(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .or_else(|| {
+            [
+                "%Y-%m-%d %H:%M:%S%.f%:z",
+                "%Y-%m-%d %H:%M:%S%.f",
+                "%Y-%m-%d %H:%M:%S",
+            ]
+            .into_iter()
+            .find_map(|format| {
+                if format.ends_with("%:z") {
+                    chrono::DateTime::parse_from_str(value, format)
+                        .ok()
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                } else {
+                    chrono::NaiveDateTime::parse_from_str(value, format)
+                        .ok()
+                        .map(|dt| chrono::DateTime::from_naive_utc_and_offset(dt, chrono::Utc))
+                }
+            })
+        })
+}
+
 impl GitlabProjectManager {
     #[must_use]
     pub fn new(db: SqlitePool, data_dir: PathBuf) -> Self {
@@ -227,13 +252,7 @@ impl GitlabProjectManager {
                         description,
                         clone_path,
                         is_cloned,
-                        last_sync_at: last_sync_at.and_then(|s| {
-                            chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
-                                .ok()
-                                .map(|dt| {
-                                    chrono::DateTime::from_naive_utc_and_offset(dt, chrono::Utc)
-                                })
-                        }),
+                        last_sync_at: last_sync_at.as_deref().and_then(parse_sqlite_utc_datetime),
                         created_at: created_at
                             .and_then(|s| {
                                 chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").ok()
@@ -304,11 +323,7 @@ impl GitlabProjectManager {
             description,
             clone_path,
             is_cloned,
-            last_sync_at: last_sync_at.and_then(|s| {
-                chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
-                    .ok()
-                    .map(|dt| chrono::DateTime::from_naive_utc_and_offset(dt, chrono::Utc))
-            }),
+            last_sync_at: last_sync_at.as_deref().and_then(parse_sqlite_utc_datetime),
             created_at: created_at
                 .and_then(|s| chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").ok())
                 .map_or_else(chrono::Utc::now, |dt| {
@@ -670,11 +685,7 @@ impl GitlabProjectManager {
             description,
             clone_path,
             is_cloned,
-            last_sync_at: last_sync_at.and_then(|s| {
-                chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
-                    .ok()
-                    .map(|dt| chrono::DateTime::from_naive_utc_and_offset(dt, chrono::Utc))
-            }),
+            last_sync_at: last_sync_at.as_deref().and_then(parse_sqlite_utc_datetime),
             created_at: created_at
                 .and_then(|s| chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").ok())
                 .map_or_else(chrono::Utc::now, |dt| {
@@ -895,4 +906,24 @@ fn decrypt_legacy_xor_token(encrypted: &str) -> String {
         .enumerate()
         .map(|(i, b)| (b ^ key_bytes[i % key_bytes.len()]) as char)
         .collect()
+}
+
+#[cfg(test)]
+mod datetime_tests {
+    use super::parse_sqlite_utc_datetime;
+
+    #[test]
+    fn parses_sqlite_and_rfc3339_sync_timestamps() {
+        for value in [
+            "2026-08-11 03:03:28",
+            "2026-08-11 03:03:28.538017",
+            "2026-08-11T03:03:28.538017Z",
+            "2026-08-11T11:03:28.538017+08:00",
+        ] {
+            assert!(
+                parse_sqlite_utc_datetime(value).is_some(),
+                "timestamp should parse: {value}"
+            );
+        }
+    }
 }

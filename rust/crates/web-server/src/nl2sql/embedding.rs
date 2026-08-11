@@ -587,8 +587,15 @@ impl EmbeddingStore {
 
         if !self.ann_files_exist() {
             *self.ann_runtime.lock() = None;
-            self.set_ann_status_unavailable("ANN artifacts not found on disk");
-            self.ann_dirty.store(false, Ordering::Release);
+            if self.col_len() > 0 {
+                self.set_ann_status_unavailable(
+                    "ANN artifacts are missing; background snapshot build scheduled",
+                );
+                self.mark_ann_dirty();
+            } else {
+                self.set_ann_status_unavailable("no column vectors available for ANN");
+                self.ann_dirty.store(false, Ordering::Release);
+            }
             return;
         }
 
@@ -2407,6 +2414,36 @@ mod tests {
         drop(store_b);
         drop(registry);
         std::fs::remove_dir_all(root).expect("remove profile test directory");
+    }
+
+    #[test]
+    fn opening_legacy_vectors_without_ann_sidecars_schedules_and_builds_snapshot() {
+        let root =
+            std::env::temp_dir().join(format!("aos-ann-upgrade-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create ANN upgrade test directory");
+        let db_path = root.join("embeddings.db");
+        {
+            let store = EmbeddingStore::open(&db_path, Some("model"), None).expect("open store");
+            store
+                .upsert_typed("ds", "orders", "id", "col", &[1.0, 0.0], "model")
+                .expect("insert legacy vector");
+        }
+
+        let reopened = EmbeddingStore::open(&db_path, Some("model"), None).expect("reopen store");
+        reopened.warm_load_ann_from_disk_at_startup();
+        let pending = reopened.ann_runtime_health();
+        assert!(pending.snapshot_pending);
+        assert!(!pending.loaded_in_memory);
+
+        assert!(reopened
+            .persist_ann_snapshot_if_dirty()
+            .expect("persist missing ANN snapshot"));
+        let loaded = reopened.ann_runtime_health();
+        assert!(loaded.loaded_in_memory);
+        assert!(loaded.disk_artifacts_present);
+        assert!(!loaded.snapshot_pending);
+        drop(reopened);
+        std::fs::remove_dir_all(root).expect("remove ANN upgrade test directory");
     }
 
     #[test]

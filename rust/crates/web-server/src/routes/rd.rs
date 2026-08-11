@@ -100,14 +100,14 @@ use self::completion::{
 };
 use self::context::{
     build_rd_context_plan_section, build_rd_context_policy_section,
-    build_rd_llm_context_plan_section, build_rd_system_prompt, build_repository_context,
-    build_repository_context_for_prompt, build_repository_prescan_context,
-    build_repository_runtime_context_hint, default_rd_context_depth,
-    load_prompt_file_context_for_task, load_repository_instructions_for_task,
-    maybe_run_rd_llm_context_planner, normalize_rd_context_depth, normalize_rd_profile_for_mode,
-    rd_context_budget_json, rd_embed_texts_with_candidate, rd_normalize_repo_relative_path,
-    record_rd_embedding_usage, resolve_rd_embedding_candidates, resolve_rd_task_context_strategy,
-    route_rd_task_intent, should_run_rd_repository_prescan,
+    build_rd_llm_context_plan_section, build_rd_system_prompt, build_repository_context_for_prompt,
+    build_repository_prescan_context, build_repository_runtime_context_hint,
+    default_rd_context_depth, load_prompt_file_context_for_task,
+    load_repository_instructions_for_task, maybe_run_rd_llm_context_planner,
+    normalize_rd_context_depth, normalize_rd_profile_for_mode, rd_context_budget_json,
+    rd_embed_texts_with_candidate, rd_normalize_repo_relative_path, record_rd_embedding_usage,
+    resolve_rd_embedding_candidates, resolve_rd_task_context_strategy, route_rd_task_intent,
+    should_run_rd_repository_prescan,
 };
 use self::diff_filters::{
     filter_rd_unified_diff_excluded_paths, infer_files_from_unified_diff,
@@ -161,6 +161,62 @@ pub fn start_periodic_repository_sync(
 ) {
     repositories::start_periodic_repository_sync(state)
 }
+
+pub(crate) async fn recover_interrupted_plan_generations(db: &SqlitePool) -> Result<(), AppError> {
+    let recovery_message =
+        "AOS restarted while this plan stage was running. Retry the current stage to continue.";
+    sqlx::query(
+        "UPDATE rd_specs SET status = 'failed', last_error = ?, \
+         stage_status_json = json_set(COALESCE(stage_status_json, JSON_OBJECT()), \
+             '$.' || current_stage, 'failed'), updated_at = CURRENT_TIMESTAMP \
+         WHERE status IN ('queued', 'running')",
+    )
+    .bind(recovery_message)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod interrupted_plan_recovery_tests {
+    use super::recover_interrupted_plan_generations;
+
+    #[tokio::test]
+    async fn interrupted_plan_generation_becomes_retryable_after_restart() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite");
+        sqlx::query(
+            "CREATE TABLE rd_specs (id TEXT PRIMARY KEY, status TEXT, current_stage TEXT, \
+             last_error TEXT, stage_status_json TEXT, updated_at TEXT)",
+        )
+        .execute(&db)
+        .await
+        .expect("plan schema");
+        sqlx::query(
+            "INSERT INTO rd_specs VALUES \
+             ('plan-1', 'running', 'design', NULL, '{\"design\":\"running\"}', CURRENT_TIMESTAMP)",
+        )
+        .execute(&db)
+        .await
+        .expect("running plan fixture");
+
+        recover_interrupted_plan_generations(&db)
+            .await
+            .expect("recover interrupted plan");
+        let (status, error, stage_status): (String, String, String) = sqlx::query_as(
+            "SELECT status, last_error, CAST(stage_status_json AS TEXT) FROM rd_specs WHERE id = 'plan-1'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("recovered plan");
+        assert_eq!(status, "failed");
+        assert!(error.contains("Retry the current stage"));
+        assert!(stage_status.contains("\"design\":\"failed\""));
+    }
+}
 use self::review_passes::{maybe_run_rd_architecture_pass, maybe_run_rd_reviewer_pass};
 #[cfg(test)]
 use self::runtime_config::{
@@ -198,7 +254,7 @@ use self::runtime_tools::{
     resolve_rd_runtime_tool_policy_with_switches,
 };
 use self::specs::{
-    approve_design, approve_spec, approve_tasks, create_spec, create_task_from_spec,
+    approve_design, approve_spec, approve_tasks, create_spec, create_task_from_spec, delete_spec,
     final_report_spec, generate_design, generate_spec, generate_tasks, get_spec, implement_all,
     implement_task, list_spec_events, list_specs, update_spec,
 };
@@ -625,6 +681,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/specs", routing_post(create_spec))
         .route("/specs/{id}", routing_get(get_spec))
         .route("/specs/{id}", routing_patch(update_spec))
+        .route("/specs/{id}", routing_delete(delete_spec))
         .route("/specs/{id}/events", routing_get(list_spec_events))
         .route("/specs/{id}/generate-spec", routing_post(generate_spec))
         .route("/specs/{id}/approve-spec", routing_post(approve_spec))

@@ -2062,7 +2062,7 @@ async fn load_adversarial_context_archive_previews(
     let rows = sqlx::query(
         r#"
         SELECT window_id, role, ordinal, content_kind, char_count,
-               LEFT(content, 1200) AS preview
+               substr(content, 1, 1200) AS preview
         FROM agent_context_archives
         WHERE tenant_id = ? AND user_id = ? AND session_id = ?
           AND source = 'chat_adversarial'

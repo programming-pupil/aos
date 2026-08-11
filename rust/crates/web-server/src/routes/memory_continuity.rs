@@ -2105,6 +2105,29 @@ pub(crate) async fn list_unified_memory_items(
         let db_limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let rows = sqlx::query(
             r#"
+            WITH session_candidates AS (
+                SELECT id, pinned, updated_at
+                FROM agent_memory_items
+                WHERE tenant_id = ? AND user_id = ? AND enabled = 1 AND session_id = ?
+                  AND (? IS NULL OR app = ? OR app = 'shared')
+                ORDER BY pinned DESC, updated_at DESC, id DESC
+                LIMIT ?
+            ),
+            global_candidates AS (
+                SELECT id, pinned, updated_at
+                FROM agent_memory_items
+                WHERE tenant_id = ? AND user_id = ? AND enabled = 1 AND session_id IS NULL
+                  AND (? IS NULL OR app = ? OR app = 'shared')
+                ORDER BY pinned DESC, updated_at DESC, id DESC
+                LIMIT ?
+            ),
+            ranked AS (
+                SELECT id, pinned, updated_at FROM session_candidates
+                UNION ALL
+                SELECT id, pinned, updated_at FROM global_candidates
+                ORDER BY pinned DESC, updated_at DESC, id DESC
+                LIMIT ?
+            )
             SELECT memory.id, memory.tenant_id, memory.user_id, memory.scope, memory.app,
                    memory.session_id, memory.memory_type, memory.content, memory.source_type,
                    CAST(memory.confidence AS DOUBLE) AS confidence, memory.pinned, memory.enabled,
@@ -2114,26 +2137,7 @@ pub(crate) async fn list_unified_memory_items(
                    memory.embedding_model, memory.embedding_dimensions, memory.embedding_json,
                    CAST(memory.created_at AS TEXT) AS created_at,
                    CAST(memory.updated_at AS TEXT) AS updated_at
-            FROM (
-                SELECT candidates.id, candidates.pinned, candidates.updated_at
-                FROM (
-                    (SELECT id, pinned, updated_at
-                     FROM agent_memory_items
-                     WHERE tenant_id = ? AND user_id = ? AND enabled = 1 AND session_id = ?
-                       AND (? IS NULL OR app = ? OR app = 'shared')
-                     ORDER BY pinned DESC, updated_at DESC, id DESC
-                     LIMIT ?)
-                    UNION ALL
-                    (SELECT id, pinned, updated_at
-                     FROM agent_memory_items
-                     WHERE tenant_id = ? AND user_id = ? AND enabled = 1 AND session_id IS NULL
-                       AND (? IS NULL OR app = ? OR app = 'shared')
-                     ORDER BY pinned DESC, updated_at DESC, id DESC
-                     LIMIT ?)
-                ) AS candidates
-                ORDER BY candidates.pinned DESC, candidates.updated_at DESC, candidates.id DESC
-                LIMIT ?
-            ) AS ranked
+            FROM ranked
             INNER JOIN agent_memory_items AS memory ON memory.id = ranked.id
             ORDER BY ranked.pinned DESC, ranked.updated_at DESC, ranked.id DESC
             "#,
@@ -3773,6 +3777,76 @@ fn render_items_markdown(title: &str, items: &[AgentMemoryItem]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn memory_test_pool() -> sqlx::SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect memory database");
+        sqlx::query(
+            r#"
+            CREATE TABLE agent_memory_items (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                app TEXT NOT NULL,
+                session_id TEXT,
+                memory_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                pinned INTEGER NOT NULL,
+                enabled INTEGER NOT NULL,
+                stale_at TEXT,
+                verified_at TEXT,
+                metadata_json TEXT,
+                embedding_model TEXT,
+                embedding_dimensions INTEGER,
+                embedding_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create memory table");
+        pool
+    }
+
+    async fn insert_memory_fixture(
+        pool: &sqlx::SqlitePool,
+        id: &str,
+        session_id: Option<&str>,
+        pinned: bool,
+        updated_at: &str,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO agent_memory_items (
+                id, tenant_id, user_id, scope, app, session_id, memory_type, content,
+                source_type, confidence, pinned, enabled, created_at, updated_at
+            ) VALUES (?, 'tenant', 'user', ?, 'chat', ?, 'note', ?, 'manual', 1.0, ?, 1, ?, ?)
+            "#,
+        )
+        .bind(id)
+        .bind(if session_id.is_some() {
+            "session"
+        } else {
+            "global"
+        })
+        .bind(session_id)
+        .bind(format!("memory {id}"))
+        .bind(i64::from(pinned))
+        .bind(updated_at)
+        .bind(updated_at)
+        .execute(pool)
+        .await
+        .expect("insert memory fixture");
+    }
 
     fn test_memory_item(content: &str) -> AgentMemoryItem {
         AgentMemoryItem {
@@ -3802,6 +3876,49 @@ mod tests {
             virtual_path: "MEMORY.md".to_string(),
             legacy_source: None,
         }
+    }
+
+    #[tokio::test]
+    async fn unified_memory_list_combines_current_session_and_global_rows() {
+        let pool = memory_test_pool().await;
+        insert_memory_fixture(
+            &pool,
+            "session",
+            Some("session-1"),
+            false,
+            "2026-08-10 02:00:00",
+        )
+        .await;
+        insert_memory_fixture(&pool, "global", None, true, "2026-08-10 01:00:00").await;
+        insert_memory_fixture(
+            &pool,
+            "other",
+            Some("session-2"),
+            true,
+            "2026-08-10 03:00:00",
+        )
+        .await;
+
+        let items = list_unified_memory_items(
+            &pool,
+            "tenant",
+            "user",
+            None,
+            Some("chat"),
+            Some("session-1"),
+            false,
+            10,
+        )
+        .await
+        .expect("list unified memory");
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["global", "session"]
+        );
     }
 
     #[test]

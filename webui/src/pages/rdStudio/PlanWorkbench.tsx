@@ -1,5 +1,5 @@
-import { Alert, Button, Empty, Input, Select, Space, Spin, Tabs, Tag, Typography, message } from 'antd';
-import { CheckCircleOutlined, FileTextOutlined, PlayCircleOutlined, ReloadOutlined } from '@ant-design/icons';
+import { Alert, Button, Empty, Input, Popconfirm, Select, Space, Spin, Tabs, Tag, Typography, message } from 'antd';
+import { CheckCircleOutlined, DeleteOutlined, FileTextOutlined, PlayCircleOutlined, ReloadOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -46,6 +46,7 @@ export function PlanWorkbench({
   const [selectedSpecId, setSelectedSpecId] = useState<string | undefined>();
   const [prompt, setPrompt] = useState('');
   const [title, setTitle] = useState('');
+  const [planRepositoryIds, setPlanRepositoryIds] = useState<string[]>(selectedRepoId ? [selectedRepoId] : []);
   const [draftSpec, setDraftSpec] = useState<RdSpec | null>(null);
   const [implementingTaskId, setImplementingTaskId] = useState<string | null>(null);
 
@@ -94,7 +95,8 @@ export function PlanWorkbench({
 
   const createSpecMutation = useMutation({
     mutationFn: () => rdApi.createSpec({
-      repositoryId: selectedRepoId,
+      repositoryIds: planRepositoryIds,
+      repositoryId: planRepositoryIds[0],
       title: title.trim() || undefined,
       prompt: prompt.trim(),
       model,
@@ -105,7 +107,9 @@ export function PlanWorkbench({
       setPrompt('');
       setTitle('');
       setSelectedSpecId(spec.id);
-      setDraftSpec(spec);
+      // Initial generation runs in the background. Keep the server query as
+      // the source of truth so queued/running/completed transitions can poll.
+      setDraftSpec(null);
       await invalidateSpec(spec.id);
     },
     onError: (error: Error) => message.error(error.message || t('rd.planSpecCreateFailed', '创建计划失败')),
@@ -146,6 +150,19 @@ export function PlanWorkbench({
       await invalidateSpec(spec.id);
     },
     onError: (error: Error) => message.error(error.message || t('rd.planStageActionFailed', '阶段操作失败')),
+  });
+
+  const deleteSpecMutation = useMutation({
+    mutationFn: rdApi.deleteSpec,
+    onSuccess: async (_, deletedId) => {
+      if (selectedSpecId === deletedId) {
+        setSelectedSpecId(undefined);
+        setDraftSpec(null);
+      }
+      message.success(t('rd.planDeleted', '计划已删除'));
+      await invalidateSpec();
+    },
+    onError: (error: Error) => message.error(error.message || t('rd.planDeleteFailed', '删除计划失败')),
   });
 
   const implementTaskMutation = useMutation({
@@ -201,6 +218,16 @@ export function PlanWorkbench({
           </div>
           <div className="rd-plan-create">
             <Text strong>{t('rd.createPlan', '创建计划')}</Text>
+            <Select
+              mode="multiple"
+              allowClear
+              showSearch
+              optionFilterProp="label"
+              value={planRepositoryIds}
+              onChange={setPlanRepositoryIds}
+              options={repositories.map((repo) => ({ value: repo.id, label: `${repo.name} · ${repo.branch}` }))}
+              placeholder={t('rd.repositories', '选择参与仓库')}
+            />
             <Input
               value={title}
               onChange={(event) => setTitle(event.target.value)}
@@ -260,13 +287,32 @@ export function PlanWorkbench({
                 </Space>
                 <Text type="secondary" ellipsis={{ tooltip: selectedSpec.prompt }}>{selectedSpec.prompt}</Text>
               </Space>
-              <Button
-                size="small"
-                icon={<ReloadOutlined />}
-                onClick={() => invalidateSpec(selectedSpec.id)}
-              >
-                {t('common.refresh', '刷新')}
-              </Button>
+              <Space>
+                <Button
+                  size="small"
+                  icon={<ReloadOutlined />}
+                  onClick={() => invalidateSpec(selectedSpec.id)}
+                >
+                  {t('common.refresh', '刷新')}
+                </Button>
+                <Popconfirm
+                  title={t('rd.planDeleteConfirm', '确认删除该研发计划？')}
+                  onConfirm={() => deleteSpecMutation.mutate(selectedSpec.id)}
+                  okText={t('common.delete')}
+                  cancelText={t('common.cancel')}
+                  disabled={['queued', 'running'].includes(selectedSpec.status)}
+                >
+                  <Button
+                    size="small"
+                    danger
+                    icon={<DeleteOutlined />}
+                    disabled={['queued', 'running'].includes(selectedSpec.status)}
+                    loading={deleteSpecMutation.isPending}
+                  >
+                    {t('common.delete')}
+                  </Button>
+                </Popconfirm>
+              </Space>
             </div>
             <PlanStageStepper currentStage={selectedSpec.currentStage} />
             {selectedSpec.lastError ? <Alert type="error" showIcon message={selectedSpec.lastError} /> : null}

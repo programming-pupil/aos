@@ -241,6 +241,62 @@ pub(crate) async fn correct_sql(
     datasource_id: &str,
     preferred_model: Option<&str>,
 ) -> String {
+    let repair_timeout_secs = std::env::var("NL2SQL_SQL_REPAIR_TOTAL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(75)
+        .clamp(15, 180);
+    match tokio::time::timeout(
+        tokio::time::Duration::from_secs(repair_timeout_secs),
+        correct_sql_bounded(
+            state,
+            claims,
+            failed_sql,
+            error_msg,
+            question,
+            schema,
+            foreign_keys,
+            join_paths,
+            conversation_id,
+            context,
+            clarification_ctx,
+            db_type,
+            datasource_id,
+            preferred_model,
+        ),
+    )
+    .await
+    {
+        Ok(corrected) => corrected,
+        Err(_) => {
+            tracing::warn!(
+                datasource_id,
+                repair_timeout_secs,
+                "correct_sql: bounded repair timed out; returning original SQL"
+            );
+            context.add(failed_sql.to_string(), error_msg.to_string());
+            failed_sql.to_string()
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn correct_sql_bounded(
+    state: &AppState,
+    claims: &Claims,
+    failed_sql: &str,
+    error_msg: &str,
+    question: &str,
+    schema: &serde_json::Value,
+    foreign_keys: &[ForeignKeyPrompt],
+    join_paths: &[(String, String)],
+    conversation_id: &str,
+    context: &mut SelfCorrectContext,
+    clarification_ctx: Option<&crate::nl2sql::ClarificationContext>,
+    db_type: &str,
+    datasource_id: &str,
+    preferred_model: Option<&str>,
+) -> String {
     let mut chat_candidates = match crate::nl2sql::resolve_chat_config_candidates(
         state.config_registry(),
         &claims.tenant_id,
@@ -274,7 +330,7 @@ pub(crate) async fn correct_sql(
     // P2-5 + P1-2 BUG-FIX: Re-load QU result and metrics for correction prompt.
     // QU: re-parse the original question to extract constraints.
     let qu_result: Option<crate::nl2sql::query_understanding::QueryUnderstandingResult> =
-        if should_enable_qu() {
+        if should_enable_qu() && !conversation_id.is_empty() {
             let qu = crate::nl2sql::query_understanding::QueryUnderstanding::new(
                 state.db.clone(),
                 preferred_chat_cfg.clone(),
@@ -351,11 +407,7 @@ pub(crate) async fn correct_sql(
     }
 
     let has_alternatives = chat_candidates.len() > 1;
-    let candidate_attempts = if has_alternatives {
-        chat_candidates
-    } else {
-        vec![chat_candidates[0].clone(), chat_candidates[0].clone()]
-    };
+    let candidate_attempts = chat_candidates;
     let total_attempts = candidate_attempts.len();
     for (attempt, chat_cfg) in candidate_attempts.into_iter().enumerate() {
         if has_alternatives
@@ -371,18 +423,6 @@ pub(crate) async fn correct_sql(
             );
             continue;
         }
-        if attempt > 0 && !has_alternatives {
-            tracing::info!(
-                "correct_sql: LLM call failed, retrying (attempt {}/{})",
-                attempt + 1,
-                total_attempts
-            );
-            tokio::time::sleep(tokio::time::Duration::from_millis(
-                500 * u64::try_from(attempt + 1).unwrap_or(1),
-            ))
-            .await;
-        }
-
         let metrics_refs: Vec<(String, String, Option<&str>)> = metrics
             .iter()
             .map(|(n, e, f)| (n.clone(), e.clone(), f.as_deref()))
@@ -470,7 +510,7 @@ pub(crate) async fn correct_sql_once(
     // implicit context into the LLM prompt without changing the prompt
     // builder signature.
     let enriched_summary = history.enriched_summary(question);
-    let system_prompt = build_nl2sql_prompt(
+    let mut system_prompt = build_nl2sql_prompt(
         schema,
         foreign_keys,
         join_paths,
@@ -482,6 +522,12 @@ pub(crate) async fn correct_sql_once(
         metrics, // P1-2: inject metrics so corrections respect metric definitions
         _selected_tables,
         reference_snippets,
+    );
+    system_prompt.push_str(
+        "\n\nSQL REPAIR MODE: The original question has already passed clarification. \
+         Never return CLARIFICATION_NEEDED, prose, Markdown, or an explanation. \
+         Correct the failed query using only the supplied schema and evidence, and return exactly one safe executable SELECT or WITH statement. \
+         When a referenced column is missing, choose a verified schema column with matching semantics; never invent identifiers.",
     );
 
     let history_section = if history.messages.is_empty() {
@@ -539,16 +585,25 @@ pub(crate) async fn correct_sql_once(
         extra_body: None,
     };
 
-    let (response, tool_reference_snippets) = super::send_generation_request_with_sql_tools(
-        state,
-        claims,
-        Some(datasource_id),
-        question,
-        schema,
-        chat_cfg,
-        &request,
+    let response_timeout_secs = std::env::var("NL2SQL_SQL_REPAIR_MODEL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(55)
+        .clamp(10, 120);
+    let (response, tool_reference_snippets) = tokio::time::timeout(
+        tokio::time::Duration::from_secs(response_timeout_secs),
+        super::send_generation_request_with_sql_tools(
+            state,
+            claims,
+            Some(datasource_id),
+            question,
+            schema,
+            chat_cfg,
+            &request,
+        ),
     )
     .await
+    .map_err(|_| anyhow::anyhow!("LLM repair timed out after {response_timeout_secs}s"))?
     .map_err(|e| anyhow::anyhow!("LLM call failed: {}", e))?;
     if !tool_reference_snippets.is_empty() {
         tracing::info!(

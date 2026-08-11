@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Badge,
@@ -46,6 +46,7 @@ import type {
   Nl2sqlReferenceFile,
   Nl2sqlReferencePack,
   Nl2sqlReferenceUsage,
+  SqlKnowledgeImportTask,
 } from '@/types';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
 import { useDismissibleNotice } from '@/hooks/useDismissibleNotice';
@@ -129,6 +130,7 @@ export default function SqlKnowledgeBase() {
   const [editContent, setEditContent] = useState('');
   const [createForm] = Form.useForm();
   const uploadBatchKeyRef = useRef<string | null>(null);
+  const completedImportRefreshRef = useRef<string | null>(null);
 
   const spacesQuery = useQuery({
     queryKey: queryKeys.nl2sql.sqlKnowledge.spaces({ includeGlobal: true }),
@@ -157,6 +159,10 @@ export default function SqlKnowledgeBase() {
     selectedSpace && isDeletedDatasourceId(selectedSpace.datasourceId),
   );
 
+  useEffect(() => {
+    if (!selectedSpaceId && spaces[0]?.id) setSelectedSpaceId(spaces[0].id);
+  }, [selectedSpaceId, spaces]);
+
   const datasourceOptions = useMemo(
     () => datasources.map((ds) => ({
       label: `${ds.name} · ${ds.db_type} · ${t(`sqlKnowledge.visibility.${ds.visibility}`)}`,
@@ -175,7 +181,7 @@ export default function SqlKnowledgeBase() {
     [datasourceOptions, isAdmin, t],
   );
 
-  const invalidateReferencePackCaches = (affectedDatasourceIds?: Iterable<string | null | undefined>) => {
+  const invalidateReferencePackCaches = useCallback((affectedDatasourceIds?: Iterable<string | null | undefined>) => {
     const ids = new Set<string>();
     for (const id of affectedDatasourceIds ?? []) {
       if (id && id !== 'global') ids.add(id);
@@ -193,12 +199,12 @@ export default function SqlKnowledgeBase() {
         query.queryKey[0] === 'nl2sql' &&
         query.queryKey[1] === 'referencePacks',
     });
-  };
+  }, [qc]);
 
-  const refresh = (affectedDatasourceIds?: Iterable<string | null | undefined>) => {
+  const refresh = useCallback((affectedDatasourceIds?: Iterable<string | null | undefined>) => {
     qc.invalidateQueries({ queryKey: queryKeys.nl2sql.sqlKnowledge.all() });
     invalidateReferencePackCaches(affectedDatasourceIds);
-  };
+  }, [invalidateReferencePackCaches, qc]);
 
   const createMutation = useMutation({
     mutationFn: (values: {
@@ -254,13 +260,35 @@ export default function SqlKnowledgeBase() {
 
   const uploadMutation = useMutation({
     mutationFn: ({ spaceId, files }: { spaceId: string; files: File[] }) =>
-      nl2sqlApi.uploadSqlKnowledgeFiles(spaceId, files),
-    onSuccess: (res) => {
-      message.success(t('sqlKnowledge.messages.filesUploaded', { count: res.files.length }));
+      nl2sqlApi.createSqlKnowledgeImportTask(spaceId, files),
+    onSuccess: (task) => {
+      message.success(t('sqlKnowledge.messages.importQueued', { count: task.totalFiles }));
       refresh(selectedSpace ? spaceBindings(selectedSpace) : undefined);
+      qc.invalidateQueries({ queryKey: queryKeys.nl2sql.sqlKnowledge.importTasks(task.packId) });
     },
     onError: (error: Error) => message.error(error.message || t('sqlKnowledge.messages.uploadFailed')),
   });
+
+  const importTasksQuery = useQuery({
+    queryKey: queryKeys.nl2sql.sqlKnowledge.importTasks(selectedSpaceId),
+    queryFn: () => nl2sqlApi.listSqlKnowledgeImportTasks(selectedSpaceId!),
+    enabled: Boolean(selectedSpaceId),
+    refetchInterval: (query) => (query.state.data ?? []).some((task) =>
+      task.status === 'pending' || task.status === 'running'
+    ) ? 2000 : 15_000,
+  });
+  const activeImportTask = (importTasksQuery.data ?? []).find((task) =>
+    task.status === 'pending' || task.status === 'running'
+  );
+
+  useEffect(() => {
+    const latest = importTasksQuery.data?.[0];
+    if (!latest || latest.status === 'pending' || latest.status === 'running') return;
+    if (latest.id !== completedImportRefreshRef.current) {
+      completedImportRefreshRef.current = latest.id;
+      refresh(selectedSpace ? spaceBindings(selectedSpace) : undefined);
+    }
+  }, [importTasksQuery.data, refresh, selectedSpace]);
 
   const deleteFileMutation = useMutation({
     mutationFn: (fileId: string) => nl2sqlApi.deleteSqlKnowledgeFile(fileId),
@@ -366,7 +394,7 @@ export default function SqlKnowledgeBase() {
       });
       return Upload.LIST_IGNORE;
     },
-    disabled: !selectedSpace || !selectedSpace.writable || selectedSpacePrimaryDeleted || !embeddingAvailable || uploadMutation.isPending,
+    disabled: !selectedSpace || !selectedSpace.writable || selectedSpacePrimaryDeleted || !embeddingAvailable || uploadMutation.isPending || Boolean(activeImportTask),
   };
   const folderUploadProps: UploadProps = {
     ...uploadProps,
@@ -650,6 +678,36 @@ export default function SqlKnowledgeBase() {
                       description={t('sqlKnowledge.deletedDatasourceDesc')}
                     />
                   )}
+                  {activeImportTask ? (
+                    <Alert
+                      type="info"
+                      showIcon
+                      icon={<ReloadOutlined spin />}
+                      style={{ marginBottom: 16 }}
+                      message={t('sqlKnowledge.importRunning', '知识文件正在后台导入')}
+                      description={t('sqlKnowledge.importProgress', {
+                        processed: activeImportTask.processedFiles,
+                        total: activeImportTask.totalFiles,
+                        filename: activeImportTask.currentFilename || t('sqlKnowledge.importWaiting', '等待处理'),
+                      })}
+                    />
+                  ) : null}
+                  {(() => {
+                    const latest = (importTasksQuery.data ?? [])[0] as SqlKnowledgeImportTask | undefined;
+                    if (!latest || !['partial', 'failed'].includes(latest.status)) return null;
+                    return (
+                      <Alert
+                        type="warning"
+                        showIcon
+                        style={{ marginBottom: 16 }}
+                        message={t('sqlKnowledge.importFinishedWithErrors', {
+                          failed: latest.failedFiles,
+                          total: latest.totalFiles,
+                        })}
+                        description={latest.failureDetails.slice(0, 5).map((item) => `${item.filename}: ${item.error}`).join('\n')}
+                      />
+                    );
+                  })()}
                   <Dragger {...uploadProps} style={{ marginBottom: 16 }}>
                     <p className="ant-upload-drag-icon"><UploadOutlined /></p>
                     <p className="ant-upload-text">{t('sqlKnowledge.uploadTitle')}</p>
@@ -658,8 +716,8 @@ export default function SqlKnowledgeBase() {
                   <Upload {...folderUploadProps}>
                     <Button
                       icon={<UploadOutlined />}
-                      loading={uploadMutation.isPending}
-                      disabled={!selectedSpace || !selectedSpace.writable || selectedSpacePrimaryDeleted || !embeddingAvailable}
+                      loading={uploadMutation.isPending || Boolean(activeImportTask)}
+                      disabled={!selectedSpace || !selectedSpace.writable || selectedSpacePrimaryDeleted || !embeddingAvailable || Boolean(activeImportTask)}
                       style={{ marginBottom: 16 }}
                     >
                       {t('sqlKnowledge.importFolder')}

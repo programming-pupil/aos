@@ -19,6 +19,9 @@ pub fn start(db: SqlitePool, registry: Arc<EmbeddingStoreRegistry>) {
         if let Err(error) = prepare_jobs(&db).await {
             tracing::warn!(error = %error, "failed to prepare embedding reindex jobs");
         }
+        if let Err(error) = warm_active_profiles(&db, registry.as_ref()).await {
+            tracing::warn!(error = %error, "failed to warm active embedding profiles at startup");
+        }
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -59,6 +62,49 @@ pub fn start(db: SqlitePool, registry: Arc<EmbeddingStoreRegistry>) {
             }
         }
     });
+}
+
+async fn warm_active_profiles(
+    db: &SqlitePool,
+    registry: &EmbeddingStoreRegistry,
+) -> anyhow::Result<()> {
+    let rows = sqlx::query(
+        "SELECT DISTINCT d.tenant_id, d.active_profile_id, p.model, p.base_url \
+         FROM nl2sql_datasource_embedding_profiles d \
+         JOIN nl2sql_embedding_profiles p ON p.id = d.active_profile_id \
+         WHERE d.status = 'ready' AND d.active_profile_id IS NOT NULL",
+    )
+    .fetch_all(db)
+    .await?;
+    for row in rows {
+        let tenant_id: String = row.get("tenant_id");
+        let profile_id: String = row.get("active_profile_id");
+        let model: String = row.get("model");
+        let base_url: String = row.get("base_url");
+        match registry.profile_store(
+            &tenant_id,
+            &profile_id,
+            &model,
+            (!base_url.trim().is_empty()).then_some(base_url),
+        ) {
+            Ok(store) => tracing::info!(
+                tenant_id,
+                profile_id,
+                vectors = store.len(),
+                "active embedding profile warmed at startup"
+            ),
+            Err(error) => tracing::warn!(
+                tenant_id,
+                profile_id,
+                error = %error,
+                "failed to warm active embedding profile"
+            ),
+        }
+    }
+    if let Err(error) = registry.persist_ann_snapshots_if_dirty() {
+        tracing::warn!(error = %error, "failed to build missing ANN snapshots during startup warmup");
+    }
+    Ok(())
 }
 
 async fn prepare_jobs(db: &SqlitePool) -> anyhow::Result<()> {

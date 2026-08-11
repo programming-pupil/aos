@@ -992,6 +992,7 @@ export interface RdSpecTaskItem {
 export interface RdSpec {
   id: string;
   repositoryId?: string | null;
+  repositoryIds?: string[];
   title: string;
   prompt: string;
   requirementsMd?: string | null;
@@ -1910,6 +1911,23 @@ export interface SqlKnowledgeReadResponse {
   startLine: number;
   endLine: number;
   content: string;
+}
+
+export interface SqlKnowledgeImportTask {
+  id: string;
+  packId: string;
+  datasourceId: string;
+  status: 'pending' | 'running' | 'completed' | 'partial' | 'failed';
+  totalFiles: number;
+  processedFiles: number;
+  failedFiles: number;
+  currentFilename?: string | null;
+  errorMessage?: string | null;
+  failureDetails: Array<{ filename?: string; error?: string }>;
+  createdAt: string;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  updatedAt: string;
 }
 
 export interface Nl2sqlQueryTaskStartResponse {

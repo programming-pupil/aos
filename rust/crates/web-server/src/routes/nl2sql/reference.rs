@@ -8,6 +8,7 @@ use axum::routing::{delete, get, patch, post};
 use axum::Router;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{sqlite::SqliteRow, QueryBuilder, Row};
 use std::borrow::Cow;
@@ -15,8 +16,10 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
 use std::path::{Path as FsPath, PathBuf};
+use std::time::Duration;
 
 const MAX_REFERENCE_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
+const MAX_REFERENCE_BATCH_UPLOAD_BYTES: usize = 256 * 1024 * 1024;
 const MAX_ARCHIVE_FILES: usize = 200;
 const MAX_REFERENCE_CHARS: usize = 1_200_000;
 const CHUNK_LINE_TARGET: usize = 80;
@@ -77,6 +80,33 @@ pub struct ReferencePackDto {
     pub files: Vec<ReferenceFileDto>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferenceImportTaskDto {
+    pub id: String,
+    pub pack_id: String,
+    pub datasource_id: String,
+    pub status: String,
+    pub total_files: u64,
+    pub processed_files: u64,
+    pub failed_files: u64,
+    pub current_filename: Option<String>,
+    pub error_message: Option<String>,
+    pub failure_details: Vec<serde_json::Value>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReferenceImportManifestItem {
+    filename: String,
+    media_type: Option<String>,
+    staged_filename: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -457,6 +487,14 @@ pub(crate) fn routes() -> Router<AppState> {
             post(upload_sql_knowledge_files).layer(DefaultBodyLimit::max(
                 MAX_REFERENCE_UPLOAD_BYTES + 512 * 1024,
             )),
+        )
+        .route(
+            "/sql-knowledge/spaces/{space_id}/import-tasks",
+            get(list_sql_knowledge_import_tasks)
+                .post(create_sql_knowledge_import_task)
+                .layer(DefaultBodyLimit::max(
+                    MAX_REFERENCE_BATCH_UPLOAD_BYTES + 1024 * 1024,
+                )),
         )
         .route(
             "/sql-knowledge/files/{file_id}",
@@ -897,6 +935,143 @@ pub(crate) async fn upload_sql_knowledge_files(
         );
     }
     Ok(Json(UploadReferenceFilesResponse { files }))
+}
+
+pub(crate) async fn create_sql_knowledge_import_task(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(space_id): Path<String>,
+    mut multipart: Multipart,
+) -> Result<Json<ReferenceImportTaskDto>> {
+    super::require_nl2sql_embedding_config(&state, &claims.tenant_id).await?;
+    let (datasource_id, _) = require_pack_write_access(&state, &claims, &space_id).await?;
+    let task_id = format!("nlref-import-{}", uuid::Uuid::new_v4());
+    let staging_dir = reference_import_staging_dir(&state, &claims.tenant_id, &task_id);
+    tokio::fs::create_dir_all(&staging_dir).await?;
+
+    let mut manifest = Vec::new();
+    let mut total_bytes = 0usize;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::ValidationError(format!("invalid multipart/form-data: {e}")))?
+    {
+        let field_name = field.name().unwrap_or_default().to_string();
+        if field_name != "file" && field_name != "files" {
+            continue;
+        }
+        let filename = field
+            .file_name()
+            .map(safe_reference_upload_name)
+            .unwrap_or_else(|| "reference.txt".to_string());
+        let media_type = field.content_type().map(ToString::to_string);
+        let data = field
+            .bytes()
+            .await
+            .map_err(|e| AppError::ValidationError(format!("failed to read upload: {e}")))?;
+        if data.len() > MAX_REFERENCE_UPLOAD_BYTES {
+            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            return Err(AppError::PayloadTooLarge(format!(
+                "reference file exceeds {} bytes",
+                MAX_REFERENCE_UPLOAD_BYTES
+            )));
+        }
+        total_bytes = total_bytes.saturating_add(data.len());
+        if total_bytes > MAX_REFERENCE_BATCH_UPLOAD_BYTES {
+            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            return Err(AppError::PayloadTooLarge(format!(
+                "SQL knowledge import exceeds {} bytes",
+                MAX_REFERENCE_BATCH_UPLOAD_BYTES
+            )));
+        }
+
+        let uploads = if is_zip_filename(&filename) {
+            extract_zip_reference_uploads(&data)?
+        } else {
+            vec![ReferenceUpload {
+                filename,
+                media_type,
+                bytes: data.to_vec(),
+            }]
+        };
+        for upload in uploads {
+            if manifest.len() >= MAX_ARCHIVE_FILES {
+                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                return Err(AppError::PayloadTooLarge(format!(
+                    "too many files in SQL knowledge upload; max {}",
+                    MAX_ARCHIVE_FILES
+                )));
+            }
+            let staged_filename = format!("{:04}.upload", manifest.len());
+            tokio::fs::write(staging_dir.join(&staged_filename), upload.bytes).await?;
+            manifest.push(ReferenceImportManifestItem {
+                filename: upload.filename,
+                media_type: upload.media_type,
+                staged_filename,
+            });
+        }
+    }
+    if manifest.is_empty() {
+        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        return Err(AppError::ValidationError("missing file field".into()));
+    }
+
+    let insert_result = sqlx::query::<sqlx::Sqlite>(
+        "INSERT INTO nl2sql_reference_import_tasks \
+         (id, tenant_id, user_id, pack_id, datasource_id, status, total_files, manifest_json, staging_dir) \
+         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+    )
+    .bind(&task_id)
+    .bind(&claims.tenant_id)
+    .bind(&claims.sub)
+    .bind(&space_id)
+    .bind(&datasource_id)
+    .bind(i64::try_from(manifest.len()).unwrap_or(i64::MAX))
+    .bind(serde_json::to_string(&manifest)?)
+    .bind(staging_dir.to_string_lossy().as_ref())
+    .execute(&state.db)
+    .await;
+    if let Err(error) = insert_result {
+        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        return Err(error.into());
+    }
+    tracing::info!(
+        tenant_id = %claims.tenant_id,
+        pack_id = %space_id,
+        task_id = %task_id,
+        files = manifest.len(),
+        "SQL knowledge import queued"
+    );
+    Ok(Json(
+        load_reference_import_task(&state.db, &claims.tenant_id, &claims.sub, &task_id).await?,
+    ))
+}
+
+pub(crate) async fn list_sql_knowledge_import_tasks(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(space_id): Path<String>,
+) -> Result<Json<Vec<ReferenceImportTaskDto>>> {
+    require_pack_write_access(&state, &claims, &space_id).await?;
+    let rows = sqlx::query::<sqlx::Sqlite>(
+        "SELECT id, pack_id, datasource_id, status, total_files, processed_files, failed_files, \
+                current_filename, error_message, failure_details_json, \
+                CAST(created_at AS TEXT) created_at, CAST(started_at AS TEXT) started_at, \
+                CAST(completed_at AS TEXT) completed_at, CAST(updated_at AS TEXT) updated_at \
+         FROM nl2sql_reference_import_tasks \
+         WHERE tenant_id = ? AND user_id = ? AND pack_id = ? \
+         ORDER BY created_at DESC LIMIT 20",
+    )
+    .bind(&claims.tenant_id)
+    .bind(&claims.sub)
+    .bind(&space_id)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(reference_import_task_from_row)
+            .collect(),
+    ))
 }
 
 pub(crate) async fn update_sql_knowledge_file(
@@ -1415,7 +1590,12 @@ pub(crate) async fn resolve_auto_query_references(
     let query_embedding = embed_reference_query(state, tenant_id, datasource_id, question)
         .await
         .ok();
-    let candidates = load_candidate_chunks(
+    // Retrieval is deliberately split into independent lexical and semantic
+    // lanes. Requiring a lexical match on the semantic query used to miss
+    // useful SQL such as ROI questions whose files only mention revenue,
+    // spend, or ROAS. Conversely, exact rg-like matches must remain available
+    // when embedding generation or profile backfill is unavailable.
+    let lexical_candidates = load_candidate_chunks(
         &state.db,
         tenant_id,
         datasource_id,
@@ -1423,11 +1603,63 @@ pub(crate) async fn resolve_auto_query_references(
         &[],
         &[],
         Some(question),
-        query_embedding
-            .as_ref()
-            .map(|embedding| embedding.profile_id.as_str()),
+        None,
     )
     .await?;
+    let mut candidates_by_id = HashMap::new();
+    for candidate in lexical_candidates {
+        merge_hybrid_candidate(&mut candidates_by_id, candidate);
+    }
+    match load_rg_like_candidate_chunks(
+        &state.db,
+        tenant_id,
+        datasource_id,
+        question,
+        None,
+        rg_like_scan_limit(),
+    )
+    .await
+    {
+        Ok(candidates) => {
+            for candidate in candidates {
+                merge_hybrid_candidate(&mut candidates_by_id, candidate);
+            }
+        }
+        Err(error) => tracing::warn!(
+            tenant_id,
+            datasource_id,
+            error = %error,
+            "SQL knowledge deterministic retrieval lane failed; keeping other candidates"
+        ),
+    }
+    if let Some(embedding) = query_embedding.as_ref() {
+        match load_candidate_chunks(
+            &state.db,
+            tenant_id,
+            datasource_id,
+            true,
+            &[],
+            &[],
+            None,
+            Some(embedding.profile_id.as_str()),
+        )
+        .await
+        {
+            Ok(candidates) => {
+                for candidate in candidates {
+                    merge_hybrid_candidate(&mut candidates_by_id, candidate);
+                }
+            }
+            Err(error) => tracing::warn!(
+                tenant_id,
+                datasource_id,
+                profile_id = %embedding.profile_id,
+                error = %error,
+                "SQL knowledge semantic retrieval lane failed; keeping deterministic candidates"
+            ),
+        }
+    }
+    let candidates = candidates_by_id.into_values().collect::<Vec<_>>();
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
@@ -1441,43 +1673,18 @@ pub(crate) async fn resolve_auto_query_references(
     let selected_file_ids = HashSet::new();
     let mut scored: Vec<(f64, String, CandidateChunk)> = candidates
         .into_iter()
-        .map(|mut chunk| {
-            let (mut score, mut reason) = score_chunk(
-                &chunk,
+        .map(|chunk| {
+            score_auto_query_chunk(
+                chunk,
+                question,
                 &query_tokens,
                 &selected_pack_ids,
                 &selected_file_ids,
                 query_embedding
                     .as_ref()
                     .map(|embedding| embedding.vector.as_slice()),
-            );
-            let schema_overlap = schema_overlap_score(&chunk.extracted_tables, &schema_tables);
-            if schema_overlap > 0.0 {
-                score += schema_overlap;
-                reason = append_reason(reason, format!("schema overlap {:.2}", schema_overlap));
-            } else if !chunk.extracted_tables.is_empty() && !schema_tables.is_empty() {
-                score *= 0.45;
-                reason = append_reason(reason, "schema mismatch downgraded".to_string());
-                chunk.stale = true;
-            }
-            if chunk.verified {
-                score += 1.2;
-                reason = append_reason(reason, "verified".to_string());
-            }
-            if chunk.stale {
-                score *= 0.55;
-                let stale_reason = chunk
-                    .file_age_days
-                    .filter(|days| *days >= sql_knowledge_stale_after_days())
-                    .map(|days| format!("stale downgraded: file age {days}d"))
-                    .unwrap_or_else(|| "stale downgraded".to_string());
-                reason = append_reason(reason, stale_reason);
-            }
-            if chunk.pack_scope == "tenant" {
-                score += 0.25;
-                reason = append_reason(reason, "tenant knowledge".to_string());
-            }
-            (score, reason, chunk)
+                &schema_tables,
+            )
         })
         .filter(|(score, _, _)| *score >= 0.20)
         .collect();
@@ -1492,6 +1699,83 @@ pub(crate) async fn resolve_auto_query_references(
             snippet_from_scored_chunk(chunk, score, reason, &chunks_by_file)
         })
         .collect())
+}
+
+fn merge_hybrid_candidate(
+    candidates: &mut HashMap<String, CandidateChunk>,
+    candidate: CandidateChunk,
+) {
+    match candidates.entry(candidate.chunk_id.clone()) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(candidate);
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            let existing = entry.get_mut();
+            existing.fulltext_score = existing.fulltext_score.max(candidate.fulltext_score);
+            if candidate.embedding.is_some() {
+                existing.embedding_model = candidate.embedding_model;
+                existing.embedding = candidate.embedding;
+            }
+        }
+    }
+}
+
+fn score_auto_query_chunk(
+    chunk: CandidateChunk,
+    question: &str,
+    query_tokens: &HashSet<String>,
+    selected_pack_ids: &HashSet<String>,
+    selected_file_ids: &HashSet<String>,
+    query_embedding: Option<&[f32]>,
+    schema_tables: &HashSet<String>,
+) -> (f64, String, CandidateChunk) {
+    let (mut score, mut reason) = score_chunk(
+        &chunk,
+        query_tokens,
+        selected_pack_ids,
+        selected_file_ids,
+        query_embedding,
+    );
+    // Deterministic exact/term scoring is additive and intentionally stronger
+    // than a weak semantic similarity. This keeps the Codex-like rg path in
+    // control for exact business terms while still allowing semantic-only
+    // candidates when the wording differs.
+    if let Some((lexical_score, lexical_reason)) = rg_score_chunk(&chunk, question) {
+        score += lexical_score;
+        reason = append_reason(
+            reason,
+            format!("deterministic {lexical_score:.2}: {lexical_reason}"),
+        );
+    }
+    let schema_overlap = schema_overlap_score(&chunk.extracted_tables, schema_tables);
+    if schema_overlap > 0.0 {
+        score += schema_overlap;
+        reason = append_reason(reason, format!("schema overlap {:.2}", schema_overlap));
+    } else if !chunk.extracted_tables.is_empty() && !schema_tables.is_empty() {
+        // Cached discovery is often partial (permissions, catalog limits, or
+        // transient failures). Treat mismatch as a weak confidence signal,
+        // not proof that a SQL file is stale.
+        score *= 0.85;
+        reason = append_reason(reason, "not present in cached schema".to_string());
+    }
+    if chunk.verified {
+        score += 1.2;
+        reason = append_reason(reason, "verified".to_string());
+    }
+    if chunk.stale {
+        score *= 0.55;
+        let stale_reason = chunk
+            .file_age_days
+            .filter(|days| *days >= sql_knowledge_stale_after_days())
+            .map(|days| format!("stale downgraded: file age {days}d"))
+            .unwrap_or_else(|| "stale downgraded".to_string());
+        reason = append_reason(reason, stale_reason);
+    }
+    if chunk.pack_scope == "tenant" {
+        score += 0.25;
+        reason = append_reason(reason, "tenant knowledge".to_string());
+    }
+    (score, reason, chunk)
 }
 
 pub(crate) async fn resolve_recent_sql_examples_for_datasource(
@@ -2838,11 +3122,26 @@ async fn load_candidate_chunks(
         qb.push(")");
         qb.push(" ORDER BY fulltext_score DESC, f.updated_at DESC, c.chunk_index ASC LIMIT 2000");
     } else {
-        qb.push(" ORDER BY f.updated_at DESC, c.chunk_index ASC LIMIT 1500");
+        let limit = if profile_id.is_some() {
+            semantic_candidate_scan_limit()
+        } else {
+            1_500
+        };
+        qb.push(" ORDER BY f.updated_at DESC, c.chunk_index ASC LIMIT ")
+            .push_bind(i64::try_from(limit).unwrap_or(i64::MAX));
     }
 
     let rows = qb.build().fetch_all(db).await?;
     Ok(rows.into_iter().map(candidate_chunk_from_row).collect())
+}
+
+fn semantic_candidate_scan_limit() -> usize {
+    std::env::var("NL2SQL_SQL_KNOWLEDGE_SEMANTIC_SCAN_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= 1_000)
+        .unwrap_or(12_000)
+        .min(50_000)
 }
 
 async fn load_rg_like_candidate_chunks(
@@ -3436,6 +3735,264 @@ fn reference_pack_dir(state: &AppState, tenant_id: &str, pack_id: &str) -> PathB
         .join("nl2sql-reference")
         .join(safe_path_segment(tenant_id))
         .join(safe_path_segment(pack_id))
+}
+
+fn reference_import_staging_dir(state: &AppState, tenant_id: &str, task_id: &str) -> PathBuf {
+    state
+        .data_dir
+        .join(".aos")
+        .join("nl2sql-reference-imports")
+        .join(safe_path_segment(tenant_id))
+        .join(safe_path_segment(task_id))
+}
+
+fn reference_import_task_from_row(row: SqliteRow) -> ReferenceImportTaskDto {
+    let failure_details_json: Option<String> = row.get("failure_details_json");
+    ReferenceImportTaskDto {
+        id: row.get("id"),
+        pack_id: row.get("pack_id"),
+        datasource_id: row.get("datasource_id"),
+        status: row.get("status"),
+        total_files: i64_to_u64(row.get("total_files")),
+        processed_files: i64_to_u64(row.get("processed_files")),
+        failed_files: i64_to_u64(row.get("failed_files")),
+        current_filename: row.get("current_filename"),
+        error_message: row.get("error_message"),
+        failure_details: failure_details_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_default(),
+        created_at: row.get("created_at"),
+        started_at: row.get("started_at"),
+        completed_at: row.get("completed_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+async fn load_reference_import_task(
+    db: &sqlx::SqlitePool,
+    tenant_id: &str,
+    user_id: &str,
+    task_id: &str,
+) -> Result<ReferenceImportTaskDto> {
+    let row = sqlx::query::<sqlx::Sqlite>(
+        "SELECT id, pack_id, datasource_id, status, total_files, processed_files, failed_files, \
+                current_filename, error_message, failure_details_json, \
+                CAST(created_at AS TEXT) created_at, CAST(started_at AS TEXT) started_at, \
+                CAST(completed_at AS TEXT) completed_at, CAST(updated_at AS TEXT) updated_at \
+         FROM nl2sql_reference_import_tasks WHERE tenant_id = ? AND user_id = ? AND id = ?",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(task_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or_else(|| AppError::NotFound("SQL knowledge import task not found".into()))?;
+    Ok(reference_import_task_from_row(row))
+}
+
+pub(crate) fn start_sql_knowledge_import_worker(state: AppState) {
+    tokio::spawn(async move {
+        let _ = sqlx::query::<sqlx::Sqlite>(
+            "UPDATE nl2sql_reference_import_tasks SET status = 'pending', current_filename = NULL, \
+             error_message = 'server restarted; import resumed', updated_at = CURRENT_TIMESTAMP \
+             WHERE status = 'running'",
+        )
+        .execute(&state.db)
+        .await;
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            match claim_reference_import_task(&state.db).await {
+                Ok(Some(task)) => {
+                    if let Err(error) = process_reference_import_task(&state, &task).await {
+                        let safe_error = runtime::protect_sensitive_text(
+                            &error.to_string(),
+                            runtime::configured_data_protection_mode(),
+                        )
+                        .value;
+                        let safe_error = safe_error.chars().take(2000).collect::<String>();
+                        tracing::error!(
+                            task_id = %task.id,
+                            pack_id = %task.pack_id,
+                            error = %safe_error,
+                            "SQL knowledge import task failed"
+                        );
+                        let _ = sqlx::query::<sqlx::Sqlite>(
+                            "UPDATE nl2sql_reference_import_tasks SET status = 'failed', \
+                             error_message = ?, current_filename = NULL, completed_at = CURRENT_TIMESTAMP, \
+                             updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        )
+                        .bind(safe_error)
+                        .bind(&task.id)
+                        .execute(&state.db)
+                        .await;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(error = %error, "failed to claim SQL knowledge import task")
+                }
+            }
+        }
+    });
+}
+
+#[derive(Debug)]
+struct ClaimedReferenceImportTask {
+    id: String,
+    tenant_id: String,
+    user_id: String,
+    pack_id: String,
+    datasource_id: String,
+    manifest: Vec<ReferenceImportManifestItem>,
+    staging_dir: PathBuf,
+    processed_files: usize,
+    failure_details: Vec<serde_json::Value>,
+}
+
+async fn claim_reference_import_task(
+    db: &sqlx::SqlitePool,
+) -> Result<Option<ClaimedReferenceImportTask>> {
+    let mut tx = db.begin().await?;
+    crate::acquire_sqlite_write_lock(&mut tx).await?;
+    let row = sqlx::query::<sqlx::Sqlite>(
+        "SELECT id, tenant_id, user_id, pack_id, datasource_id, manifest_json, staging_dir, \
+                processed_files, failure_details_json \
+         FROM nl2sql_reference_import_tasks WHERE status = 'pending' \
+         ORDER BY created_at ASC LIMIT 1",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = row else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    let id: String = row.get("id");
+    let claimed = sqlx::query::<sqlx::Sqlite>(
+        "UPDATE nl2sql_reference_import_tasks SET status = 'running', \
+         started_at = COALESCE(started_at, CURRENT_TIMESTAMP), error_message = NULL, \
+         updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'",
+    )
+    .bind(&id)
+    .execute(&mut *tx)
+    .await?;
+    if claimed.rows_affected() != 1 {
+        tx.commit().await?;
+        return Ok(None);
+    }
+    let manifest_json: String = row.get("manifest_json");
+    let failure_details_json: Option<String> = row.get("failure_details_json");
+    let task = ClaimedReferenceImportTask {
+        id,
+        tenant_id: row.get("tenant_id"),
+        user_id: row.get("user_id"),
+        pack_id: row.get("pack_id"),
+        datasource_id: row.get("datasource_id"),
+        manifest: serde_json::from_str(&manifest_json)?,
+        staging_dir: PathBuf::from(row.get::<String, _>("staging_dir")),
+        processed_files: usize::try_from(row.get::<i64, _>("processed_files").max(0))
+            .unwrap_or(usize::MAX),
+        failure_details: failure_details_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_default(),
+    };
+    tx.commit().await?;
+    Ok(Some(task))
+}
+
+async fn process_reference_import_task(
+    state: &AppState,
+    task: &ClaimedReferenceImportTask,
+) -> Result<()> {
+    let claims = Claims::new(&task.user_id, "", "member", &task.tenant_id);
+    let mut failures = task.failure_details.clone();
+    let mut failed_files = failures.len();
+    for (index, item) in task.manifest.iter().enumerate().skip(task.processed_files) {
+        sqlx::query::<sqlx::Sqlite>(
+            "UPDATE nl2sql_reference_import_tasks SET current_filename = ?, \
+             updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(&item.filename)
+        .bind(&task.id)
+        .execute(&state.db)
+        .await?;
+        let file_path = task.staging_dir.join(&item.staged_filename);
+        let result = match tokio::fs::read(&file_path).await {
+            Ok(bytes) => index_reference_upload(
+                state,
+                &claims,
+                &task.pack_id,
+                &task.datasource_id,
+                item.filename.clone(),
+                item.media_type.clone(),
+                bytes,
+            )
+            .await
+            .map(|_| ()),
+            Err(error) => Err(AppError::Io(error)),
+        };
+        if let Err(error) = result {
+            failed_files = failed_files.saturating_add(1);
+            let safe_error = runtime::protect_sensitive_text(
+                &error.to_string(),
+                runtime::configured_data_protection_mode(),
+            )
+            .value;
+            failures.push(json!({
+                "filename": item.filename,
+                "error": safe_error.chars().take(1000).collect::<String>(),
+            }));
+        }
+        sqlx::query::<sqlx::Sqlite>(
+            "UPDATE nl2sql_reference_import_tasks SET processed_files = ?, failed_files = ?, \
+             failure_details_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(i64::try_from(index + 1).unwrap_or(i64::MAX))
+        .bind(i64::try_from(failed_files).unwrap_or(i64::MAX))
+        .bind(serde_json::to_string(&failures)?)
+        .bind(&task.id)
+        .execute(&state.db)
+        .await?;
+        // Persist the resume offset before deleting staged input. If AOS
+        // restarts between these operations, the worker skips this completed
+        // item instead of reporting a false missing-file failure.
+        let _ = tokio::fs::remove_file(file_path).await;
+    }
+    let status = if failed_files == 0 {
+        "completed"
+    } else if failed_files >= task.manifest.len() {
+        "failed"
+    } else {
+        "partial"
+    };
+    let error_message = match status {
+        "failed" => Some("all files failed to import"),
+        "partial" => Some("some files failed to import"),
+        _ => None,
+    };
+    sqlx::query::<sqlx::Sqlite>(
+        "UPDATE nl2sql_reference_import_tasks SET status = ?, current_filename = NULL, \
+         error_message = ?, completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
+         WHERE id = ?",
+    )
+    .bind(status)
+    .bind(error_message)
+    .bind(&task.id)
+    .execute(&state.db)
+    .await?;
+    let _ = tokio::fs::remove_dir_all(&task.staging_dir).await;
+    tracing::info!(
+        task_id = %task.id,
+        pack_id = %task.pack_id,
+        total_files = task.manifest.len(),
+        failed_files,
+        status,
+        "SQL knowledge import finished"
+    );
+    Ok(())
 }
 
 async fn assert_storage_path_safe(
@@ -5039,6 +5596,76 @@ fn sha256_hex_bytes(input: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    async fn import_task_test_pool() -> sqlx::SqlitePool {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite");
+        sqlx::query("CREATE TABLE aos_setup_lock (lock_id INTEGER PRIMARY KEY)")
+            .execute(&db)
+            .await
+            .expect("SQLite writer lock schema");
+        sqlx::query("INSERT INTO aos_setup_lock (lock_id) VALUES (1)")
+            .execute(&db)
+            .await
+            .expect("SQLite writer lock fixture");
+        sqlx::query("CREATE TABLE nl2sql_reference_packs (id TEXT PRIMARY KEY)")
+            .execute(&db)
+            .await
+            .expect("reference pack schema");
+        sqlx::query(include_str!(
+            "../../../sqlite-migrations/0015_sql_knowledge_async_imports.sql"
+        ))
+        .execute(&db)
+        .await
+        .expect("import task schema");
+        sqlx::query("INSERT INTO nl2sql_reference_packs (id) VALUES ('pack-1')")
+            .execute(&db)
+            .await
+            .expect("reference pack fixture");
+        db
+    }
+
+    #[tokio::test]
+    async fn reference_import_task_claim_is_exclusive_and_preserves_resume_offset() {
+        let db = import_task_test_pool().await;
+        let manifest = serde_json::to_string(&vec![
+            ReferenceImportManifestItem {
+                filename: "one.sql".to_string(),
+                media_type: None,
+                staged_filename: "0000.upload".to_string(),
+            },
+            ReferenceImportManifestItem {
+                filename: "two.sql".to_string(),
+                media_type: None,
+                staged_filename: "0001.upload".to_string(),
+            },
+        ])
+        .expect("manifest");
+        sqlx::query(
+            "INSERT INTO nl2sql_reference_import_tasks \
+             (id, tenant_id, user_id, pack_id, datasource_id, status, total_files, processed_files, manifest_json, staging_dir) \
+             VALUES ('task-1', 'tenant-1', 'user-1', 'pack-1', 'ds-1', 'pending', 2, 1, ?, '/tmp/staged')",
+        )
+        .bind(manifest)
+        .execute(&db)
+        .await
+        .expect("insert task");
+
+        let claimed = claim_reference_import_task(&db)
+            .await
+            .expect("claim task")
+            .expect("pending task");
+        assert_eq!(claimed.id, "task-1");
+        assert_eq!(claimed.processed_files, 1);
+        assert_eq!(claimed.manifest.len(), 2);
+        assert!(claim_reference_import_task(&db)
+            .await
+            .expect("second claim")
+            .is_none());
+    }
+
     #[test]
     fn knowledge_binding_policy_follows_datasource_visibility() {
         let tenant_policies = vec![
@@ -5466,6 +6093,64 @@ GROUP BY region
     }
 
     #[test]
+    fn exact_deterministic_sql_match_beats_weak_semantic_similarity() {
+        let mut exact = test_candidate_chunk(0, "SELECT roi FROM campaign_performance");
+        exact.fulltext_score = 0.0;
+        exact.embedding = Some(vec![0.0, 1.0]);
+        let mut semantic_only =
+            test_candidate_chunk(1, "SELECT revenue / spend FROM campaign_performance");
+        semantic_only.fulltext_score = 0.0;
+        semantic_only.embedding = Some(vec![1.0, 0.0]);
+        let query_tokens = tokenize_for_reference("ROI");
+        let empty = HashSet::new();
+        let exact_score = score_auto_query_chunk(
+            exact,
+            "ROI",
+            &query_tokens,
+            &empty,
+            &empty,
+            Some(&[0.0, 1.0]),
+            &empty,
+        )
+        .0;
+        let semantic_score = score_auto_query_chunk(
+            semantic_only,
+            "ROI",
+            &query_tokens,
+            &empty,
+            &empty,
+            Some(&[0.0, 1.0]),
+            &empty,
+        )
+        .0;
+
+        assert!(
+            exact_score > semantic_score,
+            "exact SQL evidence must outrank semantic-only evidence: exact={exact_score}, semantic={semantic_score}"
+        );
+    }
+
+    #[test]
+    fn hybrid_candidate_merge_keeps_lexical_score_and_profile_vector() {
+        let mut lexical = test_candidate_chunk(0, "SELECT roi FROM campaign_performance");
+        lexical.fulltext_score = 6.0;
+        lexical.embedding = None;
+        let mut semantic = lexical.clone();
+        semantic.fulltext_score = 0.0;
+        semantic.embedding_model = Some("semantic-profile".to_string());
+        semantic.embedding = Some(vec![0.2, 0.8]);
+
+        let mut candidates = HashMap::new();
+        merge_hybrid_candidate(&mut candidates, lexical);
+        merge_hybrid_candidate(&mut candidates, semantic);
+
+        let merged = candidates.get("chunk-0").expect("merged candidate");
+        assert_eq!(merged.fulltext_score, 6.0);
+        assert_eq!(merged.embedding.as_deref(), Some([0.2, 0.8].as_slice()));
+        assert_eq!(merged.embedding_model.as_deref(), Some("semantic-profile"));
+    }
+
+    #[test]
     fn knowledge_outline_extracts_sql_structure() {
         let outline = build_reference_outline(
             "orders.sql",
@@ -5517,6 +6202,14 @@ GROUP BY region
         .await
         .expect("chunks table");
         sqlx::query(
+            "CREATE TABLE nl2sql_reference_chunk_embeddings (\
+             tenant_id TEXT NOT NULL, chunk_id TEXT NOT NULL, profile_id TEXT NOT NULL, \
+             model TEXT, embedding_json TEXT)",
+        )
+        .execute(&db)
+        .await
+        .expect("profile embeddings table");
+        sqlx::query(
             "INSERT INTO nl2sql_reference_packs VALUES \
              ('p1', 't1', 'u1', 'd1', '[\"d1\"]', '订单知识', NULL, 'datasource', '[]', 1, 1, 0, 'sql_knowledge', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
@@ -5539,6 +6232,13 @@ GROUP BY region
         .execute(&db)
         .await
         .expect("chunk row");
+        sqlx::query(
+            "INSERT INTO nl2sql_reference_chunk_embeddings VALUES \
+             ('t1', 'c1', 'profile-1', 'semantic-model', '[0.1,0.9]')",
+        )
+        .execute(&db)
+        .await
+        .expect("profile embedding row");
 
         validate_file_ids_with_builder(&db, "t1", "d1", &["f1".to_string()])
             .await
@@ -5550,5 +6250,15 @@ GROUP BY region
 
         assert_eq!(candidates.len(), 1);
         assert!(candidates[0].fulltext_score > 0.0);
+
+        let semantic_candidates =
+            load_candidate_chunks(&db, "t1", "d1", true, &[], &[], None, Some("profile-1"))
+                .await
+                .expect("semantic lane without a lexical filter should be valid SQLite");
+        assert_eq!(semantic_candidates.len(), 1);
+        assert_eq!(
+            semantic_candidates[0].embedding.as_deref(),
+            Some([0.1, 0.9].as_slice())
+        );
     }
 }

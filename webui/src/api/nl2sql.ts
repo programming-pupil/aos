@@ -45,7 +45,9 @@ export const dataSourcesApi = {
     schema_info?: Record<string, unknown>;
     enabled?: boolean;
   }) =>
-    client.patch<DataSourceInfo>(`/data-sources/${encodeURIComponent(id)}`, data).then((r) => r.data),
+    client.patch<DataSourceInfo>(`/data-sources/${encodeURIComponent(id)}`, data, {
+      timeout: 30_000,
+    }).then((r) => r.data),
 
   delete: (id: string) =>
     client.delete(`/data-sources/${encodeURIComponent(id)}`).then((r) => r.data),
@@ -421,6 +423,24 @@ export const nl2sqlApi = {
       { headers: { 'Content-Type': 'multipart/form-data' } }
     ).then((r) => r.data);
   },
+
+  createSqlKnowledgeImportTask: (spaceId: string, files: File[]) => {
+    const form = new FormData();
+    files.forEach((file) => {
+      const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
+      form.append('file', file, relativePath || file.name);
+    });
+    return client.post<import('@/types').SqlKnowledgeImportTask>(
+      `/nl2sql/sql-knowledge/spaces/${encodeURIComponent(spaceId)}/import-tasks`,
+      form,
+      { headers: { 'Content-Type': 'multipart/form-data' }, timeout: 15 * 60_000 }
+    ).then((r) => r.data);
+  },
+
+  listSqlKnowledgeImportTasks: (spaceId: string) =>
+    client.get<import('@/types').SqlKnowledgeImportTask[]>(
+      `/nl2sql/sql-knowledge/spaces/${encodeURIComponent(spaceId)}/import-tasks`
+    ).then((r) => r.data),
 
   deleteSqlKnowledgeFile: (fileId: string) =>
     client.delete<{ deleted: boolean }>(

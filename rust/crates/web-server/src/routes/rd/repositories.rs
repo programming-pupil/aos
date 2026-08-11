@@ -271,6 +271,50 @@ pub(super) async fn create_repository(
         auto_sync_interval_minutes,
     )
     .await?;
+    mark_repository_index_status(&state.db, &claims.tenant_id, &project.id, "syncing", None)
+        .await?;
+    let sync_state = state.clone();
+    let sync_tenant = claims.tenant_id.clone();
+    let sync_user = claims.sub.clone();
+    let sync_repository_id = project.id.clone();
+    tokio::spawn(async move {
+        if let Err(error) = perform_repository_sync(
+            &sync_state,
+            &sync_tenant,
+            &sync_user,
+            &sync_repository_id,
+            "repository_create",
+        )
+        .await
+        {
+            let safe_error = runtime::protect_sensitive_text(
+                &error.to_string(),
+                runtime::configured_data_protection_mode(),
+            )
+            .value;
+            let message = safe_error.chars().take(1000).collect::<String>();
+            tracing::warn!(
+                repository_id = %sync_repository_id,
+                error = %message,
+                "initial repository synchronization failed"
+            );
+            let _ = mark_repository_index_status(
+                &sync_state.db,
+                &sync_tenant,
+                &sync_repository_id,
+                "failed",
+                Some(&message),
+            )
+            .await;
+            let _ = sqlx::query("UPDATE rd_repository_settings SET last_sync_error = ?, updated_at = CURRENT_TIMESTAMP WHERE tenant_id = ? AND user_id = ? AND project_id = ?")
+                .bind(&message)
+                .bind(&sync_tenant)
+                .bind(&sync_user)
+                .bind(&sync_repository_id)
+                .execute(&sync_state.db)
+                .await;
+        }
+    });
     Ok(Json(RdRepositoryDto {
         id: project.id,
         name: project.name,
@@ -283,7 +327,7 @@ pub(super) async fn create_repository(
         created_at: project.created_at.to_rfc3339(),
         default_test_command: req.default_test_command,
         default_build_command: req.default_build_command,
-        index_status: Some("idle".to_string()),
+        index_status: Some("syncing".to_string()),
         indexed_file_count: 0,
         indexed_symbol_count: 0,
         indexed_import_count: 0,
@@ -396,15 +440,68 @@ pub(super) async fn sync_repository(
     Extension(claims): Extension<Claims>,
     AxumPath(repository_id): AxumPath<String>,
 ) -> Result<Json<Value>, AppError> {
-    perform_repository_sync(
-        &state,
+    ensure_repository_exists(&state, &claims, &repository_id).await?;
+    let indexes = load_repo_index_map(&state.db, &claims.tenant_id).await?;
+    if indexes
+        .get(&repository_id)
+        .is_some_and(|index| index.status == "syncing")
+    {
+        return Ok(Json(json!({ "accepted": true, "status": "syncing" })));
+    }
+    mark_repository_index_status(
+        &state.db,
         &claims.tenant_id,
-        &claims.sub,
         &repository_id,
-        "repository_sync",
+        "syncing",
+        None,
     )
-    .await
-    .map(Json)
+    .await?;
+    let worker_state = state.clone();
+    let tenant_id = claims.tenant_id.clone();
+    let user_id = claims.sub.clone();
+    let worker_repository_id = repository_id.clone();
+    tokio::spawn(async move {
+        if let Err(error) = perform_repository_sync(
+            &worker_state,
+            &tenant_id,
+            &user_id,
+            &worker_repository_id,
+            "repository_sync",
+        )
+        .await
+        {
+            let safe_error = runtime::protect_sensitive_text(
+                &error.to_string(),
+                runtime::configured_data_protection_mode(),
+            )
+            .value;
+            let message = safe_error.chars().take(1000).collect::<String>();
+            tracing::warn!(
+                repository_id = %worker_repository_id,
+                error = %message,
+                "manual repository synchronization failed"
+            );
+            let _ = mark_repository_index_status(
+                &worker_state.db,
+                &tenant_id,
+                &worker_repository_id,
+                "failed",
+                Some(&message),
+            )
+            .await;
+            let _ = sqlx::query(
+                "UPDATE rd_repository_settings SET last_sync_error = ?, updated_at = CURRENT_TIMESTAMP \
+                 WHERE tenant_id = ? AND user_id = ? AND project_id = ?",
+            )
+            .bind(&message)
+            .bind(&tenant_id)
+            .bind(&user_id)
+            .bind(&worker_repository_id)
+            .execute(&worker_state.db)
+            .await;
+        }
+    });
+    Ok(Json(json!({ "accepted": true, "status": "syncing" })))
 }
 
 async fn perform_repository_sync(
@@ -490,6 +587,25 @@ async fn perform_repository_sync(
         "contextSummaryCount": context_summary_count,
         "detection": detection,
     }))
+}
+
+async fn mark_repository_index_status(
+    db: &SqlitePool,
+    tenant_id: &str,
+    repository_id: &str,
+    status: &str,
+    error_message: Option<&str>,
+) -> Result<(), AppError> {
+    let detail = error_message.map(|error| json!({ "error": error }));
+    sqlx::query("INSERT INTO rd_repository_indexes (id, tenant_id, repository_id, status, file_count, symbol_count, detail_json) VALUES (?, ?, ?, ?, 0, 0, ?) ON CONFLICT(repository_id) DO UPDATE SET status = excluded.status, detail_json = excluded.detail_json, updated_at = CURRENT_TIMESTAMP")
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(tenant_id)
+        .bind(repository_id)
+        .bind(status)
+        .bind(detail)
+        .execute(db)
+        .await?;
+    Ok(())
 }
 
 pub(super) async fn repository_tree(
@@ -904,6 +1020,9 @@ pub(super) fn start_periodic_repository_sync(
         .max(15);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let handle = tokio::spawn(async move {
+        if let Err(error) = recover_interrupted_repository_syncs(&state.db).await {
+            tracing::warn!(%error, "failed to recover interrupted repository sync states");
+        }
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(tick_seconds));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await;
@@ -920,6 +1039,20 @@ pub(super) fn start_periodic_repository_sync(
         }
     });
     (shutdown_tx, handle)
+}
+
+async fn recover_interrupted_repository_syncs(db: &SqlitePool) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE rd_repository_indexes \
+         SET status = 'failed', \
+             detail_json = json_set(COALESCE(detail_json, JSON_OBJECT()), '$.error', \
+                 'AOS restarted while repository synchronization was running; retry synchronization'), \
+             updated_at = CURRENT_TIMESTAMP \
+         WHERE status = 'syncing'",
+    )
+    .execute(db)
+    .await?;
+    Ok(())
 }
 
 async fn run_due_repository_syncs(state: &AppState) {
@@ -1058,7 +1191,7 @@ async fn upsert_repository_index(
 
 #[cfg(test)]
 mod repository_auto_sync_tests {
-    use super::normalize_auto_sync_interval;
+    use super::{normalize_auto_sync_interval, recover_interrupted_repository_syncs};
 
     #[test]
     fn repository_auto_sync_interval_is_bounded() {
@@ -1070,6 +1203,41 @@ mod repository_auto_sync_tests {
         );
         assert!(normalize_auto_sync_interval(Some(4)).is_err());
         assert!(normalize_auto_sync_interval(Some(10_081)).is_err());
+    }
+
+    #[tokio::test]
+    async fn interrupted_repository_sync_is_recoverable_after_restart() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite");
+        sqlx::query(
+            "CREATE TABLE rd_repository_indexes (\
+             id TEXT PRIMARY KEY, repository_id TEXT, status TEXT, detail_json TEXT, updated_at TEXT)",
+        )
+        .execute(&db)
+        .await
+        .expect("index schema");
+        sqlx::query(
+            "INSERT INTO rd_repository_indexes VALUES \
+             ('index-1', 'repo-1', 'syncing', NULL, CURRENT_TIMESTAMP)",
+        )
+        .execute(&db)
+        .await
+        .expect("syncing fixture");
+
+        recover_interrupted_repository_syncs(&db)
+            .await
+            .expect("recover sync state");
+        let (status, detail): (String, String) = sqlx::query_as(
+            "SELECT status, CAST(detail_json AS TEXT) FROM rd_repository_indexes WHERE id = 'index-1'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("recovered row");
+        assert_eq!(status, "failed");
+        assert!(detail.contains("retry synchronization"));
     }
 }
 

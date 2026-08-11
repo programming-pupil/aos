@@ -1451,6 +1451,25 @@ async fn probe_connection(
     db_type: &str,
     config_json: &serde_json::Value,
 ) -> Result<TestConnectionResponse> {
+    let started_at = std::time::Instant::now();
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        probe_connection_inner(db_type, config_json),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Ok(probe_result(
+            started_at,
+            Some("connection timed out after 12 seconds".into()),
+        )),
+    }
+}
+
+async fn probe_connection_inner(
+    db_type: &str,
+    config_json: &serde_json::Value,
+) -> Result<TestConnectionResponse> {
     let start = std::time::Instant::now();
     match db_type {
         "mysql" | "tidb" => {

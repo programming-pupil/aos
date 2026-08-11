@@ -13,8 +13,9 @@ import {
   Tag,
   Typography,
   message,
+  Popconfirm,
 } from 'antd';
-import { CopyOutlined, DownloadOutlined, FileTextOutlined, PlayCircleOutlined, PlusOutlined, SyncOutlined } from '@ant-design/icons';
+import { CheckCircleOutlined, CopyOutlined, DeleteOutlined, DownloadOutlined, FileTextOutlined, PlayCircleOutlined, PlusOutlined, SyncOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
@@ -81,9 +82,18 @@ export default function RdSpecs() {
     const key = raw.toLowerCase();
     return t(`rd.statuses.${key}`, { defaultValue: raw });
   };
+  const statusColor = (value?: string | null) => {
+    switch (value?.toLowerCase()) {
+      case 'completed': return 'success';
+      case 'failed': return 'error';
+      case 'running': return 'processing';
+      case 'queued': return 'warning';
+      default: return 'default';
+    }
+  };
 
   const createMutation = useMutation({
-    mutationFn: (values: { repositoryId?: string; title?: string; prompt: string; model?: string }) => rdApi.createSpec(values),
+    mutationFn: (values: { repositoryId?: string; repositoryIds?: string[]; title?: string; prompt: string; model?: string }) => rdApi.createSpec(values),
     onSuccess: (spec) => {
       message.success(t('rd.specCreated', '计划已保存，核心设计将在后台生成'));
       setDrawerOpen(false);
@@ -93,6 +103,54 @@ export default function RdSpecs() {
     },
     onError: (error: Error) => message.error(error.message || t('rd.specCreateFailed', '规格生成失败')),
   });
+
+  const deleteMutation = useMutation({
+    mutationFn: rdApi.deleteSpec,
+    onSuccess: async (_, deletedId) => {
+      if (selectedSpecId === deletedId) setSelectedSpecId(undefined);
+      message.success(t('rd.planDeleted', '计划已删除'));
+      await queryClient.invalidateQueries({ queryKey: queryKeys.rd.specs() });
+    },
+    onError: (error: Error) => message.error(error.message || t('rd.planDeleteFailed', '删除计划失败')),
+  });
+
+  const stageMutation = useMutation({
+    mutationFn: async ({ id, action }: { id: string; action: 'approveSpec' | 'generateDesign' | 'approveDesign' | 'generateTasks' | 'approveTasks' }) => {
+      switch (action) {
+        case 'approveSpec': return rdApi.approveSpec(id);
+        case 'generateDesign': return rdApi.generateDesign(id);
+        case 'approveDesign': return rdApi.approveDesign(id);
+        case 'generateTasks': return rdApi.generateTasks(id);
+        case 'approveTasks': return rdApi.approveTasks(id);
+      }
+    },
+    onSuccess: async (spec) => {
+      message.success(t('rd.planStageCompleted', '阶段操作已完成'));
+      await queryClient.invalidateQueries({ queryKey: queryKeys.rd.specs() });
+      setSelectedSpecId(spec.id);
+    },
+    onError: (error: Error) => message.error(error.message || t('rd.planStageActionFailed', '阶段操作失败')),
+  });
+
+  const nextStageAction = (spec: RdSpec) => {
+    if (['queued', 'running'].includes(spec.status)) return null;
+    if (spec.requirementsMd?.trim() && !spec.approvedRequirementsAt) {
+      return { action: 'approveSpec' as const, label: t('rd.approveSpec', '确认核心设计') };
+    }
+    if (spec.approvedRequirementsAt && !spec.designMd?.trim()) {
+      return { action: 'generateDesign' as const, label: t('rd.generateDesign', '生成代码研发方案') };
+    }
+    if (spec.designMd?.trim() && !spec.approvedDesignAt) {
+      return { action: 'approveDesign' as const, label: t('rd.approveDesign', '确认代码研发方案') };
+    }
+    if (spec.approvedDesignAt && !spec.tasksMd?.trim()) {
+      return { action: 'generateTasks' as const, label: t('rd.generateTasks', '生成 Tasks') };
+    }
+    if (spec.tasksMd?.trim() && !spec.approvedTasksAt) {
+      return { action: 'approveTasks' as const, label: t('rd.approveTasks', '确认 Tasks') };
+    }
+    return null;
+  };
 
   const downloadSpecPackage = (spec: RdSpec) => {
     const sections = [
@@ -134,13 +192,22 @@ export default function RdSpecs() {
       title: t('rd.repository', '仓库'),
       dataIndex: 'repositoryId',
       width: 180,
-      render: (id?: string | null) => id ? repoNameMap.get(id) ?? id : t('common.na'),
+      render: (_id: string | null | undefined, record) => {
+        const ids = record.repositoryIds?.length ? record.repositoryIds : (record.repositoryId ? [record.repositoryId] : []);
+        if (ids.length === 0) return t('common.na');
+        return <Space size={4} wrap>{ids.map((id) => <Tag key={id}>{repoNameMap.get(id) ?? id}</Tag>)}</Space>;
+      },
     },
     {
       title: t('common.status'),
       dataIndex: 'status',
       width: 120,
-      render: (value: string) => <Tag color="blue">{statusLabel(value)}</Tag>,
+      render: (value: string, record) => (
+        <Space size={4} wrap>
+          <Tag color={statusColor(value)} icon={value === 'running' || value === 'queued' ? <SyncOutlined spin /> : undefined}>{statusLabel(value)}</Tag>
+          <Text type="secondary" style={{ fontSize: 12 }}>{statusLabel(record.currentStage)}</Text>
+        </Space>
+      ),
     },
     {
       title: t('common.model'),
@@ -158,11 +225,27 @@ export default function RdSpecs() {
       title: t('common.actions'),
       key: 'actions',
       fixed: 'right',
-      width: 210,
+      width: 260,
       render: (_, record) => (
         <Space>
           <Button size="small" onClick={() => setSelectedSpecId(record.id)}>{t('common.viewDetail')}</Button>
           <Button size="small" icon={<DownloadOutlined />} onClick={() => downloadSpecPackage(record)}>{t('rd.downloadPlan', '下载方案')}</Button>
+          <Popconfirm
+            title={t('rd.planDeleteConfirm', '确认删除该研发计划？')}
+            onConfirm={() => deleteMutation.mutate(record.id)}
+            okText={t('common.delete')}
+            cancelText={t('common.cancel')}
+            disabled={['queued', 'running'].includes(record.status)}
+          >
+            <Button
+              size="small"
+              danger
+              icon={<DeleteOutlined />}
+              disabled={['queued', 'running'].includes(record.status)}
+              loading={deleteMutation.isPending && deleteMutation.variables === record.id}
+              aria-label={t('common.delete')}
+            />
+          </Popconfirm>
         </Space>
       ),
     },
@@ -207,8 +290,8 @@ export default function RdSpecs() {
         </Space>
       }>
         <Form form={form} layout="vertical" requiredMark="optional" initialValues={{ model: models[0]?.value }}>
-          <Form.Item name="repositoryId" label={t('rd.repository', '仓库')}>
-            <Select allowClear showSearch options={repositories.map((repo) => ({ value: repo.id, label: repo.name }))} placeholder={t('rd.noRepoSelected', '未选择仓库')} />
+          <Form.Item name="repositoryIds" label={t('rd.repositories', '参与仓库')} extra={t('rd.repositoriesExtra', '可选择多个相互调用的服务，AI 会分别读取并标注各仓库的代码证据。')}>
+            <Select mode="multiple" allowClear showSearch optionFilterProp="label" options={repositories.map((repo) => ({ value: repo.id, label: `${repo.name} · ${repo.branch}` }))} placeholder={t('rd.noRepoSelected', '未选择仓库')} />
           </Form.Item>
           <Form.Item name="model" label={t('common.model')} rules={[{ required: true, message: t('common.required') }]}>
             <Select options={models} placeholder={t('rd.selectModel', '选择研发模型')} />
@@ -229,6 +312,15 @@ export default function RdSpecs() {
         width={900}
         extra={selectedSpec ? (
           <Space>
+            <Popconfirm
+              title={t('rd.planDeleteConfirm', '确认删除该研发计划？')}
+              onConfirm={() => deleteMutation.mutate(selectedSpec.id)}
+              okText={t('common.delete')}
+              cancelText={t('common.cancel')}
+              disabled={['queued', 'running'].includes(selectedSpec.status)}
+            >
+              <Button danger icon={<DeleteOutlined />} disabled={['queued', 'running'].includes(selectedSpec.status)}>{t('common.delete')}</Button>
+            </Popconfirm>
             <Button icon={<CopyOutlined />} onClick={() => void copyHandoffPrompt(selectedSpec)}>{t('rd.copyHandoff', '复制交接提示词')}</Button>
             <Button type="primary" icon={<DownloadOutlined />} onClick={() => downloadSpecPackage(selectedSpec)}>{t('rd.downloadPlan', '下载方案')}</Button>
           </Space>
@@ -239,6 +331,37 @@ export default function RdSpecs() {
             <Card size="small" title={t('rd.originalRequirement', '原始需求')}>
               <Paragraph>{selectedSpec.prompt}</Paragraph>
             </Card>
+            {['queued', 'running'].includes(selectedSpec.status) ? (
+              <Alert
+                type="info"
+                showIcon
+                icon={<SyncOutlined spin />}
+                message={t('rd.planRunning', '计划正在生成')}
+                description={t('rd.planRunningDesc', '已保存到计划列表，当前阶段：{{stage}}。页面会自动刷新，生成完成前可以离开此页面。', { stage: statusLabel(selectedSpec.currentStage) || selectedSpec.currentStage || 'spec' })}
+              />
+            ) : null}
+            {selectedSpec.lastError ? <Alert type="error" showIcon message={t('rd.planFailed', '计划生成失败')} description={selectedSpec.lastError} /> : null}
+            {nextStageAction(selectedSpec) ? (
+              <Alert
+                type="info"
+                showIcon
+                message={t('rd.planAwaitingConfirmation', '当前阶段已完成，请确认后进入下一步')}
+                description={t('rd.planAwaitingConfirmationDesc', '先审查当前文档；确认后 AOS 才会生成下一阶段，避免错误方案继续扩散。')}
+                action={(() => {
+                  const next = nextStageAction(selectedSpec)!;
+                  return (
+                    <Button
+                      type="primary"
+                      icon={<CheckCircleOutlined />}
+                      loading={stageMutation.isPending}
+                      onClick={() => stageMutation.mutate({ id: selectedSpec.id, action: next.action })}
+                    >
+                      {next.label}
+                    </Button>
+                  );
+                })()}
+              />
+            ) : null}
             <SpecSection title={t('rd.requirementsDoc', '需求文档')} children={selectedSpec.requirementsMd} emptyText={t('common.noData')} />
             <SpecSection title={t('rd.designDoc', '技术设计')} children={selectedSpec.designMd} emptyText={t('common.noData')} />
             <SpecSection title={t('rd.tasksDoc', '任务清单')} children={selectedSpec.tasksMd} emptyText={t('common.noData')} />

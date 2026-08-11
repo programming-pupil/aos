@@ -885,6 +885,193 @@ pub(crate) fn extract_top_level_tables(sql: &str) -> Vec<String> {
     nl2sql_domain::sql::extract_top_level_tables(sql)
 }
 
+/// Fill missing cached schema entries from physical tables referenced by the
+/// selected SQL knowledge snippets. This is deliberately narrower than a full
+/// datasource scan: it keeps the request bounded, uses the already-authorized
+/// datasource configuration on the server, and never sends credentials to the
+/// model or stores them in the knowledge context.
+pub(crate) async fn discover_knowledge_schema_tables(
+    state: &AppState,
+    datasource_id: &str,
+    db_type: &str,
+    encrypted_config: &serde_json::Value,
+    existing_schema: &serde_json::Value,
+    references: &[ReferencePromptSnippet],
+) -> serde_json::Value {
+    const DEFAULT_MAX_TABLES: usize = 16;
+    const DEFAULT_TABLE_TIMEOUT_SECS: u64 = 8;
+    let max_tables = std::env::var("NL2SQL_ON_DEMAND_SCHEMA_MAX_TABLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_TABLES)
+        .min(64);
+    let timeout_secs = std::env::var("NL2SQL_ON_DEMAND_SCHEMA_TABLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value >= 1)
+        .unwrap_or(DEFAULT_TABLE_TIMEOUT_SECS)
+        .min(30);
+
+    let mut known_aliases = std::collections::HashSet::new();
+    let existing_tables = existing_schema.as_array().or_else(|| {
+        existing_schema
+            .get("tables")
+            .and_then(|value| value.as_array())
+    });
+    if let Some(existing_tables) = existing_tables {
+        for table in existing_tables {
+            insert_schema_table_aliases(&mut known_aliases, table);
+        }
+    }
+
+    let mut table_names = std::collections::BTreeSet::new();
+    for reference in references {
+        if reference.stale {
+            continue;
+        }
+        for table in knowledge_physical_table_names(&reference.content) {
+            let table = table.trim().to_string();
+            if table.is_empty()
+                || table_name_aliases(&table)
+                    .iter()
+                    .any(|name| known_aliases.contains(name))
+            {
+                continue;
+            }
+            table_names.insert(table);
+            if table_names.len() >= max_tables {
+                break;
+            }
+        }
+        if table_names.len() >= max_tables {
+            break;
+        }
+    }
+    if table_names.is_empty() {
+        return serde_json::json!([]);
+    }
+
+    let config =
+        match crate::routes::data_sources::decrypt_config(encrypted_config, &state.data_dir) {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(
+                    datasource_id,
+                    error = %error,
+                    "on-demand SQL knowledge schema hydration could not decrypt datasource config"
+                );
+                return serde_json::json!([]);
+            }
+        };
+    let discovery = crate::nl2sql::schema_discovery::SchemaDiscovery::new();
+    let db_type = db_type.to_string();
+    let futures = table_names.into_iter().map(|table_name| {
+        let config = config.clone();
+        let db_type = db_type.clone();
+        let discovery = discovery.clone();
+        async move {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                discovery.discover_table(&db_type, &config, &table_name),
+            )
+            .await
+            {
+                Ok(Ok(Some(table))) => Some(table),
+                Ok(Ok(None)) => None,
+                Ok(Err(error)) => {
+                    tracing::debug!(table = %table_name, error = %error, "on-demand schema table was not discoverable");
+                    None
+                }
+                Err(_) => {
+                    tracing::debug!(table = %table_name, timeout_secs, "on-demand schema table discovery timed out");
+                    None
+                }
+            }
+        }
+    });
+    let tables = futures_util::future::join_all(futures)
+        .await
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    tracing::info!(
+        datasource_id,
+        requested_tables = references
+            .iter()
+            .flat_map(|reference| knowledge_physical_table_names(&reference.content))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        discovered_tables = tables.len(),
+        "on-demand SQL knowledge schema hydration completed"
+    );
+    serde_json::Value::Array(tables)
+}
+
+/// Extract physical table references from SQL knowledge without trying to
+/// introspect CTE aliases or system catalogs. The SQL parser is intentionally
+/// best-effort here; the database remains the authority during discovery and
+/// execution.
+fn knowledge_physical_table_names(sql: &str) -> Vec<String> {
+    let cte_names =
+        regex::Regex::new(r#"(?im)(?:\bwith\s+|,)\s*([A-Za-z_][A-Za-z0-9_$]*)\s+as\s*\("#)
+            .ok()
+            .map(|regex| {
+                regex
+                    .captures_iter(sql)
+                    .filter_map(|capture| {
+                        capture
+                            .get(1)
+                            .map(|value| value.as_str().to_ascii_lowercase())
+                    })
+                    .collect::<std::collections::HashSet<_>>()
+            })
+            .unwrap_or_default();
+
+    extract_top_level_tables(sql)
+        .into_iter()
+        .filter(|table| {
+            let bare = table
+                .rsplit('.')
+                .next()
+                .unwrap_or(table)
+                .to_ascii_lowercase();
+            !cte_names.contains(&bare)
+                && !table.eq_ignore_ascii_case("dual")
+                && !table
+                    .to_ascii_lowercase()
+                    .starts_with("information_schema.")
+                && !table.to_ascii_lowercase().starts_with("pg_catalog.")
+        })
+        .collect()
+}
+
+fn merge_schema_tables(
+    existing: &serde_json::Value,
+    discovered: &serde_json::Value,
+) -> serde_json::Value {
+    let Some(existing_tables) = existing.as_array() else {
+        return discovered.clone();
+    };
+    let Some(discovered_tables) = discovered.as_array() else {
+        return existing.clone();
+    };
+    let mut merged = existing_tables.clone();
+    let mut aliases = std::collections::HashSet::new();
+    for table in existing_tables {
+        insert_schema_table_aliases(&mut aliases, table);
+    }
+    for table in discovered_tables {
+        let mut table_aliases = std::collections::HashSet::new();
+        insert_schema_table_aliases(&mut table_aliases, table);
+        if table_aliases.is_empty() || table_aliases.is_disjoint(&aliases) {
+            merged.push(table.clone());
+            aliases.extend(table_aliases);
+        }
+    }
+    serde_json::Value::Array(merged)
+}
+
 pub(crate) fn normalize_table_identifier(raw: &str) -> String {
     raw.trim()
         .trim_end_matches(';')
@@ -3077,6 +3264,7 @@ Check whether the SQL actually answers the user's question using the live schema
 Rules:
 - Prefer fixing the SQL over asking for clarification.
 - If live schema is empty but high-relevance SQL Knowledge is present, treat those SQL examples and metric definitions as authoritative workspace context.
+- Metadata discovery can be partial even when query access works. If a current high-relevance SQL example supplies an exact missing table or column, validate it through execution/correction instead of discarding the evidence; never invent identifiers.
 - Verify metric formulas, date filters, grouping dimensions, joins, table/column compatibility, and whether the SQL returns aggregate/report rows or raw rows as requested.
 - If the SQL is correct enough, return verdict "pass".
 - If the SQL is wrong but fixable, return verdict "rewrite" and a complete single SELECT statement.
@@ -3622,6 +3810,12 @@ pub(crate) async fn query(
 
     let schema_load_started = std::time::Instant::now();
     self::query_async::emit_stage("load_schema", "正在加载 Schema");
+    let config_json =
+        sqlx::query_scalar::<_, serde_json::Value>("SELECT config FROM data_sources WHERE id = ?")
+            .bind(&req.data_source_id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or_else(|| AppError::NotFound("data source not found".into()))?;
     let schema_info: serde_json::Value = {
         let row = sqlx::query("SELECT schema_info FROM data_sources WHERE id = ?")
             .bind(&req.data_source_id)
@@ -4109,6 +4303,22 @@ pub(crate) async fn query(
     }
     reference_snippets =
         merge_reference_snippets(&[], reference_snippets, sql_knowledge_prompt_max_snippets());
+    let hydrated = discover_knowledge_schema_tables(
+        &state,
+        &req.data_source_id,
+        &db_type,
+        &config_json,
+        &schema_tables,
+        &reference_snippets,
+    )
+    .await;
+    if hydrated.as_array().is_some_and(|tables| !tables.is_empty()) {
+        self::query_async::emit_stage("load_schema", "已按 SQL 知识库命中的表按需确认 Schema");
+        schema_tables = merge_schema_tables(&schema_tables, &hydrated);
+        if let Some(allowed_tables) = strict_allow_tables.as_ref() {
+            schema_tables = filter_schema_tables_by_allowlist(&schema_tables, allowed_tables);
+        }
+    }
     let mut used_references: Vec<ReferenceUsageDto> = reference_snippets
         .iter()
         .map(ReferencePromptSnippet::to_usage_dto)
@@ -7472,6 +7682,40 @@ mod tests {
         assert!(aliases.contains("iceberg.mps_prod.business_order"));
         assert!(aliases.contains("mps_prod.business_order"));
         assert!(aliases.contains("business_order"));
+    }
+
+    #[test]
+    fn knowledge_schema_extraction_ignores_cte_and_system_tables() {
+        let names = knowledge_physical_table_names(
+            "WITH base AS (SELECT * FROM orders), grouped AS (SELECT * FROM base)\n\
+             SELECT * FROM grouped JOIN customer_dim c ON c.id = grouped.customer_id\n\
+             JOIN information_schema.columns i ON 1 = 1",
+        );
+
+        assert_eq!(
+            names,
+            vec!["customer_dim".to_string(), "orders".to_string()]
+        );
+    }
+
+    #[test]
+    fn merge_schema_tables_preserves_existing_and_deduplicates_aliases() {
+        let existing = serde_json::json!([{
+            "table_name": "catalog.analytics.orders",
+            "schema": "analytics",
+            "physical_table_name": "orders",
+            "columns": []
+        }]);
+        let discovered = serde_json::json!([
+            {"table_name": "orders", "columns": [{"name": "id"}]},
+            {"table_name": "customers", "columns": [{"name": "id"}]}
+        ]);
+
+        let merged = merge_schema_tables(&existing, &discovered);
+        let tables = merged.as_array().expect("merged schema array");
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0]["table_name"], "catalog.analytics.orders");
+        assert_eq!(tables[1]["table_name"], "customers");
     }
 
     #[test]

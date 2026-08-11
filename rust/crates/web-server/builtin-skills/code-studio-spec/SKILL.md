@@ -23,6 +23,7 @@ Requirements:
 - requirementsMd must cover goals, user scenarios, boundaries, non-goals, and key constraints.
 - acceptanceMd must be written as verifiable acceptance criteria.
 - If information is missing, list confirmation questions inside requirementsMd, while still producing a useful first draft.
+- When repository context contains multiple repository sections, describe each service's responsibility and collaboration boundary separately. Never attribute one repository's evidence to another.
 
 User requirement:
 {{requirement}}
@@ -45,6 +46,8 @@ Output JSON only:
 Requirements:
 - designMd must include architecture, affected modules, data/API changes, execution flow, risks, and test strategy.
 - Ground the design in the repository context.
+- For every selected repository, cite actual file paths and symbols/entry points. For cross-service calls, specify direction, contract, compatibility strategy, and rollout order.
+- If a repository was not synced or its context could not be read, mark the evidence gap explicitly. Never invent files, APIs, or code inspection results.
 - Mark uncertain assumptions explicitly.
 
 Original requirement:
@@ -84,6 +87,7 @@ Requirements:
 - taskItems must have stable IDs and be ordered by implementation sequence.
 - Each task should cover one clear implementation target.
 - acceptance must be concrete checks for that task.
+- Cross-service tasks must identify their target repository and dependent tasks. tasksMd must include integration, compatibility, rollout, and rollback checks across repositories.
 
 Original requirement:
 {{requirement}}

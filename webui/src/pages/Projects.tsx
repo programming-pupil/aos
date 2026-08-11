@@ -42,7 +42,7 @@ import relativeTime from 'dayjs/plugin/relativeTime';
 import { rdApi } from '@/api';
 import { queryKeys } from '@/api/queryKeys';
 import { languageFromPath, LazyCodeHighlighter } from '@/components/code/LazyCodeHighlighter';
-import type { RdFileNode, RdRepository } from '@/types';
+import type { RdFileNode, RdRepository, RdRepositoryListResponse } from '@/types';
 
 dayjs.extend(relativeTime);
 
@@ -311,6 +311,7 @@ export default function Projects() {
   const repositoriesQuery = useQuery({
     queryKey: queryKeys.rd.repositories(),
     queryFn: rdApi.listRepositories,
+    refetchInterval: (query) => (query.state.data?.repositories ?? []).some((repository) => repository.indexStatus === 'syncing') ? 2500 : false,
   });
   const repositories = repositoriesQuery.data?.repositories ?? [];
 
@@ -350,10 +351,15 @@ export default function Projects() {
 
   const createMutation = useMutation({
     mutationFn: rdApi.createRepository,
-    onSuccess: () => {
+    onSuccess: (repository) => {
       message.success(t('projects.addSuccess'));
       setAddDrawerOpen(false);
       form.resetFields();
+      queryClient.setQueryData<RdRepositoryListResponse>(queryKeys.rd.repositories(), (current) => {
+        if (!current) return { repositories: [repository], total: 1 };
+        const repositories = [repository, ...current.repositories.filter((item) => item.id !== repository.id)];
+        return { ...current, repositories, total: Math.max(current.total, repositories.length) };
+      });
       queryClient.invalidateQueries({ queryKey: queryKeys.rd.repositories() });
     },
     onError: (error: Error) => message.error(error.message || t('projects.syncFailed')),
@@ -389,15 +395,34 @@ export default function Projects() {
 
   const syncMutation = useMutation({
     mutationFn: rdApi.syncRepository,
-    onMutate: (id) => setSyncingId(id),
+    onMutate: async (id) => {
+      setSyncingId(id);
+      await queryClient.cancelQueries({ queryKey: queryKeys.rd.repositories() });
+      const previous = queryClient.getQueryData<RdRepositoryListResponse>(queryKeys.rd.repositories());
+      queryClient.setQueryData<RdRepositoryListResponse>(queryKeys.rd.repositories(), (current) => current ? {
+        ...current,
+        repositories: current.repositories.map((repository) => repository.id === id
+          ? { ...repository, indexStatus: 'syncing', lastSyncError: null }
+          : repository),
+      } : current);
+      return { previous };
+    },
     onSuccess: (_, id) => {
-      message.success(t('projects.syncSuccess'));
+      message.success(t('projects.syncStarted', '同步任务已启动'));
       queryClient.invalidateQueries({ queryKey: queryKeys.rd.repositories() });
       queryClient.invalidateQueries({ queryKey: queryKeys.rd.repositoryTree(id) });
       queryClient.invalidateQueries({ queryKey: queryKeys.rd.branches(id) });
     },
-    onError: (error: Error) => message.error(error.message || t('projects.syncFailed')),
-    onSettled: () => setSyncingId(null),
+    onError: (error: Error, _id, context) => {
+      if (context?.previous) {
+        queryClient.setQueryData(queryKeys.rd.repositories(), context.previous);
+      }
+      message.error(error.message || t('projects.syncFailed'));
+    },
+    onSettled: () => {
+      setSyncingId(null);
+      queryClient.invalidateQueries({ queryKey: queryKeys.rd.repositories() });
+    },
   });
 
   const deleteMutation = useMutation({
@@ -511,8 +536,9 @@ export default function Projects() {
           </Button>
           <Button
             size="small"
-            icon={<SyncOutlined spin={syncingId === record.id} />}
-            disabled={!!syncingId}
+            icon={<SyncOutlined spin={syncingId === record.id || record.indexStatus === 'syncing'} />}
+            loading={syncingId === record.id || record.indexStatus === 'syncing'}
+            disabled={!!syncingId || record.indexStatus === 'syncing'}
             onClick={() => syncMutation.mutate(record.id)}
           >
             {t('projects.sync')}
