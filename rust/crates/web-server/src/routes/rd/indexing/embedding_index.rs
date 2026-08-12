@@ -9,7 +9,7 @@ pub(in crate::routes::rd) fn schedule_rd_repository_embedding_index(
     repository_id: String,
     reason: &'static str,
 ) {
-    if state.rd_embedding_store.is_none() || state.config_registry.is_none() {
+    if state.rd_embedding_store.is_none() {
         return;
     }
     let flight_key = format!("{tenant_id}:{repository_id}");
@@ -97,7 +97,9 @@ async fn run_rd_repository_embedding_index(
         return Ok(0);
     }
 
-    let mut last_error = None;
+    let mut errors = Vec::new();
+    let mut successful_models = Vec::new();
+    let mut aggregate = RdEmbeddingIndexStats::default();
     for candidate in candidates {
         update_rd_repository_embedding_status(
             &state.db,
@@ -123,26 +125,28 @@ async fn run_rd_repository_embedding_index(
         .await
         {
             Ok(count) => {
-                update_rd_repository_embedding_status(
-                    &state.db,
-                    tenant_id,
-                    repository_id,
-                    "ready",
-                    Some(&candidate.model),
-                    Some(count.total_chunks),
-                    Some(&count),
-                    None,
-                )
-                .await?;
-                update_rd_file_summary_embedding_cache(
-                    &state.db,
-                    tenant_id,
-                    repository_id,
-                    &candidate.model,
-                    &chunks,
-                )
-                .await?;
-                return Ok(count.total_chunks);
+                aggregate.total_chunks = aggregate.total_chunks.max(count.total_chunks);
+                aggregate.reused_chunks =
+                    aggregate.reused_chunks.saturating_add(count.reused_chunks);
+                aggregate.regenerated_chunks = aggregate
+                    .regenerated_chunks
+                    .saturating_add(count.regenerated_chunks);
+                aggregate.pruned_chunks =
+                    aggregate.pruned_chunks.saturating_add(count.pruned_chunks);
+                aggregate.estimated_tokens_saved = aggregate
+                    .estimated_tokens_saved
+                    .saturating_add(count.estimated_tokens_saved);
+                successful_models.push(candidate.model.clone());
+                if candidate.is_local {
+                    update_rd_file_summary_embedding_cache(
+                        &state.db,
+                        tenant_id,
+                        repository_id,
+                        &candidate.model,
+                        &chunks,
+                    )
+                    .await?;
+                }
             }
             Err(error) => {
                 tracing::warn!(
@@ -152,11 +156,34 @@ async fn run_rd_repository_embedding_index(
                     error = %error,
                     "RD embedding candidate failed during repository indexing; trying next candidate"
                 );
-                last_error = Some(error.to_string());
+                errors.push(format!("{}: {error}", candidate.model));
             }
         }
     }
 
+    if !successful_models.is_empty() {
+        let status = if errors.is_empty() {
+            "ready"
+        } else {
+            "degraded"
+        };
+        let model_summary = successful_models.join(" + ");
+        let error_summary = (!errors.is_empty()).then(|| errors.join("; "));
+        update_rd_repository_embedding_status(
+            &state.db,
+            tenant_id,
+            repository_id,
+            status,
+            Some(&model_summary),
+            Some(aggregate.total_chunks),
+            Some(&aggregate),
+            error_summary.as_deref(),
+        )
+        .await?;
+        return Ok(aggregate.total_chunks);
+    }
+
+    let last_error = errors.join("; ");
     update_rd_repository_embedding_status(
         &state.db,
         tenant_id,
@@ -165,12 +192,14 @@ async fn run_rd_repository_embedding_index(
         None,
         None,
         None,
-        last_error.as_deref(),
+        Some(&last_error),
     )
     .await?;
-    Err(AppError::Internal(last_error.unwrap_or_else(|| {
+    Err(AppError::Internal(if last_error.is_empty() {
         "RD repository embedding indexing failed".to_string()
-    })))
+    } else {
+        last_error
+    }))
 }
 
 async fn index_rd_repository_with_embedding_candidate(
@@ -186,7 +215,7 @@ async fn index_rd_repository_with_embedding_candidate(
     let hash_store = store.clone();
     let tenant = tenant_id.to_string();
     let repo = repository_id.to_string();
-    let model = candidate.model.clone();
+    let model = candidate.vector_space_id.clone();
     let existing_hashes = tokio::task::spawn_blocking(move || {
         hash_store.repository_chunk_hashes(&tenant, &repo, &model)
     })
@@ -220,7 +249,12 @@ async fn index_rd_repository_with_embedding_candidate(
         .collect::<HashSet<_>>();
 
     let mut indexed_count = 0usize;
-    for batch in chunks_to_embed.chunks(RD_EMBEDDING_BATCH_SIZE) {
+    let batch_size = if candidate.is_local {
+        RD_LOCAL_EMBEDDING_BACKGROUND_BATCH_SIZE
+    } else {
+        RD_EMBEDDING_BATCH_SIZE
+    };
+    for batch in chunks_to_embed.chunks(batch_size) {
         let texts = batch
             .iter()
             .map(|chunk| chunk.text.clone())
@@ -228,7 +262,7 @@ async fn index_rd_repository_with_embedding_candidate(
         let input_chars = texts.iter().map(|text| text.chars().count()).sum::<usize>();
         let output = timeout(
             Duration::from_secs(RD_EMBEDDING_INDEX_BATCH_TIMEOUT_SECS),
-            rd_embed_texts_with_candidate(candidate, &texts),
+            rd_embed_texts_with_candidate_background(candidate, &texts),
         )
         .await
         .map_err(|_| {
@@ -272,7 +306,7 @@ async fn index_rd_repository_with_embedding_candidate(
         let write_store = store.clone();
         let tenant = tenant_id.to_string();
         let repo = repository_id.to_string();
-        let model = candidate.model.clone();
+        let model = candidate.vector_space_id.clone();
         let written = upserts.len();
         tokio::task::spawn_blocking(move || {
             write_store.upsert_chunks(&tenant, &repo, &model, &upserts)
@@ -281,12 +315,15 @@ async fn index_rd_repository_with_embedding_candidate(
         .map_err(|error| AppError::Internal(format!("RD embedding write worker failed: {error}")))?
         .map_err(|error| AppError::Internal(format!("RD embedding write failed: {error}")))?;
         indexed_count = indexed_count.saturating_add(written);
+        if candidate.is_local {
+            tokio::task::yield_now().await;
+        }
     }
 
     let prune_store = store.clone();
     let tenant = tenant_id.to_string();
     let repo = repository_id.to_string();
-    let model = candidate.model.clone();
+    let model = candidate.vector_space_id.clone();
     let pruned_chunks = tokio::task::spawn_blocking(move || {
         prune_store.prune_repository_index(&tenant, &repo, &model, &keep_chunk_ids)
     })
@@ -617,7 +654,7 @@ pub(in crate::routes::rd) fn schedule_rd_task_embedding_index(
     user_id: String,
     task_id: String,
 ) {
-    if state.rd_embedding_store.is_none() || state.config_registry.is_none() {
+    if state.rd_embedding_store.is_none() {
         return;
     }
     tokio::spawn(async move {
@@ -655,21 +692,22 @@ async fn run_rd_task_embedding_index(
     let texts = vec![chunk.text.clone()];
     let input_chars = chunk.text.chars().count();
 
-    let mut last_error = None;
+    let mut errors = Vec::new();
+    let mut indexed = 0usize;
     for candidate in candidates {
         let output = match timeout(
             Duration::from_secs(RD_EMBEDDING_INDEX_BATCH_TIMEOUT_SECS),
-            rd_embed_texts_with_candidate(&candidate, &texts),
+            rd_embed_texts_with_candidate_background(&candidate, &texts),
         )
         .await
         {
             Ok(Ok(output)) => output,
             Ok(Err(error)) => {
-                last_error = Some(error.to_string());
+                errors.push(format!("{}: {error}", candidate.model));
                 continue;
             }
             Err(_) => {
-                last_error = Some(format!(
+                errors.push(format!(
                     "RD task embedding timed out after {}s",
                     RD_EMBEDDING_INDEX_BATCH_TIMEOUT_SECS
                 ));
@@ -706,7 +744,7 @@ async fn run_rd_task_embedding_index(
         let write_store = store.clone();
         let tenant = tenant_id.to_string();
         let repo = repository_id.to_string();
-        let model = candidate.model.clone();
+        let model = candidate.vector_space_id.clone();
         tokio::task::spawn_blocking(move || {
             write_store.upsert_chunks(&tenant, &repo, &model, &[upsert])
         })
@@ -715,12 +753,18 @@ async fn run_rd_task_embedding_index(
             AppError::Internal(format!("RD task embedding write worker failed: {error}"))
         })?
         .map_err(|error| AppError::Internal(format!("RD task embedding write failed: {error}")))?;
-        return Ok(());
+        indexed = indexed.saturating_add(1);
     }
 
-    Err(AppError::Internal(
-        last_error.unwrap_or_else(|| "RD task embedding failed".to_string()),
-    ))
+    if indexed > 0 {
+        Ok(())
+    } else {
+        Err(AppError::Internal(if errors.is_empty() {
+            "RD task embedding failed".to_string()
+        } else {
+            errors.join("; ")
+        }))
+    }
 }
 
 async fn load_rd_task_touched_files(

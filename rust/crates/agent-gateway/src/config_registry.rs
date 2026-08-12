@@ -1297,7 +1297,7 @@ impl TenantConfigRegistry {
               (id, tenant_id, user_id, session_id, window_id, previous_window_id, trigger,
                strategy, summary_tokens, removed_message_count, retained_tail_tokens,
                used_memory_refs_json, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON), CAST(? AS JSON))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, json(?), json(?))
             "#,
         )
         .bind(uuid::Uuid::new_v4().to_string())
@@ -1333,7 +1333,7 @@ impl TenantConfigRegistry {
                 INSERT INTO agent_context_archives
                   (id, tenant_id, user_id, session_id, window_id, source, role, ordinal,
                    content, content_hash, content_kind, char_count, metadata_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON))
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, json(?))
                 ON CONFLICT DO UPDATE SET
                   metadata_json = COALESCE(excluded.metadata_json, metadata_json)
                 "#,

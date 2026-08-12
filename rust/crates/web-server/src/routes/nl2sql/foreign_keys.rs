@@ -761,6 +761,7 @@ pub(crate) async fn clarify(
         &[],
         None,
         None,
+        true,
     )
     .await;
 

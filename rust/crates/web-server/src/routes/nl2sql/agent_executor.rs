@@ -6,7 +6,7 @@
 //! crate owns pure domain rules; this module owns application-service wiring.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use api::{InputContentBlock, InputMessage};
 use serde::{Deserialize, Serialize};
@@ -110,6 +110,40 @@ fn trino_explain_circuit_breaker(
     static CIRCUIT_BREAKER: OnceLock<tokio::sync::Mutex<HashMap<String, std::time::Instant>>> =
         OnceLock::new();
     CIRCUIT_BREAKER.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+const TRINO_USER_CONCURRENCY_LIMIT: usize = 3;
+
+fn trino_user_execution_gates(
+) -> &'static tokio::sync::Mutex<HashMap<String, Weak<tokio::sync::Semaphore>>> {
+    static GATES: OnceLock<tokio::sync::Mutex<HashMap<String, Weak<tokio::sync::Semaphore>>>> =
+        OnceLock::new();
+    GATES.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+fn trino_user_execution_key(tenant_id: &str, user_id: &str) -> String {
+    format!("{tenant_id}\u{1f}{user_id}")
+}
+
+pub(crate) async fn acquire_trino_user_permit(
+    tenant_id: &str,
+    user_id: &str,
+) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
+    let key = trino_user_execution_key(tenant_id, user_id);
+    let gate = {
+        let mut gates = trino_user_execution_gates().lock().await;
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(&key).and_then(Weak::upgrade) {
+            gate
+        } else {
+            let gate = Arc::new(tokio::sync::Semaphore::new(TRINO_USER_CONCURRENCY_LIMIT));
+            gates.insert(key, Arc::downgrade(&gate));
+            gate
+        }
+    };
+    gate.acquire_owned()
+        .await
+        .map_err(|_| anyhow::anyhow!("Trino user execution gate is closed"))
 }
 
 async fn claim_trino_explain_probe(datasource_id: &str) -> bool {
@@ -788,6 +822,11 @@ fn format_agent_sql_knowledge_context(snippets: &[ReferencePromptSnippet]) -> St
 #[derive(Debug, Deserialize)]
 pub struct AgentExecuteRequest {
     pub question: String,
+    /// Optional concise query used only for datasource routing and SQL knowledge
+    /// retrieval. The full `question` remains the model task. Deadline-bound
+    /// orchestrators use this to keep their control instructions out of search.
+    #[serde(default)]
+    pub retrieval_question: Option<String>,
     /// Model selected by the calling assistant turn. The NL2SQL runtime still
     /// resolves and authorizes keys server-side and uses other keys on failure.
     #[serde(default)]
@@ -806,6 +845,243 @@ pub struct AgentExecuteRequest {
     pub conversation_id: Option<String>,
     #[serde(default)]
     pub max_steps: Option<usize>,
+    /// Keep deterministic hybrid retrieval and full-file evidence, but avoid
+    /// an additional open-ended LLM tool-navigation loop. Deadline-bound
+    /// callers such as attribution use this to reserve time for SQL execution.
+    #[serde(default)]
+    pub bounded: bool,
+}
+
+/// Caps concurrent datasource work inside one top-level request. This is not a
+/// lifetime submission quota: a completed request releases its permit so a
+/// later drill-down can proceed. Trino also has the tenant-and-user scoped gate
+/// above, which is the authoritative cross-task concurrency limit.
+#[derive(Debug)]
+pub(crate) struct DatasourceRequestBudget {
+    in_flight: Arc<tokio::sync::Semaphore>,
+}
+
+impl DatasourceRequestBudget {
+    pub(crate) fn new(max_requests: usize) -> Arc<Self> {
+        let max_requests = max_requests.max(1);
+        Arc::new(Self {
+            in_flight: Arc::new(tokio::sync::Semaphore::new(max_requests)),
+        })
+    }
+
+    pub(crate) async fn acquire(
+        self: &Arc<Self>,
+        operation: &str,
+    ) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
+        self.in_flight
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("datasource concurrency gate closed before {operation}"))
+    }
+}
+
+struct TrinoSubmissionGuard {
+    client: Option<Arc<trino_rust_client::Client>>,
+    query_id: Arc<std::sync::Mutex<Option<String>>>,
+    user_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    unresolved_hold: std::time::Duration,
+    completed: bool,
+}
+
+impl TrinoSubmissionGuard {
+    fn new(
+        client: Arc<trino_rust_client::Client>,
+        user_permit: tokio::sync::OwnedSemaphorePermit,
+        unresolved_hold: std::time::Duration,
+    ) -> Self {
+        Self {
+            client: Some(client),
+            query_id: Arc::new(std::sync::Mutex::new(None)),
+            user_permit: Some(user_permit),
+            unresolved_hold,
+            completed: false,
+        }
+    }
+
+    fn record_query_id(&self, query_id: &str) {
+        *self
+            .query_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(query_id.to_string());
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+
+    async fn cancel(&mut self, reason: &str) {
+        let query_id = self
+            .query_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let (Some(client), Some(query_id)) = (self.client.as_ref(), query_id) {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), client.cancel(&query_id))
+                .await
+            {
+                Ok(Ok(())) => {
+                    tracing::warn!(query_id, reason, "cancelled Trino query");
+                    self.completed = true;
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(query_id, reason, error = %error, "Trino query cancellation failed")
+                }
+                Err(_) => tracing::warn!(query_id, reason, "Trino query cancellation timed out"),
+            }
+        }
+    }
+}
+
+impl Drop for TrinoSubmissionGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        let query_id = self
+            .query_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let user_permit = self.user_permit.take();
+        let unresolved_hold = self.unresolved_hold;
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            if let Some(query_id) = query_id {
+                let cancelled = match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    client.cancel(&query_id),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        tracing::warn!(query_id, "cancelled abandoned Trino query");
+                        true
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(query_id, error = %error, "abandoned Trino query cancellation failed");
+                        false
+                    }
+                    Err(_) => {
+                        tracing::warn!(query_id, "abandoned Trino query cancellation timed out");
+                        false
+                    }
+                };
+                if !cancelled {
+                    tokio::time::sleep(unresolved_hold).await;
+                }
+            } else {
+                // The POST may have reached Trino before its first response was
+                // cancelled. Keep the user's slot for the original execution
+                // budget instead of allowing an immediate replacement burst.
+                tokio::time::sleep(unresolved_hold).await;
+            }
+            drop(user_permit);
+        });
+    }
+}
+
+pub(crate) async fn execute_trino_query_bounded(
+    client: trino_rust_client::Client,
+    sql: String,
+    timeout_secs: u64,
+    tenant_id: &str,
+    user_id: &str,
+    operation: &str,
+    request_budget: Arc<DatasourceRequestBudget>,
+) -> anyhow::Result<trino_rust_client::DataSet<trino_rust_client::Row>> {
+    let _request_permit = request_budget.acquire(operation).await?;
+    let user_permit = acquire_trino_user_permit(tenant_id, user_id).await?;
+    let client = Arc::new(client);
+    let unresolved_hold = std::time::Duration::from_secs(timeout_secs.max(1));
+    let mut guard = TrinoSubmissionGuard::new(client.clone(), user_permit, unresolved_hold);
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.max(1));
+
+    tracing::info!(
+        tenant_id,
+        user_id,
+        operation,
+        "submitting bounded Trino query"
+    );
+
+    let mut response =
+        match tokio::time::timeout_at(deadline, client.get::<trino_rust_client::Row>(sql)).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => return Err(anyhow::anyhow!("trino query failed: {error}")),
+            Err(_) => {
+                guard.cancel("initial response timeout").await;
+                return Err(anyhow::anyhow!(
+                    "Query execution timed out after {timeout_secs}s"
+                ));
+            }
+        };
+    guard.record_query_id(&response.id);
+    tracing::info!(
+        tenant_id,
+        user_id,
+        operation,
+        query_id = %response.id,
+        "Trino query accepted"
+    );
+
+    let mut columns = response.columns.take();
+    let mut rows = Vec::new();
+    loop {
+        if let Some(error) = response.error.take() {
+            guard.complete();
+            return Err(anyhow::anyhow!("trino query failed: {error}"));
+        }
+        if let Some(data) = response.data.take() {
+            match data {
+                trino_rust_client::QueryResultData::Direct(data) => rows.extend(data),
+                trino_rust_client::QueryResultData::Spooled(_) => {
+                    guard.cancel("unsupported spooled response").await;
+                    return Err(anyhow::anyhow!(
+                        "trino query failed: server returned spooled data but this build does not enable spooling"
+                    ));
+                }
+            }
+        }
+        let Some(next_uri) = response.next_uri.take() else {
+            break;
+        };
+        response = match tokio::time::timeout_at(
+            deadline,
+            client.get_next::<trino_rust_client::Row>(&next_uri),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                guard.cancel("result polling failed").await;
+                return Err(anyhow::anyhow!("trino query failed: {error}"));
+            }
+            Err(_) => {
+                guard.cancel("result polling timeout").await;
+                return Err(anyhow::anyhow!(
+                    "Query execution timed out after {timeout_secs}s"
+                ));
+            }
+        };
+        if columns.is_none() {
+            columns = response.columns.take();
+        }
+    }
+
+    guard.complete();
+    trino_rust_client::build_dataset(rows, columns)
+        .map_err(|error| anyhow::anyhow!("trino query failed: {error}"))
 }
 
 #[derive(Debug, Serialize)]
@@ -860,15 +1136,38 @@ pub struct Nl2SqlAgent {
     max_steps: usize,
     max_rows_per_step: usize,
     preferred_model: Option<String>,
+    bounded: bool,
+    network_budget: Arc<DatasourceRequestBudget>,
+    protected_request: bool,
 }
 
 impl Nl2SqlAgent {
-    pub fn new(state: Arc<AppState>, preferred_model: Option<String>) -> Self {
+    pub fn new(state: Arc<AppState>, preferred_model: Option<String>, bounded: bool) -> Self {
         Self {
             state,
             max_steps: max_agent_steps(),
             max_rows_per_step: max_rows_per_step(),
             preferred_model: preferred_model.filter(|model| !model.trim().is_empty()),
+            bounded,
+            network_budget: DatasourceRequestBudget::new(3),
+            protected_request: false,
+        }
+    }
+
+    pub fn with_network_budget(
+        state: Arc<AppState>,
+        preferred_model: Option<String>,
+        bounded: bool,
+        network_budget: Arc<DatasourceRequestBudget>,
+    ) -> Self {
+        Self {
+            state,
+            max_steps: max_agent_steps(),
+            max_rows_per_step: max_rows_per_step(),
+            preferred_model: preferred_model.filter(|model| !model.trim().is_empty()),
+            bounded,
+            network_budget,
+            protected_request: true,
         }
     }
 
@@ -1176,6 +1475,7 @@ impl Nl2SqlAgent {
             &prompt_references,
             None,
             self.preferred_model.as_deref(),
+            !self.bounded,
         )
         .await
         {
@@ -1221,48 +1521,50 @@ impl Nl2SqlAgent {
             )));
         }
 
-        super::agent_async::emit_agent_stage("explain_sql", "正在 EXPLAIN 校验联邦 SQL");
-        match self
-            .explain_and_repair_federated_sql(
-                claims,
-                question,
-                &schema,
-                &execution_source.schema.datasource_id,
-                &execution_source.schema.config,
-                &mut current_sql,
-            )
-            .await
-        {
-            Ok(()) => {}
-            Err(e) => {
-                if federated_trino_explain_soft_fail() {
-                    if trino_explain_preflight_was_skipped(&e) {
-                        tracing::info!(
-                            datasource_id = %execution_source.schema.datasource_id,
-                            "federated Trino EXPLAIN preflight skipped during datasource cooldown; continuing to execution-stage validation"
+        if !self.bounded {
+            super::agent_async::emit_agent_stage("explain_sql", "正在 EXPLAIN 校验联邦 SQL");
+            match self
+                .explain_and_repair_federated_sql(
+                    claims,
+                    question,
+                    &schema,
+                    &execution_source.schema.datasource_id,
+                    &execution_source.schema.config,
+                    &mut current_sql,
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(e) => {
+                    if federated_trino_explain_soft_fail() {
+                        if trino_explain_preflight_was_skipped(&e) {
+                            tracing::info!(
+                                datasource_id = %execution_source.schema.datasource_id,
+                                "federated Trino EXPLAIN preflight skipped during datasource cooldown; continuing to execution-stage validation"
+                            );
+                        } else {
+                            tracing::warn!(
+                                error = %e,
+                                "federated Trino EXPLAIN preflight did not pass; continuing to execution-stage validation"
+                            );
+                        }
+                        super::agent_async::emit_agent_stage(
+                            "explain_sql",
+                            if trino_explain_preflight_was_skipped(&e) {
+                                "已跳过近期不可用的 EXPLAIN，直接进入执行阶段验证"
+                            } else {
+                                "EXPLAIN 未通过，继续进入执行阶段验证和修复"
+                            },
                         );
                     } else {
-                        tracing::warn!(
-                            error = %e,
-                            "federated Trino EXPLAIN preflight did not pass; continuing to execution-stage validation"
-                        );
+                        return Ok(Some(self.federated_error_response(
+                            start,
+                            &workspace,
+                            Some(current_sql),
+                            e,
+                            used_references,
+                        )));
                     }
-                    super::agent_async::emit_agent_stage(
-                        "explain_sql",
-                        if trino_explain_preflight_was_skipped(&e) {
-                            "已跳过近期不可用的 EXPLAIN，直接进入执行阶段验证"
-                        } else {
-                            "EXPLAIN 未通过，继续进入执行阶段验证和修复"
-                        },
-                    );
-                } else {
-                    return Ok(Some(self.federated_error_response(
-                        start,
-                        &workspace,
-                        Some(current_sql),
-                        e,
-                        used_references,
-                    )));
                 }
             }
         }
@@ -1428,7 +1730,7 @@ impl Nl2SqlAgent {
         let max_attempts = federated_trino_explain_repair_attempts();
         let mut context = SelfCorrectContext::default();
         for attempt in 0..=max_attempts {
-            match self.explain_trino_sql(config_json, sql).await {
+            match self.explain_trino_sql(claims, config_json, sql).await {
                 Ok(()) => {
                     clear_trino_explain_suppression(datasource_id).await;
                     return Ok(());
@@ -1461,6 +1763,7 @@ impl Nl2SqlAgent {
                         "trino",
                         datasource_id,
                         self.preferred_model.as_deref(),
+                        self.bounded,
                     )
                     .await;
                     let repaired = strip_trailing_semicolon(&repaired);
@@ -1512,6 +1815,7 @@ impl Nl2SqlAgent {
             let attempt_started = std::time::Instant::now();
             match self
                 .execute_trino_with_timeout(
+                    claims,
                     sql,
                     config_json,
                     self.max_rows_per_step,
@@ -1611,6 +1915,7 @@ impl Nl2SqlAgent {
                         "trino",
                         datasource_id,
                         self.preferred_model.as_deref(),
+                        self.bounded,
                     )
                     .await;
                     let repaired = strip_trailing_semicolon(&repaired);
@@ -1628,7 +1933,9 @@ impl Nl2SqlAgent {
                     }
                     next_retry_reason = Some("sql_repair:model".to_string());
                     if federated_trino_explain_after_execution_repair() {
-                        if let Err(explain_err) = self.explain_trino_sql(config_json, sql).await {
+                        if let Err(explain_err) =
+                            self.explain_trino_sql(claims, config_json, sql).await
+                        {
                             tracing::warn!(
                                 error = %explain_err,
                                 "federated Trino repaired SQL failed post-repair EXPLAIN; continuing with execution retry"
@@ -1642,11 +1949,13 @@ impl Nl2SqlAgent {
 
     async fn explain_trino_sql(
         &self,
+        claims: &Claims,
         config_json: &serde_json::Value,
         sql: &str,
     ) -> Result<(), String> {
         let explain_sql = format!("EXPLAIN {}", strip_trailing_semicolon(sql));
         self.execute_trino_with_timeout(
+            claims,
             &explain_sql,
             config_json,
             5,
@@ -1744,6 +2053,7 @@ impl Nl2SqlAgent {
         &self,
         claims: &Claims,
         question: &str,
+        retrieval_question: &str,
         schema: &DatasourceSchemaInfo,
         route_snippets: &[ReferencePromptSnippet],
     ) -> anyhow::Result<AgentExecuteResponse> {
@@ -1803,7 +2113,7 @@ impl Nl2SqlAgent {
             &self.state,
             &claims.tenant_id,
             &schema.datasource_id,
-            question,
+            retrieval_question,
             super::sql_knowledge_prompt_max_snippets().min(12),
         )
         .await
@@ -1889,8 +2199,9 @@ impl Nl2SqlAgent {
             &self.state,
             claims,
             &schema.datasource_id,
-            question,
+            retrieval_question,
             &reference_snippets,
+            if self.bounded { Some(2) } else { None },
         )
         .await;
         if !auto_opened_sql_files.is_empty() {
@@ -1902,13 +2213,22 @@ impl Nl2SqlAgent {
             super::agent_async::emit_agent_stage("load_context", "已打开命中的完整 SQL 文件上下文");
         }
 
+        if self.bounded {
+            reference_snippets = super::focus_bounded_sql_knowledge_references(
+                retrieval_question,
+                &reference_snippets,
+            );
+        }
+
         let hydrated = discover_knowledge_schema_tables(
             &self.state,
+            claims,
             &schema.datasource_id,
             &schema.db_type,
             &schema.config,
             &schema_tables,
             &reference_snippets,
+            self.protected_request.then(|| self.network_budget.clone()),
         )
         .await;
         if hydrated.as_array().is_some_and(|tables| !tables.is_empty()) {
@@ -2019,7 +2339,7 @@ impl Nl2SqlAgent {
         let matched_metrics = matched_metric_names(question, &metric_candidates);
 
         let qu_result: Option<crate::nl2sql::query_understanding::QueryUnderstandingResult> =
-            if should_enable_qu() {
+            if should_enable_qu() && !self.bounded {
                 let chat_cfg = match crate::nl2sql::resolve_chat_config_candidates(
                     self.state.config_registry(),
                     &claims.tenant_id,
@@ -2107,6 +2427,7 @@ impl Nl2SqlAgent {
             &reference_snippets,
             None,
             self.preferred_model.as_deref(),
+            !self.bounded,
         )
         .await
         {
@@ -2151,7 +2472,7 @@ impl Nl2SqlAgent {
             ));
         }
 
-        if matches!(schema.db_type.as_str(), "presto" | "trino") {
+        if !self.bounded && matches!(schema.db_type.as_str(), "presto" | "trino") {
             super::agent_async::emit_agent_stage("explain_sql", "正在 EXPLAIN 校验 SQL");
             if let Err(e) = self
                 .explain_and_repair_federated_sql(
@@ -2259,6 +2580,7 @@ impl Nl2SqlAgent {
         &self,
         claims: &Claims,
         question: &str,
+        retrieval_question: Option<&str>,
         shared_context: Option<&str>,
         max_steps_override: Option<usize>,
         allowed_datasource_ids: &[String],
@@ -2294,9 +2616,13 @@ impl Nl2SqlAgent {
         }
 
         let model_question = contextual_agent_question(question, shared_context);
-        let mut routing_question = question;
+        let retrieval_question = retrieval_question
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(question);
+        let mut routing_question = retrieval_question;
         let mut sql_knowledge_route = if allowed_datasource_ids.is_empty() {
-            self.resolve_sql_knowledge_route_candidate(claims, question, &schemas)
+            self.resolve_sql_knowledge_route_candidate(claims, retrieval_question, &schemas)
                 .await
         } else {
             None
@@ -2353,6 +2679,7 @@ impl Nl2SqlAgent {
                 .execute_single_datasource_query(
                     claims,
                     &model_question,
+                    retrieval_question,
                     &schemas[0],
                     route_snippets,
                 )
@@ -2807,10 +3134,12 @@ impl Nl2SqlAgent {
                     Err(anyhow::anyhow!(preflight_error))
                 } else {
                     self.execute_sql_on_datasource(
+                        claims,
                         &db_type,
                         &config_json,
                         &current_sql,
                         effective_max_rows,
+                        datasource_id,
                     )
                     .await
                 };
@@ -2879,7 +3208,6 @@ impl Nl2SqlAgent {
                         error: Some(err_msg.clone()),
                         retry_reason: next_retry_reason.take(),
                     });
-
                     if err_kind.is_transient_operational()
                         && operational_attempts < max_operational_attempts
                     {
@@ -2961,6 +3289,7 @@ impl Nl2SqlAgent {
                                     &db_type,
                                     datasource_id,
                                     self.preferred_model.as_deref(),
+                                    self.bounded,
                                 )
                                 .await,
                                 "model",
@@ -3035,15 +3364,26 @@ impl Nl2SqlAgent {
     /// Execute SQL on a datasource, returning (columns, rows).
     async fn execute_sql_on_datasource(
         &self,
+        claims: &Claims,
         db_type: &str,
         config_json: &serde_json::Value,
         sql: &str,
         max_rows: usize,
+        _datasource_id: &str,
     ) -> anyhow::Result<(Vec<String>, Vec<serde_json::Value>)> {
+        let _network_permit = if matches!(db_type, "presto" | "trino") {
+            None
+        } else {
+            Some(
+                self.network_budget
+                    .acquire("datasource SQL execution")
+                    .await?,
+            )
+        };
         match db_type {
             "mysql" | "tidb" => self.execute_mysql(sql, config_json, max_rows).await,
             "clickhouse" => self.execute_clickhouse(sql, config_json, max_rows).await,
-            "presto" | "trino" => self.execute_trino(sql, config_json, max_rows).await,
+            "presto" | "trino" => self.execute_trino(claims, sql, config_json, max_rows).await,
             "postgres" => self.execute_postgres(sql, config_json, max_rows).await,
             "mongodb" => {
                 let config_val = decrypt_config(config_json, &self.state.data_dir)?;
@@ -3205,11 +3545,13 @@ impl Nl2SqlAgent {
 
     async fn execute_trino(
         &self,
+        claims: &Claims,
         sql: &str,
         config_json: &serde_json::Value,
         max_rows: usize,
     ) -> anyhow::Result<(Vec<String>, Vec<serde_json::Value>)> {
         self.execute_trino_with_timeout(
+            claims,
             sql,
             config_json,
             max_rows,
@@ -3220,6 +3562,7 @@ impl Nl2SqlAgent {
 
     async fn execute_trino_with_timeout(
         &self,
+        claims: &Claims,
         sql: &str,
         config_json: &serde_json::Value,
         max_rows: usize,
@@ -3270,16 +3613,27 @@ impl Nl2SqlAgent {
             ));
         }
         let cli = builder
+            .max_attempt(0)
             .build()
             .map_err(|e| anyhow::anyhow!("trino client build failed: {}", e))?;
 
-        let dataset = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            cli.get_all::<trino_rust_client::Row>(sql.to_string()),
+        let dataset = match execute_trino_query_bounded(
+            cli,
+            sql.to_string(),
+            timeout_secs,
+            &claims.tenant_id,
+            &claims.sub,
+            "Trino SQL execution or EXPLAIN",
+            self.network_budget.clone(),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("Query execution timed out after {timeout_secs}s"))?
-        .map_err(|e| anyhow::anyhow!("trino query failed: {}", e))?;
+        {
+            Ok(dataset) => dataset,
+            Err(error) if error.to_string().contains("empty data") => {
+                return Ok((Vec::new(), Vec::new()));
+            }
+            Err(error) => return Err(error),
+        };
 
         let (types, rows) = dataset.split();
         let column_count = types.len();
@@ -3509,9 +3863,411 @@ impl Nl2SqlAgent {
 #[cfg(test)]
 mod tests {
     use super::{
-        contextual_agent_question, deterministic_dialect_repair, dialect_preflight_error,
-        merge_input_error, AGENT_SHARED_CONTEXT_MAX_CHARS,
+        acquire_trino_user_permit, contextual_agent_question, deterministic_dialect_repair,
+        dialect_preflight_error, execute_trino_query_bounded, merge_input_error,
+        DatasourceRequestBudget, AGENT_SHARED_CONTEXT_MAX_CHARS,
     };
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::routing::{delete, get, post};
+    use axum::{Json, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct FakeTrinoState {
+        base_url: String,
+        submissions: Arc<AtomicUsize>,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+        cancellations: Arc<AtomicUsize>,
+        submit_delay: std::time::Duration,
+        poll_delay: Option<std::time::Duration>,
+    }
+
+    fn fake_trino_stats() -> serde_json::Value {
+        serde_json::json!({
+            "state": "FINISHED",
+            "queued": false,
+            "scheduled": true,
+            "nodes": 1,
+            "totalSplits": 1,
+            "queuedSplits": 0,
+            "runningSplits": 0,
+            "completedSplits": 1,
+            "cpuTimeMillis": 1,
+            "wallTimeMillis": 1,
+            "queuedTimeMillis": 0,
+            "elapsedTimeMillis": 1,
+            "processedRows": 1,
+            "processedBytes": 1,
+            "peakMemoryBytes": 1,
+            "spilledBytes": 0
+        })
+    }
+
+    async fn fake_trino_submit(State(state): State<FakeTrinoState>) -> Json<serde_json::Value> {
+        let submission = state.submissions.fetch_add(1, Ordering::SeqCst) + 1;
+        let active = state.active.fetch_add(1, Ordering::SeqCst) + 1;
+        state.max_active.fetch_max(active, Ordering::SeqCst);
+        tokio::time::sleep(state.submit_delay).await;
+        state.active.fetch_sub(1, Ordering::SeqCst);
+
+        let query_id = format!("query-{submission}");
+        let next_uri = state
+            .poll_delay
+            .map(|_| format!("{}/v1/next/{query_id}", state.base_url));
+        Json(serde_json::json!({
+            "id": query_id,
+            "infoUri": format!("{}/ui/query.html", state.base_url),
+            "partialCancelUri": null,
+            "nextUri": next_uri,
+            "columns": if next_uri.is_none() {
+                serde_json::json!([{
+                    "name": "value",
+                    "type": "varchar",
+                    "typeSignature": {"rawType": "varchar", "arguments": []}
+                }])
+            } else {
+                serde_json::Value::Null
+            },
+            "data": if next_uri.is_none() {
+                serde_json::json!([["ok"]])
+            } else {
+                serde_json::Value::Null
+            },
+            "error": null,
+            "stats": fake_trino_stats(),
+            "warnings": [],
+            "updateType": null,
+            "updateCount": null
+        }))
+    }
+
+    async fn fake_trino_poll(State(state): State<FakeTrinoState>) -> Json<serde_json::Value> {
+        tokio::time::sleep(
+            state
+                .poll_delay
+                .unwrap_or_else(|| std::time::Duration::from_millis(1)),
+        )
+        .await;
+        Json(serde_json::json!({
+            "id": "query-poll",
+            "infoUri": format!("{}/ui/query.html", state.base_url),
+            "partialCancelUri": null,
+            "nextUri": null,
+            "columns": [{
+                "name": "value",
+                "type": "varchar",
+                "typeSignature": {"rawType": "varchar", "arguments": []}
+            }],
+            "data": [["ok"]],
+            "error": null,
+            "stats": fake_trino_stats(),
+            "warnings": [],
+            "updateType": null,
+            "updateCount": null
+        }))
+    }
+
+    async fn fake_trino_cancel(State(state): State<FakeTrinoState>) -> StatusCode {
+        state.cancellations.fetch_add(1, Ordering::SeqCst);
+        StatusCode::NO_CONTENT
+    }
+
+    async fn start_fake_trino(
+        submit_delay: std::time::Duration,
+        poll_delay: Option<std::time::Duration>,
+    ) -> (FakeTrinoState, u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake Trino");
+        let port = listener.local_addr().expect("fake Trino address").port();
+        let state = FakeTrinoState {
+            base_url: format!("http://127.0.0.1:{port}"),
+            submissions: Arc::new(AtomicUsize::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
+            max_active: Arc::new(AtomicUsize::new(0)),
+            cancellations: Arc::new(AtomicUsize::new(0)),
+            submit_delay,
+            poll_delay,
+        };
+        let app = Router::new()
+            .route("/v1/statement", post(fake_trino_submit))
+            .route("/v1/next/{query_id}", get(fake_trino_poll))
+            .route("/v1/query/{query_id}", delete(fake_trino_cancel))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve fake Trino");
+        });
+        (state, port, server)
+    }
+
+    fn fake_trino_client(port: u16) -> trino_rust_client::Client {
+        trino_rust_client::ClientBuilder::new("test-user", "127.0.0.1")
+            .port(port)
+            .catalog("memory")
+            .schema("default")
+            .secure(false)
+            .max_attempt(0)
+            .build()
+            .expect("build fake Trino client")
+    }
+
+    #[tokio::test]
+    async fn datasource_budget_limits_concurrency_without_becoming_a_lifetime_quota() {
+        let budget = DatasourceRequestBudget::new(3);
+        let first = budget.acquire("one").await.expect("first permit");
+        let second = budget.acquire("two").await.expect("second permit");
+        let third = budget.acquire("three").await.expect("third permit");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), budget.acquire("four"),)
+                .await
+                .is_err(),
+            "the fourth concurrent request must wait"
+        );
+
+        drop(first);
+        let fourth =
+            tokio::time::timeout(std::time::Duration::from_secs(1), budget.acquire("four"))
+                .await
+                .expect("fourth request should proceed after a completion")
+                .expect("fourth permit");
+        drop((second, third, fourth));
+    }
+
+    #[tokio::test]
+    async fn fourth_concurrent_trino_request_waits_for_the_same_user() {
+        let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
+        let user = format!("user-{}", uuid::Uuid::new_v4());
+        let first = acquire_trino_user_permit(&tenant, &user)
+            .await
+            .expect("first permit");
+        let second = acquire_trino_user_permit(&tenant, &user)
+            .await
+            .expect("second permit");
+        let third = acquire_trino_user_permit(&tenant, &user)
+            .await
+            .expect("third permit");
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                acquire_trino_user_permit(&tenant, &user),
+            )
+            .await
+            .is_err(),
+            "the fourth same-user request must wait"
+        );
+
+        drop(first);
+        let fourth = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            acquire_trino_user_permit(&tenant, &user),
+        )
+        .await
+        .expect("fourth permit should wake after one slot is released")
+        .expect("fourth permit");
+        drop((second, third, fourth));
+    }
+
+    #[tokio::test]
+    async fn trino_concurrency_is_isolated_between_users_in_one_tenant() {
+        let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
+        let first_user = format!("user-a-{}", uuid::Uuid::new_v4());
+        let second_user = format!("user-b-{}", uuid::Uuid::new_v4());
+        let mut first_user_permits = Vec::new();
+        for _ in 0..3 {
+            first_user_permits.push(
+                acquire_trino_user_permit(&tenant, &first_user)
+                    .await
+                    .expect("first user permit"),
+            );
+        }
+
+        let second_user_permit = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            acquire_trino_user_permit(&tenant, &second_user),
+        )
+        .await
+        .expect("another user in the tenant must not be blocked")
+        .expect("second user permit");
+        drop((first_user_permits, second_user_permit));
+    }
+
+    #[tokio::test]
+    async fn actual_trino_submissions_never_exceed_three_for_one_user() {
+        let (state, port, server) =
+            start_fake_trino(std::time::Duration::from_millis(150), None).await;
+        let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
+        let user = format!("user-{}", uuid::Uuid::new_v4());
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            let tenant = tenant.clone();
+            let user = user.clone();
+            tasks.push(tokio::spawn(async move {
+                execute_trino_query_bounded(
+                    fake_trino_client(port),
+                    "SELECT 'ok' AS value".to_string(),
+                    5,
+                    &tenant,
+                    &user,
+                    "test query",
+                    DatasourceRequestBudget::new(1),
+                )
+                .await
+            }));
+        }
+        for task in tasks {
+            task.await.expect("join fake Trino query").expect("query");
+        }
+
+        assert_eq!(state.submissions.load(Ordering::SeqCst), 4);
+        assert_eq!(state.max_active.load(Ordering::SeqCst), 3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn shared_request_budget_allows_later_trino_submissions_after_completion() {
+        let (state, port, server) =
+            start_fake_trino(std::time::Duration::from_millis(1), None).await;
+        let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
+        let user = format!("user-{}", uuid::Uuid::new_v4());
+        let budget = DatasourceRequestBudget::new(3);
+        for _ in 0..3 {
+            execute_trino_query_bounded(
+                fake_trino_client(port),
+                "SELECT 'ok' AS value".to_string(),
+                5,
+                &tenant,
+                &user,
+                "test query",
+                budget.clone(),
+            )
+            .await
+            .expect("bounded query");
+        }
+        execute_trino_query_bounded(
+            fake_trino_client(port),
+            "SELECT 'later' AS value".to_string(),
+            5,
+            &tenant,
+            &user,
+            "fourth query",
+            budget,
+        )
+        .await
+        .expect("fourth query should run after the first three completed");
+
+        assert_eq!(state.submissions.load(Ordering::SeqCst), 4);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn timed_out_trino_query_is_cancelled_without_recovery_submission() {
+        let (state, port, server) = start_fake_trino(
+            std::time::Duration::from_millis(1),
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .await;
+        let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
+        let user = format!("user-{}", uuid::Uuid::new_v4());
+        let error = execute_trino_query_bounded(
+            fake_trino_client(port),
+            "SELECT 'slow' AS value".to_string(),
+            1,
+            &tenant,
+            &user,
+            "timeout query",
+            DatasourceRequestBudget::new(3),
+        )
+        .await
+        .expect_err("query should time out");
+
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(state.submissions.load(Ordering::SeqCst), 1);
+        assert_eq!(state.cancellations.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicit AOS_REAL_TRINO_* environment variables and network access"]
+    async fn real_trino_single_submission_smoke() {
+        use sqlx::{sqlite::SqliteConnectOptions, Row};
+
+        let db_path = std::env::var("AOS_REAL_TRINO_DB_PATH")
+            .expect("AOS_REAL_TRINO_DB_PATH must point to an existing AOS SQLite database");
+        let data_dir = std::env::var("AOS_REAL_TRINO_DATA_DIR")
+            .expect("AOS_REAL_TRINO_DATA_DIR must point to its matching data directory");
+        let datasource_id = std::env::var("AOS_REAL_TRINO_DATASOURCE_ID")
+            .expect("AOS_REAL_TRINO_DATASOURCE_ID must identify one Trino datasource");
+
+        let options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .read_only(true);
+        let pool = sqlx::SqlitePool::connect_with(options)
+            .await
+            .expect("open AOS database read-only");
+        let row = sqlx::query(
+            "SELECT tenant_id, user_id, db_type, config FROM data_sources WHERE id = ?",
+        )
+        .bind(&datasource_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load Trino datasource");
+        let tenant_id: String = row.get("tenant_id");
+        let user_id: Option<String> = row.get("user_id");
+        let db_type: String = row.get("db_type");
+        assert!(matches!(db_type.as_str(), "trino" | "presto"));
+        let encrypted: serde_json::Value = row.get("config");
+        let config = crate::routes::data_sources::decrypt_config(
+            &encrypted,
+            std::path::Path::new(&data_dir),
+        )
+        .expect("decrypt Trino datasource config");
+
+        let host = config["host"].as_str().expect("Trino host");
+        let normalized_host = nl2sql_domain::datasource_config::normalize_host_input(host);
+        let configured_port = config["port"].as_u64().unwrap_or(8080) as u16;
+        let port = normalized_host.port.unwrap_or(configured_port);
+        let username = config["username"].as_str().expect("Trino username");
+        let catalog = config["catalog"].as_str().expect("Trino catalog");
+        let schema = config["schema"].as_str().unwrap_or("default");
+        let password = config["password"].as_str().unwrap_or_default();
+        let secure = config["ssl"]
+            .as_bool()
+            .or(normalized_host.secure)
+            .unwrap_or(port == 443);
+        let mut builder = trino_rust_client::ClientBuilder::new(username, &normalized_host.host)
+            .port(port)
+            .catalog(catalog)
+            .schema(schema)
+            .secure(secure);
+        if config["basic_auth"]
+            .as_bool()
+            .unwrap_or(!password.is_empty())
+        {
+            builder = builder.auth(trino_rust_client::auth::Auth::Basic(
+                username.to_string(),
+                Some(password.to_string()),
+            ));
+        }
+        let client = builder.max_attempt(0).build().expect("build Trino client");
+        let effective_user = user_id.as_deref().unwrap_or(&tenant_id);
+
+        let dataset = execute_trino_query_bounded(
+            client,
+            "SELECT 1 AS aos_smoke_check".to_string(),
+            10,
+            &tenant_id,
+            effective_user,
+            "explicit real Trino single-submission smoke test",
+            DatasourceRequestBudget::new(1),
+        )
+        .await
+        .expect("single Trino SELECT 1 should succeed");
+        assert_eq!(dataset.len(), 1);
+    }
 
     #[test]
     fn mysql_tidb_recursive_cte_is_rejected_before_execution() {

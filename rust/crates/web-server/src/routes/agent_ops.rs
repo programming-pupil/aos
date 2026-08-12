@@ -4182,11 +4182,13 @@ async fn retry_nl2sql_agent_query(
         &claims,
         crate::routes::nl2sql::AgentExecuteRequest {
             question,
+            retrieval_question: None,
             preferred_model: None,
             shared_context: None,
             datasource_ids: Vec::new(),
             conversation_id: Some(conversation_id.clone()),
             max_steps: None,
+            bounded: false,
         },
     )
     .await?;

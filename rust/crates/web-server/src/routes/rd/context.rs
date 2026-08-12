@@ -19,12 +19,13 @@ pub(super) use planner::{
 };
 mod repository;
 pub(super) use repository::{
-    build_repository_context_for_prompt, build_repository_runtime_context_hint,
-    rd_normalize_repo_relative_path,
+    build_repository_context_for_prompt, build_repository_exact_evidence_context,
+    build_repository_runtime_context_hint, rd_normalize_repo_relative_path,
 };
 mod semantic;
 pub(super) use semantic::{
-    rd_embed_texts_with_candidate, record_rd_embedding_usage, resolve_rd_embedding_candidates,
+    rd_embed_texts_with_candidate_background, record_rd_embedding_usage,
+    resolve_rd_embedding_candidates,
 };
 use semantic::{rd_semantic_hit_metadata_hint, rd_semantic_repository_search};
 pub(super) fn build_rd_system_prompt(
@@ -93,6 +94,76 @@ fn extract_repository_retrieval_terms(prompt: &str, limit: usize) -> Vec<String>
         }
     }
     terms.into_iter().collect()
+}
+
+fn extract_repository_literal_terms(prompt: &str, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let token_pattern = regex::Regex::new(r#"[A-Za-z0-9_$][A-Za-z0-9_.$:/@{}-]{1,159}"#)
+        .expect("repository literal token regex must compile");
+    let quoted_pattern = regex::Regex::new(r#"[`\"'“‘]([^`\"'”’]{2,160})[`\"'”’]"#)
+        .expect("repository quoted literal regex must compile");
+    let mut values = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_if_signal = |raw: &str| {
+        let value = raw
+            .trim()
+            .trim_matches(|ch: char| ",;，。；！？!?()[]<>".contains(ch));
+        let char_count = value.chars().count();
+        if char_count < 2 || char_count > 160 {
+            return;
+        }
+        let has_separator = value
+            .chars()
+            .any(|ch| matches!(ch, '.' | '/' | ':' | '_' | '-' | '$' | '{' | '}'));
+        let has_digit = value.chars().any(|ch| ch.is_ascii_digit());
+        let ascii_letters = value
+            .chars()
+            .filter(|ch| ch.is_ascii_alphabetic())
+            .collect::<String>();
+        let uppercase_identifier =
+            ascii_letters.len() >= 2 && ascii_letters.chars().all(|ch| ch.is_ascii_uppercase());
+        if !has_separator && !has_digit && !uppercase_identifier {
+            return;
+        }
+        let dedupe_key = value.to_ascii_lowercase();
+        if seen.insert(dedupe_key) {
+            values.push(value.to_string());
+        }
+    };
+
+    for captures in quoted_pattern.captures_iter(prompt) {
+        if let Some(value) = captures.get(1) {
+            push_if_signal(value.as_str());
+        }
+    }
+    for value in token_pattern.find_iter(prompt) {
+        push_if_signal(value.as_str());
+    }
+    values.sort_by(|left, right| {
+        right
+            .chars()
+            .count()
+            .cmp(&left.chars().count())
+            .then_with(|| left.cmp(right))
+    });
+    values.truncate(limit);
+    values
+}
+
+fn extract_repository_identifier_terms(snippet: &str, limit: usize) -> Vec<String> {
+    let identifier_pattern = regex::Regex::new(r"\b[A-Z][A-Z0-9_]{2,63}\b")
+        .expect("repository identifier regex must compile");
+    let mut identifiers = identifier_pattern
+        .find_iter(snippet)
+        .map(|matched| matched.as_str().to_string())
+        .filter(|value| !matches!(value.as_str(), "HTTP" | "HTTPS" | "TODO" | "FIXME"))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    identifiers.truncate(limit);
+    identifiers
 }
 
 pub(super) fn should_run_rd_repository_prescan(
@@ -228,5 +299,35 @@ fn redact_sensitive_snippet(snippet: &str) -> String {
         )
     } else {
         truncate_text(snippet, 240)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_repository_identifier_terms, extract_repository_literal_terms};
+
+    #[test]
+    fn literal_terms_preserve_bucket_paths_and_short_platform_names() {
+        let terms = extract_repository_literal_terms(
+            "检查 S3 桶 shareit.activity.ap-southeast-1，并评估替换为 OBS 的范围，参考 `config/storage.yml`。",
+            8,
+        );
+
+        assert!(terms
+            .iter()
+            .any(|term| term == "shareit.activity.ap-southeast-1"));
+        assert!(terms.iter().any(|term| term == "config/storage.yml"));
+        assert!(terms.iter().any(|term| term == "S3"));
+        assert!(terms.iter().any(|term| term == "OBS"));
+    }
+
+    #[test]
+    fn identifier_expansion_extracts_constant_references() {
+        let terms = extract_repository_identifier_terms(
+            "s3Service.download(key, path, CommonConstants.ACTIVITY_BUCKET);",
+            4,
+        );
+
+        assert_eq!(terms, vec!["ACTIVITY_BUCKET"]);
     }
 }

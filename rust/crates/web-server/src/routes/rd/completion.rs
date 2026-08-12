@@ -107,50 +107,85 @@ pub(super) async fn run_rd_completion_with_options(
             use_max_completion_tokens: None,
             extra_body: None,
         };
-        match provider.send_message(&req).await {
-            Ok(response) => {
-                let text = response
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
-                        api::OutputContentBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
-                let usage = response.usage.clone();
-                let _ = state
-                    .config_registry()
-                    .record_token_usage(agent_gateway::TokenUsageParams {
-                        tenant_id: tenant_id.to_string(),
-                        user_id: user_id.to_string(),
-                        session_id: None,
+        for attempt in 1..=2 {
+            match provider.send_message(&req).await {
+                Ok(response) => {
+                    let text = response
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            api::OutputContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    let usage = response.usage.clone();
+                    let _ = state
+                        .config_registry()
+                        .record_token_usage(agent_gateway::TokenUsageParams {
+                            tenant_id: tenant_id.to_string(),
+                            user_id: user_id.to_string(),
+                            session_id: None,
+                            model: model.clone(),
+                            input_tokens: i64::from(usage.input_tokens),
+                            output_tokens: i64::from(usage.output_tokens),
+                            cache_creation_tokens: i64::from(usage.cache_creation_input_tokens),
+                            cache_read_tokens: i64::from(usage.cache_read_input_tokens),
+                            api_key_id: Some(entry.id.clone()),
+                            provider: entry.provider.clone(),
+                            custom_input_price: None,
+                            custom_output_price: None,
+                        })
+                        .await;
+                    return Ok(RdCompletionResult {
+                        text,
                         model: model.clone(),
-                        input_tokens: i64::from(usage.input_tokens),
-                        output_tokens: i64::from(usage.output_tokens),
-                        cache_creation_tokens: i64::from(usage.cache_creation_input_tokens),
-                        cache_read_tokens: i64::from(usage.cache_read_input_tokens),
-                        api_key_id: Some(entry.id.clone()),
-                        provider: entry.provider.clone(),
-                        custom_input_price: None,
-                        custom_output_price: None,
-                    })
-                    .await;
-                return Ok(RdCompletionResult {
-                    text,
-                    model: model.clone(),
-                    provider: entry.provider,
-                    api_key_id: Some(entry.id),
-                    usage: Some(RdTokenUsageSnapshot::from_api(&usage, &model)),
-                });
+                        provider: entry.provider,
+                        api_key_id: Some(entry.id),
+                        usage: Some(RdTokenUsageSnapshot::from_api(&usage, &model)),
+                    });
+                }
+                Err(error) => {
+                    let retryable = rd_completion_error_is_retryable(&error);
+                    last_error = Some(error.to_string());
+                    if retryable && attempt < 2 {
+                        tracing::warn!(
+                            model = %model,
+                            provider = %entry.provider,
+                            attempt,
+                            error = %error,
+                            "transient RD model response failure; retrying bounded completion"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+                        continue;
+                    }
+                    break;
+                }
             }
-            Err(error) => last_error = Some(error.to_string()),
         }
     }
     Err(AppError::Internal(format!(
         "all RD model candidates failed: {}",
         last_error.unwrap_or_else(|| "unknown error".to_string())
     )))
+}
+
+fn rd_completion_error_is_retryable(error: &api::ApiError) -> bool {
+    if error.is_retryable() {
+        return true;
+    }
+    let message = error.to_string().to_ascii_lowercase();
+    [
+        "error decoding response body",
+        "body read",
+        "connection reset",
+        "connection closed",
+        "broken pipe",
+        "unexpected eof",
+        "temporarily unavailable",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 pub(super) fn extract_rd_allowed_tools(

@@ -1,0 +1,38 @@
+import { describe, expect, it } from 'vitest';
+import type { SqlKnowledgeImportTask } from '@/types';
+import { selectActiveSqlKnowledgeImportTask } from './sqlKnowledgeImportTasks';
+
+function task(
+  id: string,
+  status: SqlKnowledgeImportTask['status'],
+  processedFiles: number,
+): SqlKnowledgeImportTask {
+  return {
+    id,
+    packId: 'pack-1',
+    datasourceId: 'ds-1',
+    status,
+    totalFiles: 45,
+    processedFiles,
+    failedFiles: 0,
+    currentFilename: status === 'running' ? 'query.sql' : null,
+    errorMessage: null,
+    failureDetails: [],
+    createdAt: '2026-08-11T00:00:00Z',
+    startedAt: null,
+    completedAt: null,
+    updatedAt: '2026-08-11T00:00:00Z',
+  };
+}
+
+describe('selectActiveSqlKnowledgeImportTask', () => {
+  it('shows the running task before a newer queued task', () => {
+    const selected = selectActiveSqlKnowledgeImportTask([
+      task('new-pending', 'pending', 0),
+      task('active', 'running', 19),
+    ]);
+
+    expect(selected?.id).toBe('active');
+    expect(selected?.processedFiles).toBe(19);
+  });
+});

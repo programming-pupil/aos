@@ -39,8 +39,9 @@ pub(super) async fn rd_semantic_repository_search(
     }
 
     let mut backfill_scheduled = false;
+    let mut ranked_hit_sets = Vec::new();
     for candidate in candidates {
-        let model = candidate.model.clone();
+        let model = candidate.vector_space_id.clone();
         let tenant_id = claims.tenant_id.clone();
         let repo_id = repository_id.to_string();
         let count_store = store.clone();
@@ -113,67 +114,130 @@ pub(super) async fn rd_semantic_repository_search(
         let search_store = store.clone();
         let tenant_id = claims.tenant_id.clone();
         let repo_id = repository_id.to_string();
-        let model = candidate.model.clone();
+        let model = candidate.vector_space_id.clone();
         let hits = tokio::task::spawn_blocking(move || {
-            search_store.search_repository(&tenant_id, &repo_id, &model, &query_vector, top_k)
+            search_store.search_repository(
+                &tenant_id,
+                &repo_id,
+                &model,
+                &query_vector,
+                top_k.saturating_mul(2).max(top_k),
+            )
         })
         .await
         .ok()
         .and_then(Result::ok)
         .unwrap_or_else(Vec::new);
         if !hits.is_empty() {
-            return hits;
+            ranked_hit_sets.push(hits);
         }
     }
 
-    Vec::new()
+    fuse_rd_semantic_hits(ranked_hit_sets, top_k)
+}
+
+fn fuse_rd_semantic_hits(
+    ranked_hit_sets: Vec<Vec<RdEmbeddingSearchHit>>,
+    top_k: usize,
+) -> Vec<RdEmbeddingSearchHit> {
+    const RRF_K: f32 = 60.0;
+    let mut fused = HashMap::<String, (RdEmbeddingSearchHit, f32, usize)>::new();
+    for hits in ranked_hit_sets {
+        for (rank, hit) in hits.into_iter().enumerate() {
+            let rank_score = 1.0 / (RRF_K + rank as f32 + 1.0);
+            let semantic_tiebreaker = hit.score.clamp(0.0, 1.0) * 0.001;
+            let contribution = rank_score + semantic_tiebreaker;
+            fused
+                .entry(hit.chunk_id.clone())
+                .and_modify(|(best, score, profile_count)| {
+                    *score += contribution;
+                    *profile_count = profile_count.saturating_add(1);
+                    if hit.score > best.score {
+                        *best = hit.clone();
+                    }
+                })
+                .or_insert((hit, contribution, 1));
+        }
+    }
+    let mut hits = fused.into_values().collect::<Vec<_>>();
+    hits.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hits.truncate(top_k);
+    let max_fusion_score = hits
+        .first()
+        .map_or(1.0, |(_, score, _)| *score)
+        .max(f32::EPSILON);
+    hits.into_iter()
+        .map(|(mut hit, fusion_score, profile_count)| {
+            let rank_confidence = (fusion_score / max_fusion_score).clamp(0.0, 1.0);
+            let consensus_boost = (profile_count.saturating_sub(1) as f32 * 0.04).min(0.08);
+            hit.score =
+                (hit.score.clamp(0.0, 1.0) * 0.85 + rank_confidence * 0.15 + consensus_boost)
+                    .clamp(0.0, 1.0);
+            hit
+        })
+        .collect()
 }
 
 pub(in crate::routes::rd) async fn resolve_rd_embedding_candidates(
     state: &AppState,
     tenant_id: &str,
 ) -> Vec<RdEmbeddingApiKey> {
-    let Some(registry) = state.config_registry.as_ref() else {
-        return Vec::new();
-    };
-    let entries = match registry
-        .resolve_api_keys_by_model_type(tenant_id, Some(RD_SCENARIO), "embedding")
-        .await
+    #[cfg(not(feature = "nl2sql"))]
     {
-        Ok(entries) => entries,
-        Err(error) => {
-            tracing::warn!(
-                tenant_id = %tenant_id,
-                error = %error,
-                "failed to resolve RD embedding api_keys"
-            );
-            return Vec::new();
+        let _ = (state, tenant_id);
+        return Vec::new();
+    }
+    #[cfg(feature = "nl2sql")]
+    {
+        let profiles =
+            crate::nl2sql::resolve_embedding_profiles(&state.db, tenant_id, Some(RD_SCENARIO))
+                .await;
+        let mut configs = vec![profiles.local];
+        if let Some(api) = profiles.api {
+            configs.push(api);
         }
-    };
-    entries
-        .into_iter()
-        .filter_map(|entry| {
-            let model = entry
-                .model
-                .clone()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "text-embedding-3-small".to_string());
-            (!entry.key.trim().is_empty()).then_some(RdEmbeddingApiKey {
-                id: entry.id,
-                provider: entry.provider,
-                #[cfg(feature = "nl2sql")]
-                base_url: entry.base_url,
-                model,
-                #[cfg(feature = "nl2sql")]
-                api_key: entry.key,
+        configs
+            .into_iter()
+            .map(|config| {
+                let is_local = config.profile_kind == crate::nl2sql::EmbeddingProfileKind::Local;
+                RdEmbeddingApiKey {
+                    id: config.key_id.clone(),
+                    provider: config.provider.clone(),
+                    base_url: config.base_url.clone(),
+                    model: config.model.clone(),
+                    vector_space_id: config.profile_id(tenant_id),
+                    dimensions: config.dimensions,
+                    is_local,
+                    api_key: config.api_key,
+                }
             })
-        })
-        .collect()
+            .collect()
+    }
 }
 
-pub(in crate::routes::rd) async fn rd_embed_texts_with_candidate(
+async fn rd_embed_texts_with_candidate(
     candidate: &RdEmbeddingApiKey,
     texts: &[String],
+) -> anyhow::Result<RdEmbeddingBatchOutput> {
+    rd_embed_texts_with_candidate_priority(candidate, texts, false).await
+}
+
+pub(in crate::routes::rd) async fn rd_embed_texts_with_candidate_background(
+    candidate: &RdEmbeddingApiKey,
+    texts: &[String],
+) -> anyhow::Result<RdEmbeddingBatchOutput> {
+    rd_embed_texts_with_candidate_priority(candidate, texts, true).await
+}
+
+async fn rd_embed_texts_with_candidate_priority(
+    candidate: &RdEmbeddingApiKey,
+    texts: &[String],
+    background: bool,
 ) -> anyhow::Result<RdEmbeddingBatchOutput> {
     #[cfg(not(feature = "nl2sql"))]
     {
@@ -182,12 +246,17 @@ pub(in crate::routes::rd) async fn rd_embed_texts_with_candidate(
     }
     #[cfg(feature = "nl2sql")]
     {
-        let model = crate::nl2sql::embedding::EmbeddingModel::new(
+        let model = crate::nl2sql::embedding::EmbeddingModel::new_with_dimensions(
             &candidate.model,
             candidate.base_url.clone(),
             Some(candidate.api_key.clone()),
+            candidate.dimensions,
         );
-        let (vectors, usage) = model.embed_batch_with_usage(texts).await?;
+        let (vectors, usage) = if background {
+            model.embed_batch_with_usage_background(texts).await?
+        } else {
+            model.embed_batch_with_usage(texts).await?
+        };
         if vectors.len() != texts.len() {
             anyhow::bail!(
                 "embedding response length mismatch: got {}, expected {}",
@@ -238,7 +307,7 @@ pub(in crate::routes::rd) async fn record_rd_embedding_usage(
         cache_read_tokens,
         total_tokens,
         estimated_cost_usd: 0.0,
-        api_key_id: Some(candidate.id.clone()),
+        api_key_id: candidate.id.clone(),
         provider: format!("rd_embedding:{}", candidate.provider),
         created_at: Utc::now(),
     };
@@ -249,5 +318,41 @@ pub(in crate::routes::rd) async fn record_rd_embedding_usage(
             error = %error,
             "failed to record RD embedding token usage"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fuse_rd_semantic_hits;
+    use crate::routes::rd::embedding::{RdEmbeddingChunkType, RdEmbeddingSearchHit};
+
+    fn hit(id: &str, score: f32) -> RdEmbeddingSearchHit {
+        RdEmbeddingSearchHit {
+            chunk_id: id.to_string(),
+            chunk_type: RdEmbeddingChunkType::FileSummary,
+            file_path: Some(format!("src/{id}.rs")),
+            symbol_name: None,
+            line_number: None,
+            score,
+            text: id.to_string(),
+            metadata_json: serde_json::json!({}),
+            task_id: None,
+        }
+    }
+
+    #[test]
+    fn local_and_remote_rankings_are_fused_without_duplicate_chunks() {
+        let fused = fuse_rd_semantic_hits(
+            vec![
+                vec![hit("shared", 0.72), hit("local-only", 0.91)],
+                vec![hit("shared", 0.88), hit("remote-only", 0.80)],
+            ],
+            3,
+        );
+
+        assert_eq!(fused.len(), 3);
+        assert_eq!(fused[0].chunk_id, "shared");
+        assert_eq!(fused[0].text, "shared");
+        assert!(fused[0].score > 0.85);
     }
 }

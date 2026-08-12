@@ -464,7 +464,7 @@ async fn update_legacy_chat_memory(
     let affected = sqlx::query::<sqlx::Sqlite>(
         r#"
         UPDATE chat_memories
-        SET memory_type = ?, content = ?, pinned = ?, enabled = ?, metadata_json = CAST(? AS JSON)
+        SET memory_type = ?, content = ?, pinned = ?, enabled = ?, metadata_json = json(?)
         WHERE tenant_id = ? AND user_id = ? AND id = ?
         "#,
     )
@@ -1142,7 +1142,7 @@ async fn index_chat_file(
             r#"
             INSERT INTO chat_file_workspace_chunks
               (id, tenant_id, user_id, file_id, chunk_index, line_start, line_end, content, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, json(?))
             "#,
         )
         .bind(&chunk_id)
@@ -1814,7 +1814,7 @@ pub async fn persist_chat_artifact(
     let _ = sqlx::query::<sqlx::Sqlite>(
         r#"
         INSERT INTO chat_turn_artifacts (id, tenant_id, user_id, session_id, artifact_type, payload_json)
-        VALUES (?, ?, ?, ?, ?, CAST(? AS JSON))
+        VALUES (?, ?, ?, ?, ?, json(?))
         "#,
     )
     .bind(uuid::Uuid::new_v4().to_string())

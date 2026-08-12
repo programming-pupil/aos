@@ -49,11 +49,10 @@ pub const MIN_CONFIDENCE: f32 = 0.30;
 /// Built-in multilingual model used when a tenant has not configured a remote
 /// embedding API. The quantized ONNX model keeps the open-source package small
 /// enough for local deployment while retaining Chinese and English retrieval.
-pub const LOCAL_EMBEDDING_MODEL: &str = "local/paraphrase-multilingual-minilm-l12-v2-q";
-pub const LOCAL_EMBEDDING_DIMENSIONS: usize = 384;
-pub const LOCAL_EMBEDDING_MODEL_VERSION: &str = "faf4aa4225822f3bc6376869cb1164e8e3feedd0";
-pub const LOCAL_EMBEDDING_VECTOR_SIGNATURE: &str =
-    "sha256:634d0f66c29dc934c8fa72b8a4fe91dd4d420a22f1d82a241058d4316e659a99";
+pub const LOCAL_EMBEDDING_MODEL: &str = runtime::local_embedding::MODEL;
+pub const LOCAL_EMBEDDING_DIMENSIONS: usize = runtime::local_embedding::DIMENSIONS;
+pub const LOCAL_EMBEDDING_MODEL_VERSION: &str = runtime::local_embedding::MODEL_VERSION;
+pub const LOCAL_EMBEDDING_VECTOR_SIGNATURE: &str = runtime::local_embedding::VECTOR_SIGNATURE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -374,12 +373,10 @@ pub fn prioritize_chat_candidates(
 
 /// Resolves the per-tenant embedding model configuration.
 ///
-/// Resolution order:
-/// 1. Query `api_keys` for rows where `model_type = 'embedding'` and `enabled = 1`
-///    and `scenarios` matches (NULL = all scenarios, or JSON_CONTAINS).
-/// 2. Development-only environment fallback requires the explicit
-///    `AOS_ALLOW_TENANT_EMBEDDING_ENV_FALLBACK=1` opt-in.
-/// 3. If no remote key is usable, return the built-in local embedding model.
+/// Remote embedding configuration is resolved separately and participates in
+/// dual-profile retrieval only after an operator explicitly configures an
+/// embedding API key. Single-profile callers always receive the bundled local
+/// model so remote configuration cannot silently replace the offline baseline.
 async fn resolve_remote_embedding_config(
     db: &SqlitePool,
     tenant_id: &str,
@@ -496,9 +493,8 @@ pub async fn resolve_embedding_config(
     tenant_id: &str,
     scenario: Option<&str>,
 ) -> Option<EmbeddingTenantConfig> {
-    resolve_remote_embedding_config(db, tenant_id, scenario)
-        .await
-        .or_else(|| Some(local_embedding_config()))
+    let _ = (db, tenant_id, scenario);
+    Some(local_embedding_config())
 }
 
 pub async fn resolve_embedding_profiles(

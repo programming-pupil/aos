@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   Alert,
   Button,
@@ -15,7 +15,7 @@ import {
   message,
   Popconfirm,
 } from 'antd';
-import { CheckCircleOutlined, CopyOutlined, DeleteOutlined, DownloadOutlined, FileTextOutlined, PlayCircleOutlined, PlusOutlined, SyncOutlined } from '@ant-design/icons';
+import { CheckCircleOutlined, CopyOutlined, DeleteOutlined, DownloadOutlined, EditOutlined, FileTextOutlined, PlayCircleOutlined, PlusOutlined, SyncOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
@@ -61,6 +61,7 @@ export default function RdSpecs() {
   const queryClient = useQueryClient();
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [selectedSpecId, setSelectedSpecId] = useState<string | undefined>();
+  const [revisionFeedback, setRevisionFeedback] = useState('');
   const [form] = Form.useForm();
 
   const specsQuery = useQuery({
@@ -115,9 +116,8 @@ export default function RdSpecs() {
   });
 
   const stageMutation = useMutation({
-    mutationFn: async ({ id, action }: { id: string; action: 'approveSpec' | 'generateDesign' | 'approveDesign' | 'generateTasks' | 'approveTasks' }) => {
+    mutationFn: async ({ id, action }: { id: string; action: 'generateDesign' | 'approveDesign' | 'generateTasks' | 'approveTasks' }) => {
       switch (action) {
-        case 'approveSpec': return rdApi.approveSpec(id);
         case 'generateDesign': return rdApi.generateDesign(id);
         case 'approveDesign': return rdApi.approveDesign(id);
         case 'generateTasks': return rdApi.generateTasks(id);
@@ -132,10 +132,22 @@ export default function RdSpecs() {
     onError: (error: Error) => message.error(error.message || t('rd.planStageActionFailed', '阶段操作失败')),
   });
 
+  const revisionMutation = useMutation({
+    mutationFn: ({ id, stage, feedback }: { id: string; stage: 'spec' | 'design' | 'tasks'; feedback: string }) =>
+      rdApi.reviseSpecStage(id, { stage, feedback }),
+    onSuccess: async (spec) => {
+      setRevisionFeedback('');
+      message.success(t('rd.planRevisionQueued', '修改意见已提交，AI 正在后台修订当前文档'));
+      await queryClient.invalidateQueries({ queryKey: queryKeys.rd.specs() });
+      setSelectedSpecId(spec.id);
+    },
+    onError: (error: Error) => message.error(error.message || t('rd.planRevisionFailed', '提交修改意见失败')),
+  });
+
   const nextStageAction = (spec: RdSpec) => {
     if (['queued', 'running'].includes(spec.status)) return null;
     if (spec.requirementsMd?.trim() && !spec.approvedRequirementsAt) {
-      return { action: 'approveSpec' as const, label: t('rd.approveSpec', '确认核心设计') };
+      return { action: 'generateDesign' as const, label: t('rd.generateDesign', '生成代码研发方案') };
     }
     if (spec.approvedRequirementsAt && !spec.designMd?.trim()) {
       return { action: 'generateDesign' as const, label: t('rd.generateDesign', '生成代码研发方案') };
@@ -151,6 +163,17 @@ export default function RdSpecs() {
     }
     return null;
   };
+
+  const revisionStage = (spec: RdSpec): 'spec' | 'design' | 'tasks' | null => {
+    if (spec.tasksMd?.trim()) return 'tasks';
+    if (spec.designMd?.trim()) return 'design';
+    if (spec.requirementsMd?.trim()) return 'spec';
+    return null;
+  };
+
+  useEffect(() => {
+    setRevisionFeedback('');
+  }, [selectedSpecId]);
 
   const downloadSpecPackage = (spec: RdSpec) => {
     const sections = [
@@ -345,8 +368,8 @@ export default function RdSpecs() {
               <Alert
                 type="info"
                 showIcon
-                message={t('rd.planAwaitingConfirmation', '当前阶段已完成，请确认后进入下一步')}
-                description={t('rd.planAwaitingConfirmationDesc', '先审查当前文档；确认后 AOS 才会生成下一阶段，避免错误方案继续扩散。')}
+                message={t('rd.planAwaitingNextStage', '当前阶段已完成，可继续生成下一阶段')}
+                description={t('rd.planAwaitingNextStageDesc', '请先审查当前文档；如有偏差，可在下方填写修改意见让 AI 修订，确认内容合适后再生成下一阶段。')}
                 action={(() => {
                   const next = nextStageAction(selectedSpec)!;
                   return (
@@ -361,6 +384,35 @@ export default function RdSpecs() {
                   );
                 })()}
               />
+            ) : null}
+            {revisionStage(selectedSpec) && !['queued', 'running'].includes(selectedSpec.status) ? (
+              <Card size="small" title={t('rd.planRevisionTitle', '让 AI 修改当前文档')}>
+                <Space direction="vertical" size={10} style={{ width: '100%' }}>
+                  <Text type="secondary">
+                    {t('rd.planRevisionDesc', '说明哪些内容不符合需求、需要补充哪些约束或代码证据。修订会保留历史版本，并使依赖当前文档的后续阶段重新生成。')}
+                  </Text>
+                  <Input.TextArea
+                    value={revisionFeedback}
+                    onChange={(event) => setRevisionFeedback(event.target.value)}
+                    autoSize={{ minRows: 3, maxRows: 8 }}
+                    maxLength={4000}
+                    showCount
+                    placeholder={t('rd.planRevisionPlaceholder', '例如：补充灰度发布和回滚方案；说明三个微服务的调用顺序，并引用真实文件路径。')}
+                  />
+                  <Button
+                    icon={<EditOutlined />}
+                    loading={revisionMutation.isPending}
+                    disabled={!revisionFeedback.trim()}
+                    onClick={() => revisionMutation.mutate({
+                      id: selectedSpec.id,
+                      stage: revisionStage(selectedSpec)!,
+                      feedback: revisionFeedback.trim(),
+                    })}
+                  >
+                    {t('rd.planReviseAction', '按修改意见重新生成当前文档')}
+                  </Button>
+                </Space>
+              </Card>
             ) : null}
             <SpecSection title={t('rd.requirementsDoc', '需求文档')} children={selectedSpec.requirementsMd} emptyText={t('common.noData')} />
             <SpecSection title={t('rd.designDoc', '技术设计')} children={selectedSpec.designMd} emptyText={t('common.noData')} />

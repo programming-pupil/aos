@@ -181,11 +181,13 @@ async fn run_refresh_cycle(state: &AppState) {
         };
 
         for ds in sources {
-            let (ds_tenant_id, ds_id, _user_id, db_type, config_json) = ds;
+            let (ds_tenant_id, ds_id, user_id, db_type, config_json) = ds;
+            let effective_user_id = user_id.as_deref().unwrap_or(&ds_tenant_id);
             let result = refresh_single(
                 &state.db,
                 &state.data_dir,
                 &ds_tenant_id,
+                effective_user_id,
                 &ds_id,
                 &db_type,
                 &config_json,
@@ -234,6 +236,7 @@ async fn refresh_single(
     db: &SqlitePool,
     data_dir: &std::path::Path,
     tenant_id: &str,
+    user_id: &str,
     ds_id: &str,
     db_type: &str,
     config_json: &Value,
@@ -260,6 +263,15 @@ async fn refresh_single(
     let config_val =
         decrypt_config(config_json, data_dir).map_err(|e| format!("decrypt config failed: {e}"))?;
 
+    let _trino_permit = if matches!(db_type, "presto" | "trino") {
+        Some(
+            crate::routes::nl2sql::agent_executor::acquire_trino_user_permit(tenant_id, user_id)
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
     let live_schema = fetch_current_schema(db_type, &config_val).await?;
 
     // Compare with stored schema_info.

@@ -48,6 +48,7 @@ import type {
   Nl2sqlReferenceUsage,
   SqlKnowledgeImportTask,
 } from '@/types';
+import { selectActiveSqlKnowledgeImportTask } from './sqlKnowledgeImportTasks';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
 import { useDismissibleNotice } from '@/hooks/useDismissibleNotice';
 import { useAuthStore } from '@/store/auth';
@@ -277,9 +278,9 @@ export default function SqlKnowledgeBase() {
       task.status === 'pending' || task.status === 'running'
     ) ? 2000 : 15_000,
   });
-  const activeImportTask = (importTasksQuery.data ?? []).find((task) =>
-    task.status === 'pending' || task.status === 'running'
-  );
+  const activeImportTask = useMemo(() => {
+    return selectActiveSqlKnowledgeImportTask(importTasksQuery.data ?? []);
+  }, [importTasksQuery.data]);
 
   useEffect(() => {
     const latest = importTasksQuery.data?.[0];

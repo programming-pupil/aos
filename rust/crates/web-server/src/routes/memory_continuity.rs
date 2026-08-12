@@ -617,7 +617,7 @@ pub async fn persist_exact_context_archive_entries(
             INSERT INTO agent_context_archives
               (id, tenant_id, user_id, session_id, window_id, source, role, ordinal,
                content, content_hash, content_kind, char_count, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, json(?))
             ON CONFLICT DO UPDATE SET
               metadata_json = COALESCE(excluded.metadata_json, metadata_json)
             "#,
@@ -736,7 +736,7 @@ pub async fn replace_exact_context_archive_entry(
             INSERT INTO agent_context_archives
               (id, tenant_id, user_id, session_id, window_id, source, role, ordinal,
                content, content_hash, content_kind, char_count, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, CAST(? AS JSON))
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, json(?))
             "#,
         )
         .bind(uuid::Uuid::new_v4().to_string())
@@ -902,7 +902,7 @@ pub async fn mark_thread_memory_polluted(
         INSERT INTO agent_thread_memory_state
           (tenant_id, user_id, session_id, use_memories, generate_memories, pollution_state,
            pollution_reason, last_external_context_at, metadata_json)
-        VALUES (?, ?, ?, 1, 1, 'polluted', ?, CURRENT_TIMESTAMP, CAST(? AS JSON))
+        VALUES (?, ?, ?, 1, 1, 'polluted', ?, CURRENT_TIMESTAMP, json(?))
         ON CONFLICT DO UPDATE SET
           pollution_state = 'polluted',
           pollution_reason = excluded.pollution_reason,
@@ -1045,7 +1045,7 @@ pub async fn record_memory_citations(
             INSERT INTO agent_memory_citations
               (id, tenant_id, user_id, session_id, turn_id, memory_id, path, line_start, line_end,
                note, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'memory context injected', CAST(? AS JSON))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'memory context injected', json(?))
             "#,
         )
         .bind(uuid::Uuid::new_v4().to_string())
@@ -1676,7 +1676,7 @@ pub(crate) async fn update_memory_item_internal(
         UPDATE agent_memory_items
         SET scope = ?, app = ?, session_id = ?, session_key = ?, memory_type = ?, content = ?, content_hash = ?,
             source_type = ?, confidence = ?, pinned = ?, enabled = ?, stale_at = ?,
-            verified_at = ?, metadata_json = CAST(? AS JSON),
+            verified_at = ?, metadata_json = json(?),
             embedding_model = ?, embedding_dimensions = ?, embedding_json = ?
         WHERE tenant_id = ? AND user_id = ? AND id = ?
         "#,
@@ -1871,7 +1871,7 @@ async fn consolidate_memory(
         r#"
         INSERT INTO agent_memory_summaries
           (id, tenant_id, user_id, scope, app, session_id, session_key, summary, source_type, turn_count, metadata_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'session_summary', ?, CAST(? AS JSON))
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'session_summary', ?, json(?))
         ON CONFLICT DO UPDATE SET
           summary = excluded.summary,
           source_type = excluded.source_type,
@@ -1962,7 +1962,7 @@ pub(crate) async fn create_memory_item_internal(
                 END,
                 stale_at = COALESCE(?, stale_at),
                 verified_at = COALESCE(?, verified_at),
-                metadata_json = COALESCE(CAST(? AS JSON), metadata_json)
+                metadata_json = COALESCE(json(?), metadata_json)
             WHERE tenant_id = ? AND user_id = ? AND id = ?
             "#,
         )
@@ -1991,7 +1991,7 @@ pub(crate) async fn create_memory_item_internal(
           (id, tenant_id, user_id, scope, app, session_id, session_key, memory_type, content, content_hash,
            source_type, confidence, pinned, enabled, stale_at, verified_at, metadata_json,
            embedding_model, embedding_dimensions, embedding_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON), ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, json(?), ?, ?, ?)
         ON CONFLICT DO UPDATE SET
           updated_at = CURRENT_TIMESTAMP,
           confidence = MAX(confidence, excluded.confidence),

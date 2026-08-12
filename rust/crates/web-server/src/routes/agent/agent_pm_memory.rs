@@ -897,7 +897,7 @@ async fn update_legacy_pm_memory(
         .map_err(|error| AppError::ValidationError(format!("invalid memory metadata: {error}")))?;
     let affected = sqlx::query(
         "UPDATE pm_session_memories
-         SET memory_type = ?, content = ?, pinned = ?, enabled = ?, metadata_json = CAST(? AS JSON)
+         SET memory_type = ?, content = ?, pinned = ?, enabled = ?, metadata_json = json(?)
          WHERE tenant_id = ? AND user_id = ? AND session_id = ? AND id = ?",
     )
     .bind(memory_type)
@@ -1321,7 +1321,7 @@ pub(super) async fn persist_pm_session_summary_after_turn(
         "INSERT INTO pm_session_summaries
           (tenant_id, user_id, session_id, summary, turn_count, source_task_id,
            last_compacted_removed_messages, metadata_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON))
+         VALUES (?, ?, ?, ?, ?, ?, ?, json(?))
          ON CONFLICT DO UPDATE SET
            summary = excluded.summary,
            turn_count = excluded.turn_count,

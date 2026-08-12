@@ -717,7 +717,12 @@ async fn create(
         }
     }
 
-    let probe = probe_connection(&req.db_type, &req.config).await?;
+    let probe = probe_connection(
+        &req.db_type,
+        &req.config,
+        Some((&claims.tenant_id, &claims.sub)),
+    )
+    .await?;
     if !probe.success {
         return Err(AppError::ValidationError(format!(
             "data source connection failed: {}",
@@ -1002,7 +1007,12 @@ async fn update(
                     }
                 }
             }
-            let probe = probe_connection(&db_type, &serde_json::json!(merged.clone())).await?;
+            let probe = probe_connection(
+                &db_type,
+                &serde_json::json!(merged.clone()),
+                Some((&claims.tenant_id, &claims.sub)),
+            )
+            .await?;
             if !probe.success {
                 return Err(AppError::ValidationError(format!(
                     "data source connection failed: {}",
@@ -1413,7 +1423,8 @@ async fn test_connection(
     }
 
     let config = decrypt_config(&config_json, &state.data_dir)?;
-    let response = probe_connection(&db_type, &config).await?;
+    let response =
+        probe_connection(&db_type, &config, Some((&claims.tenant_id, &claims.sub))).await?;
     if response.success {
         sqlx::query(
             "UPDATE data_sources SET last_tested_at = CURRENT_TIMESTAMP, last_error = NULL WHERE id = ?",
@@ -1450,11 +1461,18 @@ fn probe_result(start: std::time::Instant, error: Option<String>) -> TestConnect
 async fn probe_connection(
     db_type: &str,
     config_json: &serde_json::Value,
+    trino_owner: Option<(&str, &str)>,
 ) -> Result<TestConnectionResponse> {
+    if matches!(db_type, "presto" | "trino") && trino_owner.is_some() {
+        // The Trino branch owns query-id-aware timeout and cancellation. An
+        // outer timeout could discard that future while cancellation is still
+        // in progress and release the user's concurrency slot too early.
+        return probe_connection_inner(db_type, config_json, trino_owner).await;
+    }
     let started_at = std::time::Instant::now();
     match tokio::time::timeout(
         std::time::Duration::from_secs(12),
-        probe_connection_inner(db_type, config_json),
+        probe_connection_inner(db_type, config_json, trino_owner),
     )
     .await
     {
@@ -1469,6 +1487,7 @@ async fn probe_connection(
 async fn probe_connection_inner(
     db_type: &str,
     config_json: &serde_json::Value,
+    trino_owner: Option<(&str, &str)>,
 ) -> Result<TestConnectionResponse> {
     let start = std::time::Instant::now();
     match db_type {
@@ -1554,18 +1573,36 @@ async fn probe_connection_inner(
                 ));
             }
             let cli = builder
+                .max_attempt(0)
                 .build()
                 .map_err(|e| AppError::ValidationError(format!("invalid trino connection configuration: {e}")))?;
 
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                cli.get_all::<trino_rust_client::Row>("SELECT 1".to_string()),
-            )
-            .await
-            {
-                Ok(Ok(_)) => Ok(probe_result(start, None)),
-                Ok(Err(error)) => Ok(probe_result(start, Some(error.to_string()))),
-                Err(_) => Ok(probe_result(start, Some("connection timed out after 10 seconds".into()))),
+            if let Some((tenant_id, user_id)) = trino_owner {
+                match crate::routes::nl2sql::agent_executor::execute_trino_query_bounded(
+                    cli,
+                    "SELECT 1".to_string(),
+                    10,
+                    tenant_id,
+                    user_id,
+                    "Trino connection probe",
+                    crate::routes::nl2sql::agent_executor::DatasourceRequestBudget::new(1),
+                )
+                .await
+                {
+                    Ok(_) => Ok(probe_result(start, None)),
+                    Err(error) => Ok(probe_result(start, Some(error.to_string()))),
+                }
+            } else {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    cli.get_all::<trino_rust_client::Row>("SELECT 1".to_string()),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => Ok(probe_result(start, None)),
+                    Ok(Err(error)) => Ok(probe_result(start, Some(error.to_string()))),
+                    Err(_) => Ok(probe_result(start, Some("connection timed out after 10 seconds".into()))),
+                }
             }
         }
         "mongodb" => {
@@ -1606,7 +1643,7 @@ async fn probe_connection_inner(
 }
 
 async fn discover_trino_schemas_for_config(
-    Extension(_claims): Extension<Claims>,
+    Extension(claims): Extension<Claims>,
     Json(req): Json<DiscoverTrinoSchemasRequest>,
 ) -> Result<Json<DiscoverTrinoSchemasResponse>> {
     let normalized_host = normalize_host_input(&req.host);
@@ -1626,6 +1663,12 @@ async fn discover_trino_schemas_for_config(
     let port = normalized_host.port.or(req.port).unwrap_or(443);
     let secure = req.ssl.or(normalized_host.secure).unwrap_or(port == 443);
     let basic_auth = req.basic_auth.unwrap_or(true);
+    let _trino_permit = crate::routes::nl2sql::agent_executor::acquire_trino_user_permit(
+        &claims.tenant_id,
+        &claims.sub,
+    )
+    .await
+    .map_err(|error| AppError::Internal(error.to_string()))?;
     let result = crate::nl2sql::schema_discovery::discover_trino_schemas(
         &host,
         port,
@@ -1841,6 +1884,12 @@ async fn discover_schema(
             let cfg: TrinoConfig = serde_json::from_value(decrypted)
                 .map_err(|_| AppError::ValidationError("invalid trino/presto config".into()))?;
             let schemas = cfg.effective_schemas();
+            let _trino_permit = crate::routes::nl2sql::agent_executor::acquire_trino_user_permit(
+                &claims.tenant_id,
+                &claims.sub,
+            )
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
             crate::nl2sql::schema_discovery::discover_trino_multi(
                 &cfg.host,
                 cfg.port,
@@ -2078,6 +2127,18 @@ async fn discover_table_schema(
 
     let decrypted = decrypt_config(&config_json, &state.data_dir)?;
 
+    let _trino_permit = if matches!(db_type.as_str(), "presto" | "trino") {
+        Some(
+            crate::routes::nl2sql::agent_executor::acquire_trino_user_permit(
+                &claims.tenant_id,
+                &claims.sub,
+            )
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?,
+        )
+    } else {
+        None
+    };
     let live_table = crate::nl2sql::schema_discovery::SchemaDiscovery::new()
         .discover_table(&db_type, &decrypted, &table_name)
         .await
@@ -4860,6 +4921,7 @@ mod tests {
                 "username": "",
                 "password": ""
             }),
+            None,
         )
         .await
         .expect("probe should return a failed result");

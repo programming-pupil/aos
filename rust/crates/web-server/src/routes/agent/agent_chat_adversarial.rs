@@ -1967,7 +1967,7 @@ async fn persist_adversarial_thread_summary_after_run(
         INSERT INTO agent_memory_summaries
           (id, tenant_id, user_id, scope, app, session_id, session_key, summary,
            source_type, turn_count, metadata_json)
-        VALUES (?, ?, ?, 'session', 'shared', ?, ?, ?, 'compaction', ?, CAST(? AS JSON))
+        VALUES (?, ?, ?, 'session', 'shared', ?, ?, ?, 'compaction', ?, json(?))
         ON CONFLICT DO UPDATE SET
           summary = excluded.summary,
           source_type = excluded.source_type,

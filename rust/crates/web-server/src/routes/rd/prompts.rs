@@ -45,6 +45,24 @@ pub(super) fn plan_generate_tasks_prompt(
     )
 }
 
+pub(super) fn plan_revise_stage_prompt(
+    stage: &str,
+    output_schema: &str,
+    requirement: &str,
+    current_document: &str,
+    feedback: &str,
+    repo_context: &str,
+) -> String {
+    format!(
+        "You are the AOS Code Studio Spec Mode revision agent.\n\n\
+Revise the current {stage} document according to the user's feedback. Preserve correct content, \
+resolve every actionable feedback item, and keep the result grounded in real repository evidence. \
+Do not implement code. Return JSON only using this schema:\n{output_schema}\n\n\
+Original requirement:\n{requirement}\n\nCurrent document:\n{current_document}\n\n\
+User feedback:\n{feedback}\n\nRepository context:\n{repo_context}"
+    )
+}
+
 pub(super) fn plan_implement_task_prompt(
     title: &str,
     requirements_md: &str,
@@ -98,6 +116,17 @@ mod tests {
         let tasks = plan_generate_tasks_prompt("需求", "规格", "设计", "验收", "上下文");
         assert!(tasks.contains("\"tasksMd\""));
         assert!(tasks.contains("\"taskItems\""));
+
+        let revision = plan_revise_stage_prompt(
+            "design",
+            r#"{"designMd": string}"#,
+            "需求",
+            "当前设计",
+            "补充回滚方案",
+            "仓库上下文",
+        );
+        assert!(revision.contains("补充回滚方案"));
+        assert!(revision.contains("\"designMd\""));
 
         let report = plan_final_report_prompt("标题", "规格", "设计", "任务", "{}");
         assert!(report.contains("\"finalReportMd\""));

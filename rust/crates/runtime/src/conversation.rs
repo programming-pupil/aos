@@ -2340,6 +2340,7 @@ mod tests {
     use crate::usage::TokenUsage;
     use crate::ToolError;
     use serde_json::Value;
+    use std::collections::BTreeSet;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};

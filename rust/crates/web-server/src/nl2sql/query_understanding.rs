@@ -783,6 +783,21 @@ mod tests {
     }
 
     #[test]
+    fn strong_trend_wording_overrides_a_shallow_select_classification() {
+        assert_eq!(
+            extract_intent_from_text(
+                r#"{"intent":"select"}"#,
+                "有没有哪些 app 的 ROI 持续下降？或者骤降？"
+            ),
+            Intent::Trend
+        );
+        assert_eq!(
+            extract_intent_from_text(r#"{"intent":"detail"}"#, "哪些指标连续上升或暴跌"),
+            Intent::Trend
+        );
+    }
+
+    #[test]
     fn attach_time_entity_should_write_back_to_entities() {
         let entities = QueryEntities::default();
         let resolved = Some(TimeEntity {

@@ -15,14 +15,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) const CACHE_MAX_ENTRIES: usize = 50_000;
-
-static LOCAL_EMBEDDING_CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
-static LOCAL_EMBEDDING_MODEL_INSTANCE: OnceLock<Mutex<Option<fastembed::TextEmbedding>>> =
-    OnceLock::new();
 
 /// Registry of physically isolated per-tenant, per-profile vector stores.
 ///
@@ -177,130 +173,27 @@ impl EmbeddingStoreRegistry {
 pub fn configure_local_embedding_cache_for_data_dir(
     data_dir: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let cache_dir = std::env::var_os("AOS_LOCAL_EMBEDDING_CACHE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| data_dir.join("models").join("fastembed"));
-    configure_local_embedding_cache_dir(cache_dir)
+    runtime::local_embedding::configure_cache_for_data_dir(data_dir)
 }
 
 pub fn configure_local_embedding_cache_dir(cache_dir: PathBuf) -> anyhow::Result<()> {
-    std::fs::create_dir_all(&cache_dir)?;
-    if let Some(existing) = LOCAL_EMBEDDING_CACHE_DIR.get() {
-        if existing != &cache_dir {
-            anyhow::bail!(
-                "local embedding cache already configured at {}; cannot change it to {}",
-                existing.display(),
-                cache_dir.display()
-            );
-        }
-        return Ok(());
-    }
-    LOCAL_EMBEDDING_CACHE_DIR.set(cache_dir).map_err(|path| {
-        anyhow::anyhow!(
-            "failed to configure local embedding cache at {}",
-            path.display()
-        )
-    })
-}
-
-fn build_local_embedding_model() -> anyhow::Result<fastembed::TextEmbedding> {
-    let cache_dir = LOCAL_EMBEDDING_CACHE_DIR
-        .get()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("local embedding cache directory is not configured"))?;
-    let snapshot_dir = cache_dir
-        .join("models--Qdrant--paraphrase-multilingual-MiniLM-L12-v2-onnx-Q")
-        .join("snapshots")
-        .join(super::LOCAL_EMBEDDING_MODEL_VERSION);
-    let model_path = snapshot_dir.join("model_optimized.onnx");
-    let required_files = [
-        model_path.clone(),
-        snapshot_dir.join("tokenizer.json"),
-        snapshot_dir.join("config.json"),
-        snapshot_dir.join("special_tokens_map.json"),
-        snapshot_dir.join("tokenizer_config.json"),
-    ];
-    if required_files.iter().all(|path| path.is_file()) {
-        let model_bytes = std::fs::read(&model_path)?;
-        let actual_signature = format!("sha256:{}", hex::encode(Sha256::digest(&model_bytes)));
-        if actual_signature != super::LOCAL_EMBEDDING_VECTOR_SIGNATURE {
-            anyhow::bail!(
-                "bundled local embedding model checksum mismatch at {}; expected {}, got {}",
-                model_path.display(),
-                super::LOCAL_EMBEDDING_VECTOR_SIGNATURE,
-                actual_signature
-            );
-        }
-        let tokenizer_files = fastembed::TokenizerFiles {
-            tokenizer_file: std::fs::read(&required_files[1])?,
-            config_file: std::fs::read(&required_files[2])?,
-            special_tokens_map_file: std::fs::read(&required_files[3])?,
-            tokenizer_config_file: std::fs::read(&required_files[4])?,
-        };
-        let model = fastembed::UserDefinedEmbeddingModel::new(model_bytes, tokenizer_files)
-            .with_pooling(fastembed::Pooling::Mean)
-            .with_quantization(fastembed::QuantizationMode::Static);
-        return fastembed::TextEmbedding::try_new_from_user_defined(
-            model,
-            fastembed::InitOptionsUserDefined::new(),
-        )
-        .map_err(|error| anyhow::anyhow!("failed to load bundled local embedding model: {error}"));
-    }
-    let missing = required_files
-        .iter()
-        .filter(|path| !path.is_file())
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    anyhow::bail!(
-        "bundled local embedding model is incomplete; missing: {missing}. AOS never downloads model files from the server process"
-    )
-}
-
-fn with_local_embedding_model<T>(
-    operation: impl FnOnce(&mut fastembed::TextEmbedding) -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    let model_slot = LOCAL_EMBEDDING_MODEL_INSTANCE.get_or_init(|| Mutex::new(None));
-    let mut model = model_slot.lock();
-    if model.is_none() {
-        *model = Some(build_local_embedding_model()?);
-    }
-    operation(
-        model
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("built-in embedding model was not initialized"))?,
-    )
+    runtime::local_embedding::configure_cache_dir(cache_dir)
 }
 
 pub fn warm_local_embedding_model() -> anyhow::Result<()> {
-    let vectors = with_local_embedding_model(|model| {
-        model
-            .embed(vec!["AOS local embedding readiness check"], None)
-            .map_err(|error| anyhow::anyhow!("built-in embedding readiness check failed: {error}"))
-    })?;
-    let dimensions = vectors.first().map_or(0, Vec::len);
-    if dimensions != super::LOCAL_EMBEDDING_DIMENSIONS {
-        anyhow::bail!(
-            "built-in embedding model returned {dimensions} dimensions; expected {}",
-            super::LOCAL_EMBEDDING_DIMENSIONS
-        );
-    }
-    Ok(())
+    runtime::local_embedding::warm()
 }
 
 pub fn shutdown_local_embedding_model() {
-    if let Some(model_slot) = LOCAL_EMBEDDING_MODEL_INSTANCE.get() {
-        let model = model_slot.lock().take();
-        drop(model);
-    }
+    runtime::local_embedding::shutdown();
 }
 
 fn embed_with_local_model(texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
-    with_local_embedding_model(|model| {
-        model
-            .embed(texts, None)
-            .map_err(|error| anyhow::anyhow!("built-in embedding inference failed: {error}"))
-    })
+    runtime::local_embedding::embed(texts)
+}
+
+fn embed_with_local_model_background(texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+    runtime::local_embedding::embed_background(texts)
 }
 
 #[derive(Clone)]
@@ -1967,6 +1860,21 @@ impl EmbeddingModel {
         &self,
         texts: &[String],
     ) -> anyhow::Result<(Vec<Vec<f32>>, Option<api::Usage>)> {
+        self.embed_batch_with_usage_priority(texts, false).await
+    }
+
+    pub async fn embed_batch_with_usage_background(
+        &self,
+        texts: &[String],
+    ) -> anyhow::Result<(Vec<Vec<f32>>, Option<api::Usage>)> {
+        self.embed_batch_with_usage_priority(texts, true).await
+    }
+
+    async fn embed_batch_with_usage_priority(
+        &self,
+        texts: &[String],
+        background: bool,
+    ) -> anyhow::Result<(Vec<Vec<f32>>, Option<api::Usage>)> {
         if texts.is_empty() {
             return Ok((Vec::new(), None));
         }
@@ -1987,9 +1895,15 @@ impl EmbeddingModel {
             });
         if self.model == super::LOCAL_EMBEDDING_MODEL || remote_api_key.is_none() {
             let owned_texts = texts.to_vec();
-            let vectors = tokio::task::spawn_blocking(move || embed_with_local_model(owned_texts))
-                .await
-                .map_err(|error| anyhow::anyhow!("local embedding worker failed: {error}"))??;
+            let vectors = tokio::task::spawn_blocking(move || {
+                if background {
+                    embed_with_local_model_background(owned_texts)
+                } else {
+                    embed_with_local_model(owned_texts)
+                }
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("local embedding worker failed: {error}"))??;
             validate_embedding_output(&vectors, texts.len(), self.dimensions, "local")?;
             return Ok((vectors, None));
         }

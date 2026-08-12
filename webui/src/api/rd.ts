@@ -304,6 +304,9 @@ export const rdApi = {
   generateDesign: (id: string) =>
     client.post<RdSpec>(`/rd/specs/${encodeURIComponent(id)}/generate-design`, {}).then((r) => r.data),
 
+  reviseSpecStage: (id: string, data: { stage: 'spec' | 'design' | 'tasks'; feedback: string }) =>
+    client.post<RdSpec>(`/rd/specs/${encodeURIComponent(id)}/revise`, data).then((r) => r.data),
+
   approveDesign: (id: string) =>
     client.post<RdSpec>(`/rd/specs/${encodeURIComponent(id)}/approve-design`, {}).then((r) => r.data),
 

@@ -47,6 +47,7 @@ pub(super) async fn build_repository_retrieval_context(
     context_profile: RdContextProfile,
 ) -> Result<RdRepositoryRetrievalContext, AppError> {
     let context_budget = context_profile.budget();
+    let root = repository_root(state, claims, repository_id).await?;
     let semantic_hits = rd_semantic_repository_search(
         state,
         claims,
@@ -69,6 +70,7 @@ pub(super) async fn build_repository_retrieval_context(
 
     let mut file_notes: HashMap<String, Vec<String>> = HashMap::new();
     let mut file_scores: HashMap<String, f32> = HashMap::new();
+    let mut file_line_hints: HashMap<String, BTreeSet<u64>> = HashMap::new();
     let mut context_notes = Vec::new();
     let mut task_notes = Vec::new();
     let mut observability_sources = BTreeSet::new();
@@ -103,6 +105,12 @@ pub(super) async fn build_repository_retrieval_context(
                     truncate_text(&hit.text, 520),
                     metadata_hint
                 ));
+            if let Some(line_number) = hit.line_number.filter(|line| *line > 0) {
+                file_line_hints
+                    .entry(file_path.to_string())
+                    .or_default()
+                    .insert(line_number);
+            }
             let type_boost = match hit.chunk_type {
                 RdEmbeddingChunkType::ContextSummary => 1.8,
                 RdEmbeddingChunkType::FileSummary => 1.4,
@@ -127,6 +135,67 @@ pub(super) async fn build_repository_retrieval_context(
                 "- 相似历史任务 taskId={task_id} score={score:.2}: {}",
                 truncate_text(&hit.text, 650)
             ));
+        }
+    }
+
+    let literal_terms = extract_repository_literal_terms(prompt, 8);
+    let literal_term_keys = literal_terms
+        .iter()
+        .map(|term| term.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let mut expansion_terms = BTreeSet::new();
+    for term in &literal_terms {
+        let hits = run_exact_repository_search(&root, term, 24).await?;
+        if !hits.is_empty() {
+            observability_sources.insert("literal_search".to_string());
+        }
+        for hit in hits {
+            let safe_snippet = redact_sensitive_snippet(&hit.snippet);
+            file_notes
+                .entry(hit.path.clone())
+                .or_default()
+                .push(format!(
+                    "literal(term={}, line={}): {}",
+                    truncate_text(term, 120),
+                    hit.line_number,
+                    safe_snippet
+                ));
+            *file_scores.entry(hit.path.clone()).or_default() +=
+                if term.chars().count() >= 6 { 18.0 } else { 5.0 };
+            if hit.line_number > 0 {
+                file_line_hints
+                    .entry(hit.path.clone())
+                    .or_default()
+                    .insert(hit.line_number);
+            }
+            expansion_terms.extend(extract_repository_identifier_terms(&hit.snippet, 4));
+        }
+    }
+    for term in expansion_terms
+        .into_iter()
+        .filter(|term| !literal_term_keys.contains(&term.to_ascii_lowercase()))
+        .take(6)
+    {
+        let hits = run_exact_repository_search(&root, &term, 20).await?;
+        if !hits.is_empty() {
+            observability_sources.insert("identifier_expansion".to_string());
+        }
+        for hit in hits {
+            file_notes
+                .entry(hit.path.clone())
+                .or_default()
+                .push(format!(
+                    "identifier(term={term}, line={}): {}",
+                    hit.line_number,
+                    redact_sensitive_snippet(&hit.snippet)
+                ));
+            *file_scores.entry(hit.path.clone()).or_default() += 9.0;
+            if hit.line_number > 0 {
+                file_line_hints
+                    .entry(hit.path)
+                    .or_default()
+                    .insert(hit.line_number);
+            }
         }
     }
 
@@ -280,7 +349,13 @@ pub(super) async fn build_repository_retrieval_context(
             .any(|note| note.starts_with("semantic-") || note.contains("semantic-"))
     }) || !task_notes.is_empty()
         || !context_notes.is_empty();
-    let strategy = if semantic_enabled {
+    let literal_enabled = observability_sources.contains("literal_search")
+        || observability_sources.contains("identifier_expansion");
+    let strategy = if semantic_enabled && literal_enabled {
+        "精确字面量检索 + 标识符展开 + embedding 语义召回 + 词法索引混合重排"
+    } else if literal_enabled {
+        "精确字面量检索 + 标识符展开 + 词法索引混合重排"
+    } else if semantic_enabled {
         "embedding 语义召回 + 词法索引混合重排"
     } else {
         "词法索引召回"
@@ -300,6 +375,8 @@ pub(super) async fn build_repository_retrieval_context(
         .enumerate()
         .collect::<Vec<_>>();
     let mut evidence = Vec::with_capacity(selected_files.len());
+    let mut source_excerpts = Vec::new();
+    let mut candidate_notes = Vec::new();
     for (rank_index, (file_path, notes)) in selected_files {
         let deduped = notes
             .into_iter()
@@ -318,7 +395,25 @@ pub(super) async fn build_repository_retrieval_context(
             notes: deduped.iter().take(6).cloned().collect(),
             reason,
         });
-        lines.push(format!("- `{file_path}`\n  - {}", deduped.join("\n  - ")));
+        candidate_notes.push(format!("- `{file_path}`\n  - {}", deduped.join("\n  - ")));
+        if let Some(excerpt) = read_repository_evidence_excerpt(
+            &root,
+            &file_path,
+            file_line_hints.get(&file_path),
+            2_800,
+        ) {
+            source_excerpts.push(format!("### `{file_path}`\n```text\n{excerpt}\n```"));
+        }
+    }
+    if !source_excerpts.is_empty() {
+        lines.push(
+            "真实文件证据（带原始行号；规划中的文件位置和改动范围必须以此为准）：".to_string(),
+        );
+        lines.extend(source_excerpts);
+    }
+    if !candidate_notes.is_empty() {
+        lines.push("候选文件及混合检索依据：".to_string());
+        lines.extend(candidate_notes);
     }
     if !task_notes.is_empty() {
         lines.push("相似历史研发任务（仅作背景提示，不可替代真实文件核对）：".to_string());
@@ -333,6 +428,63 @@ pub(super) async fn build_repository_retrieval_context(
         task_memory_hit_count,
         context_summary_hit_count,
     })
+}
+
+fn read_repository_evidence_excerpt(
+    root: &Path,
+    relative_path: &str,
+    line_hints: Option<&BTreeSet<u64>>,
+    max_chars: usize,
+) -> Option<String> {
+    let normalized = rd_normalize_repo_relative_path(relative_path);
+    if normalized.is_empty() {
+        return None;
+    }
+    let root = root.canonicalize().ok()?;
+    let path = root.join(&normalized).canonicalize().ok()?;
+    if !path.starts_with(&root) || !path.is_file() {
+        return None;
+    }
+    let metadata = path.metadata().ok()?;
+    if metadata.len() > MAX_FILE_BYTES {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    let lines = content.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+
+    let mut selected_lines = BTreeSet::new();
+    if let Some(line_hints) = line_hints.filter(|hints| !hints.is_empty()) {
+        for line in line_hints.iter().take(8) {
+            let center = usize::try_from(*line).unwrap_or(1).saturating_sub(1);
+            let start = center.saturating_sub(5);
+            let end = center.saturating_add(6).min(lines.len());
+            selected_lines.extend(start..end);
+        }
+    } else {
+        selected_lines.extend(0..lines.len().min(70));
+    }
+
+    let mut excerpt = String::new();
+    let mut previous = None;
+    for index in selected_lines {
+        if excerpt.chars().count() >= max_chars {
+            break;
+        }
+        if previous.is_some_and(|previous: usize| index > previous.saturating_add(1)) {
+            excerpt.push_str("     …\n");
+        }
+        excerpt.push_str(&format!("{:>6} | {}\n", index + 1, lines[index]));
+        previous = Some(index);
+    }
+    let protected = runtime::protect_sensitive_text(
+        &truncate_text(&excerpt, max_chars),
+        runtime::configured_data_protection_mode(),
+    );
+    let value = protected.value.trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 fn default_repository_retrieval_terms(context_profile: RdContextProfile) -> Vec<String> {

@@ -94,6 +94,9 @@ impl SqlExecErrorKind {
             "type_mismatch",
             "function_not_found",
             "invalid_function_argument",
+            "ambiguous_name",
+            "column is ambiguous",
+            "column reference is ambiguous",
         ]
         .iter()
         .any(|marker| msg_lower.contains(marker))
@@ -269,6 +272,10 @@ mod tests {
             SqlExecErrorKind::new("COLUMN_NOT_FOUND: Column 'revenue' cannot be resolved")
                 .is_retryable()
         );
+        assert!(SqlExecErrorKind::new(
+            "Query failed with AMBIGUOUS_NAME: Column 'app_id' is ambiguous"
+        )
+        .is_retryable());
         assert!(!SqlExecErrorKind::new("Query execution timed out after 60s").is_retryable());
         assert!(!SqlExecErrorKind::new("connector does not support EXPLAIN").is_retryable());
         assert!(!SqlExecErrorKind::new("authentication failed").is_retryable());

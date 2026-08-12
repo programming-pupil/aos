@@ -1213,7 +1213,7 @@ async fn persist_market_skill_files(
         "
         INSERT INTO skills_registry
             (id, tenant_id, name, description, source, marketplace_origin_json, path, tags, enabled, file_size, created_by)
-        VALUES (?, ?, ?, ?, ?, CAST(? AS JSON), ?, ?, TRUE, ?, ?)
+        VALUES (?, ?, ?, ?, ?, json(?), ?, ?, TRUE, ?, ?)
         ON CONFLICT DO UPDATE SET
             description = excluded.description,
             marketplace_origin_json = excluded.marketplace_origin_json,
@@ -1372,7 +1372,7 @@ async fn persist_skill(params: PersistSkillParams<'_>) -> Result<SkillInfo> {
         "
         INSERT INTO skills_registry
             (id, tenant_id, name, description, source, marketplace_origin_json, path, tags, enabled, file_size, created_by)
-        VALUES (?, ?, ?, ?, ?, CAST(? AS JSON), ?, ?, TRUE, ?, ?)
+        VALUES (?, ?, ?, ?, ?, json(?), ?, ?, TRUE, ?, ?)
         ON CONFLICT DO UPDATE SET
             description = excluded.description,
             marketplace_origin_json = excluded.marketplace_origin_json,

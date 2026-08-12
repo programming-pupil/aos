@@ -4116,6 +4116,21 @@ pub fn supports_official_deepseek_responses_web_search(model: &str, base_url: &s
     is_official_deepseek_base_url(base_url)
 }
 
+/// Official DeepSeek V4 chat-completions accepts an explicit
+/// `thinking: { type: "disabled" }` control. Execution-oriented callers can
+/// use this to reserve their deadline for a concise tool/SQL result while
+/// leaving thinking enabled for planning and synthesis turns.
+#[must_use]
+pub fn supports_official_deepseek_v4_thinking_control(model: &str, base_url: &str) -> bool {
+    let canonical_model = model
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    canonical_model.starts_with("deepseek-v4") && is_official_deepseek_base_url(base_url)
+}
+
 fn is_official_deepseek_base_url(base_url: &str) -> bool {
     let normalized_url = base_url.trim().to_ascii_lowercase();
     let without_scheme = normalized_url
@@ -4326,7 +4341,8 @@ mod tests {
         is_reasoning_model, normalize_finish_reason, normalize_response,
         normalize_responses_response, openai_tool_choice, parse_responses_sse_frame,
         parse_tool_arguments, response_exhausted_in_reasoning, responses_endpoint,
-        supports_official_deepseek_responses_web_search, ChatChoice, ChatCompletionChunk,
+        supports_official_deepseek_responses_web_search,
+        supports_official_deepseek_v4_thinking_control, ChatChoice, ChatCompletionChunk,
         ChatCompletionResponse, ChatMessage, ChunkChoice, ChunkDelta, OpenAiCompatClient,
         OpenAiCompatConfig, ResponsesApiResponse, ResponsesStreamState, StreamState,
         DEFAULT_MAX_RETRIES, DEFAULT_OPENAI_BASE_URL, DEFAULT_XAI_BASE_URL,
@@ -4726,6 +4742,18 @@ mod tests {
         ));
         assert!(!supports_official_deepseek_responses_web_search(
             "deepseek-v4-flash",
+            "https://api.deepseek.com.evil.example/v1"
+        ));
+        assert!(supports_official_deepseek_v4_thinking_control(
+            "deepseek-v4-flash",
+            "https://api.deepseek.com/v1"
+        ));
+        assert!(supports_official_deepseek_v4_thinking_control(
+            "deepseek-v4-pro",
+            "https://api.deepseek.com/v1"
+        ));
+        assert!(!supports_official_deepseek_v4_thinking_control(
+            "deepseek-v4-pro",
             "https://api.deepseek.com.evil.example/v1"
         ));
         assert_eq!(

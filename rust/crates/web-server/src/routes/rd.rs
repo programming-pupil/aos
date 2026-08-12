@@ -101,13 +101,13 @@ use self::completion::{
 use self::context::{
     build_rd_context_plan_section, build_rd_context_policy_section,
     build_rd_llm_context_plan_section, build_rd_system_prompt, build_repository_context_for_prompt,
-    build_repository_prescan_context, build_repository_runtime_context_hint,
-    default_rd_context_depth, load_prompt_file_context_for_task,
-    load_repository_instructions_for_task, maybe_run_rd_llm_context_planner,
-    normalize_rd_context_depth, normalize_rd_profile_for_mode, rd_context_budget_json,
-    rd_embed_texts_with_candidate, rd_normalize_repo_relative_path, record_rd_embedding_usage,
-    resolve_rd_embedding_candidates, resolve_rd_task_context_strategy, route_rd_task_intent,
-    should_run_rd_repository_prescan,
+    build_repository_exact_evidence_context, build_repository_prescan_context,
+    build_repository_runtime_context_hint, default_rd_context_depth,
+    load_prompt_file_context_for_task, load_repository_instructions_for_task,
+    maybe_run_rd_llm_context_planner, normalize_rd_context_depth, normalize_rd_profile_for_mode,
+    rd_context_budget_json, rd_embed_texts_with_candidate_background,
+    rd_normalize_repo_relative_path, record_rd_embedding_usage, resolve_rd_embedding_candidates,
+    resolve_rd_task_context_strategy, route_rd_task_intent, should_run_rd_repository_prescan,
 };
 use self::diff_filters::{
     filter_rd_unified_diff_excluded_paths, infer_files_from_unified_diff,
@@ -147,8 +147,8 @@ use self::repositories::{
     create_repository, delete_repository, ensure_repository_exists, list_repositories,
     load_repo_setting, repository_branches, repository_file, repository_file_suggestions,
     repository_imports, repository_root, repository_search, repository_symbols, repository_tree,
-    repository_worktree_status, run_rg_repository_search, sync_repository, update_repository,
-    RdRepositoryWorktreeStatusDto,
+    repository_worktree_status, run_exact_repository_search, run_rg_repository_search,
+    sync_repository, update_repository, RdRepositoryWorktreeStatusDto,
 };
 use self::review::{
     analyze_review_quality, record_rd_task_risk_map, record_review_quality_metrics,
@@ -256,7 +256,7 @@ use self::runtime_tools::{
 use self::specs::{
     approve_design, approve_spec, approve_tasks, create_spec, create_task_from_spec, delete_spec,
     final_report_spec, generate_design, generate_spec, generate_tasks, get_spec, implement_all,
-    implement_task, list_spec_events, list_specs, update_spec,
+    implement_task, list_spec_events, list_specs, revise_spec_stage, update_spec,
 };
 use self::steering::{
     build_steering_context, create_steering_rule, delete_steering_rule, list_steering_rules,
@@ -337,6 +337,7 @@ const MAX_CONTEXT_BYTES: usize = 80_000;
 const RD_INLINE_CONTEXT_BUDGET_BYTES: usize = 52_000;
 const RD_FILE_SUMMARY_INDEX_LIMIT: usize = 2_000;
 const RD_EMBEDDING_BATCH_SIZE: usize = 48;
+const RD_LOCAL_EMBEDDING_BACKGROUND_BATCH_SIZE: usize = 8;
 const RD_EMBEDDING_QUERY_TIMEOUT_SECS: u64 = 20;
 const RD_EMBEDDING_INDEX_BATCH_TIMEOUT_SECS: u64 = 60;
 const RD_EMBEDDING_SYMBOL_INDEX_LIMIT: usize = 6_000;
@@ -525,11 +526,14 @@ struct RdEmbeddingIndexStats {
 
 #[derive(Debug, Clone)]
 struct RdEmbeddingApiKey {
-    id: String,
+    id: Option<String>,
     provider: String,
     #[cfg(feature = "nl2sql")]
     base_url: Option<String>,
     model: String,
+    vector_space_id: String,
+    dimensions: Option<usize>,
+    is_local: bool,
     #[cfg(feature = "nl2sql")]
     api_key: String,
 }
@@ -686,6 +690,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/specs/{id}/generate-spec", routing_post(generate_spec))
         .route("/specs/{id}/approve-spec", routing_post(approve_spec))
         .route("/specs/{id}/generate-design", routing_post(generate_design))
+        .route("/specs/{id}/revise", routing_post(revise_spec_stage))
         .route("/specs/{id}/approve-design", routing_post(approve_design))
         .route("/specs/{id}/generate-tasks", routing_post(generate_tasks))
         .route("/specs/{id}/approve-tasks", routing_post(approve_tasks))

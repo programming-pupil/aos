@@ -240,6 +240,7 @@ pub(crate) async fn correct_sql(
     db_type: &str,
     datasource_id: &str,
     preferred_model: Option<&str>,
+    deadline_bounded: bool,
 ) -> String {
     let repair_timeout_secs = std::env::var("NL2SQL_SQL_REPAIR_TOTAL_TIMEOUT_SECS")
         .ok()
@@ -263,6 +264,7 @@ pub(crate) async fn correct_sql(
             db_type,
             datasource_id,
             preferred_model,
+            deadline_bounded,
         ),
     )
     .await
@@ -296,6 +298,7 @@ async fn correct_sql_bounded(
     db_type: &str,
     datasource_id: &str,
     preferred_model: Option<&str>,
+    deadline_bounded: bool,
 ) -> String {
     let mut chat_candidates = match crate::nl2sql::resolve_chat_config_candidates(
         state.config_registry(),
@@ -330,7 +333,7 @@ async fn correct_sql_bounded(
     // P2-5 + P1-2 BUG-FIX: Re-load QU result and metrics for correction prompt.
     // QU: re-parse the original question to extract constraints.
     let qu_result: Option<crate::nl2sql::query_understanding::QueryUnderstandingResult> =
-        if should_enable_qu() && !conversation_id.is_empty() {
+        if should_enable_qu() && !conversation_id.is_empty() && !deadline_bounded {
             let qu = crate::nl2sql::query_understanding::QueryUnderstanding::new(
                 state.db.clone(),
                 preferred_chat_cfg.clone(),
@@ -379,7 +382,10 @@ async fn correct_sql_bounded(
             Vec::new()
         }
     };
-    if !super::should_enable_sql_generation_tool_loop() {
+    if deadline_bounded {
+        reference_snippets =
+            super::focus_bounded_sql_knowledge_references(question, &reference_snippets);
+    } else if !super::should_enable_sql_generation_tool_loop() {
         let tool_question = format!(
             "{question}\n\nFailed SQL:\n{failed_sql}\n\nDatabase error:\n{error_msg}\n\nFind SQL examples, metric definitions, schema facts, or business rules that help repair this SQL."
         );
@@ -445,6 +451,7 @@ async fn correct_sql_bounded(
             None,
             &reference_snippets,
             datasource_id,
+            deadline_bounded,
         )
         .await;
 
@@ -503,6 +510,7 @@ pub(crate) async fn correct_sql_once(
     _selected_tables: Option<&[String]>,
     reference_snippets: &[super::reference::ReferencePromptSnippet],
     datasource_id: &str,
+    deadline_bounded: bool,
 ) -> anyhow::Result<String> {
     let history = load_conversation_history(&state.db, &claims.tenant_id, conversation_id, 3).await;
     // R-9: weave coreference resolution against the most recent turn into the
@@ -559,7 +567,22 @@ pub(crate) async fn correct_sql_once(
 
     // SQL repair needs enough room for reasoning models to reach the corrected
     // statement, while never exceeding the configured provider/model ceiling.
-    let max_tokens = 8_192.min(chat_cfg.max_output_tokens).max(1);
+    let max_tokens = if deadline_bounded { 4_096 } else { 8_192 }
+        .min(chat_cfg.max_output_tokens)
+        .max(1);
+
+    let mut extra_body = None;
+    if deadline_bounded
+        && api::supports_official_deepseek_v4_thinking_control(
+            &chat_cfg.model,
+            chat_cfg.client.base_url(),
+        )
+    {
+        extra_body = Some(serde_json::Map::from_iter([(
+            "thinking".to_string(),
+            serde_json::json!({"type": "disabled"}),
+        )]));
+    }
 
     let request = MessageRequest {
         model: chat_cfg.model.clone(),
@@ -582,7 +605,7 @@ pub(crate) async fn correct_sql_once(
         reasoning_effort: None,
         include_reasoning: None,
         use_max_completion_tokens: None,
-        extra_body: None,
+        extra_body,
     };
 
     let response_timeout_secs = std::env::var("NL2SQL_SQL_REPAIR_MODEL_TIMEOUT_SECS")
@@ -600,6 +623,7 @@ pub(crate) async fn correct_sql_once(
             schema,
             chat_cfg,
             &request,
+            !deadline_bounded,
         ),
     )
     .await
@@ -1011,6 +1035,10 @@ pub(crate) async fn execute(
     let mut self_correct_failed = false;
     let mut attempts = 0;
     let mut operational_attempts = 0;
+    // COUNT, SELECT, and any repair attempts share one concurrency gate. A
+    // completed statement releases its slot; retry counts and timeouts remain
+    // bounded separately by the self-correction policy below.
+    let request_budget = crate::routes::nl2sql::agent_executor::DatasourceRequestBudget::new(3);
     let mut correct_context = SelfCorrectContext::default();
     let timeout_secs = req.timeout_seconds.unwrap_or(30);
 
@@ -1049,6 +1077,7 @@ pub(crate) async fn execute(
             req.limit,
             req.offset,
             &datasource_sensitive_patterns,
+            request_budget.clone(),
         )
         .await;
 
@@ -1377,6 +1406,7 @@ pub(crate) async fn execute(
                         &db_type,
                         &effective_data_source_id,
                         None,
+                        false,
                     )
                     .await;
 
@@ -1485,6 +1515,7 @@ async fn execute_once(
     _limit: i64,
     _offset: i64,
     datasource_sensitive_patterns: &[String],
+    request_budget: std::sync::Arc<crate::routes::nl2sql::agent_executor::DatasourceRequestBudget>,
 ) -> Result<ExecOnceResult> {
     let start = std::time::Instant::now();
     // Normalize trailing separators once so every dialect-specific execution
@@ -1565,18 +1596,23 @@ async fn execute_once(
                 "SELECT CAST(COUNT(*) AS SIGNED) FROM ({}) AS t",
                 normalized_sql
             );
-            let count_row = match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs as u64),
-                sqlx::query(&count_sql).fetch_one(&mut *conn),
-            )
-            .await
-            {
-                Ok(result) => {
-                    result.map_err(|e| AppError::Internal(format!("count query failed: {e}")))?
-                }
-                Err(_) => {
-                    conn.close_on_drop();
-                    return Err(AppError::Internal("Count query timed out".to_string()));
+            let count_row = {
+                let _count_permit = request_budget
+                    .acquire("MySQL count query")
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs as u64),
+                    sqlx::query(&count_sql).fetch_one(&mut *conn),
+                )
+                .await
+                {
+                    Ok(result) => result
+                        .map_err(|e| AppError::Internal(format!("count query failed: {e}")))?,
+                    Err(_) => {
+                        conn.close_on_drop();
+                        return Err(AppError::Internal("Count query timed out".to_string()));
+                    }
                 }
             };
             let total_rows: i64 = count_row.get(0);
@@ -1589,16 +1625,22 @@ async fn execute_once(
                 &normalized_sql,
                 (timeout_secs as u64).saturating_mul(1000),
             );
-            let mut sql_rows = match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs as u64),
-                sqlx::query(&hinted_sql).fetch_all(&mut *conn),
-            )
-            .await
-            {
-                Ok(result) => result.map_err(|e| AppError::Internal(e.to_string()))?,
-                Err(_) => {
-                    conn.close_on_drop();
-                    return Err(AppError::Internal("Query execution timed out".to_string()));
+            let mut sql_rows = {
+                let _query_permit = request_budget
+                    .acquire("MySQL result query")
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs as u64),
+                    sqlx::query(&hinted_sql).fetch_all(&mut *conn),
+                )
+                .await
+                {
+                    Ok(result) => result.map_err(|e| AppError::Internal(e.to_string()))?,
+                    Err(_) => {
+                        conn.close_on_drop();
+                        return Err(AppError::Internal("Query execution timed out".to_string()));
+                    }
                 }
             };
 
@@ -1847,39 +1889,23 @@ async fn execute_once(
                 ));
             }
             let cli = builder
+                .max_attempt(0)
                 .build()
                 .map_err(|e| AppError::Internal(format!("trino client build failed: {e}")))?;
 
-            // Trino/Presto returns count through JSON/string parsing here, not MySQL unsigned BIGINT decoding.
-            let count_sql = format!("SELECT COUNT(*) FROM ({}) AS t", normalized_sql);
-            let count_dataset = tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs as u64),
-                cli.get_all::<trino_rust_client::Row>(count_sql),
-            )
-            .await
-            .map_err(|_| AppError::Internal("Count query timed out".to_string()))?
-            .map_err(|e| AppError::Internal(format!("trino count failed: {e}")))?;
-            let (_, count_rows) = count_dataset.split();
-            let total_rows: i64 = count_rows
-                .first()
-                .map(|r| {
-                    let data: Vec<serde_json::Value> = r.clone().into_json();
-                    data.first()
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0)
-                })
-                .unwrap_or(0);
-
             // Execute exactly the SQL shown in the editor. Do not append hidden
             // LIMIT/OFFSET clauses.
-            let dataset = tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs as u64),
-                cli.get_all::<trino_rust_client::Row>(normalized_sql.clone()),
+            let dataset = crate::routes::nl2sql::agent_executor::execute_trino_query_bounded(
+                cli,
+                normalized_sql.clone(),
+                timeout_secs as u64,
+                &claims.tenant_id,
+                &claims.sub,
+                "Trino result query",
+                request_budget,
             )
             .await
-            .map_err(|_| AppError::Internal("Query execution timed out".to_string()))?
-            .map_err(|e| AppError::Internal(format!("trino query failed: {e}")))?;
+            .map_err(|e| AppError::Internal(e.to_string()))?;
 
             let (types, rows) = dataset.split();
             let column_count = types.len();
@@ -1917,6 +1943,10 @@ async fn execute_once(
                 .collect();
 
             let rows_count = json_rows.len();
+            // Avoid a second COUNT statement against Trino. The result itself
+            // is authoritative for this request, and the direct endpoint uses
+            // the bounded preview size by design.
+            let total_rows = i64::try_from(rows_count).unwrap_or(i64::MAX);
 
             sqlx::query(
                 "UPDATE nl2sql_queries SET executed = 1, rows_returned = ?, execution_ms = ? WHERE id = ?",
@@ -2004,36 +2034,46 @@ async fn execute_once(
 
             // Postgres COUNT(*) is signed BIGINT, so it does not need the MySQL CAST guard.
             let count_sql = format!("SELECT COUNT(*) FROM ({}) AS t", normalized_sql);
-            let count_row = match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs as u64),
-                sqlx::query(&count_sql).fetch_one(&mut *conn),
-            )
-            .await
-            {
-                Ok(result) => {
-                    result.map_err(|e| AppError::Internal(format!("count query failed: {e}")))?
-                }
-                Err(_) => {
-                    conn.close_on_drop();
-                    return Err(AppError::Internal("Count query timed out".to_string()));
+            let count_row = {
+                let _count_permit = request_budget
+                    .acquire("Postgres count query")
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs as u64),
+                    sqlx::query(&count_sql).fetch_one(&mut *conn),
+                )
+                .await
+                {
+                    Ok(result) => result
+                        .map_err(|e| AppError::Internal(format!("count query failed: {e}")))?,
+                    Err(_) => {
+                        conn.close_on_drop();
+                        return Err(AppError::Internal("Count query timed out".to_string()));
+                    }
                 }
             };
             let total_rows: i64 = count_row.get(0);
 
             // Execute exactly the SQL shown in the editor. Do not append hidden
             // LIMIT/OFFSET clauses.
-            let mut sql_rows = match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs as u64),
-                sqlx::query(&normalized_sql).fetch_all(&mut *conn),
-            )
-            .await
-            {
-                Ok(result) => {
-                    result.map_err(|e| AppError::Internal(format!("postgres query failed: {e}")))?
-                }
-                Err(_) => {
-                    conn.close_on_drop();
-                    return Err(AppError::Internal("Query execution timed out".to_string()));
+            let mut sql_rows = {
+                let _query_permit = request_budget
+                    .acquire("Postgres result query")
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs as u64),
+                    sqlx::query(&normalized_sql).fetch_all(&mut *conn),
+                )
+                .await
+                {
+                    Ok(result) => result
+                        .map_err(|e| AppError::Internal(format!("postgres query failed: {e}")))?,
+                    Err(_) => {
+                        conn.close_on_drop();
+                        return Err(AppError::Internal("Query execution timed out".to_string()));
+                    }
                 }
             };
 

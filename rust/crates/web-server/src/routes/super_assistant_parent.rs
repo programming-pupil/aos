@@ -3926,6 +3926,7 @@ async fn execute_or_join_subtask(
                                 context: Some(parent.composed_context.clone()),
                                 datasource_ids,
                                 depth: Some(depth),
+                                network_budget: None,
                             },
                         )
                         .await?;
@@ -4166,6 +4167,7 @@ async fn execute_nl2sql_subtask(
                 claims,
                 super::nl2sql::AgentExecuteRequest {
                     question: question.to_string(),
+                    retrieval_question: None,
                     preferred_model: Some(parent.model.clone()),
                     shared_context: Some(parent.composed_context.clone()),
                     datasource_ids,
@@ -4174,6 +4176,7 @@ async fn execute_nl2sql_subtask(
                         .get("maxSteps")
                         .and_then(Value::as_u64)
                         .and_then(|value| usize::try_from(value).ok()),
+                    bounded: false,
                 },
             ),
         )

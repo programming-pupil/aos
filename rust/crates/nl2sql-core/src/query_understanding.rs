@@ -96,6 +96,18 @@ fn intent_from_question_heuristic(question: &str) -> Intent {
         || q.contains("变化")
         || q.contains("变化率")
         || q.contains("增长")
+        || q.contains("持续上升")
+        || q.contains("持续下降")
+        || q.contains("连续上升")
+        || q.contains("连续下降")
+        || q.contains("骤升")
+        || q.contains("骤降")
+        || q.contains("暴涨")
+        || q.contains("暴跌")
+        || q.contains("decline")
+        || q.contains("drop")
+        || q.contains("increase")
+        || q.contains("decrease")
     {
         return Intent::Trend;
     }
@@ -150,9 +162,23 @@ fn intent_from_question_heuristic(question: &str) -> Intent {
 }
 
 pub fn extract_intent_from_text(raw: &str, question: &str) -> Intent {
+    let deterministic = intent_from_question_heuristic(question);
+    let apply_strong_override = |model_intent: Intent| {
+        if matches!(
+            model_intent,
+            Intent::Select | Intent::Detail | Intent::List | Intent::Unknown
+        ) && matches!(
+            deterministic,
+            Intent::Compare | Intent::Trend | Intent::Ranking
+        ) {
+            deterministic
+        } else {
+            model_intent
+        }
+    };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return intent_from_question_heuristic(question);
+        return deterministic;
     }
 
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
@@ -165,7 +191,7 @@ pub fn extract_intent_from_text(raw: &str, question: &str) -> Intent {
             .trim()
             .to_lowercase();
         if let Some(intent) = intent_from_label(candidate.as_str()) {
-            return intent;
+            return apply_strong_override(intent);
         }
     }
 
@@ -177,7 +203,7 @@ pub fn extract_intent_from_text(raw: &str, question: &str) -> Intent {
         .to_lowercase();
 
     if let Some(intent) = intent_from_label(normalized.as_str()) {
-        return intent;
+        return apply_strong_override(intent);
     }
 
     const LABELS: [&str; 13] = [
@@ -200,7 +226,7 @@ pub fn extract_intent_from_text(raw: &str, question: &str) -> Intent {
         .find(|label| normalized.contains(**label))
         .and_then(|label| intent_from_label(label))
     {
-        return found;
+        return apply_strong_override(found);
     }
 
     if normalized.contains("环比")
@@ -245,7 +271,7 @@ pub fn extract_intent_from_text(raw: &str, question: &str) -> Intent {
         return Intent::List;
     }
 
-    intent_from_question_heuristic(question)
+    deterministic
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

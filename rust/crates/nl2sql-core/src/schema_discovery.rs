@@ -26,6 +26,7 @@
 //!     back into `schema_info` via [`schema_diff::extract_manual_tables`].
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::datasource_config::{
@@ -1593,6 +1594,152 @@ fn parse_trino_table_reference(
     }
 }
 
+fn trino_table_discovery_candidates(
+    default_catalog: &str,
+    default_schema: &str,
+    schemas: &[String],
+    table_ref: &str,
+) -> Vec<(String, String, String)> {
+    let parsed = parse_trino_table_reference(default_catalog, default_schema, table_ref);
+    let part_count = table_ref
+        .split('.')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .count();
+    if part_count >= 2 {
+        return vec![parsed];
+    }
+
+    let schema_limit = std::env::var("NL2SQL_TRINO_ON_DEMAND_SCHEMA_PROBE_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(24)
+        .min(64);
+    normalize_trino_schemas(default_schema, schemas.iter().map(String::as_str))
+        .into_iter()
+        .take(schema_limit)
+        .map(|schema| (default_catalog.to_string(), schema, parsed.2.clone()))
+        .collect()
+}
+
+async fn probe_trino_table_candidates<F, Fut>(
+    candidates: Vec<(String, String, String)>,
+    _concurrency: usize,
+    probe: F,
+) -> Result<Option<Value>, String>
+where
+    F: Fn(String, String, String) -> Fut + Clone,
+    Fut: std::future::Future<Output = Result<Option<Value>, String>>,
+{
+    // The web-server holds one tenant+user Trino permit for the whole
+    // discovery operation. Keep candidate probes sequential and short-circuit
+    // on the first match. An uncertain remote state must also stop immediately;
+    // continuing to another schema could overlap a still-running Trino query.
+    let mut errors = Vec::new();
+    for (catalog, schema, table) in candidates {
+        match probe.clone()(catalog, schema, table).await {
+            Ok(Some(table)) => return Ok(Some(table)),
+            Ok(None) => {}
+            Err(error) if trino_remote_state_is_uncertain(&error) => return Err(error),
+            Err(error) => errors.push(error),
+        }
+    }
+    if errors.is_empty() {
+        Ok(None)
+    } else {
+        Err(errors.join(" | "))
+    }
+}
+
+fn trino_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+async fn discover_unqualified_trino_table(
+    host: &str,
+    port: u16,
+    catalog: &str,
+    schemas: &[String],
+    username: &str,
+    password: Option<&str>,
+    secure: bool,
+    basic_auth: bool,
+    table_name: &str,
+) -> Result<Option<Value>, String> {
+    let schemas = normalize_trino_schemas("", schemas.iter().map(String::as_str));
+    let default_schema = schemas.first().map(String::as_str).unwrap_or("default");
+    let cli = build_trino_client(
+        host,
+        port,
+        catalog,
+        default_schema,
+        username,
+        password,
+        secure,
+        basic_auth,
+    )?;
+    let schema_list = schemas
+        .iter()
+        .map(|schema| trino_string_literal(schema))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT table_schema, column_name, data_type, is_nullable \
+         FROM {}.information_schema.columns \
+         WHERE table_name = {} AND table_schema IN ({schema_list}) \
+         ORDER BY ordinal_position",
+        trino_ident(catalog),
+        trino_string_literal(table_name),
+    );
+    let dataset = match run_trino_query(&cli, sql.clone(), 6).await {
+        Ok(dataset) => dataset,
+        Err(error) if error == "empty data" => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let (_types, rows) = dataset.split();
+    let mut by_schema: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for row in rows {
+        let values: Vec<Value> = row.into_json();
+        let Some(schema) = values.first().and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(name) = values.get(1).and_then(Value::as_str) else {
+            continue;
+        };
+        let column_type = values.get(2).and_then(Value::as_str).unwrap_or_default();
+        let nullable = values
+            .get(3)
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case("YES"));
+        by_schema
+            .entry(schema.to_string())
+            .or_default()
+            .push(json!({
+                "name": name,
+                "type": column_type,
+                "nullable": nullable,
+            }));
+    }
+    let Some((schema, columns)) = schemas
+        .iter()
+        .find_map(|schema| by_schema.remove(schema).map(|columns| (schema, columns)))
+    else {
+        return Ok(None);
+    };
+    let full_name = trino_full_table_name(catalog, schema, table_name);
+    Ok(Some(json!({
+        "table_name": full_name,
+        "name": table_name,
+        "physical_table_name": table_name,
+        "catalog": catalog,
+        "schema": schema,
+        "qualified_name": trino_schema_table_name(schema, table_name),
+        "fully_qualified_name": full_name,
+        "columns": columns,
+    })))
+}
+
 fn build_trino_client(
     host: &str,
     port: u16,
@@ -1602,7 +1749,7 @@ fn build_trino_client(
     password: Option<&str>,
     secure: bool,
     basic_auth: bool,
-) -> Result<trino_rust_client::Client, String> {
+) -> Result<Arc<trino_rust_client::Client>, String> {
     let normalized_host = crate::datasource_config::normalize_host_input(host);
     let port = normalized_host.port.unwrap_or(port);
     let secure = normalized_host.secure.unwrap_or(secure);
@@ -1618,21 +1765,219 @@ fn build_trino_client(
         ));
     }
     builder
+        // Retry policy is owned by the caller's bounded datasource workflow.
+        // The client-level default can silently multiply metadata requests
+        // and bypass the per-user concurrency/request budget.
+        .max_attempt(0)
         .build()
+        .map(Arc::new)
         .map_err(|e| format!("Trino client build failed: {e}"))
 }
 
+const TRINO_REMOTE_STATE_UNCERTAIN: &str = "Trino remote query state is uncertain";
+
+#[must_use]
+pub fn trino_remote_state_is_uncertain(error: &str) -> bool {
+    error.contains(TRINO_REMOTE_STATE_UNCERTAIN)
+}
+
+struct TrinoMetadataQueryGuard {
+    client: Arc<trino_rust_client::Client>,
+    query_id: Arc<Mutex<Option<String>>>,
+    completed: bool,
+}
+
+impl TrinoMetadataQueryGuard {
+    fn new(client: Arc<trino_rust_client::Client>) -> Self {
+        Self {
+            client,
+            query_id: Arc::new(Mutex::new(None)),
+            completed: false,
+        }
+    }
+
+    fn record_query_id(&self, query_id: &str) {
+        *self
+            .query_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(query_id.to_string());
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+
+    async fn cancel(&mut self, reason: &str) -> bool {
+        let query_id = self
+            .query_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(query_id) = query_id else {
+            return false;
+        };
+        match tokio::time::timeout(Duration::from_secs(10), self.client.cancel(&query_id)).await {
+            Ok(Ok(())) => {
+                tracing::warn!(query_id, reason, "cancelled Trino metadata query");
+                self.completed = true;
+                true
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(query_id, reason, error = %error, "Trino metadata query cancellation failed");
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    query_id,
+                    reason,
+                    "Trino metadata query cancellation timed out"
+                );
+                false
+            }
+        }
+    }
+}
+
+impl Drop for TrinoMetadataQueryGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let query_id = self
+            .query_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(query_id) = query_id else {
+            return;
+        };
+        let client = Arc::clone(&self.client);
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            match tokio::time::timeout(Duration::from_secs(10), client.cancel(&query_id)).await {
+                Ok(Ok(())) => tracing::warn!(query_id, "cancelled abandoned Trino metadata query"),
+                Ok(Err(error)) => tracing::warn!(
+                    query_id,
+                    error = %error,
+                    "abandoned Trino metadata query cancellation failed"
+                ),
+                Err(_) => tracing::warn!(
+                    query_id,
+                    "abandoned Trino metadata query cancellation timed out"
+                ),
+            }
+        });
+    }
+}
+
+async fn run_trino_query(
+    client: &Arc<trino_rust_client::Client>,
+    sql: String,
+    timeout_secs: u64,
+) -> Result<trino_rust_client::DataSet<trino_rust_client::Row>, String> {
+    let timeout_secs = timeout_secs.max(1);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let mut guard = TrinoMetadataQueryGuard::new(Arc::clone(client));
+    let mut response = match tokio::time::timeout_at(
+        deadline,
+        client.get::<trino_rust_client::Row>(sql),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
+            return Err(format!(
+                "{TRINO_REMOTE_STATE_UNCERTAIN}: initial request failed before a query id was available: {error}"
+            ));
+        }
+        Err(_) => {
+            // The POST may have reached Trino even though no response (and no
+            // query id) reached us. Keep the caller's user-scoped permit for
+            // one more execution window so a retry cannot immediately replace
+            // an unresolved remote query.
+            tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
+            return Err(format!(
+                "{TRINO_REMOTE_STATE_UNCERTAIN}: initial response timed out after {timeout_secs}s before a query id was available"
+            ));
+        }
+    };
+    guard.record_query_id(&response.id);
+
+    let mut columns = response.columns.take();
+    let mut rows = Vec::new();
+    loop {
+        if let Some(error) = response.error.take() {
+            guard.complete();
+            return Err(error.to_string());
+        }
+        if let Some(data) = response.data.take() {
+            match data {
+                trino_rust_client::QueryResultData::Direct(data) => rows.extend(data),
+                trino_rust_client::QueryResultData::Spooled(_) => {
+                    let cancelled = guard.cancel("unsupported spooled metadata response").await;
+                    let suffix = if cancelled {
+                        String::new()
+                    } else {
+                        format!("; {TRINO_REMOTE_STATE_UNCERTAIN}: cancellation was not confirmed")
+                    };
+                    return Err(format!(
+                        "Trino metadata query returned unsupported spooled data{suffix}"
+                    ));
+                }
+            }
+        }
+        let Some(next_uri) = response.next_uri.take() else {
+            break;
+        };
+        response = match tokio::time::timeout_at(
+            deadline,
+            client.get_next::<trino_rust_client::Row>(&next_uri),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                let cancelled = guard.cancel("metadata result polling failed").await;
+                if cancelled {
+                    return Err(error.to_string());
+                }
+                return Err(format!(
+                    "{TRINO_REMOTE_STATE_UNCERTAIN}: result polling failed and cancellation was not confirmed: {error}"
+                ));
+            }
+            Err(_) => {
+                let cancelled = guard.cancel("metadata result polling timeout").await;
+                if cancelled {
+                    return Err(format!(
+                        "query timed out after {timeout_secs}s and was cancelled"
+                    ));
+                }
+                return Err(format!(
+                    "{TRINO_REMOTE_STATE_UNCERTAIN}: result polling timed out after {timeout_secs}s and cancellation was not confirmed"
+                ));
+            }
+        };
+        if columns.is_none() {
+            columns = response.columns.take();
+        }
+    }
+
+    guard.complete();
+    trino_rust_client::build_dataset(rows, columns).map_err(|error| error.to_string())
+}
+
 async fn run_trino_first_column_query(
-    cli: &trino_rust_client::Client,
+    cli: &Arc<trino_rust_client::Client>,
     sql: &str,
     timeout_secs: u64,
 ) -> Result<Vec<String>, String> {
-    let query = cli.get_all::<trino_rust_client::Row>(sql.to_string());
-    let dataset = match tokio::time::timeout(Duration::from_secs(timeout_secs), query).await {
-        Ok(Ok(dataset)) => dataset,
-        Ok(Err(e)) if e.to_string() == "empty data" => return Ok(Vec::new()),
-        Ok(Err(e)) => return Err(e.to_string()),
-        Err(_) => return Err(format!("query timed out after {timeout_secs}s")),
+    let dataset = match run_trino_query(cli, sql.to_string(), timeout_secs).await {
+        Ok(dataset) => dataset,
+        Err(error) if error == "empty data" => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     };
     let (_types, rows) = dataset.split();
     let mut values = Vec::new();
@@ -1646,7 +1991,7 @@ async fn run_trino_first_column_query(
 }
 
 async fn run_trino_statement_best_effort(
-    cli: &trino_rust_client::Client,
+    cli: &Arc<trino_rust_client::Client>,
     sql: &str,
     timeout_secs: u64,
 ) -> Result<(), String> {
@@ -1691,6 +2036,9 @@ pub async fn discover_trino_schemas(
                 ));
             }
         }
+        Err(e) if trino_remote_state_is_uncertain(&e) => {
+            return Err(format!("SHOW CATALOGS failed: {e}"));
+        }
         Err(e) => warnings.push(format!("SHOW CATALOGS failed: {e}")),
     }
 
@@ -1715,6 +2063,9 @@ pub async fn discover_trino_schemas(
                 });
             }
             Ok(_) => errors.push(format!("{sql}: empty result")),
+            Err(e) if trino_remote_state_is_uncertain(&e) => {
+                return Err(format!("{sql}: {e}"));
+            }
             Err(e) => errors.push(format!("{sql}: {e}")),
         }
     }
@@ -1732,6 +2083,9 @@ pub async fn discover_trino_schemas(
             Ok(_) => errors.push("SHOW DATABASES: empty result".to_string()),
             Err(e) => errors.push(format!("SHOW DATABASES: {e}")),
         },
+        Err(e) if trino_remote_state_is_uncertain(&e) => {
+            return Err(format!("{use_sql}: {e}"));
+        }
         Err(e) => errors.push(format!("{use_sql}: {e}")),
     }
 
@@ -1742,7 +2096,7 @@ pub async fn discover_trino_schemas(
 }
 
 async fn list_trino_tables_for_schema(
-    cli: &trino_rust_client::Client,
+    cli: &Arc<trino_rust_client::Client>,
     catalog: &str,
     schema: &str,
     timeout_secs: u64,
@@ -1764,6 +2118,7 @@ async fn list_trino_tables_for_schema(
     for (sql, method) in attempts {
         match run_trino_first_column_query(cli, &sql, timeout_secs).await {
             Ok(tables) => return Ok((tables, method.to_string())),
+            Err(e) if trino_remote_state_is_uncertain(&e) => return Err(e),
             Err(e) => errors.push(format!("{sql}: {e}")),
         }
     }
@@ -1840,23 +2195,33 @@ pub async fn discover_trino_multi(
         if listed_table_count as u64 >= cap {
             break;
         }
-        let (schema_tables, method) =
-            match list_trino_tables_for_schema(&cli, catalog, schema, list_timeout.as_secs()).await
-            {
-                Ok(result) => result,
-                Err(e) if e == "empty data" => (Vec::new(), "empty".to_string()),
-                Err(e) => {
-                    let schema_ref = trino_qualified_schema(catalog, schema);
-                    tracing::warn!(
-                        catalog,
-                        schema = %schema,
-                        error = %e,
-                        "Trino schema discovery: schema table listing failed, skipping schema"
-                    );
-                    skipped.push((schema_ref, e));
-                    continue;
+        let (schema_tables, method) = match list_trino_tables_for_schema(
+            &cli,
+            catalog,
+            schema,
+            list_timeout.as_secs(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(e) if e == "empty data" => (Vec::new(), "empty".to_string()),
+            Err(e) => {
+                let schema_ref = trino_qualified_schema(catalog, schema);
+                if trino_remote_state_is_uncertain(&e) {
+                    return Err(format!(
+                            "Trino/Presto schema discovery stopped because the remote query state is uncertain: {e}"
+                        ));
                 }
-            };
+                tracing::warn!(
+                    catalog,
+                    schema = %schema,
+                    error = %e,
+                    "Trino schema discovery: schema table listing failed, skipping schema"
+                );
+                skipped.push((schema_ref, e));
+                continue;
+            }
+        };
         tracing::info!(
             catalog,
             schema = %schema,
@@ -1870,7 +2235,15 @@ pub async fn discover_trino_multi(
             if tables.len() as u64 >= cap {
                 break;
             }
-            match describe_trino_with_retry(&cli, catalog, schema, &table_name).await {
+            match describe_trino_with_retry(
+                &cli,
+                catalog,
+                schema,
+                &table_name,
+                trino_schema_listing_timeout_secs(),
+            )
+            .await
+            {
                 Ok(cols) => {
                     let full_name = trino_full_table_name(catalog, schema, &table_name);
                     tables.push(json!({
@@ -1950,13 +2323,42 @@ pub async fn discover_trino_table(
     basic_auth: bool,
     table_name: &str,
 ) -> Result<Option<Value>, String> {
+    discover_trino_table_with_timeout(
+        host,
+        port,
+        catalog,
+        schema,
+        username,
+        password,
+        secure,
+        basic_auth,
+        table_name,
+        trino_schema_listing_timeout_secs(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn discover_trino_table_with_timeout(
+    host: &str,
+    port: u16,
+    catalog: &str,
+    schema: &str,
+    username: &str,
+    password: Option<&str>,
+    secure: bool,
+    basic_auth: bool,
+    table_name: &str,
+    timeout_secs: u64,
+) -> Result<Option<Value>, String> {
     let (catalog, schema, physical_table) =
         parse_trino_table_reference(catalog, schema, table_name);
     let cli = build_trino_client(
         host, port, &catalog, &schema, username, password, secure, basic_auth,
     )?;
 
-    let cols = describe_trino_with_retry(&cli, &catalog, &schema, &physical_table).await?;
+    let cols =
+        describe_trino_with_retry(&cli, &catalog, &schema, &physical_table, timeout_secs).await?;
 
     if cols.is_empty() {
         return Ok(None);
@@ -1982,7 +2384,7 @@ pub async fn discover_trino_table(
 /// Strategy 2: Column name pattern matching -- same heuristic as ClickHouse
 ///              (best-effort fallback for connectors without FK metadata)
 async fn discover_trino_foreign_keys(
-    cli: &trino_rust_client::Client,
+    cli: &Arc<trino_rust_client::Client>,
     schema: &str,
     tables: &[serde_json::Value],
 ) -> Vec<ForeignKey> {
@@ -2018,7 +2420,7 @@ async fn discover_trino_foreign_keys(
 /// Query Trino's information_schema for actual foreign key constraints.
 /// Returns `Some(Vec<ForeignKey>)` on success (may be empty), `None` on failure.
 async fn try_trino_information_schema_fks(
-    cli: &trino_rust_client::Client,
+    cli: &Arc<trino_rust_client::Client>,
     schema: &str,
 ) -> Option<Vec<ForeignKey>> {
     let query = format!(
@@ -2040,22 +2442,10 @@ async fn try_trino_information_schema_fks(
         schema_safe = schema.replace('\'', "''")
     );
 
-    let result = match tokio::time::timeout(
-        Duration::from_secs(trino_schema_listing_timeout_secs()),
-        cli.get_all::<trino_rust_client::Row>(query),
-    )
-    .await
-    {
-        Ok(Ok(result)) => result,
-        Ok(Err(e)) => {
+    let result = match run_trino_query(cli, query, trino_schema_listing_timeout_secs()).await {
+        Ok(result) => result,
+        Err(e) => {
             tracing::debug!(error = %e, "Trino information_schema FK query failed");
-            return None;
-        }
-        Err(_) => {
-            tracing::debug!(
-                timeout_secs = trino_schema_listing_timeout_secs(),
-                "Trino information_schema FK query timed out"
-            );
             return None;
         }
     };
@@ -2085,55 +2475,56 @@ async fn try_trino_information_schema_fks(
 }
 
 async fn describe_trino_with_retry(
-    cli: &trino_rust_client::Client,
+    cli: &Arc<trino_rust_client::Client>,
     catalog: &str,
     schema: &str,
     table_name: &str,
+    timeout_secs: u64,
 ) -> Result<Vec<Value>, String> {
     let mut last_err = String::new();
     for attempt in 0..RETRY_ATTEMPTS {
         backoff(attempt).await;
-        let sql = format!(
-            "DESCRIBE TABLE {}",
-            trino_qualified_table(catalog, schema, table_name)
-        );
-        match tokio::time::timeout(
-            Duration::from_secs(trino_schema_listing_timeout_secs()),
-            cli.get_all::<trino_rust_client::Row>(sql.clone()),
-        )
-        .await
-        {
-            Ok(Ok(ds)) => {
-                let (_types, rows) = ds.split();
-                let cols: Vec<Value> = rows
-                    .into_iter()
-                    .map(|r| {
-                        let vals: Vec<Value> = r.into_json();
-                        let name = vals
-                            .first()
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_owned();
-                        let col_type = vals
-                            .get(1)
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_owned();
-                        json!({ "name": name, "type": col_type })
-                    })
-                    .collect();
-                return Ok(cols);
-            }
-            Ok(Err(e)) => last_err = e.to_string(),
-            Err(_) => {
-                last_err = format!(
-                    "{sql} timed out after {}s",
-                    trino_schema_listing_timeout_secs()
-                )
+        for sql in trino_table_description_queries(catalog, schema, table_name) {
+            match run_trino_query(cli, sql.clone(), timeout_secs).await {
+                Ok(ds) => {
+                    let (_types, rows) = ds.split();
+                    let cols: Vec<Value> = rows
+                        .into_iter()
+                        .filter_map(|r| {
+                            let vals: Vec<Value> = r.into_json();
+                            let name = vals.first().and_then(Value::as_str)?.trim();
+                            if name.is_empty() {
+                                return None;
+                            }
+                            let col_type = vals
+                                .get(1)
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .trim();
+                            Some(json!({ "name": name, "type": col_type }))
+                        })
+                        .collect();
+                    return Ok(cols);
+                }
+                Err(e) => {
+                    let uncertain = trino_remote_state_is_uncertain(&e);
+                    last_err = format!("{sql}: {e}");
+                    if uncertain {
+                        return Err(last_err);
+                    }
+                }
             }
         }
     }
     Err(last_err)
+}
+
+fn trino_table_description_queries(catalog: &str, schema: &str, table_name: &str) -> [String; 2] {
+    let table = trino_qualified_table(catalog, schema, table_name);
+    [
+        format!("DESCRIBE {table}"),
+        format!("SHOW COLUMNS FROM {table}"),
+    ]
 }
 
 /// Unified schema discovery wrapper. Delegates to the appropriate database-specific
@@ -2372,13 +2763,6 @@ impl SchemaDiscovery {
                         .flatten()
                         .filter_map(|v| v.as_str()),
                 );
-                let (_, resolved_schema, _) =
-                    parse_trino_table_reference(catalog, schema, table_name);
-                let schema = if schemas.iter().any(|s| s == &resolved_schema) {
-                    resolved_schema.as_str()
-                } else {
-                    schemas.first().map(String::as_str).unwrap_or(schema)
-                };
                 let username = config
                     .get("username")
                     .and_then(|v| v.as_str())
@@ -2395,16 +2779,59 @@ impl SchemaDiscovery {
                     .get("basic_auth")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(!password.is_empty());
-                discover_trino_table(
-                    host,
-                    port,
-                    catalog,
-                    schema,
-                    username,
-                    Some(password),
-                    secure,
-                    basic_auth,
-                    table_name,
+                let candidates =
+                    trino_table_discovery_candidates(catalog, schema, &schemas, table_name);
+                let probe_timeout = Duration::from_secs(
+                    std::env::var("NL2SQL_TRINO_ON_DEMAND_SCHEMA_PROBE_TIMEOUT_SECS")
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .filter(|value| *value > 0)
+                        .unwrap_or(6)
+                        .min(30),
+                );
+                if candidates.len() > 1 {
+                    match discover_unqualified_trino_table(
+                        host,
+                        port,
+                        catalog,
+                        &schemas,
+                        username,
+                        Some(password),
+                        secure,
+                        basic_auth,
+                        table_name,
+                    )
+                    .await
+                    {
+                        Ok(result) => return Ok(result),
+                        Err(error) if trino_remote_state_is_uncertain(&error) => {
+                            return Err(error);
+                        }
+                        Err(error) => tracing::debug!(
+                            table = table_name,
+                            error = %error,
+                            "Trino information_schema table discovery failed; using bounded DESCRIBE fallback"
+                        ),
+                    }
+                }
+                probe_trino_table_candidates(
+                    candidates,
+                    1,
+                    move |catalog, schema, table| async move {
+                        discover_trino_table_with_timeout(
+                            host,
+                            port,
+                            &catalog,
+                            &schema,
+                            username,
+                            Some(password),
+                            secure,
+                            basic_auth,
+                            &table,
+                            probe_timeout.as_secs(),
+                        )
+                        .await
+                    },
                 )
                 .await
             }
@@ -2421,6 +2848,152 @@ impl SchemaDiscovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::routing::{delete, get, post};
+    use axum::{Json, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct FakeTrinoState {
+        base_url: String,
+        submissions: Arc<AtomicUsize>,
+        cancellations: Arc<AtomicUsize>,
+        initial_delay: Duration,
+        poll_delay: Duration,
+    }
+
+    fn fake_trino_stats() -> Value {
+        json!({
+            "state": "RUNNING",
+            "queued": false,
+            "scheduled": true,
+            "nodes": 1,
+            "totalSplits": 1,
+            "queuedSplits": 0,
+            "runningSplits": 1,
+            "completedSplits": 0,
+            "cpuTimeMillis": 1,
+            "wallTimeMillis": 1,
+            "queuedTimeMillis": 0,
+            "elapsedTimeMillis": 1,
+            "processedRows": 0,
+            "processedBytes": 0,
+            "peakMemoryBytes": 1,
+            "spilledBytes": 0
+        })
+    }
+
+    async fn fake_trino_submit(State(state): State<FakeTrinoState>) -> Json<Value> {
+        let submission = state.submissions.fetch_add(1, Ordering::SeqCst) + 1;
+        tokio::time::sleep(state.initial_delay).await;
+        let query_id = format!("metadata-{submission}");
+        Json(json!({
+            "id": query_id,
+            "infoUri": format!("{}/ui/query.html", state.base_url),
+            "partialCancelUri": null,
+            "nextUri": format!("{}/v1/next/{query_id}", state.base_url),
+            "columns": null,
+            "data": null,
+            "error": null,
+            "stats": fake_trino_stats(),
+            "warnings": [],
+            "updateType": null,
+            "updateCount": null
+        }))
+    }
+
+    async fn fake_trino_poll(State(state): State<FakeTrinoState>) -> Json<Value> {
+        tokio::time::sleep(state.poll_delay).await;
+        Json(json!({
+            "id": "metadata-poll",
+            "infoUri": format!("{}/ui/query.html", state.base_url),
+            "partialCancelUri": null,
+            "nextUri": null,
+            "columns": [{
+                "name": "value",
+                "type": "varchar",
+                "typeSignature": {"rawType": "varchar", "arguments": []}
+            }],
+            "data": [["ok"]],
+            "error": null,
+            "stats": fake_trino_stats(),
+            "warnings": [],
+            "updateType": null,
+            "updateCount": null
+        }))
+    }
+
+    async fn fake_trino_cancel(State(state): State<FakeTrinoState>) -> StatusCode {
+        state.cancellations.fetch_add(1, Ordering::SeqCst);
+        StatusCode::NO_CONTENT
+    }
+
+    async fn start_fake_trino(
+        initial_delay: Duration,
+        poll_delay: Duration,
+    ) -> (FakeTrinoState, u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake Trino");
+        let port = listener.local_addr().expect("fake Trino address").port();
+        let state = FakeTrinoState {
+            base_url: format!("http://127.0.0.1:{port}"),
+            submissions: Arc::new(AtomicUsize::new(0)),
+            cancellations: Arc::new(AtomicUsize::new(0)),
+            initial_delay,
+            poll_delay,
+        };
+        let app = Router::new()
+            .route("/v1/statement", post(fake_trino_submit))
+            .route("/v1/next/{query_id}", get(fake_trino_poll))
+            .route("/v1/query/{query_id}", delete(fake_trino_cancel))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve fake Trino");
+        });
+        (state, port, server)
+    }
+
+    fn fake_trino_client(port: u16) -> Arc<trino_rust_client::Client> {
+        build_trino_client(
+            "127.0.0.1",
+            port,
+            "memory",
+            "default",
+            "test-user",
+            None,
+            false,
+            false,
+        )
+        .expect("build fake Trino client")
+    }
+
+    #[tokio::test]
+    async fn trino_metadata_poll_timeout_cancels_the_remote_query() {
+        let (state, port, server) = start_fake_trino(Duration::ZERO, Duration::from_secs(5)).await;
+        let error = run_trino_query(&fake_trino_client(port), "SHOW TABLES".to_string(), 1)
+            .await
+            .expect_err("metadata query should time out");
+
+        assert!(error.contains("timed out"));
+        assert_eq!(state.submissions.load(Ordering::SeqCst), 1);
+        assert_eq!(state.cancellations.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn trino_initial_timeout_stops_compatibility_fallback_submissions() {
+        let (state, port, server) = start_fake_trino(Duration::from_secs(5), Duration::ZERO).await;
+        let error = list_trino_tables_for_schema(&fake_trino_client(port), "memory", "default", 1)
+            .await
+            .expect_err("initial timeout must stop discovery");
+
+        assert!(trino_remote_state_is_uncertain(&error));
+        assert_eq!(state.submissions.load(Ordering::SeqCst), 1);
+        assert_eq!(state.cancellations.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
 
     #[test]
     fn mongodb_schema_sampling_flattens_nested_fields_and_tracks_nullability() {
@@ -2462,6 +3035,23 @@ mod tests {
     }
 
     #[test]
+    fn trino_string_literal_escapes_quotes() {
+        assert_eq!(trino_string_literal("simple"), "'simple'");
+        assert_eq!(trino_string_literal("schema'o"), "'schema''o'");
+    }
+
+    #[test]
+    fn trino_table_description_uses_cross_version_syntaxes() {
+        assert_eq!(
+            trino_table_description_queries("iceberg", "mps_prod", "orders"),
+            [
+                "DESCRIBE iceberg.mps_prod.orders".to_string(),
+                "SHOW COLUMNS FROM iceberg.mps_prod.orders".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn parse_trino_table_reference_supports_table_schema_and_catalog_schema() {
         assert_eq!(
             parse_trino_table_reference("iceberg", "mps_prod", "business_order"),
@@ -2487,5 +3077,103 @@ mod tests {
                 "business_order".to_string()
             )
         );
+    }
+
+    #[test]
+    fn explicit_trino_schema_does_not_fan_out() {
+        let schemas = vec!["first".to_string(), "later".to_string()];
+        assert_eq!(
+            trino_table_discovery_candidates("iceberg", "first", &schemas, "later.orders"),
+            vec![(
+                "iceberg".to_string(),
+                "later".to_string(),
+                "orders".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn unqualified_trino_table_searches_configured_schemas_in_order() {
+        let schemas = vec!["first".to_string(), "later".to_string()];
+        assert_eq!(
+            trino_table_discovery_candidates("iceberg", "first", &schemas, "orders"),
+            vec![
+                (
+                    "iceberg".to_string(),
+                    "first".to_string(),
+                    "orders".to_string()
+                ),
+                (
+                    "iceberg".to_string(),
+                    "later".to_string(),
+                    "orders".to_string()
+                )
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn unqualified_trino_table_can_match_a_later_schema() {
+        let candidates = vec![
+            (
+                "iceberg".to_string(),
+                "first".to_string(),
+                "orders".to_string(),
+            ),
+            (
+                "iceberg".to_string(),
+                "later".to_string(),
+                "orders".to_string(),
+            ),
+        ];
+        let table =
+            probe_trino_table_candidates(candidates, 2, |catalog, schema, table| async move {
+                Ok((schema == "later")
+                    .then(|| json!({"table_name": format!("{catalog}.{schema}.{table}")})))
+            })
+            .await
+            .expect("probe later schema");
+        assert_eq!(
+            table.and_then(|value| value["table_name"].as_str().map(str::to_string)),
+            Some("iceberg.later.orders".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn trino_table_schema_probing_has_bounded_concurrency() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let candidates = (0..8)
+            .map(|index| {
+                (
+                    "iceberg".to_string(),
+                    format!("schema_{index}"),
+                    "orders".to_string(),
+                )
+            })
+            .collect();
+        probe_trino_table_candidates(candidates, 2, {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            move |_, _, _| {
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(None)
+                }
+            }
+        })
+        .await
+        .expect("bounded probe");
+        assert!(peak.load(Ordering::SeqCst) <= 2);
     }
 }

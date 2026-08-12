@@ -1060,7 +1060,8 @@ pub(crate) async fn list_sql_knowledge_import_tasks(
                 CAST(completed_at AS TEXT) completed_at, CAST(updated_at AS TEXT) updated_at \
          FROM nl2sql_reference_import_tasks \
          WHERE tenant_id = ? AND user_id = ? AND pack_id = ? \
-         ORDER BY created_at DESC LIMIT 20",
+         ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, \
+                  created_at DESC LIMIT 20",
     )
     .bind(&claims.tenant_id)
     .bind(&claims.sub)

@@ -25,9 +25,9 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use api::{
-    embeddings_endpoint, AnthropicClient, ApiError, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, OutputContentBlock, ProviderClient, ProviderKind, StreamEvent,
-    ToolChoice, ToolDefinition, ToolResultContentBlock,
+    AnthropicClient, ApiError, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
+    OutputContentBlock, ProviderClient, ProviderKind, StreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 use runtime::mcp::write_audit_log;
 use runtime::{
@@ -6567,98 +6567,6 @@ struct GatewayMemoryEmbedding {
     vector: Vec<f32>,
 }
 
-async fn gateway_resolve_embedding_config(
-    context: &GatewayMemoryContext,
-) -> Option<(String, Option<String>, String)> {
-    for scenario in [Some(context.app.as_str()), Some("chat"), None] {
-        let rows_result =
-            match scenario {
-                Some(scenario) => sqlx::query_as::<
-                    _,
-                    (String, String, String, Option<String>),
-                >(
-                    r#"
-                    SELECT id, encrypted_key, model, base_url
-                    FROM api_keys
-                    WHERE tenant_id = ? AND model_type = 'embedding' AND enabled = 1
-                      AND (scenarios IS NULL OR json_array_length(scenarios) = 0 OR EXISTS (SELECT 1 FROM json_each(scenarios) WHERE json_each.value = ?))
-                    ORDER BY priority ASC, created_at ASC
-                    "#,
-                )
-                .bind(&context.tenant_id)
-                .bind(scenario)
-                .fetch_all(&context.db)
-                .await,
-                None => sqlx::query_as::<_, (String, String, String, Option<String>)>(
-                    r#"
-                    SELECT id, encrypted_key, model, base_url
-                    FROM api_keys
-                    WHERE tenant_id = ? AND model_type = 'embedding' AND enabled = 1
-                    ORDER BY priority ASC, created_at ASC
-                    "#,
-                )
-                .bind(&context.tenant_id)
-                .fetch_all(&context.db)
-                .await,
-            };
-        let rows = match rows_result {
-            Ok(rows) => rows,
-            Err(error) => {
-                tracing::debug!(
-                    tenant_id = %context.tenant_id,
-                    error = %error,
-                    "gateway memory embedding config query failed"
-                );
-                continue;
-            }
-        };
-        for (key_id, encrypted_key, model, base_url) in rows {
-            if encrypted_key.trim().is_empty() {
-                continue;
-            }
-            match crate::crypto::decrypt(&encrypted_key) {
-                Ok(api_key) => {
-                    let model = if model.trim().is_empty() {
-                        "text-embedding-3-small".to_string()
-                    } else {
-                        model
-                    };
-                    tracing::debug!(
-                        tenant_id = %context.tenant_id,
-                        key_id = %key_id,
-                        model = %model,
-                        "gateway memory embedding config resolved"
-                    );
-                    return Some((model, base_url, api_key));
-                }
-                Err(error) => {
-                    tracing::debug!(
-                        tenant_id = %context.tenant_id,
-                        key_id = %key_id,
-                        error = %error,
-                        "gateway memory embedding key decrypt failed"
-                    );
-                }
-            }
-        }
-    }
-
-    let env_fallback_enabled =
-        runtime::explicit_env_opt_in_enabled("AOS_ALLOW_TENANT_EMBEDDING_ENV_FALLBACK");
-    if !env_fallback_enabled {
-        return None;
-    }
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-        .ok()?;
-    let model =
-        std::env::var("EMBEDDING_MODEL").unwrap_or_else(|_| "text-embedding-3-small".to_string());
-    let base_url = std::env::var("EMBEDDING_BASE_URL")
-        .ok()
-        .or_else(|| std::env::var("OPENAI_BASE_URL").ok());
-    Some((model, base_url, api_key))
-}
-
 async fn gateway_embed_memory_text_best_effort(
     context: &GatewayMemoryContext,
     text: &str,
@@ -6666,69 +6574,31 @@ async fn gateway_embed_memory_text_best_effort(
     if text.trim().is_empty() {
         return None;
     }
-    let (model, base_url, api_key) = gateway_resolve_embedding_config(context).await?;
-    let protected = runtime::protect_sensitive_text(
-        &gateway_compact_text(text, 2_000),
-        runtime::configured_data_protection_mode(),
-    );
-    if protected.report.redacted {
-        tracing::warn!(
-            tenant_id = %context.tenant_id,
-            model = %model,
-            finding_count = protected.report.finding_count,
-            categories = ?protected.report.categories,
-            "gateway memory embedding outbound data protection redacted sensitive values"
-        );
-    }
-    let base = base_url.unwrap_or_else(|| "https://api.openai.com".to_string());
-    let url = embeddings_endpoint(&base);
-    let body = json!({
-        "model": model,
-        "input": [protected.value],
-    });
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .ok()?;
-    let resp = match client
-        .post(url)
-        .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {api_key}"))
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(resp) => resp,
+    let input = gateway_compact_text(text, 2_000);
+    let result =
+        tokio::task::spawn_blocking(move || runtime::local_embedding::embed(vec![input])).await;
+    match result {
+        Ok(Ok(mut vectors)) => vectors.pop().map(|vector| GatewayMemoryEmbedding {
+            model: runtime::local_embedding::MODEL.to_string(),
+            vector,
+        }),
+        Ok(Err(error)) => {
+            tracing::debug!(
+                tenant_id = %context.tenant_id,
+                error = %error,
+                "gateway local memory embedding unavailable; using keyword recall"
+            );
+            None
+        }
         Err(error) => {
             tracing::debug!(
                 tenant_id = %context.tenant_id,
                 error = %error,
-                "gateway memory embedding request failed"
+                "gateway local memory embedding worker failed; using keyword recall"
             );
-            return None;
+            None
         }
-    };
-    let status = resp.status();
-    let text = resp.text().await.ok()?;
-    if !status.is_success() {
-        tracing::debug!(
-            tenant_id = %context.tenant_id,
-            status = %status,
-            "gateway memory embedding provider returned error"
-        );
-        return None;
     }
-    let parsed: Value = serde_json::from_str(&text).ok()?;
-    let vector = parsed
-        .get("data")
-        .and_then(Value::as_array)
-        .and_then(|items| items.first())
-        .and_then(|item| item.get("embedding"))
-        .and_then(Value::as_array)?
-        .iter()
-        .filter_map(|value| value.as_f64().map(|num| num as f32))
-        .collect::<Vec<_>>();
-    (!vector.is_empty()).then_some(GatewayMemoryEmbedding { model, vector })
 }
 
 fn gateway_cosine_similarity(a: &[f32], b: &[f32]) -> Option<f64> {
@@ -8105,7 +7975,7 @@ async fn gateway_memory_note(
         INSERT INTO agent_memory_items
           (id, tenant_id, user_id, scope, app, session_id, session_key, memory_type, content, content_hash,
            source_type, confidence, pinned, enabled, metadata_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'explicit_user', 1.0, ?, 1, CAST(? AS JSON))
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'explicit_user', 1.0, ?, 1, json(?))
         ON CONFLICT DO UPDATE SET
           updated_at = CURRENT_TIMESTAMP,
           confidence = MAX(confidence, excluded.confidence),

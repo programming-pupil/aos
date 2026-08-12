@@ -9,7 +9,7 @@ publish.workspace = true
 default = ["full"]
 agent = []
 pm = ["agent", "dep:pm-orchestrator", "dep:pm-report"]
-nl2sql = ["dep:nl2sql-domain", "dep:nl2sql-core", "dep:fastembed"]
+nl2sql = ["dep:nl2sql-domain", "dep:nl2sql-core", "runtime/local-embedding"]
 rd = ["projects", "dep:rd-core"]
 bot-agents = ["pm", "dep:feishu-sdk", "dep:tokio-tungstenite", "dep:rustls"]
 projects = []
@@ -55,7 +55,6 @@ rusqlite = { workspace = true }
 parking_lot.workspace = true
 fs2.workspace = true
 hnsw_rs = "0.3"
-fastembed = { version = "=5.13.0", default-features = false, features = ["ort-load-dynamic"], optional = true }
 clickhouse = { version = "0.14", features = ["native-tls"] }
 trino-rust-client = "0.9"
 clap = { version = "4", features = ["derive"] }

@@ -3061,11 +3061,13 @@ async fn run_nl2sql_capability(
         &claims,
         crate::routes::nl2sql::AgentExecuteRequest {
             question: user_text.to_string(),
+            retrieval_question: None,
             preferred_model: None,
             shared_context: None,
             datasource_ids: datasource_ids.clone(),
             conversation_id: Some(conversation_id.clone()),
             max_steps,
+            bounded: false,
         },
     )
     .await
@@ -4952,7 +4954,7 @@ async fn persist_staged_bot_attachments(
     sqlx::query::<sqlx::Sqlite>(
         "UPDATE bot_message_logs
          SET content_json = JSON_SET(COALESCE(content_json, JSON_OBJECT()),
-             '$.stagedAttachments', CAST(? AS JSON)), updated_at = CURRENT_TIMESTAMP
+             '$.stagedAttachments', json(?)), updated_at = CURRENT_TIMESTAMP
          WHERE tenant_id = ? AND id = ?
            AND status NOT IN ('cancelling','cancelled')
            AND queue_status NOT IN ('cancelling','cancelled')",

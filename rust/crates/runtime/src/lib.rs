@@ -44,6 +44,8 @@ pub mod session_control;
 pub use session_control::SessionStore;
 pub mod egress;
 pub mod isolation;
+#[cfg(feature = "local-embedding")]
+pub mod local_embedding;
 mod sse;
 pub mod stale_base;
 pub mod stale_branch;

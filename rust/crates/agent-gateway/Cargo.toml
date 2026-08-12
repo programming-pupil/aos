@@ -7,7 +7,7 @@ publish.workspace = true
 
 [dependencies]
 # Core runtime (we ONLY call public interfaces, never touch internals)
-runtime = { path = "../runtime" }
+runtime = { path = "../runtime", features = ["local-embedding"] }
 api = { path = "../api" }
 tools = { path = "../tools" }
 plugins = { path = "../plugins" }

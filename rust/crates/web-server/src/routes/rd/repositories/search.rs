@@ -140,6 +140,98 @@ pub(in crate::routes::rd) async fn run_rg_repository_search(
     Ok(Some(hits))
 }
 
+pub(in crate::routes::rd) async fn run_exact_repository_search(
+    root: &Path,
+    needle: &str,
+    limit: usize,
+) -> Result<Vec<RdRepositorySearchHitDto>, AppError> {
+    let needle = needle.trim();
+    if needle.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let output = match timeout(
+        Duration::from_secs(8),
+        tokio::process::Command::new("rg")
+            .args([
+                "--line-number",
+                "--no-heading",
+                "--color",
+                "never",
+                "--smart-case",
+                "--fixed-strings",
+                "--max-columns",
+                "240",
+                "--max-columns-preview",
+                "--max-filesize",
+                "512K",
+                "--glob",
+                "!.git",
+                "--glob",
+                "!node_modules",
+                "--glob",
+                "!target",
+                "--glob",
+                "!dist",
+                "--glob",
+                "!build",
+                "--glob",
+                "!.next",
+                "--glob",
+                "!.cache",
+                "--glob",
+                "!vendor",
+                needle,
+                ".",
+            ])
+            .current_dir(root)
+            .output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(manual_repository_search(root, needle, limit));
+        }
+        Ok(Err(error)) => {
+            return Err(AppError::Internal(format!(
+                "exact repository search failed: {error}"
+            )));
+        }
+        Err(_) => return Ok(manual_repository_search(root, needle, limit)),
+    };
+
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Ok(manual_repository_search(root, needle, limit));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut hits = Vec::new();
+    for line in stdout.lines() {
+        if hits.len() >= limit {
+            break;
+        }
+        let mut parts = line.splitn(3, ':');
+        let Some(path) = parts
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let line_number = parts
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let snippet = parts.next().unwrap_or_default().trim();
+        hits.push(RdRepositorySearchHitDto {
+            path: path.trim_start_matches("./").to_string(),
+            line_number,
+            snippet: truncate_text(snippet, 500),
+        });
+    }
+    Ok(hits)
+}
+
 async fn query_repository_file_suggestions(
     db: &SqlitePool,
     tenant_id: &str,

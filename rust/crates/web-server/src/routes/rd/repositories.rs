@@ -3,7 +3,10 @@
 use super::*;
 
 mod search;
-pub(super) use search::{repository_file_suggestions, repository_search, run_rg_repository_search};
+pub(super) use search::{
+    repository_file_suggestions, repository_search, run_exact_repository_search,
+    run_rg_repository_search,
+};
 
 #[derive(Debug, Deserialize)]
 pub(super) struct RdRepositoryCreateRequest {

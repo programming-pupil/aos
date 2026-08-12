@@ -1,5 +1,6 @@
-use super::agent::execute_agent_request;
+use super::agent::{execute_agent_request, execute_agent_request_with_budget};
 use super::agent_async::{with_agent_stage_emitter, AgentStageSignal};
+use super::agent_executor::DatasourceRequestBudget;
 use super::reference::ReferenceUsageDto;
 use super::{AgentExecuteRequest, PaginationParams};
 use crate::auth::Claims;
@@ -10,13 +11,12 @@ use api::{InputContentBlock, InputMessage, MessageRequest, OutputContentBlock};
 use axum::extract::{Extension, Path, Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::Json;
-use futures_util::{stream, FutureExt, StreamExt};
+use futures_util::FutureExt;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Row};
 use std::collections::HashMap;
 use std::env;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex, OwnedSemaphorePermit, Semaphore};
@@ -41,6 +41,22 @@ pub struct AttributionAnalyzeRequest {
     pub datasource_ids: Vec<String>,
     #[serde(default)]
     pub depth: Option<AttributionDepth>,
+    #[serde(skip)]
+    pub(crate) network_budget: Option<Arc<DatasourceRequestBudget>>,
+}
+
+impl Default for AttributionAnalyzeRequest {
+    fn default() -> Self {
+        Self {
+            question: String::new(),
+            preferred_model: None,
+            conversation_id: None,
+            context: None,
+            datasource_ids: Vec::new(),
+            depth: None,
+            network_budget: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +159,31 @@ fn attribution_step_budget(depth: AttributionDepth) -> Duration {
             .filter(|value| *value >= 30)
             .unwrap_or(default_secs),
     )
+}
+
+fn attribution_step_budget_for(depth: AttributionDepth, step: &AttributionPlanStep) -> Duration {
+    let base = attribution_step_budget(depth);
+    let extra_secs = match step.id.as_str() {
+        "main_metric" => match depth {
+            AttributionDepth::Fast => 30,
+            AttributionDepth::Standard => 45,
+            AttributionDepth::Deep => 60,
+        },
+        "metric_decomposition" | "dimension_drilldown" => 20,
+        _ => 0,
+    };
+    base.saturating_add(Duration::from_secs(extra_secs))
+}
+
+fn attribution_primary_attempt_deadline(step_deadline: Instant) -> Instant {
+    let remaining = remaining_attribution_budget(step_deadline);
+    if remaining <= Duration::from_secs(45) {
+        return step_deadline;
+    }
+    let reserve = (remaining / 3)
+        .max(Duration::from_secs(35))
+        .min(Duration::from_secs(70));
+    step_deadline.checked_sub(reserve).unwrap_or(step_deadline)
 }
 
 fn attribution_synthesis_reserve() -> Duration {
@@ -1314,7 +1355,7 @@ async fn persist_attribution_task_started(
     let result = sqlx::query::<sqlx::Sqlite>(
         "INSERT INTO nl2sql_attribution_tasks \
             (task_id, tenant_id, user_id, conversation_id, parent_task_id, question, depth, datasource_ids_json, status, cancel_requested) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON), 'queued', 0) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, json(?), 'queued', 0) \
          ON CONFLICT DO UPDATE SET \
             question = excluded.question, \
             depth = excluded.depth, \
@@ -1365,8 +1406,8 @@ async fn persist_attribution_task_completed(
     let summary = attribution_response_summary(response);
     if let Err(e) = sqlx::query::<sqlx::Sqlite>(
         "UPDATE nl2sql_attribution_tasks \
-         SET status = ?, summary = ?, response_json = CAST(? AS JSON), \
-             evidence_cards_json = CAST(? AS JSON), error = ?, total_execution_ms = ?, \
+         SET status = ?, summary = ?, response_json = json(?), \
+             evidence_cards_json = json(?), error = ?, total_execution_ms = ?, \
              updated_at = CURRENT_TIMESTAMP \
          WHERE tenant_id = ? AND user_id = ? AND task_id = ?
            AND status IN ('queued', 'running') AND cancel_requested = 0",
@@ -2178,7 +2219,9 @@ async fn persisted_attribution_task_snapshot(
     task_id: &str,
 ) -> Option<AttributionTaskEvent> {
     let row = sqlx::query::<sqlx::Sqlite>(
-        "SELECT status, summary, CAST(response_json AS TEXT) AS response_json,
+        "SELECT conversation_id, question, depth, status, summary,
+                CAST(response_json AS TEXT) AS response_json,
+                CAST(progress_events_json AS TEXT) AS progress_events_json,
                 error, CAST(total_execution_ms AS INTEGER) AS total_execution_ms
          FROM nl2sql_attribution_tasks
          WHERE task_id = ? AND tenant_id = ? AND user_id = ? LIMIT 1",
@@ -2191,11 +2234,33 @@ async fn persisted_attribution_task_snapshot(
     .ok()
     .flatten()?;
     let status = row.try_get::<String, _>("status").ok()?;
+    let total_execution_ms = row
+        .try_get::<Option<i64>, _>("total_execution_ms")
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+        .max(0) as u64;
+    let error = row.try_get::<Option<String>, _>("error").ok().flatten();
     let response = row
         .try_get::<Option<String>, _>("response_json")
         .ok()
         .flatten()
-        .and_then(|raw| serde_json::from_str::<AttributionAnalyzeResponse>(&raw).ok());
+        .and_then(|raw| serde_json::from_str::<AttributionAnalyzeResponse>(&raw).ok())
+        .or_else(|| {
+            recover_attribution_response_from_progress(
+                row.try_get::<String, _>("question").unwrap_or_default(),
+                row.try_get::<String, _>("depth")
+                    .unwrap_or_else(|_| "standard".to_string()),
+                row.try_get::<String, _>("conversation_id")
+                    .unwrap_or_default(),
+                status.clone(),
+                total_execution_ms,
+                error.clone(),
+                row.try_get::<Option<String>, _>("progress_events_json")
+                    .ok()
+                    .flatten(),
+            )
+        });
     Some(AttributionTaskEvent {
         task_id: task_id.to_string(),
         status: status.clone(),
@@ -2211,12 +2276,7 @@ async fn persisted_attribution_task_snapshot(
                     "数据归因任务仍在执行".to_string()
                 })
             }),
-        elapsed_ms: row
-            .try_get::<Option<i64>, _>("total_execution_ms")
-            .ok()
-            .flatten()
-            .unwrap_or(0)
-            .max(0) as u64,
+        elapsed_ms: total_execution_ms,
         stage_elapsed_ms: None,
         progress_percent: Some(if attribution_status_is_terminal(&status) {
             100
@@ -2227,7 +2287,7 @@ async fn persisted_attribution_task_snapshot(
         step_total: None,
         observation: None,
         response,
-        error: row.try_get::<Option<String>, _>("error").ok().flatten(),
+        error,
     })
 }
 
@@ -2416,30 +2476,98 @@ pub(crate) async fn list_attribution_conversations(
     }))
 }
 
+fn recover_attribution_response_from_progress(
+    question: String,
+    depth: String,
+    conversation_id: String,
+    status: String,
+    total_execution_ms: u64,
+    error: Option<String>,
+    progress_events_json: Option<String>,
+) -> Option<AttributionAnalyzeResponse> {
+    let events = progress_events_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Vec<AttributionTaskEvent>>(raw).ok())?;
+    let mut observations_by_step = HashMap::new();
+    let mut step_order = Vec::new();
+    for event in events {
+        let Some(observation) = event.observation else {
+            continue;
+        };
+        if !observations_by_step.contains_key(&observation.step_id) {
+            step_order.push(observation.step_id.clone());
+        }
+        observations_by_step.insert(observation.step_id.clone(), observation);
+    }
+    let observations = step_order
+        .into_iter()
+        .filter_map(|step_id| observations_by_step.remove(&step_id))
+        .collect::<Vec<_>>();
+    if observations.is_empty() {
+        return None;
+    }
+    let evidence_health = AttributionEvidenceHealth::from_observations(&observations);
+    let evidence_cards = build_evidence_cards(&observations);
+    let report = Some(fallback_report(&question, &observations));
+    Some(AttributionAnalyzeResponse {
+        status,
+        question,
+        depth,
+        conversation_id: (!conversation_id.trim().is_empty()).then_some(conversation_id),
+        clarification_question: None,
+        report,
+        plan: None,
+        observations,
+        evidence_health,
+        evidence_cards,
+        total_execution_ms,
+        error,
+    })
+}
+
 fn attribution_task_row_to_item(row: sqlx::sqlite::SqliteRow) -> AttributionConversationTaskItem {
-    let response = row
-        .try_get::<Option<String>, _>("response_json")
-        .ok()
-        .flatten()
-        .and_then(|raw| serde_json::from_str::<AttributionAnalyzeResponse>(&raw).ok());
+    let task_id: String = row.try_get("task_id").unwrap_or_default();
+    let conversation_id: String = row.try_get("conversation_id").unwrap_or_default();
+    let question: String = row.try_get("question").unwrap_or_default();
+    let depth: String = row
+        .try_get("depth")
+        .unwrap_or_else(|_| "standard".to_string());
+    let status: String = row
+        .try_get("status")
+        .unwrap_or_else(|_| "queued".to_string());
+    let error = row.try_get::<Option<String>, _>("error").ok().flatten();
     let total_execution_ms = row
         .try_get::<Option<u64>, _>("total_execution_ms")
         .ok()
         .flatten()
         .unwrap_or(0);
+    let response = row
+        .try_get::<Option<String>, _>("response_json")
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<AttributionAnalyzeResponse>(&raw).ok())
+        .or_else(|| {
+            recover_attribution_response_from_progress(
+                question.clone(),
+                depth.clone(),
+                conversation_id.clone(),
+                status.clone(),
+                total_execution_ms,
+                error.clone(),
+                row.try_get::<Option<String>, _>("progress_events_json")
+                    .ok()
+                    .flatten(),
+            )
+        });
     AttributionConversationTaskItem {
-        task_id: row.try_get("task_id").unwrap_or_default(),
-        conversation_id: row.try_get("conversation_id").unwrap_or_default(),
-        question: row.try_get("question").unwrap_or_default(),
-        depth: row
-            .try_get("depth")
-            .unwrap_or_else(|_| "standard".to_string()),
-        status: row
-            .try_get("status")
-            .unwrap_or_else(|_| "queued".to_string()),
+        task_id,
+        conversation_id,
+        question,
+        depth,
+        status,
         summary: row.try_get::<Option<String>, _>("summary").ok().flatten(),
         response,
-        error: row.try_get::<Option<String>, _>("error").ok().flatten(),
+        error,
         total_execution_ms,
         created_at: row.try_get("created_at").unwrap_or_default(),
         updated_at: row.try_get("updated_at").unwrap_or_default(),
@@ -2487,7 +2615,8 @@ pub(crate) async fn get_attribution_conversation(
     if !task_ids.is_empty() {
         let mut qb: QueryBuilder<sqlx::Sqlite> = QueryBuilder::new(
             "SELECT task_id, conversation_id, question, depth, status, summary, \
-                CAST(response_json AS TEXT) AS response_json, error, \
+                CAST(response_json AS TEXT) AS response_json, \
+                CAST(progress_events_json AS TEXT) AS progress_events_json, error, \
                 CAST(total_execution_ms AS INTEGER) AS total_execution_ms, \
                 strftime('%Y-%m-%d %H:%M:%S', created_at) AS created_at, \
                 strftime('%Y-%m-%d %H:%M:%S', updated_at) AS updated_at \
@@ -2609,6 +2738,13 @@ fn should_run_diagnostic_loop(observations: &[AttributionObservation]) -> bool {
     // proven root cause. At least one counter-check or robustness observation
     // is required before the deterministic convergence gate can close.
     !core_evidence_complete
+}
+
+fn should_skip_attribution_synthesis(observations: &[AttributionObservation]) -> bool {
+    observations.is_empty()
+        || observations
+            .iter()
+            .all(|observation| !observation.has_usable_evidence())
 }
 
 fn clarification_after_completed_steps(
@@ -2959,7 +3095,7 @@ async fn run_diagnostic_loop(
                 task_id,
                 Some(step_index),
                 Some(total),
-                deadline,
+                bounded_phase_deadline(deadline, attribution_step_budget_for(depth, &step)),
             )
             .await;
             let summary = if observation.error.is_some() {
@@ -3154,6 +3290,7 @@ async fn analyze_attribution(
         context: None,
         datasource_ids: req.datasource_ids.clone(),
         depth: req.depth,
+        network_budget: Some(DatasourceRequestBudget::new(3)),
     };
 
     publish(
@@ -3263,8 +3400,10 @@ async fn analyze_attribution(
             None,
         )
         .await;
-        let step_deadline =
-            bounded_phase_deadline(execution_deadline, attribution_step_budget(depth));
+        let step_deadline = bounded_phase_deadline(
+            execution_deadline,
+            attribution_step_budget_for(depth, &step),
+        );
         let observation = execute_attribution_step(
             state,
             claims,
@@ -3305,6 +3444,7 @@ async fn analyze_attribution(
             .error
             .as_deref()
             .and_then(extract_clarification_from_error);
+        let core_failed = observation.error.is_some();
         observations.push(observation);
         if let Some(question) = core_clarification {
             let evidence_health = AttributionEvidenceHealth::from_observations(&observations);
@@ -3323,85 +3463,92 @@ async fn analyze_attribution(
                 error: None,
             });
         }
+        // A failed or timed-out core query is terminal for this request. Do
+        // not start auxiliary branches while the remote statement may still
+        // be unwinding; this is the key protection against fan-out storms.
+        if core_failed {
+            indexed_steps.clear();
+        }
     }
 
-    let completed_steps = Arc::new(AtomicUsize::new(observations.len()));
-    let mut completed = stream::iter(indexed_steps.into_iter().map(|(idx, step)| {
-        let completed_steps = Arc::clone(&completed_steps);
+    let mut completed = Vec::new();
+    for (idx, step) in indexed_steps.into_iter() {
         let execution_req = &execution_req;
         let conversation_id = &conversation_id;
-        async move {
-            let step_index = idx + 1;
-            // `buffer_unordered` starts queued futures as earlier steps finish.
-            // Re-check cancellation here so a stopped attribution turn cannot
-            // launch another model/SQL request from the pending queue.
-            if task_manager().is_cancelled(task_id).await || Instant::now() >= execution_deadline {
-                return (
-                    idx,
-                    step.clone(),
-                    deadline_attribution_observation(&step, conversation_id),
-                );
-            }
-            publish(
-                state,
-                claims,
-                task_id,
-                "execute",
-                &format!(
-                    "正在执行归因查询 {}/{}：{}",
-                    step_index, total_steps, step.title
-                ),
-                Some(execute_progress_percent(0, total_steps)),
-                Some(step_index),
-                Some(total_steps),
-                None,
-            )
-            .await;
-            let step_deadline =
-                bounded_phase_deadline(execution_deadline, attribution_step_budget(depth));
-            let observation = execute_attribution_step(
-                state,
-                claims,
-                execution_req,
-                conversation_id,
-                &step,
-                depth,
-                task_id,
-                Some(step_index),
-                Some(total_steps),
-                step_deadline,
-            )
-            .await;
-            let completed_count = completed_steps.fetch_add(1, Ordering::Relaxed) + 1;
-            let step_summary = if observation.error.is_some() {
-                format!(
-                    "归因查询 {}/{} 未成功，继续查看其它方向：{}",
-                    step_index, total_steps, step.title
-                )
-            } else {
-                format!(
-                    "已完成归因查询 {}/{}：{}，返回 {} 行",
-                    step_index, total_steps, step.title, observation.row_count
-                )
-            };
-            publish(
-                state,
-                claims,
-                task_id,
-                "execute",
-                &step_summary,
-                Some(execute_progress_percent(completed_count, total_steps)),
-                Some(step_index),
-                Some(total_steps),
-                Some(observation.clone()),
-            )
-            .await;
-            (idx, step, observation)
+        let step_index = idx + 1;
+        // `buffer_unordered` starts queued futures as earlier steps finish.
+        // Re-check cancellation here so a stopped attribution turn cannot
+        // launch another model/SQL request from the pending queue.
+        if task_manager().is_cancelled(task_id).await || Instant::now() >= execution_deadline {
+            completed.push((
+                idx,
+                step.clone(),
+                deadline_attribution_observation(&step, conversation_id),
+            ));
+            continue;
         }
-    }))
-    .buffer_unordered(attribution_query_concurrency().min(total_steps.max(1)))
-    .collect::<Vec<_>>()
-    .await;
+        publish(
+            state,
+            claims,
+            task_id,
+            "execute",
+            &format!(
+                "正在执行归因查询 {}/{}：{}",
+                step_index, total_steps, step.title
+            ),
+            Some(execute_progress_percent(0, total_steps)),
+            Some(step_index),
+            Some(total_steps),
+            None,
+        )
+        .await;
+        let step_deadline = bounded_phase_deadline(
+            execution_deadline,
+            attribution_step_budget_for(depth, &step),
+        );
+        let observation = execute_attribution_step(
+            state,
+            claims,
+            execution_req,
+            conversation_id,
+            &step,
+            depth,
+            task_id,
+            Some(step_index),
+            Some(total_steps),
+            step_deadline,
+        )
+        .await;
+        let stop_after_step = observation.error.is_some();
+        let completed_count = observations.len() + completed.len() + 1;
+        let step_summary = if observation.error.is_some() {
+            format!(
+                "归因查询 {}/{} 未成功，继续查看其它方向：{}",
+                step_index, total_steps, step.title
+            )
+        } else {
+            format!(
+                "已完成归因查询 {}/{}：{}，返回 {} 行",
+                step_index, total_steps, step.title, observation.row_count
+            )
+        };
+        publish(
+            state,
+            claims,
+            task_id,
+            "execute",
+            &step_summary,
+            Some(execute_progress_percent(completed_count, total_steps)),
+            Some(step_index),
+            Some(total_steps),
+            Some(observation.clone()),
+        )
+        .await;
+        completed.push((idx, step, observation));
+        if stop_after_step {
+            break;
+        }
+    }
     completed.sort_by_key(|(idx, _, _)| *idx);
 
     if task_manager().is_cancelled(task_id).await {
@@ -3474,40 +3621,52 @@ async fn analyze_attribution(
         ));
     }
 
-    publish(
-        state,
-        claims,
-        task_id,
-        "synthesize",
-        "正在把查询结果整理成老板可读的根因结论",
-        Some(92),
-        None,
-        None,
-        None,
-    )
-    .await;
-    let mut report = match tokio::time::timeout(
-        remaining_attribution_budget(deadline),
-        synthesize_attribution_report(
+    let evidence_health = AttributionEvidenceHealth::from_observations(&observations);
+    let mut report = if should_skip_attribution_synthesis(&observations) {
+        // A failed/blocked datasource query already contains the useful
+        // evidence for the user: generated SQL, query id (when accepted),
+        // and the connector error. Calling the LLM here cannot create data
+        // evidence and used to add three 45-second retries to every outage.
+        tracing::info!(
+            task_id,
+            "skipping attribution report synthesis because no query produced executable evidence"
+        );
+        fallback_report(&analysis_question, &observations)
+    } else {
+        publish(
             state,
             claims,
-            &analysis_question,
-            depth,
-            &plan,
-            &observations,
-            req.preferred_model.as_deref(),
-        ),
-    )
-    .await
-    {
-        Ok(Ok(report)) => report,
-        Ok(Err(error)) => {
-            tracing::warn!(%error, "attribution report synthesis failed, returning evidence-aware fallback");
-            fallback_report(&analysis_question, &observations)
+            task_id,
+            "synthesize",
+            "正在把查询结果整理成老板可读的根因结论",
+            Some(92),
+            None,
+            None,
+            None,
+        )
+        .await;
+        match tokio::time::timeout(
+            remaining_attribution_budget(deadline),
+            synthesize_attribution_report(
+                state,
+                claims,
+                &analysis_question,
+                depth,
+                &plan,
+                &observations,
+                req.preferred_model.as_deref(),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(report)) => report,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "attribution report synthesis failed, returning evidence-aware fallback");
+                fallback_report(&analysis_question, &observations)
+            }
+            Err(_) => fallback_report(&analysis_question, &observations),
         }
-        Err(_) => fallback_report(&analysis_question, &observations),
     };
-    let evidence_health = AttributionEvidenceHealth::from_observations(&observations);
     let evidence_cards = build_evidence_cards(&observations);
     let success_count = evidence_health.successful_steps;
     let deadline_reached = Instant::now() >= deadline;
@@ -3575,6 +3734,10 @@ async fn publish(
     }
 }
 
+fn attribution_step_retrieval_question(original_question: &str, step_question: &str) -> String {
+    format!("{}\n{}", original_question.trim(), step_question.trim())
+}
+
 async fn execute_attribution_step(
     state: &AppState,
     claims: &Claims,
@@ -3595,11 +3758,21 @@ async fn execute_attribution_step(
     );
     let agent_req = AgentExecuteRequest {
         question: agent_question,
+        retrieval_question: Some(attribution_step_retrieval_question(
+            &req.question,
+            &step.question,
+        )),
         preferred_model: req.preferred_model.clone(),
         shared_context: req.context.clone(),
         datasource_ids: req.datasource_ids.clone(),
         conversation_id: Some(conversation_id.to_string()),
-        max_steps: Some(depth.agent_max_steps()),
+        max_steps: Some(match step.id.as_str() {
+            "main_metric" | "metric_decomposition" | "dimension_drilldown" => {
+                depth.agent_max_steps().min(2)
+            }
+            _ => depth.agent_max_steps(),
+        }),
+        bounded: true,
     };
     // Forward the executor's fine-grained stages. Without this scope the
     // attribution worker only exposed its final observation, which looked like
@@ -3633,15 +3806,20 @@ async fn execute_attribution_step(
             .await;
         });
     });
-    let execution = with_agent_stage_emitter(
-        stage_emitter,
-        execute_agent_request(state, claims, agent_req),
-    );
+    let execution = with_agent_stage_emitter(stage_emitter.clone(), async move {
+        match req.network_budget.clone() {
+            Some(budget) => {
+                execute_agent_request_with_budget(state, claims, agent_req, budget).await
+            }
+            None => execute_agent_request(state, claims, agent_req).await,
+        }
+    });
     tokio::pin!(execution);
+    let primary_deadline = attribution_primary_attempt_deadline(deadline);
     let response = loop {
         tokio::select! {
             result = &mut execution => break Some(result),
-            _ = tokio::time::sleep_until(deadline.into()) => break None,
+            _ = tokio::time::sleep_until(primary_deadline.into()) => break None,
             _ = tokio::time::sleep(Duration::from_millis(250)) => {
                 if task_manager().is_cancelled(task_id).await {
                     break None;
@@ -3649,11 +3827,19 @@ async fn execute_attribution_step(
             }
         }
     };
+    // Never launch a fallback while the original future is still in flight.
+    // Cancelling a client-side future does not guarantee that the remote Trino
+    // statement has stopped, so a second recovery query could overlap it and
+    // multiply load. A timeout is terminal for this step; retain the timeout
+    // evidence and let the caller decide whether any already-completed steps
+    // are sufficient for a partial report.
     let Some(response) = response else {
         let mut observation = cancelled_attribution_observation(step, conversation_id);
         if !task_manager().is_cancelled(task_id).await {
-            observation.error =
-                Some("本步骤超过单步执行预算；系统已停止该分支并保留其它已完成证据。".to_string());
+            observation.error = Some(
+                "该分支的完整查询和单 SQL 轻量恢复均未在预算内完成；系统已保留其它已验证证据并继续综合。"
+                    .to_string(),
+            );
         }
         observation.elapsed_ms = start.elapsed().as_millis() as u64;
         return observation;
@@ -4235,7 +4421,7 @@ fn default_attribution_plan(question: &str, depth: AttributionDepth) -> Attribut
             title: "主指标对比".to_string(),
             purpose: "确认目标周期、对比周期、核心指标当前值、变化量和变化率".to_string(),
             question: format!(
-                "请围绕这个业务问题先做主指标对比查询：{question}。要求返回目标周期和合理对比周期的核心指标、差值、变化率；如果时间或对比基线不清楚，请在 SQL 生成前澄清，不要猜口径。"
+                "请围绕这个业务问题先做主指标对比查询：{question}。要求返回目标周期和合理对比周期的核心指标、差值、变化率。若问题涉及持续趋势、骤升骤降或异常对象识别，必须返回足以判断趋势的连续时间序列和业务对象维度，并让数据本身决定持续变化与突变候选，不要写死固定阈值。如果时间或对比基线不清楚，请依据知识库中的既有口径选择可解释基线并在结果中注明。"
             ),
             priority: 1,
         },
@@ -4244,7 +4430,7 @@ fn default_attribution_plan(question: &str, depth: AttributionDepth) -> Attribut
             title: "指标组成拆解".to_string(),
             purpose: "把核心指标拆成可解释的组成项，判断是分子、分母还是子项变化导致".to_string(),
             question: format!(
-                "请根据真实指标口径、SQL 知识库和可用字段，拆解这个问题里的核心指标：{question}。查询目标周期与对比周期下，各组成项的数值、变化量、变化率和贡献方向；不要使用不存在的字段。"
+                "请根据真实指标口径、SQL 知识库和可用字段，拆解这个问题里的核心指标：{question}。查询目标周期与对比周期下，各组成项的数值、变化量、变化率和贡献方向；对于比率类指标必须同时验证分子、分母及其业务口径，不要使用不存在的字段。"
             ),
             priority: 2,
         },
@@ -4253,7 +4439,7 @@ fn default_attribution_plan(question: &str, depth: AttributionDepth) -> Attribut
             title: "维度下钻归因".to_string(),
             purpose: "自动选择真实存在且适合分组的维度，找出拖动变化最大的分组".to_string(),
             question: format!(
-                "请针对这个变化问题做维度下钻：{question}。根据 schema、字段语义、SQL 知识库和历史口径，自动选择最相关且真实存在的分组维度，返回各分组的目标周期、对比周期、变化量、变化率和贡献排序。"
+                "请针对这个变化问题做维度下钻：{question}。根据 schema、字段语义、SQL 知识库和历史口径，自动选择最相关且真实存在的业务对象与分组维度，返回各分组的时间序列、目标周期、对比周期、变化量、变化率和贡献排序。先定位哪些对象真正异常，再为异常对象寻找原因。"
             ),
             priority: 3,
         },
@@ -4590,6 +4776,20 @@ fn close_json_fragment(candidate: &str, stack: &[char]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attribution_retrieval_query_excludes_model_orchestration_boilerplate() {
+        let query = attribution_step_retrieval_question(
+            "有没有哪些 app 的 ROI 持续下降？",
+            "按 app 和日期计算 ROI 趋势及突降幅度",
+        );
+
+        assert!(query.contains("ROI"));
+        assert!(query.contains("按 app 和日期"));
+        assert!(!query.contains("请围绕原始问题生成"));
+        assert!(!query.contains("不要继续规划"));
+        assert!(!query.contains("超时恢复查询"));
+    }
 
     #[tokio::test]
     async fn attribution_progress_history_is_stable_paged_and_owner_scoped() {
@@ -5091,6 +5291,69 @@ mod tests {
     }
 
     #[test]
+    fn failed_or_empty_attribution_evidence_skips_llm_synthesis() {
+        let failed = AttributionObservation {
+            step_id: "main_metric".to_string(),
+            title: "主指标".to_string(),
+            purpose: "查主指标".to_string(),
+            question: "查 ROI".to_string(),
+            datasource_ids: vec!["ds-1".to_string()],
+            time_context: None,
+            query_id: None,
+            conversation_id: None,
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            sampled: false,
+            sqls: vec!["SELECT roi FROM metrics".to_string()],
+            used_references: Vec::new(),
+            error: Some("trino query failed: connection refused".to_string()),
+            elapsed_ms: 10,
+        };
+        assert!(should_skip_attribution_synthesis(&[failed]));
+
+        let empty = AttributionObservation {
+            error: None,
+            row_count: 0,
+            columns: vec!["roi".to_string()],
+            sqls: vec!["SELECT roi FROM metrics".to_string()],
+            ..failed_observation_for_synthesis_test()
+        };
+        assert!(should_skip_attribution_synthesis(&[empty]));
+
+        let usable = AttributionObservation {
+            error: None,
+            row_count: 1,
+            rows: vec![serde_json::json!({"roi": 1.0})],
+            columns: vec!["roi".to_string()],
+            sqls: vec!["SELECT 1 AS roi".to_string()],
+            ..failed_observation_for_synthesis_test()
+        };
+        assert!(!should_skip_attribution_synthesis(&[usable]));
+    }
+
+    fn failed_observation_for_synthesis_test() -> AttributionObservation {
+        AttributionObservation {
+            step_id: "main_metric".to_string(),
+            title: "主指标".to_string(),
+            purpose: "查主指标".to_string(),
+            question: "查 ROI".to_string(),
+            datasource_ids: vec!["ds-1".to_string()],
+            time_context: None,
+            query_id: None,
+            conversation_id: None,
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            sampled: false,
+            sqls: Vec::new(),
+            used_references: Vec::new(),
+            error: Some("connection failed".to_string()),
+            elapsed_ms: 10,
+        }
+    }
+
+    #[test]
     fn evidence_cards_are_compact_and_keep_step_ids() {
         let obs = AttributionObservation {
             step_id: "dimension_drilldown".to_string(),
@@ -5338,6 +5601,49 @@ mod tests {
     }
 
     #[test]
+    fn trend_attribution_plan_preserves_series_object_and_ratio_evidence() {
+        let plan = default_attribution_plan(
+            "有没有哪些 app 的 ROI 持续下降或者骤降，原因是什么",
+            AttributionDepth::Deep,
+        );
+        let main = plan
+            .steps
+            .iter()
+            .find(|step| step.id == "main_metric")
+            .expect("main metric");
+        let decomposition = plan
+            .steps
+            .iter()
+            .find(|step| step.id == "metric_decomposition")
+            .expect("metric decomposition");
+        let drilldown = plan
+            .steps
+            .iter()
+            .find(|step| step.id == "dimension_drilldown")
+            .expect("dimension drilldown");
+
+        assert!(main.question.contains("连续时间序列"));
+        assert!(main.question.contains("不要写死固定阈值"));
+        assert!(decomposition.question.contains("分子、分母"));
+        assert!(drilldown.question.contains("先定位哪些对象真正异常"));
+        assert!(
+            attribution_step_budget_for(AttributionDepth::Deep, main)
+                > attribution_step_budget(AttributionDepth::Deep)
+        );
+    }
+
+    #[test]
+    fn step_timeout_reserves_time_for_single_sql_recovery() {
+        let deadline = Instant::now() + Duration::from_secs(150);
+        let primary_deadline = attribution_primary_attempt_deadline(deadline);
+        let recovery_budget = deadline.saturating_duration_since(primary_deadline);
+
+        assert!(primary_deadline < deadline);
+        assert!(recovery_budget >= Duration::from_secs(35));
+        assert!(recovery_budget <= Duration::from_secs(70));
+    }
+
+    #[test]
     fn normalize_plan_prefers_llm_required_step_questions() {
         let raw = AttributionPlan {
             needs_clarification: false,
@@ -5427,6 +5733,125 @@ mod tests {
             .expect("snapshot after late completion");
         assert_eq!(snapshot.status, "cancelled");
         assert!(manager.is_cancelled(&task_id).await);
+    }
+
+    #[tokio::test]
+    async fn completed_attribution_persists_json_objects_in_sqlite() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+        sqlx::query(
+            "CREATE TABLE nl2sql_attribution_tasks (
+                task_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                summary TEXT,
+                response_json TEXT,
+                evidence_cards_json TEXT,
+                error TEXT,
+                total_execution_ms INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .execute(&db)
+        .await
+        .expect("create attribution task table");
+        sqlx::query(
+            "INSERT INTO nl2sql_attribution_tasks
+             (task_id, tenant_id, user_id, status) VALUES ('task-1', 'tenant-1', 'user-1', 'running')",
+        )
+        .execute(&db)
+        .await
+        .expect("insert attribution task");
+        let claims = Claims::new("user-1", "user@example.com", "admin", "tenant-1");
+        let response = AttributionAnalyzeResponse {
+            status: "completed".to_string(),
+            question: "昨天 ROI 为什么下降".to_string(),
+            depth: "standard".to_string(),
+            conversation_id: None,
+            clarification_question: None,
+            report: None,
+            plan: None,
+            observations: Vec::new(),
+            evidence_health: AttributionEvidenceHealth::empty(),
+            evidence_cards: Vec::new(),
+            total_execution_ms: 123,
+            error: None,
+        };
+
+        persist_attribution_task_completed(&db, &claims, "task-1", &response).await;
+
+        let (response_json, evidence_json): (String, String) = sqlx::query_as(
+            "SELECT response_json, evidence_cards_json
+             FROM nl2sql_attribution_tasks WHERE task_id = 'task-1'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("read persisted attribution JSON");
+        let stored_response: serde_json::Value =
+            serde_json::from_str(&response_json).expect("response must remain JSON object text");
+        let stored_evidence: serde_json::Value =
+            serde_json::from_str(&evidence_json).expect("evidence must remain JSON array text");
+        assert_eq!(stored_response["status"], "completed");
+        assert_eq!(stored_response["totalExecutionMs"], 123);
+        assert_eq!(stored_evidence, serde_json::json!([]));
+    }
+
+    #[test]
+    fn corrupted_legacy_response_recovers_all_progress_observations() {
+        let observation = AttributionObservation {
+            step_id: "main_metric".to_string(),
+            title: "ROI 趋势".to_string(),
+            purpose: "识别下降 app".to_string(),
+            question: "按 app 和日期统计 ROI".to_string(),
+            datasource_ids: vec!["ds-1".to_string()],
+            time_context: None,
+            query_id: Some("query-1".to_string()),
+            conversation_id: Some("conv-1".to_string()),
+            columns: vec!["app".to_string(), "roi".to_string()],
+            rows: vec![serde_json::json!({"app": "demo", "roi": 0.8})],
+            row_count: 1,
+            sampled: false,
+            sqls: vec!["SELECT app, roi FROM roi_daily".to_string()],
+            used_references: Vec::new(),
+            error: None,
+            elapsed_ms: 10,
+        };
+        let progress = serde_json::to_string(&vec![AttributionTaskEvent {
+            task_id: "task-legacy".to_string(),
+            status: "running".to_string(),
+            stage: Some("execute".to_string()),
+            message: Some("完成主指标".to_string()),
+            elapsed_ms: 10,
+            stage_elapsed_ms: Some(10),
+            progress_percent: Some(60),
+            step_index: Some(1),
+            step_total: Some(1),
+            observation: Some(observation),
+            response: None,
+            error: None,
+        }])
+        .expect("serialize progress events");
+
+        let recovered = recover_attribution_response_from_progress(
+            "哪些 app 的 ROI 下降".to_string(),
+            "standard".to_string(),
+            "conv-1".to_string(),
+            "completed".to_string(),
+            10,
+            None,
+            Some(progress),
+        )
+        .expect("recover response from progress");
+
+        assert_eq!(recovered.observations.len(), 1);
+        assert_eq!(recovered.observations[0].step_id, "main_metric");
+        assert_eq!(recovered.evidence_cards.len(), 1);
+        assert_eq!(recovered.evidence_health.successful_steps, 1);
     }
 
     #[test]

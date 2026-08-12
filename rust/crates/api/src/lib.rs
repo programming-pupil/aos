@@ -28,7 +28,8 @@ pub use prompt_cache::{
 pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
 pub use providers::openai_compat::{
     chat_completions_endpoint, embeddings_endpoint, images_generations_endpoint,
-    supports_official_deepseek_responses_web_search, OpenAiCompatClient, OpenAiCompatConfig,
+    supports_official_deepseek_responses_web_search,
+    supports_official_deepseek_v4_thinking_control, OpenAiCompatClient, OpenAiCompatConfig,
 };
 pub use providers::{
     detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,

@@ -24,6 +24,7 @@ pub(in crate::routes::rd) async fn build_repository_context_for_prompt(
     let root = repository_root(state, claims, repository_id).await?;
     let context_budget = context_profile.budget();
     let mut builder = RdContextBuilder::new(budget_bytes.min(MAX_CONTEXT_BYTES));
+    let mut manifest_sections = Vec::new();
     for name in [
         "README.md",
         "README",
@@ -36,7 +37,7 @@ pub(in crate::routes::rd) async fn build_repository_context_for_prompt(
         let path = root.join(name);
         if path.is_file() {
             if let Ok(text) = std::fs::read_to_string(&path) {
-                builder.push_section(name, &text, context_budget.manifest_section_bytes);
+                manifest_sections.push((name, text));
             }
         }
     }
@@ -44,18 +45,6 @@ pub(in crate::routes::rd) async fn build_repository_context_for_prompt(
     let cached_context =
         load_repository_cached_context_summaries(state, claims, repository_id, context_profile)
             .await?;
-    if !cached_context.trim().is_empty() {
-        builder.push_section(
-            "缓存仓库/目录摘要",
-            &cached_context,
-            match context_profile {
-                RdContextProfile::Overview => 12_000,
-                RdContextProfile::FocusedAsk | RdContextProfile::Explain => 8_000,
-                _ => 6_000,
-            },
-        );
-    }
-
     let retrieval_context =
         build_repository_retrieval_context(state, claims, repository_id, prompt, context_profile)
             .await?;
@@ -68,17 +57,118 @@ pub(in crate::routes::rd) async fn build_repository_context_for_prompt(
         &retrieval_context,
     )
     .await;
-    if !retrieval_context.text.trim().is_empty() {
-        builder.push_section(
-            "任务相关候选文件（索引召回）",
-            &retrieval_context.text,
-            context_budget.retrieval_bytes,
-        );
+    let cached_budget = match context_profile {
+        RdContextProfile::Overview => 12_000,
+        RdContextProfile::FocusedAsk | RdContextProfile::Explain => 8_000,
+        _ => 6_000,
+    };
+    if context_profile == RdContextProfile::Overview {
+        for (name, text) in &manifest_sections {
+            builder.push_section(name, text, context_budget.manifest_section_bytes);
+        }
+        if !cached_context.trim().is_empty() {
+            builder.push_section("缓存仓库/目录摘要", &cached_context, cached_budget);
+        }
+        if !retrieval_context.text.trim().is_empty() {
+            builder.push_section(
+                "任务相关候选文件与真实源码证据",
+                &retrieval_context.text,
+                context_budget.retrieval_bytes,
+            );
+        }
+    } else {
+        // Focused planning must reserve the budget for task-specific source
+        // evidence before generic README/manifest or cached summaries.
+        if !retrieval_context.text.trim().is_empty() {
+            builder.push_section(
+                "任务相关候选文件与真实源码证据",
+                &retrieval_context.text,
+                context_budget.retrieval_bytes,
+            );
+        }
+        if !cached_context.trim().is_empty() {
+            builder.push_section("缓存仓库/目录摘要", &cached_context, cached_budget);
+        }
+        for (name, text) in &manifest_sections {
+            builder.push_section(name, text, 3_000);
+        }
     }
 
     let tree = collect_flat_tree(&root, context_budget.tree_item_limit).join("\n");
     builder.push_section("文件概览", &tree, 10_000);
     Ok(builder.finish())
+}
+
+pub(in crate::routes::rd) async fn build_repository_exact_evidence_context(
+    state: &AppState,
+    claims: &Claims,
+    repository_id: &str,
+    prompt: &str,
+    max_bytes: usize,
+) -> Result<String, AppError> {
+    let root = repository_root(state, claims, repository_id).await?;
+    let terms = extract_repository_literal_terms(prompt, 8)
+        .into_iter()
+        .filter(|term| {
+            term.chars().count() >= 6
+                && term
+                    .chars()
+                    .any(|ch| matches!(ch, '.' | '/' | ':' | '_' | '-' | '$'))
+        })
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut exact_hits = BTreeSet::new();
+    let mut expansion_terms = BTreeSet::new();
+    for term in &terms {
+        for hit in run_exact_repository_search(&root, term, 40).await? {
+            expansion_terms.extend(extract_repository_identifier_terms(&hit.snippet, 6));
+            exact_hits.insert((
+                term.clone(),
+                hit.path,
+                hit.line_number,
+                redact_sensitive_snippet(&hit.snippet),
+            ));
+        }
+    }
+
+    let mut expanded_hits = BTreeSet::new();
+    for term in expansion_terms.into_iter().take(8) {
+        for hit in run_exact_repository_search(&root, &term, 40).await? {
+            expanded_hits.insert((
+                term.clone(),
+                hit.path,
+                hit.line_number,
+                redact_sensitive_snippet(&hit.snippet),
+            ));
+        }
+    }
+
+    let mut lines = vec![format!(
+        "已对高特异性字面量执行全仓固定字符串检索：{}。以下结果优先级高于语义摘要。",
+        terms.join(", ")
+    )];
+    if exact_hits.is_empty() {
+        lines.push("精确字面量检索未发现匹配。".to_string());
+    } else {
+        lines.push("精确字面量命中：".to_string());
+        lines.extend(exact_hits.into_iter().map(|(term, path, line, snippet)| {
+            format!("- `{path}:{line}` (term=`{term}`): {snippet}")
+        }));
+    }
+    if !expanded_hits.is_empty() {
+        lines.push("由精确命中提取的代码标识符及其引用：".to_string());
+        lines.extend(
+            expanded_hits
+                .into_iter()
+                .map(|(term, path, line, snippet)| {
+                    format!("- `{path}:{line}` (identifier=`{term}`): {snippet}")
+                }),
+        );
+    }
+    Ok(truncate_text(&lines.join("\n"), max_bytes))
 }
 
 pub(in crate::routes::rd) async fn build_repository_runtime_context_hint(

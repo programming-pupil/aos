@@ -9206,6 +9206,7 @@ async fn start_super_assistant_data_attribution(
         datasource_ids,
         depth: Some(crate::routes::nl2sql::attribution::AttributionDepth::Deep),
         context: optional_super_assistant_data_context(recalled_context),
+        network_budget: None,
     };
     let result = crate::routes::nl2sql::attribution::start_attribution_task_from_super_assistant(
         state,
@@ -9314,12 +9315,14 @@ async fn run_super_assistant_nl2sql_agent(
         .collect::<Vec<_>>();
     let req = crate::routes::nl2sql::AgentExecuteRequest {
         question: text.trim().to_string(),
+        retrieval_question: None,
         preferred_model: Some(model.to_string()),
         shared_context: recalled_context
             .and_then(|context| optional_super_assistant_data_context(Some(context))),
         datasource_ids,
         conversation_id: Some(format!("super-assistant-{session_id}")),
         max_steps: Some(8),
+        bounded: false,
     };
     let resp = crate::routes::nl2sql::execute_agent_request(state, claims, req).await?;
     let answer = render_super_assistant_nl2sql_answer(&resp);

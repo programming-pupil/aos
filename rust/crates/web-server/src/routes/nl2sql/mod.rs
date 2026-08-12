@@ -892,11 +892,13 @@ pub(crate) fn extract_top_level_tables(sql: &str) -> Vec<String> {
 /// model or stores them in the knowledge context.
 pub(crate) async fn discover_knowledge_schema_tables(
     state: &AppState,
+    claims: &Claims,
     datasource_id: &str,
     db_type: &str,
     encrypted_config: &serde_json::Value,
     existing_schema: &serde_json::Value,
     references: &[ReferencePromptSnippet],
+    network_budget: Option<Arc<agent_executor::DatasourceRequestBudget>>,
 ) -> serde_json::Value {
     const DEFAULT_MAX_TABLES: usize = 16;
     const DEFAULT_TABLE_TIMEOUT_SECS: u64 = 8;
@@ -925,7 +927,7 @@ pub(crate) async fn discover_knowledge_schema_tables(
         }
     }
 
-    let mut table_names = std::collections::BTreeSet::new();
+    let mut extracted_table_names = Vec::new();
     for reference in references {
         if reference.stale {
             continue;
@@ -939,15 +941,11 @@ pub(crate) async fn discover_knowledge_schema_tables(
             {
                 continue;
             }
-            table_names.insert(table);
-            if table_names.len() >= max_tables {
-                break;
-            }
-        }
-        if table_names.len() >= max_tables {
-            break;
+            extracted_table_names.push(table);
         }
     }
+    let table_names =
+        nl2sql_domain::sql::prioritize_schema_discovery_tables(extracted_table_names, max_tables);
     if table_names.is_empty() {
         return serde_json::json!([]);
     }
@@ -966,35 +964,68 @@ pub(crate) async fn discover_knowledge_schema_tables(
         };
     let discovery = crate::nl2sql::schema_discovery::SchemaDiscovery::new();
     let db_type = db_type.to_string();
-    let futures = table_names.into_iter().map(|table_name| {
-        let config = config.clone();
-        let db_type = db_type.clone();
-        let discovery = discovery.clone();
-        async move {
+    let _trino_permit = if matches!(db_type.as_str(), "presto" | "trino") {
+        match agent_executor::acquire_trino_user_permit(&claims.tenant_id, &claims.sub).await {
+            Ok(permit) => Some(permit),
+            Err(error) => {
+                tracing::warn!(datasource_id, error = %error, "on-demand schema hydration stopped by user concurrency limit");
+                return serde_json::json!([]);
+            }
+        }
+    } else {
+        None
+    };
+    // Schema hydration is datasource traffic too. Keep it serial inside the
+    // request and share the concurrency gate with SQL execution. Trino also
+    // acquires the tenant-and-user scoped gate above, so concurrent tasks from
+    // one user cannot fan out beyond the global limit of three.
+    let budget = network_budget.unwrap_or_else(|| agent_executor::DatasourceRequestBudget::new(3));
+    let mut tables = Vec::new();
+    for table_name in table_names {
+        let permit = match budget.acquire("Trino schema discovery").await {
+            Ok(permit) => permit,
+            Err(error) => {
+                tracing::warn!(datasource_id, error = %error, "on-demand schema hydration stopped by request budget");
+                break;
+            }
+        };
+        let result = if matches!(db_type.as_str(), "presto" | "trino") {
+            discovery
+                .discover_table(&db_type, &config, &table_name)
+                .await
+        } else {
             match tokio::time::timeout(
                 std::time::Duration::from_secs(timeout_secs),
                 discovery.discover_table(&db_type, &config, &table_name),
             )
             .await
             {
-                Ok(Ok(Some(table))) => Some(table),
-                Ok(Ok(None)) => None,
-                Ok(Err(error)) => {
-                    tracing::debug!(table = %table_name, error = %error, "on-demand schema table was not discoverable");
-                    None
+                Ok(result) => result,
+                Err(_) => Err(format!(
+                    "schema table discovery timed out after {timeout_secs}s"
+                )),
+            }
+        };
+        drop(permit);
+        match result {
+            Ok(Some(table)) => tables.push(table),
+            Ok(None) => {}
+            Err(error) => {
+                if matches!(db_type.as_str(), "presto" | "trino")
+                    && nl2sql_core::schema_discovery::trino_remote_state_is_uncertain(&error)
+                {
+                    tracing::warn!(
+                        datasource_id,
+                        table = %table_name,
+                        error = %error,
+                        "stopping on-demand Trino schema hydration because remote query state is uncertain"
+                    );
+                    break;
                 }
-                Err(_) => {
-                    tracing::debug!(table = %table_name, timeout_secs, "on-demand schema table discovery timed out");
-                    None
-                }
+                tracing::debug!(table = %table_name, error = %error, "on-demand schema table was not discoverable")
             }
         }
-    });
-    let tables = futures_util::future::join_all(futures)
-        .await
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+    }
     tracing::info!(
         datasource_id,
         requested_tables = references
@@ -1551,7 +1582,284 @@ fn should_auto_open_sql_knowledge_snippet(snippet: &ReferencePromptSnippet) -> b
     snippet.verified || snippet.score >= 0.05
 }
 
+fn question_core_metric_terms(question: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut terms = Vec::new();
+
+    let mut ascii = String::new();
+    for ch in question.chars().chain(std::iter::once(' ')) {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            ascii.push(ch);
+            continue;
+        }
+        if !ascii.is_empty() {
+            let raw = std::mem::take(&mut ascii);
+            let token = raw.to_ascii_lowercase();
+            if is_ascii_core_metric_token(&raw) && seen.insert(token.clone()) {
+                terms.push(token);
+            }
+        }
+    }
+
+    // Chinese metric names are open-ended, but production naming conventions
+    // consistently expose a metric noun or suffix. Keep this intentionally
+    // narrower than general knowledge tokenization: a false positive here can
+    // promote an unrelated SQL file into executable evidence.
+    let chinese_exact_metrics = [
+        "收入",
+        "成本",
+        "利润",
+        "收益",
+        "营收",
+        "流水",
+        "销量",
+        "单量",
+        "订单数",
+        "用户数",
+        "活跃用户",
+        "新增用户",
+        "留存",
+        "留存率",
+        "转化率",
+        "点击率",
+        "完成率",
+        "命中率",
+        "成功率",
+        "失败率",
+        "客单价",
+        "均价",
+        "时长",
+    ];
+    let chinese_metric_suffixes = [
+        "率", "量", "数", "额", "收入", "成本", "利润", "收益", "单价", "均价", "时长", "次数",
+    ];
+    for term in question_knowledge_terms(question) {
+        if term.chars().any(|ch| ch.is_ascii()) {
+            continue;
+        }
+        let len = term.chars().count();
+        if !(2..=12).contains(&len) {
+            continue;
+        }
+        let is_metric = chinese_exact_metrics.contains(&term.as_str())
+            || chinese_metric_suffixes
+                .iter()
+                .any(|suffix| term.ends_with(suffix));
+        if is_metric && seen.insert(term.clone()) {
+            terms.push(term);
+        }
+    }
+
+    terms.sort_by(|left, right| {
+        right
+            .chars()
+            .count()
+            .cmp(&left.chars().count())
+            .then_with(|| left.cmp(right))
+    });
+    terms
+}
+
+fn is_ascii_core_metric_token(raw: &str) -> bool {
+    let token = raw.trim().to_ascii_lowercase();
+    if !(2..=64).contains(&token.len()) || token.chars().all(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    let common_metrics = [
+        "aipu",
+        "aip",
+        "arpu",
+        "arppu",
+        "cac",
+        "cpc",
+        "cpm",
+        "ctr",
+        "cvr",
+        "dau",
+        "ecpm",
+        "gmv",
+        "kpi",
+        "ltv",
+        "mau",
+        "orders",
+        "profit",
+        "revenue",
+        "roas",
+        "roi",
+        "spend",
+        "cost",
+        "retention",
+        "users",
+        "uv",
+        "pv",
+        "wau",
+    ];
+    if common_metrics.contains(&token.as_str()) {
+        return true;
+    }
+    let metric_parts = [
+        "amount", "avg", "count", "cost", "gmv", "income", "margin", "metric", "profit", "rate",
+        "revenue", "roas", "roi", "score", "spend", "total", "value",
+    ];
+    if token.contains('_') && token.split('_').any(|part| metric_parts.contains(&part)) {
+        return true;
+    }
+    let uppercase_acronym = raw.len() <= 12
+        && raw.chars().any(|ch| ch.is_ascii_uppercase())
+        && raw
+            .chars()
+            .filter(|ch| ch.is_ascii_alphabetic())
+            .all(|ch| ch.is_ascii_uppercase());
+    uppercase_acronym
+}
+
+fn sql_code_without_comments_or_string_literals(sql: &str) -> String {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum State {
+        Code,
+        SingleQuoted,
+        LineComment,
+        BlockComment,
+    }
+
+    let mut state = State::Code;
+    let mut chars = sql.chars().peekable();
+    let mut out = String::with_capacity(sql.len());
+    while let Some(ch) = chars.next() {
+        match state {
+            State::Code => match (ch, chars.peek().copied()) {
+                ('-', Some('-')) => {
+                    chars.next();
+                    out.push(' ');
+                    state = State::LineComment;
+                }
+                ('/', Some('*')) => {
+                    chars.next();
+                    out.push(' ');
+                    state = State::BlockComment;
+                }
+                ('\'', _) => {
+                    out.push(' ');
+                    state = State::SingleQuoted;
+                }
+                _ => out.push(ch),
+            },
+            State::SingleQuoted => {
+                if ch == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        chars.next();
+                    } else {
+                        state = State::Code;
+                    }
+                }
+                if ch == '\n' {
+                    out.push('\n');
+                } else {
+                    out.push(' ');
+                }
+            }
+            State::LineComment => {
+                if ch == '\n' {
+                    out.push('\n');
+                    state = State::Code;
+                } else {
+                    out.push(' ');
+                }
+            }
+            State::BlockComment => {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    out.push(' ');
+                    state = State::Code;
+                } else if ch == '\n' {
+                    out.push('\n');
+                } else {
+                    out.push(' ');
+                }
+            }
+        }
+    }
+    out
+}
+
+fn sql_code_contains_ascii_metric_identifier(sql: &str, metric: &str) -> bool {
+    let metric = metric.trim().to_ascii_lowercase();
+    if metric.is_empty() {
+        return false;
+    }
+    let code = sql_code_without_comments_or_string_literals(sql);
+    let mut identifier = String::new();
+    let matches_identifier = |identifier: &str| {
+        identifier.split('_').any(|part| {
+            part == metric || part.trim_end_matches(|ch: char| ch.is_ascii_digit()) == metric
+        })
+    };
+    for ch in code.chars().chain(std::iter::once(' ')) {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            identifier.push(ch.to_ascii_lowercase());
+        } else if !identifier.is_empty() {
+            if matches_identifier(&identifier) {
+                return true;
+            }
+            identifier.clear();
+        }
+    }
+    false
+}
+
+fn sql_content_contains_core_metric(content: &str, metric: &str) -> bool {
+    if metric
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return sql_code_contains_ascii_metric_identifier(content, metric);
+    }
+    sql_code_without_comments_or_string_literals(content).contains(metric)
+}
+
+fn sql_knowledge_snippet_matches_core_metric(
+    question: &str,
+    snippet: &ReferencePromptSnippet,
+) -> bool {
+    let ascii_core_terms = question_core_metric_terms(question)
+        .into_iter()
+        .filter(|term| term.is_ascii())
+        .collect::<Vec<_>>();
+    if ascii_core_terms.is_empty() {
+        return true;
+    }
+    ascii_core_terms
+        .iter()
+        .any(|term| sql_content_contains_core_metric(&snippet.content, term))
+}
+
+fn filter_sql_knowledge_snippets_by_core_metric(
+    question: &str,
+    snippets: Vec<ReferencePromptSnippet>,
+) -> Vec<ReferencePromptSnippet> {
+    if !question_core_metric_terms(question)
+        .iter()
+        .any(|term| term.is_ascii())
+    {
+        return snippets;
+    }
+    let matching_files = snippets
+        .iter()
+        .filter(|snippet| sql_knowledge_snippet_matches_core_metric(question, snippet))
+        .map(|snippet| snippet.file_id.clone())
+        .filter(|file_id| !file_id.trim().is_empty())
+        .collect::<std::collections::HashSet<_>>();
+    snippets
+        .into_iter()
+        .filter(|snippet| {
+            sql_knowledge_snippet_matches_core_metric(question, snippet)
+                || (!snippet.file_id.trim().is_empty() && matching_files.contains(&snippet.file_id))
+        })
+        .collect()
+}
+
 fn sql_knowledge_auto_open_file_candidates(
+    question: &str,
     snippets: &[ReferencePromptSnippet],
     max_files: usize,
 ) -> Vec<String> {
@@ -1562,11 +1870,13 @@ fn sql_knowledge_auto_open_file_candidates(
     let mut ranked = snippets
         .iter()
         .filter(|snippet| should_auto_open_sql_knowledge_snippet(snippet))
+        .filter(|snippet| sql_knowledge_snippet_matches_core_metric(question, snippet))
         .collect::<Vec<_>>();
     ranked.sort_by(|left, right| {
-        right
-            .verified
-            .cmp(&left.verified)
+        bounded_reference_relevance(question, right)
+            .partial_cmp(&bounded_reference_relevance(question, left))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.verified.cmp(&left.verified))
             .then_with(|| {
                 right
                     .score
@@ -1596,10 +1906,12 @@ async fn auto_open_relevant_sql_knowledge_files(
     datasource_id: &str,
     question: &str,
     reference_snippets: &[ReferencePromptSnippet],
+    max_files_override: Option<usize>,
 ) -> Vec<ReferencePromptSnippet> {
     let file_ids = sql_knowledge_auto_open_file_candidates(
+        question,
         reference_snippets,
-        sql_knowledge_auto_open_file_limit(),
+        max_files_override.unwrap_or_else(sql_knowledge_auto_open_file_limit),
     );
     if file_ids.is_empty() {
         return Vec::new();
@@ -1650,6 +1962,181 @@ async fn auto_open_relevant_sql_knowledge_files(
         .await;
     }
     opened
+}
+
+const BOUNDED_SQL_KNOWLEDGE_MAX_FILES: usize = 2;
+const BOUNDED_SQL_KNOWLEDGE_MAX_CHARS: usize = 18_000;
+
+fn bounded_evidence_terms(question: &str) -> Vec<String> {
+    let mut terms = question_knowledge_terms(question);
+    terms.retain(|term| !matches!(term.as_str(), "app" | "apps" | "sql" | "查询" | "分析"));
+    terms.sort_by(|left, right| {
+        let left_ascii = left
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        let right_ascii = right
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        right_ascii
+            .cmp(&left_ascii)
+            .then_with(|| right.chars().count().cmp(&left.chars().count()))
+            .then_with(|| left.cmp(right))
+    });
+    terms.dedup();
+    terms.truncate(24);
+    terms
+}
+
+fn bounded_reference_relevance(question: &str, snippet: &ReferencePromptSnippet) -> f64 {
+    let core_hits = question_core_metric_terms(question)
+        .iter()
+        .filter(|term| sql_content_contains_core_metric(&snippet.content, term))
+        .count() as f64;
+    let evidence = format!("{}\n{}", snippet.filename, snippet.content).to_lowercase();
+    let exact_hits = bounded_evidence_terms(question)
+        .iter()
+        .filter(|term| evidence.contains(term.as_str()))
+        .count() as f64;
+    core_hits * 1_000.0 + exact_hits * 100.0
+}
+
+fn append_bounded_excerpt_section(
+    output: &mut String,
+    label: &str,
+    lines: &[&str],
+    start: usize,
+    end: usize,
+    max_chars: usize,
+) {
+    if start >= end || output.chars().count() >= max_chars {
+        return;
+    }
+    if !output.is_empty() {
+        output.push_str("\n\n");
+    }
+    output.push_str(label);
+    output.push('\n');
+    for line in &lines[start..end] {
+        let line_chars = line.chars().count() + 1;
+        if output.chars().count() + line_chars > max_chars {
+            output.push_str("...[excerpt truncated]");
+            break;
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+}
+
+fn focused_bounded_sql_excerpt(content: &str, question: &str, max_chars: usize) -> String {
+    if content.chars().count() <= max_chars {
+        return content.to_string();
+    }
+    let lines = content.lines().collect::<Vec<_>>();
+    let terms = bounded_evidence_terms(question);
+    let mut matched_lines = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            let line = line.to_lowercase();
+            let hits = terms
+                .iter()
+                .filter(|term| line.contains(term.as_str()))
+                .count();
+            (hits > 0).then_some((hits, idx))
+        })
+        .collect::<Vec<_>>();
+    matched_lines.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+
+    let mut output = String::new();
+    append_bounded_excerpt_section(
+        &mut output,
+        "-- [file header]",
+        &lines,
+        0,
+        lines.len().min(24),
+        max_chars,
+    );
+    let mut windows = matched_lines
+        .into_iter()
+        .take(4)
+        .map(|(_, idx)| (idx.saturating_sub(35), (idx + 36).min(lines.len())))
+        .collect::<Vec<_>>();
+    windows.sort_unstable();
+    let mut merged = Vec::<(usize, usize)>::new();
+    for (start, end) in windows {
+        if let Some(last) = merged.last_mut().filter(|last| start <= last.1 + 4) {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    for (start, end) in merged {
+        append_bounded_excerpt_section(
+            &mut output,
+            &format!("-- [relevant lines {}-{}]", start + 1, end),
+            &lines,
+            start,
+            end,
+            max_chars,
+        );
+    }
+    if output.chars().count() < max_chars / 3 {
+        let tail_start = lines.len().saturating_sub(48);
+        append_bounded_excerpt_section(
+            &mut output,
+            &format!("-- [file tail lines {}-{}]", tail_start + 1, lines.len()),
+            &lines,
+            tail_start,
+            lines.len(),
+            max_chars,
+        );
+    }
+    output.chars().take(max_chars).collect()
+}
+
+pub(crate) fn focus_bounded_sql_knowledge_references(
+    question: &str,
+    snippets: &[ReferencePromptSnippet],
+) -> Vec<ReferencePromptSnippet> {
+    let mut ranked = snippets
+        .iter()
+        .filter(|snippet| !snippet.stale)
+        .filter(|snippet| sql_knowledge_snippet_matches_core_metric(question, snippet))
+        .cloned()
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        bounded_reference_relevance(question, right)
+            .partial_cmp(&bounded_reference_relevance(question, left))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.verified.cmp(&left.verified))
+            .then_with(|| left.filename.cmp(&right.filename))
+    });
+
+    let mut seen_files = std::collections::HashSet::new();
+    let mut selected = Vec::new();
+    let mut remaining = BOUNDED_SQL_KNOWLEDGE_MAX_CHARS;
+    for mut snippet in ranked {
+        let identity = if snippet.file_id.trim().is_empty() {
+            snippet.chunk_id.clone()
+        } else {
+            snippet.file_id.clone()
+        };
+        if !seen_files.insert(identity) {
+            continue;
+        }
+        let slots_left = BOUNDED_SQL_KNOWLEDGE_MAX_FILES - selected.len();
+        let content_budget = (remaining / slots_left.max(1)).min(10_000);
+        snippet.content = focused_bounded_sql_excerpt(&snippet.content, question, content_budget);
+        remaining = remaining.saturating_sub(snippet.content.chars().count());
+        snippet
+            .reason
+            .push_str("; bounded attribution evidence window");
+        selected.push(snippet);
+        if selected.len() >= BOUNDED_SQL_KNOWLEDGE_MAX_FILES || remaining == 0 {
+            break;
+        }
+    }
+    selected
 }
 
 fn question_knowledge_terms(question: &str) -> Vec<String> {
@@ -2269,6 +2756,26 @@ async fn execute_sql_knowledge_tool(
         ),
     };
 
+    let snippets = if tool_name == "schema_search" {
+        snippets
+    } else {
+        filter_sql_knowledge_snippets_by_core_metric(fallback_question, snippets)
+    };
+    let payload = if matches!(
+        tool_name,
+        "knowledge_rg"
+            | "knowledge_list"
+            | "knowledge_search"
+            | "knowledge_read"
+            | "sql_example_open"
+            | "knowledge_outline"
+            | "knowledge_related"
+    ) {
+        sql_knowledge_tool_payload(tool_name, &query, &snippets, content_max_chars)
+    } else {
+        payload
+    };
+
     if !snippets.is_empty() {
         self::reference::persist_sql_knowledge_usage_events(
             &state.db,
@@ -2404,6 +2911,7 @@ async fn send_generation_request_with_sql_tools(
     schema: &serde_json::Value,
     chat_cfg: &crate::nl2sql::ChatTenantConfig,
     request: &MessageRequest,
+    allow_tool_loop: bool,
 ) -> std::result::Result<(api::MessageResponse, Vec<ReferencePromptSnippet>), api::ApiError> {
     let Some(datasource_id) = datasource_id else {
         return chat_cfg
@@ -2412,7 +2920,7 @@ async fn send_generation_request_with_sql_tools(
             .await
             .map(|response| (response, Vec::new()));
     };
-    if !should_enable_sql_generation_tool_loop() {
+    if !allow_tool_loop || !should_enable_sql_generation_tool_loop() {
         return chat_cfg
             .client
             .send_message(request)
@@ -2427,7 +2935,7 @@ async fn send_generation_request_with_sql_tools(
     working.tool_choice = Some(ToolChoice::Auto);
     working.system = request.system.as_ref().map(|system| {
         format!(
-            "{system}\n\nYou may call SQL Knowledge tools before final SQL generation. Treat them like a Codex-style virtual folder: list files, rg exact terms, read line ranges, open full SQL examples, inspect outlines, find related definitions, then verify against live schema. Do not rely on a single retrieved chunk when a full SQL file or related metric definition is available. If search results are weak, refine the query and search again. Return a single final SQL statement only after the evidence is sufficient."
+            "{system}\n\nYou may call SQL Knowledge tools before final SQL generation. Treat them like a Codex-style virtual folder: list files, rg exact terms, read line ranges, open full SQL examples, inspect outlines, find related definitions, then verify against live schema. Do not rely on a single retrieved chunk when a full SQL file or related metric definition is available. If search results are weak, refine the query and search again. SQL example literals are parameters, not current user filters: do not inherit dates, experiment IDs, app/product identifiers, countries, versions, cohorts, or other predicates unless the current question or confirmed context explicitly supplies them. Return a single final SQL statement only after the evidence is sufficient."
         )
     });
     let mut remaining_tool_result_chars = sql_generation_tool_total_result_max_chars();
@@ -2556,6 +3064,7 @@ pub(crate) async fn generate_sql(
     reference_snippets: &[ReferencePromptSnippet],
     business_domain_context: Option<&str>,
     preferred_model: Option<&str>,
+    allow_tool_loop: bool,
 ) -> Result<GenerateSqlResult> {
     let gen_started = std::time::Instant::now();
     let mut chat_candidates = crate::nl2sql::resolve_chat_config_candidates(
@@ -2739,7 +3248,10 @@ pub(crate) async fn generate_sql(
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|v| *v >= 8_192)
         .unwrap_or(24_576);
-    let task_max_tokens: u32 = if large_schema_mode || table_count > 30 {
+    let deadline_bounded = !allow_tool_loop;
+    let task_max_tokens: u32 = if deadline_bounded {
+        4_096
+    } else if large_schema_mode || table_count > 30 {
         default_complex_tokens
     } else if table_count > 10 {
         16_384
@@ -2811,6 +3323,18 @@ pub(crate) async fn generate_sql(
         );
 
         let max_tokens = task_max_tokens.min(chat_cfg.max_output_tokens).max(1);
+        let mut extra_body = None;
+        if deadline_bounded
+            && api::supports_official_deepseek_v4_thinking_control(
+                &chat_cfg.model,
+                chat_cfg.client.base_url(),
+            )
+        {
+            extra_body = Some(serde_json::Map::from_iter([(
+                "thinking".to_string(),
+                serde_json::json!({"type": "disabled"}),
+            )]));
+        }
         let request = MessageRequest {
             model: chat_cfg.model.clone(),
             max_tokens,
@@ -2832,7 +3356,7 @@ pub(crate) async fn generate_sql(
             reasoning_effort: None,
             include_reasoning: None,
             use_max_completion_tokens: None,
-            extra_body: None,
+            extra_body,
         };
 
         let mut move_next_key = false;
@@ -2851,6 +3375,7 @@ pub(crate) async fn generate_sql(
                 schema,
                 &chat_cfg,
                 &request,
+                allow_tool_loop,
             )
             .await
             {
@@ -3166,6 +3691,15 @@ fn should_enable_sql_semantic_review() -> bool {
         .unwrap_or(true)
 }
 
+fn sql_semantic_review_timeout_secs() -> u64 {
+    std::env::var("NL2SQL_SQL_SEMANTIC_REVIEW_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value >= 5)
+        .unwrap_or(45)
+        .min(120)
+}
+
 fn extract_json_object_from_text(text: &str) -> Option<String> {
     let start = text.find('{')?;
     let end = text.rfind('}')?;
@@ -3263,6 +3797,7 @@ Check whether the SQL actually answers the user's question using the live schema
 
 Rules:
 - Prefer fixing the SQL over asking for clarification.
+- SQL Knowledge examples are parameterized evidence. Reject or rewrite SQL that copies a fixed date, experiment ID, app/product identifier, country, version, cohort, or other literal predicate not explicitly present in the current question or confirmed context. Questions spanning multiple entities must not be narrowed to one example entity.
 - If live schema is empty but high-relevance SQL Knowledge is present, treat those SQL examples and metric definitions as authoritative workspace context.
 - Metadata discovery can be partial even when query access works. If a current high-relevance SQL example supplies an exact missing table or column, validate it through execution/correction instead of discarding the evidence; never invent identifiers.
 - Verify metric formulas, date filters, grouping dimensions, joins, table/column compatibility, and whether the SQL returns aggregate/report rows or raw rows as requested.
@@ -3349,7 +3884,7 @@ Return JSON only:
 fn should_enable_sql_explain_preflight() -> bool {
     std::env::var("NL2SQL_ENABLE_SQL_EXPLAIN_PREFLIGHT")
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 fn sql_explain_preflight_timeout_secs() -> u64 {
@@ -3363,8 +3898,10 @@ fn sql_explain_preflight_timeout_secs() -> u64 {
 
 async fn explain_trino_or_presto_sql(
     state: &AppState,
+    claims: &Claims,
     data_source_id: &str,
     sql: &str,
+    request_budget: Arc<agent_executor::DatasourceRequestBudget>,
 ) -> std::result::Result<(), String> {
     #[derive(Debug, Deserialize)]
     struct TrinoConfig {
@@ -3408,15 +3945,20 @@ async fn explain_trino_or_presto_sql(
         ));
     }
     let cli = builder
+        .max_attempt(0)
         .build()
         .map_err(|e| format!("trino client build failed: {e}"))?;
     let explain_sql = format!("EXPLAIN {}", sql.trim().trim_end_matches(';').trim());
-    tokio::time::timeout(
-        std::time::Duration::from_secs(sql_explain_preflight_timeout_secs()),
-        cli.get_all::<trino_rust_client::Row>(explain_sql),
+    agent_executor::execute_trino_query_bounded(
+        cli,
+        explain_sql,
+        sql_explain_preflight_timeout_secs(),
+        &claims.tenant_id,
+        &claims.sub,
+        "Trino SQL EXPLAIN preflight",
+        request_budget,
     )
     .await
-    .map_err(|_| "EXPLAIN timed out".to_string())?
     .map(|_| ())
     .map_err(|e| format!("EXPLAIN failed: {e}"))
 }
@@ -4283,6 +4825,7 @@ pub(crate) async fn query(
         &req.data_source_id,
         &req.question,
         &reference_snippets,
+        None,
     )
     .await;
     if !auto_opened_sql_files.is_empty() {
@@ -4305,11 +4848,13 @@ pub(crate) async fn query(
         merge_reference_snippets(&[], reference_snippets, sql_knowledge_prompt_max_snippets());
     let hydrated = discover_knowledge_schema_tables(
         &state,
+        &claims,
         &req.data_source_id,
         &db_type,
         &config_json,
         &schema_tables,
         &reference_snippets,
+        None,
     )
     .await;
     if hydrated.as_array().is_some_and(|tables| !tables.is_empty()) {
@@ -4719,6 +5264,7 @@ pub(crate) async fn query(
         &reference_snippets,
         business_domain_context.as_deref(),
         None,
+        true,
     )
     .await;
 
@@ -4926,17 +5472,40 @@ pub(crate) async fn query(
     }
 
     self::query_async::emit_stage("semantic_review", "正在复核 SQL 语义和口径");
-    if let Some(review) = review_generated_sql_semantics(
-        &state,
-        &claims,
-        &semantic_question,
-        &sql,
-        &schema_tables,
-        &db_type,
-        &reference_snippets,
+    let semantic_review = tokio::time::timeout(
+        std::time::Duration::from_secs(sql_semantic_review_timeout_secs()),
+        review_generated_sql_semantics(
+            &state,
+            &claims,
+            &semantic_question,
+            &sql,
+            &schema_tables,
+            &db_type,
+            &reference_snippets,
+        ),
     )
-    .await
-    {
+    .await;
+    let semantic_review = match semantic_review {
+        Ok(review) => review,
+        Err(_) => {
+            tracing::warn!(
+                datasource_id = %req.data_source_id,
+                timeout_secs = sql_semantic_review_timeout_secs(),
+                "nl2sql semantic SQL review timed out; returning the generated SQL after deterministic safety checks"
+            );
+            push_rule_hit(
+                &mut applied_rules,
+                "sql_semantic_review_timeout",
+                "SQL Semantic Review",
+                Some(format!(
+                    "review exceeded {}s; continued with generated SQL",
+                    sql_semantic_review_timeout_secs()
+                )),
+            );
+            None
+        }
+    };
+    if let Some(review) = semantic_review {
         let detail = if review.issues.is_empty() {
             format!("verdict={}", review.verdict)
         } else {
@@ -4979,7 +5548,11 @@ pub(crate) async fn query(
                 Some(detail),
             );
         }
-    } else if should_enable_sql_semantic_review() {
+    } else if should_enable_sql_semantic_review()
+        && !applied_rules
+            .iter()
+            .any(|hit| hit.rule_key == "sql_semantic_review_timeout")
+    {
         push_rule_hit(
             &mut applied_rules,
             "sql_semantic_review_skipped",
@@ -5016,6 +5589,7 @@ pub(crate) async fn query(
                 &db_type,
                 &req.data_source_id,
                 None,
+                false,
             )
             .await;
             let repaired = extract_sql_from_llm_output(&repaired);
@@ -5056,8 +5630,17 @@ pub(crate) async fn query(
         self::query_async::emit_stage("explain_preflight", "正在 EXPLAIN 预校验 SQL");
         let mut preflight_context = SelfCorrectContext::default();
         let mut preflight_passed = false;
+        let preflight_budget = agent_executor::DatasourceRequestBudget::new(3);
         for attempt in 0..=max_self_correct_attempts().max(1) {
-            match explain_trino_or_presto_sql(&state, &req.data_source_id, &sql).await {
+            match explain_trino_or_presto_sql(
+                &state,
+                &claims,
+                &req.data_source_id,
+                &sql,
+                preflight_budget.clone(),
+            )
+            .await
+            {
                 Ok(()) => {
                     preflight_passed = true;
                     if attempt == 0 {
@@ -5102,6 +5685,7 @@ pub(crate) async fn query(
                         &db_type,
                         &req.data_source_id,
                         None,
+                        false,
                     )
                     .await;
                     let repaired = extract_sql_from_llm_output(&repaired);
@@ -7641,6 +8225,12 @@ mod tests {
     }
 
     #[test]
+    fn semantic_review_timeout_default_is_bounded() {
+        let timeout = sql_semantic_review_timeout_secs();
+        assert!((5..=120).contains(&timeout));
+    }
+
+    #[test]
     fn detects_only_length_truncated_private_thinking_as_suppressible() {
         let response = api::MessageResponse {
             id: "thinking-only".to_string(),
@@ -7842,14 +8432,14 @@ mod tests {
         text.score = 9.0;
 
         let mut lower_score_verified =
-            test_reference_snippet("SELECT dt, SUM(cost) AS cost FROM t");
+            test_reference_snippet("SELECT dt, AVG(ecpm) AS ecpm FROM t");
         lower_score_verified.file_id = "verified-sql".to_string();
         lower_score_verified.filename = "verified.sql".to_string();
         lower_score_verified.score = 0.01;
         lower_score_verified.verified = true;
 
         let mut higher_score_unverified =
-            test_reference_snippet("SELECT dt, SUM(revenue) AS revenue FROM t");
+            test_reference_snippet("SELECT dt, MAX(ecpm) AS peak_ecpm FROM t");
         higher_score_unverified.file_id = "unverified-sql".to_string();
         higher_score_unverified.filename = "unverified.sql".to_string();
         higher_score_unverified.score = 3.0;
@@ -7867,6 +8457,7 @@ mod tests {
         duplicate.start_line = 200;
 
         let selected = sql_knowledge_auto_open_file_candidates(
+            "ecpm",
             &[
                 stale,
                 text,
@@ -7885,6 +8476,177 @@ mod tests {
             2,
             "stale/text/duplicate/too-weak candidates are skipped"
         );
+    }
+
+    #[test]
+    fn sql_knowledge_metric_gate_rejects_verified_but_unrelated_examples() {
+        let mut hit_rate = test_reference_snippet(
+            "SELECT app, hit_uv / NULLIF(app_uv, 0) AS hit_rate_pct FROM rule_hits",
+        );
+        hit_rate.file_id = "hit-rate-file".to_string();
+        hit_rate.filename = "rule_hit_rate.sql".to_string();
+        hit_rate.score = 99.0;
+        hit_rate.verified = true;
+
+        let mut ecpm = test_reference_snippet("SELECT app, AVG(ecpm) AS ecpm FROM ad_metrics");
+        ecpm.file_id = "ecpm-file".to_string();
+        ecpm.filename = "ecpm_analysis.sql".to_string();
+        ecpm.score = 88.0;
+        ecpm.verified = true;
+
+        let selected = sql_knowledge_auto_open_file_candidates(
+            "有没有哪些 app 的 ROI 持续下降？原因是什么？",
+            &[hit_rate, ecpm],
+            2,
+        );
+
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn sql_metric_identifier_matching_ignores_substrings_comments_and_literals() {
+        let false_positive = r#"
+            -- ROI is mentioned only as an analyst note.
+            SELECT 'ROI' AS label, android_device_id, hit_rate_pct
+            FROM rule_hits
+            WHERE rule_name = 'Android-设备状态异常_高风险'
+        "#;
+        let real_metric = r#"
+            SELECT app_id,
+                   revenue / NULLIF(cost, 0) AS ad_reward_roi
+            FROM app_daily_metrics
+        "#;
+
+        assert!(!sql_code_contains_ascii_metric_identifier(
+            false_positive,
+            "roi"
+        ));
+        assert!(sql_code_contains_ascii_metric_identifier(
+            real_metric,
+            "roi"
+        ));
+    }
+
+    #[test]
+    fn tool_metric_filter_keeps_context_from_a_file_with_a_real_metric_chunk() {
+        let mut header = test_reference_snippet("WITH params AS (SELECT current_date AS dt)");
+        header.file_id = "roi-file".to_string();
+        header.chunk_id = "roi-header".to_string();
+
+        let mut metric = test_reference_snippet(
+            "SELECT app, revenue / NULLIF(cost, 0) AS roi FROM app_daily_metrics",
+        );
+        metric.file_id = "roi-file".to_string();
+        metric.chunk_id = "roi-metric".to_string();
+
+        let mut unrelated =
+            test_reference_snippet("SELECT android_device_id, hit_rate_pct FROM rule_hits");
+        unrelated.file_id = "rule-file".to_string();
+        unrelated.chunk_id = "rule-hit-rate".to_string();
+
+        let filtered = filter_sql_knowledge_snippets_by_core_metric(
+            "哪些 app 的 ROI 持续下降",
+            vec![header, unrelated, metric],
+        );
+
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|snippet| snippet.file_id == "roi-file"));
+    }
+
+    #[test]
+    fn sql_knowledge_metric_gate_keeps_matching_roi_example() {
+        let mut roi = test_reference_snippet(
+            "SELECT app, revenue / NULLIF(cost, 0) AS ROI FROM app_daily_metrics",
+        );
+        roi.file_id = "roi-file".to_string();
+        roi.filename = "app_profitability.sql".to_string();
+
+        let selected =
+            sql_knowledge_auto_open_file_candidates("有没有哪些 app 的 ROI 持续下降？", &[roi], 2);
+
+        assert_eq!(selected, vec!["roi-file"]);
+    }
+
+    #[test]
+    fn sql_knowledge_metric_gate_does_not_block_non_metric_questions() {
+        let mut devices =
+            test_reference_snippet("SELECT device_id, device_name FROM task_dispatch_device");
+        devices.file_id = "device-file".to_string();
+        devices.filename = "device_inventory.sql".to_string();
+
+        let selected = sql_knowledge_auto_open_file_candidates("查下都有哪些设备", &[devices], 2);
+
+        assert_eq!(selected, vec!["device-file"]);
+    }
+
+    #[test]
+    fn bounded_excerpt_keeps_metric_logic_near_the_end_of_long_sql() {
+        let mut lines = (1..=420)
+            .map(|line| format!("-- unrelated setup line {line}"))
+            .collect::<Vec<_>>();
+        lines.push("SELECT app, revenue / NULLIF(cost, 0) AS ROI".to_string());
+        lines.push("FROM app_daily_metrics GROUP BY app".to_string());
+        let excerpt =
+            focused_bounded_sql_excerpt(&lines.join("\n"), "哪些 app 的 ROI 持续下降或骤降", 4_000);
+
+        assert!(excerpt.contains("AS ROI"));
+        assert!(excerpt.contains("app_daily_metrics"));
+        assert!(excerpt.contains("[relevant lines"));
+        assert!(excerpt.chars().count() <= 4_000);
+    }
+
+    #[test]
+    fn bounded_references_limit_files_and_total_prompt_evidence() {
+        let mut first = test_reference_snippet(&format!(
+            "{}\nSELECT app, revenue / cost AS ROI FROM roi_daily",
+            "-- header\n".repeat(8_000)
+        ));
+        first.file_id = "roi-file".to_string();
+        first.filename = "roi.sql".to_string();
+        let mut second = test_reference_snippet(&"SELECT ROI FROM second\n".repeat(2_000));
+        second.file_id = "second-file".to_string();
+        second.filename = "second.sql".to_string();
+        let mut noise = test_reference_snippet(&"SELECT app FROM unrelated\n".repeat(2_000));
+        noise.file_id = "noise-file".to_string();
+        noise.filename = "noise.sql".to_string();
+        noise.score = 99.0;
+
+        let selected = focus_bounded_sql_knowledge_references(
+            "哪些 app 的 ROI 持续下降",
+            &[noise, second, first],
+        );
+        let total_chars = selected
+            .iter()
+            .map(|snippet| snippet.content.chars().count())
+            .sum::<usize>();
+
+        assert_eq!(selected.len(), 2);
+        assert!(selected.iter().any(|snippet| snippet.file_id == "roi-file"));
+        assert!(total_chars <= BOUNDED_SQL_KNOWLEDGE_MAX_CHARS);
+    }
+
+    #[test]
+    fn bounded_references_return_no_unrelated_files_for_explicit_metric() {
+        let mut hit_rate = test_reference_snippet(
+            "SELECT app, hit_uv / NULLIF(app_uv, 0) AS hit_rate_pct FROM rule_hits",
+        );
+        hit_rate.file_id = "hit-rate-file".to_string();
+        hit_rate.filename = "rule_hit_rate.sql".to_string();
+        hit_rate.score = 99.0;
+        hit_rate.verified = true;
+
+        let mut ecpm = test_reference_snippet("SELECT app, AVG(ecpm) AS ecpm FROM ad_metrics");
+        ecpm.file_id = "ecpm-file".to_string();
+        ecpm.filename = "ecpm_analysis.sql".to_string();
+        ecpm.score = 88.0;
+        ecpm.verified = true;
+
+        let selected = focus_bounded_sql_knowledge_references(
+            "有没有哪些 app 的 ROI 持续下降？原因是什么？",
+            &[hit_rate, ecpm],
+        );
+
+        assert!(selected.is_empty());
     }
 
     #[test]

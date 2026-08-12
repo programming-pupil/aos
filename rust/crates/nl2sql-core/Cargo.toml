@@ -9,6 +9,7 @@ publish.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clickhouse = { version = "0.14", features = ["native-tls"] }
+futures-util.workspace = true
 hex = "0.4"
 lazy_static = "1"
 nl2sql-domain = { path = "../nl2sql-domain" }
@@ -25,6 +26,9 @@ trino-rust-client = "0.9"
 urlencoding.workspace = true
 uuid.workspace = true
 mongodb.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
 
 [lints]
 workspace = true

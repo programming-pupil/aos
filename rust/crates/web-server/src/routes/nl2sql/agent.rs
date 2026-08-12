@@ -48,6 +48,24 @@ pub(crate) async fn execute_agent_request(
     claims: &Claims,
     req: AgentExecuteRequest,
 ) -> Result<AgentExecuteResponse> {
+    execute_agent_request_with_budget(
+        state,
+        claims,
+        req,
+        super::agent_executor::DatasourceRequestBudget::new(3),
+    )
+    .await
+}
+
+/// Execute one NL2SQL request with a caller-owned datasource concurrency gate.
+/// Complex orchestrators (attribution, bot tasks, etc.) pass the same gate to
+/// every branch so their simultaneous database traffic stays bounded.
+pub(crate) async fn execute_agent_request_with_budget(
+    state: &AppState,
+    claims: &Claims,
+    req: AgentExecuteRequest,
+    network_budget: Arc<super::agent_executor::DatasourceRequestBudget>,
+) -> Result<AgentExecuteResponse> {
     super::require_nl2sql_embedding_config(state, &claims.tenant_id).await?;
 
     ensure_queryable_datasource_exists(state, claims).await?;
@@ -67,11 +85,17 @@ pub(crate) async fn execute_agent_request(
         .unwrap_or_else(|| format!("conv-{}", uuid::Uuid::new_v4()));
     let query_id = uuid::Uuid::new_v4().to_string();
 
-    let agent = Nl2SqlAgent::new(Arc::new(state.clone()), req.preferred_model.clone());
+    let agent = Nl2SqlAgent::with_network_budget(
+        Arc::new(state.clone()),
+        req.preferred_model.clone(),
+        req.bounded,
+        network_budget,
+    );
     match agent
         .execute(
             &claims,
             &req.question,
+            req.retrieval_question.as_deref(),
             req.shared_context.as_deref(),
             req.max_steps,
             &req.datasource_ids,

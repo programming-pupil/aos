@@ -4722,6 +4722,7 @@ pub(crate) async fn clarify(
         &[],
         business_domain_context.as_deref(),
         None,
+        true,
     )
     .await;
     super::query_async::emit_stage("generate_sql", "SQL 生成完成");
@@ -4945,6 +4946,7 @@ pub(crate) async fn clarify(
                 &db_type,
                 &data_source_id,
                 None,
+                false,
             )
             .await;
             let repaired = super::extract_sql_from_llm_output(&repaired);

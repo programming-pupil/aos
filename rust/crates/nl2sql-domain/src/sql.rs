@@ -24,6 +24,37 @@ pub fn extract_top_level_tables(sql: &str) -> Vec<String> {
     out
 }
 
+/// Prefer physical-looking qualified names when schema hydration has a strict
+/// table budget. Input order is retained within each priority class so the
+/// knowledge retriever remains the authority for relevance.
+pub fn prioritize_schema_discovery_tables(
+    table_names: impl IntoIterator<Item = String>,
+    max_tables: usize,
+) -> Vec<String> {
+    let mut qualified = Vec::new();
+    let mut unqualified = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for table in table_names {
+        let normalized = normalize_table_ref(&table);
+        if normalized.is_empty() || !seen.insert(normalized) {
+            continue;
+        }
+        if table
+            .split('.')
+            .filter(|part| !part.trim().is_empty())
+            .count()
+            >= 2
+        {
+            qualified.push(table);
+        } else {
+            unqualified.push(table);
+        }
+    }
+    qualified.extend(unqualified);
+    qualified.truncate(max_tables);
+    qualified
+}
+
 fn normalize_table_ref(raw: &str) -> String {
     raw.trim()
         .trim_end_matches(';')
@@ -229,5 +260,28 @@ JOIN "iceberg"."dim"."user_profile" u ON u.user_id = r.user_id
         assert!(tables.contains(&"iceberg.mps_prod.business_order".to_string()));
         assert!(tables.contains(&"hive.ods.order_item".to_string()));
         assert!(tables.contains(&"iceberg.dim.user_profile".to_string()));
+    }
+
+    #[test]
+    fn schema_discovery_prioritizes_qualified_tables_and_preserves_order() {
+        let tables = prioritize_schema_discovery_tables(
+            vec![
+                "first_cte".to_string(),
+                "mps_prod.orders".to_string(),
+                "other_cte".to_string(),
+                "ads.metrics".to_string(),
+                "MPS_PROD.ORDERS".to_string(),
+            ],
+            3,
+        );
+
+        assert_eq!(
+            tables,
+            vec![
+                "mps_prod.orders".to_string(),
+                "ads.metrics".to_string(),
+                "first_cte".to_string(),
+            ]
+        );
     }
 }

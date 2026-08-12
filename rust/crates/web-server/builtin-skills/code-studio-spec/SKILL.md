@@ -24,6 +24,8 @@ Requirements:
 - acceptanceMd must be written as verifiable acceptance criteria.
 - If information is missing, list confirmation questions inside requirementsMd, while still producing a useful first draft.
 - When repository context contains multiple repository sections, describe each service's responsibility and collaboration boundary separately. Never attribute one repository's evidence to another.
+- Treat the high-confidence exact-match evidence as deterministic workspace facts with higher priority than semantic summaries. Never claim that a repository has no match when this section lists one.
+- For exhaustive usage or migration-scope requests, cover every exact-match path and use identifier-reference evidence to distinguish definitions, configuration, and runtime calls.
 
 User requirement:
 {{requirement}}
