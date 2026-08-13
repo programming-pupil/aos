@@ -19,6 +19,8 @@ use tokio::sync::{broadcast, Mutex, OwnedSemaphorePermit, Semaphore};
 pub(crate) struct AgentStageSignal {
     pub stage: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
 }
 
 type StageEmitter = Arc<dyn Fn(AgentStageSignal) + Send + Sync>;
@@ -38,6 +40,18 @@ pub(crate) fn emit_agent_stage(stage: &str, message: &str) {
     let signal = AgentStageSignal {
         stage: stage.to_string(),
         message: message.to_string(),
+        detail: None,
+    };
+    if let Ok(cb) = AGENT_STAGE_EMITTER.try_with(|c| c.clone()) {
+        cb(signal);
+    }
+}
+
+pub(crate) fn emit_agent_stage_detail(stage: &str, message: &str, detail: serde_json::Value) {
+    let signal = AgentStageSignal {
+        stage: stage.to_string(),
+        message: message.to_string(),
+        detail: Some(detail),
     };
     if let Ok(cb) = AGENT_STAGE_EMITTER.try_with(|c| c.clone()) {
         cb(signal);

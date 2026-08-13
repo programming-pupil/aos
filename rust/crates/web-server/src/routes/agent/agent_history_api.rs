@@ -164,7 +164,7 @@ async fn load_super_assistant_turn_message_metadata(
     // history recovery. NL2SQL audit data therefore comes from the durable
     // parent/subtask ledger instead of depending on runtime ToolUse blocks.
     let mut audit_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-        "SELECT parent_turn_id, tool_call_id, status, \
+        "SELECT id AS subtask_id, parent_turn_id, tool_call_id, status, \
          CAST(input_json AS TEXT) AS input_json, \
          CAST(result_json AS TEXT) AS result_json, error_message \
          FROM super_assistant_subtasks \
@@ -183,14 +183,67 @@ async fn load_super_assistant_turn_message_metadata(
     }
     audit_query.push(") ORDER BY created_at ASC, id ASC");
     let audit_rows = audit_query.build().fetch_all(db).await?;
+    let mut progress_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT turn_id, event_data FROM (
+           SELECT turn_id, event_data, seq,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY json_extract(event_data, '$.subtaskId')
+                    ORDER BY seq DESC
+                  ) AS progress_rank
+           FROM super_assistant_turn_events
+           WHERE tenant_id = ",
+    );
+    progress_query
+        .push_bind(tenant_id)
+        .push(" AND user_id = ")
+        .push_bind(user_id)
+        .push(
+            " AND event_type = 'subtask_progress'
+              AND json_valid(event_data)
+              AND json_extract(event_data, '$.engine') = 'nl2sql'
+              AND turn_id IN (",
+        );
+    {
+        let mut separated = progress_query.separated(", ");
+        for turn_id in &turn_ids {
+            separated.push_bind(turn_id);
+        }
+    }
+    progress_query.push(
+        ")
+         ) ranked_progress
+         WHERE progress_rank <= 120
+         ORDER BY seq ASC",
+    );
+    let progress_rows = progress_query.build().fetch_all(db).await?;
+    let mut nl2sql_progress_by_subtask =
+        std::collections::HashMap::<String, Vec<serde_json::Value>>::new();
+    for row in progress_rows {
+        let raw = row.try_get::<String, _>("event_data")?;
+        let Some(value) = serde_json::from_str::<serde_json::Value>(&raw).ok() else {
+            continue;
+        };
+        if let Some(subtask_id) = value.get("subtaskId").and_then(serde_json::Value::as_str) {
+            nl2sql_progress_by_subtask
+                .entry(subtask_id.to_string())
+                .or_default()
+                .push(value);
+        }
+    }
     let mut nl2sql_audits_by_turn =
         std::collections::HashMap::<String, Vec<SuperAssistantNl2sqlAuditDto>>::new();
     for row in audit_rows {
         let parse_json = |raw: Option<String>| {
             raw.and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
         };
+        let parent_turn_id = row.try_get::<String, _>("parent_turn_id")?;
+        let subtask_id = row.try_get::<String, _>("subtask_id")?;
+        let progress_events = nl2sql_progress_by_subtask
+            .get(&subtask_id)
+            .cloned()
+            .unwrap_or_default();
         nl2sql_audits_by_turn
-            .entry(row.try_get::<String, _>("parent_turn_id")?)
+            .entry(parent_turn_id)
             .or_default()
             .push(SuperAssistantNl2sqlAuditDto {
                 tool_call_id: row.try_get::<String, _>("tool_call_id")?,
@@ -198,6 +251,7 @@ async fn load_super_assistant_turn_message_metadata(
                 input: parse_json(row.try_get::<Option<String>, _>("input_json")?),
                 result: parse_json(row.try_get::<Option<String>, _>("result_json")?),
                 error_message: row.try_get::<Option<String>, _>("error_message")?,
+                progress_events,
             });
     }
 

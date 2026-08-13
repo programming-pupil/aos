@@ -17,6 +17,58 @@ export interface PmFinalDeliverySource {
   label: string;
 }
 
+export function shouldShowPmFinalDelivery({
+  sessionSource,
+  executionUiEnabled,
+  suppressExecutionUi,
+  isStreaming,
+  hasAssistantMessage,
+  synthStatus,
+  backgroundTaskStatus,
+  latestTaskStatus,
+  body,
+}: {
+  sessionSource: string;
+  executionUiEnabled: boolean;
+  suppressExecutionUi: boolean;
+  isStreaming: boolean;
+  hasAssistantMessage: boolean;
+  synthStatus?: string | null;
+  backgroundTaskStatus?: string | null;
+  latestTaskStatus?: string | null;
+  body: string;
+}): boolean {
+  if (
+    sessionSource !== "pm" ||
+    !executionUiEnabled ||
+    suppressExecutionUi ||
+    isStreaming ||
+    !hasAssistantMessage
+  ) {
+    return false;
+  }
+  const normalizedLatestStatus = latestTaskStatus?.toLowerCase() ?? null;
+  const completed =
+    synthStatus === "completed" ||
+    backgroundTaskStatus === "completed" ||
+    normalizedLatestStatus === "completed";
+  if (!completed) return false;
+  const text = body.trim();
+  if (!text || text.startsWith("研究任务失败：")) return false;
+  if (
+    text.startsWith("深度分析已启动") ||
+    text.toLowerCase().startsWith("deep analysis started")
+  ) {
+    return false;
+  }
+  return (
+    !normalizedLatestStatus ||
+    !["queued", "running", "cancelling", "interrupted"].includes(
+      normalizedLatestStatus,
+    )
+  );
+}
+
 export function PmFinalDeliveryPanel({
   t,
   title,

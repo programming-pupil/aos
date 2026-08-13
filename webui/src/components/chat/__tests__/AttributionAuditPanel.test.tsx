@@ -4,6 +4,7 @@ import {
   AttributionMarkdownDetail,
   isAttributionTaskTerminalStatus,
   normalizeAttributionMarkdown,
+  shouldShowAttributionPreparing,
 } from "../AttributionAuditPanel";
 
 describe("AttributionAuditPanel", () => {
@@ -56,5 +57,12 @@ describe("AttributionAuditPanel", () => {
     }
     expect(isAttributionTaskTerminalStatus("running")).toBe(false);
     expect(isAttributionTaskTerminalStatus("queued")).toBe(false);
+  });
+
+  it("hides the generic preparing placeholder after execution details arrive", () => {
+    expect(shouldShowAttributionPreparing(true, 0, 0)).toBe(true);
+    expect(shouldShowAttributionPreparing(true, 0, 1)).toBe(false);
+    expect(shouldShowAttributionPreparing(true, 1, 0)).toBe(false);
+    expect(shouldShowAttributionPreparing(false, 0, 0)).toBe(false);
   });
 });

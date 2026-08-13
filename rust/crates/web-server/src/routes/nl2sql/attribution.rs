@@ -117,25 +117,6 @@ fn attribution_query_concurrency() -> usize {
         .unwrap_or(2)
 }
 
-fn attribution_total_budget(depth: AttributionDepth) -> Duration {
-    let (env_name, default_secs) = match depth {
-        AttributionDepth::Fast => ("NL2SQL_ATTRIBUTION_FAST_TIMEOUT_SECS", 3 * 60),
-        AttributionDepth::Standard => ("NL2SQL_ATTRIBUTION_STANDARD_TIMEOUT_SECS", 6 * 60),
-        AttributionDepth::Deep => ("NL2SQL_ATTRIBUTION_DEEP_TIMEOUT_SECS", 8 * 60),
-    };
-    Duration::from_secs(
-        env::var(env_name)
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value >= 60)
-            .unwrap_or(default_secs),
-    )
-}
-
-fn remaining_attribution_budget(deadline: Instant) -> Duration {
-    deadline.saturating_duration_since(Instant::now())
-}
-
 fn attribution_planning_budget() -> Duration {
     Duration::from_secs(
         env::var("NL2SQL_ATTRIBUTION_PLANNING_TIMEOUT_SECS")
@@ -146,48 +127,6 @@ fn attribution_planning_budget() -> Duration {
     )
 }
 
-fn attribution_step_budget(depth: AttributionDepth) -> Duration {
-    let default_secs = match depth {
-        AttributionDepth::Fast => 75,
-        AttributionDepth::Standard => 120,
-        AttributionDepth::Deep => 150,
-    };
-    Duration::from_secs(
-        env::var("NL2SQL_ATTRIBUTION_STEP_TIMEOUT_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value >= 30)
-            .unwrap_or(default_secs),
-    )
-}
-
-fn attribution_step_budget_for(depth: AttributionDepth, step: &AttributionPlanStep) -> Duration {
-    let base = attribution_step_budget(depth);
-    let extra_secs = match step.id.as_str() {
-        "main_metric" => match depth {
-            AttributionDepth::Fast => 105,
-            AttributionDepth::Standard => 180,
-            // Deep attribution may spend roughly a minute on SQL-knowledge
-            // routing, schema hydration and SQL generation before Trino
-            // accepts the statement. Keep a full five-minute connector window
-            // available without extending every auxiliary drill-down.
-            AttributionDepth::Deep => 210,
-        },
-        "metric_decomposition" | "dimension_drilldown" => 20,
-        _ => 0,
-    };
-    base.saturating_add(Duration::from_secs(extra_secs))
-}
-
-fn attribution_primary_attempt_deadline(step_deadline: Instant) -> Instant {
-    // The former implementation reserved one third of every step for a
-    // lightweight fallback. That fallback was removed to prevent overlapping
-    // remote Trino statements, but the reserve remained and cut a 165-second
-    // standard step off at 110 seconds. Give the one bounded execution its full
-    // window; connector cancellation still runs when this deadline is reached.
-    step_deadline
-}
-
 fn attribution_synthesis_reserve() -> Duration {
     Duration::from_secs(
         env::var("NL2SQL_ATTRIBUTION_SYNTHESIS_RESERVE_SECS")
@@ -196,16 +135,6 @@ fn attribution_synthesis_reserve() -> Duration {
             .filter(|value| *value >= 20)
             .unwrap_or(55),
     )
-}
-
-fn bounded_phase_deadline(overall_deadline: Instant, budget: Duration) -> Instant {
-    overall_deadline.min(Instant::now() + budget)
-}
-
-fn attribution_execution_deadline(overall_deadline: Instant) -> Instant {
-    overall_deadline
-        .checked_sub(attribution_synthesis_reserve())
-        .unwrap_or(overall_deadline)
 }
 
 fn attribution_helper_model_budget() -> Duration {
@@ -525,6 +454,8 @@ pub(crate) struct AttributionTaskEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub step_total: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub observation: Option<AttributionObservation>,
     pub response: Option<AttributionAnalyzeResponse>,
     pub error: Option<String>,
@@ -708,6 +639,7 @@ impl AttributionTaskManager {
             progress_percent: Some(3),
             step_index: None,
             step_total: None,
+            detail: None,
             observation: None,
             response: None,
             error: None,
@@ -745,6 +677,7 @@ impl AttributionTaskManager {
         progress_percent: Option<u8>,
         step_index: Option<usize>,
         step_total: Option<usize>,
+        detail: Option<serde_json::Value>,
         observation: Option<AttributionObservation>,
     ) -> Option<AttributionTaskEvent> {
         let mut guard = self.inner.lock().await;
@@ -764,6 +697,7 @@ impl AttributionTaskManager {
                 progress_percent,
                 step_index,
                 step_total,
+                detail,
                 observation,
                 response: None,
                 error: None,
@@ -816,6 +750,7 @@ impl AttributionTaskManager {
                 progress_percent: Some(100),
                 step_index: None,
                 step_total: None,
+                detail: None,
                 observation: None,
                 response: Some(response),
                 error: None,
@@ -848,6 +783,7 @@ impl AttributionTaskManager {
                 progress_percent: Some(100),
                 step_index: None,
                 step_total: None,
+                detail: None,
                 observation: None,
                 response: None,
                 error: Some(error),
@@ -887,6 +823,7 @@ impl AttributionTaskManager {
             progress_percent: Some(100),
             step_index: None,
             step_total: None,
+            detail: None,
             observation: None,
             response: None,
             error: None,
@@ -2288,6 +2225,7 @@ async fn persisted_attribution_task_snapshot(
         }),
         step_index: None,
         step_total: None,
+        detail: None,
         observation: None,
         response,
         error,
@@ -2416,6 +2354,7 @@ pub(crate) async fn stream_attribution_task_events(
                 progress_percent: Some(100),
                 step_index: None,
                 step_total: None,
+                detail: None,
                 observation: None,
                 response: None,
                 error: Some("attribution task not found".to_string()),
@@ -2982,7 +2921,6 @@ async fn run_diagnostic_loop(
     task_id: &str,
     plan: &mut AttributionPlan,
     observations: &mut Vec<AttributionObservation>,
-    deadline: Instant,
 ) {
     if !should_run_diagnostic_loop(observations) {
         return;
@@ -3004,7 +2942,7 @@ async fn run_diagnostic_loop(
         .collect::<std::collections::HashSet<_>>();
 
     for round in 1..=diagnostic_loop_rounds(depth) {
-        if task_manager().is_cancelled(task_id).await || Instant::now() >= deadline {
+        if task_manager().is_cancelled(task_id).await {
             return;
         }
         if remaining_budget == 0 {
@@ -3025,7 +2963,7 @@ async fn run_diagnostic_loop(
 
         let max_steps = remaining_budget.min(diagnostic_steps_per_round(depth));
         let followup = match tokio::time::timeout(
-            remaining_attribution_budget(deadline),
+            attribution_helper_model_budget(),
             build_diagnostic_followup_plan(
                 state,
                 claims,
@@ -3048,7 +2986,10 @@ async fn run_diagnostic_loop(
                 );
                 fallback_diagnostic_followup_plan(&req.question, round, max_steps)
             }
-            Err(_) => break,
+            Err(_) => {
+                tracing::warn!(round, "diagnostic follow-up planner timed out");
+                break;
+            }
         };
         if followup.done {
             tracing::info!(
@@ -3070,9 +3011,13 @@ async fn run_diagnostic_loop(
             break;
         }
 
+        let usable_evidence_before = observations
+            .iter()
+            .filter(|observation| observation.has_usable_evidence())
+            .count();
         let total = steps.len();
         for (idx, step) in steps.drain(..).enumerate() {
-            if task_manager().is_cancelled(task_id).await || Instant::now() >= deadline {
+            if task_manager().is_cancelled(task_id).await {
                 return;
             }
             if remaining_budget == 0 {
@@ -3104,7 +3049,6 @@ async fn run_diagnostic_loop(
                 task_id,
                 Some(step_index),
                 Some(total),
-                bounded_phase_deadline(deadline, attribution_step_budget_for(depth, &step)),
             )
             .await;
             let summary = if observation.error.is_some() {
@@ -3130,6 +3074,17 @@ async fn run_diagnostic_loop(
             plan.steps.push(step);
             observations.push(observation);
             remaining_budget = remaining_budget.saturating_sub(1);
+        }
+        let usable_evidence_after = observations
+            .iter()
+            .filter(|observation| observation.has_usable_evidence())
+            .count();
+        if usable_evidence_after == usable_evidence_before {
+            tracing::info!(
+                round,
+                "diagnostic loop converged because the round added no usable evidence"
+            );
+            break;
         }
     }
 }
@@ -3169,7 +3124,6 @@ async fn analyze_attribution(
     super::require_nl2sql_embedding_config(state, &claims.tenant_id).await?;
     let start = Instant::now();
     let depth = req.depth.unwrap_or_default();
-    let deadline = start + attribution_total_budget(depth);
     let conversation_id = attribution_conversation_id(req.conversation_id.clone());
     let previous_context = load_previous_attribution_context(state, claims, &conversation_id).await;
     if task_manager().is_cancelled(task_id).await {
@@ -3315,7 +3269,7 @@ async fn analyze_attribution(
     )
     .await;
     let plan = match tokio::time::timeout(
-        remaining_attribution_budget(deadline).min(attribution_planning_budget()),
+        attribution_planning_budget(),
         build_attribution_plan(
             state,
             claims,
@@ -3380,7 +3334,6 @@ async fn analyze_attribution(
 
     let mut observations = Vec::new();
     let total_steps = steps.len();
-    let execution_deadline = attribution_execution_deadline(deadline);
     let mut indexed_steps = steps.into_iter().enumerate().collect::<Vec<_>>();
 
     // Establish the requested metric and comparison first. Running every
@@ -3409,10 +3362,6 @@ async fn analyze_attribution(
             None,
         )
         .await;
-        let step_deadline = bounded_phase_deadline(
-            execution_deadline,
-            attribution_step_budget_for(depth, &step),
-        );
         let observation = execute_attribution_step(
             state,
             claims,
@@ -3423,7 +3372,6 @@ async fn analyze_attribution(
             task_id,
             Some(step_index),
             Some(total_steps),
-            step_deadline,
         )
         .await;
         let step_summary = if observation.error.is_some() {
@@ -3488,7 +3436,7 @@ async fn analyze_attribution(
         // `buffer_unordered` starts queued futures as earlier steps finish.
         // Re-check cancellation here so a stopped attribution turn cannot
         // launch another model/SQL request from the pending queue.
-        if task_manager().is_cancelled(task_id).await || Instant::now() >= execution_deadline {
+        if task_manager().is_cancelled(task_id).await {
             completed.push((
                 idx,
                 step.clone(),
@@ -3511,10 +3459,6 @@ async fn analyze_attribution(
             None,
         )
         .await;
-        let step_deadline = bounded_phase_deadline(
-            execution_deadline,
-            attribution_step_budget_for(depth, &step),
-        );
         let observation = execute_attribution_step(
             state,
             claims,
@@ -3525,7 +3469,6 @@ async fn analyze_attribution(
             task_id,
             Some(step_index),
             Some(total_steps),
-            step_deadline,
         )
         .await;
         let stop_after_step = observation.error.is_some();
@@ -3616,7 +3559,6 @@ async fn analyze_attribution(
         task_id,
         &mut plan,
         &mut observations,
-        execution_deadline,
     )
     .await;
     if task_manager().is_cancelled(task_id).await {
@@ -3631,7 +3573,7 @@ async fn analyze_attribution(
     }
 
     let evidence_health = AttributionEvidenceHealth::from_observations(&observations);
-    let mut report = if should_skip_attribution_synthesis(&observations) {
+    let report = if should_skip_attribution_synthesis(&observations) {
         // A failed/blocked datasource query already contains the useful
         // evidence for the user: generated SQL, query id (when accepted),
         // and the connector error. Calling the LLM here cannot create data
@@ -3655,7 +3597,7 @@ async fn analyze_attribution(
         )
         .await;
         match tokio::time::timeout(
-            remaining_attribution_budget(deadline),
+            attribution_synthesis_reserve(),
             synthesize_attribution_report(
                 state,
                 claims,
@@ -3678,18 +3620,12 @@ async fn analyze_attribution(
     };
     let evidence_cards = build_evidence_cards(&observations);
     let success_count = evidence_health.successful_steps;
-    let deadline_reached = Instant::now() >= deadline;
-    if deadline_reached {
-        report
-            .caveats
-            .push("已达到本次归因的总时间预算，报告基于截止时已经验证的证据生成。".to_string());
-    }
     let status = if success_count == 0 && observations.iter().any(attribution_observation_timed_out)
     {
         "timed_out".to_string()
     } else if success_count == 0 {
         "no_data".to_string()
-    } else if deadline_reached || success_count < observations.len() {
+    } else if success_count < observations.len() {
         "partial".to_string()
     } else {
         "completed".to_string()
@@ -3738,7 +3674,36 @@ async fn publish(
             progress_percent,
             step_index,
             step_total,
+            None,
             observation,
+        )
+        .await
+    {
+        persist_attribution_progress_event(&state.db, claims, &event).await;
+    }
+}
+
+async fn publish_detail(
+    state: &AppState,
+    claims: &Claims,
+    task_id: &str,
+    stage: &str,
+    message: &str,
+    progress_percent: Option<u8>,
+    step_index: Option<usize>,
+    step_total: Option<usize>,
+    detail: serde_json::Value,
+) {
+    if let Some(event) = task_manager()
+        .publish_stage_progress(
+            task_id,
+            stage,
+            message,
+            progress_percent,
+            step_index,
+            step_total,
+            Some(detail),
+            None,
         )
         .await
     {
@@ -3760,7 +3725,6 @@ async fn execute_attribution_step(
     task_id: &str,
     step_index: Option<usize>,
     step_total: Option<usize>,
-    deadline: Instant,
 ) -> AttributionObservation {
     let start = Instant::now();
     let agent_question = format!(
@@ -3794,29 +3758,47 @@ async fn execute_attribution_step(
     let claims_for_stage = claims.clone();
     let stage_prefix = format!("execute_{}", attribution_stage_component(&step.id));
     let step_title = step.title.clone();
+    let (stage_sender, mut stage_receiver) =
+        tokio::sync::mpsc::unbounded_channel::<Option<AgentStageSignal>>();
+    let stage_persist_task = tokio::spawn(async move {
+        while let Some(Some(signal)) = stage_receiver.recv().await {
+            let stage = format!(
+                "{stage_prefix}_{}",
+                attribution_stage_component(&signal.stage)
+            );
+            let message = format!("{}：{}", step_title, signal.message);
+            if let Some(detail) = signal.detail {
+                publish_detail(
+                    &state_for_stage,
+                    &claims_for_stage,
+                    &task_id_for_stage,
+                    &stage,
+                    &message,
+                    Some(48),
+                    step_index,
+                    step_total,
+                    detail,
+                )
+                .await;
+            } else {
+                publish(
+                    &state_for_stage,
+                    &claims_for_stage,
+                    &task_id_for_stage,
+                    &stage,
+                    &message,
+                    Some(48),
+                    step_index,
+                    step_total,
+                    None,
+                )
+                .await;
+            }
+        }
+    });
+    let stage_sender_for_emitter = stage_sender.clone();
     let stage_emitter = Arc::new(move |signal: AgentStageSignal| {
-        let task_id = task_id_for_stage.clone();
-        let state = state_for_stage.clone();
-        let claims = claims_for_stage.clone();
-        let stage = format!(
-            "{stage_prefix}_{}",
-            attribution_stage_component(&signal.stage)
-        );
-        let message = format!("{}：{}", step_title, signal.message);
-        tokio::spawn(async move {
-            publish(
-                &state,
-                &claims,
-                &task_id,
-                &stage,
-                &message,
-                Some(48),
-                step_index,
-                step_total,
-                None,
-            )
-            .await;
-        });
+        let _ = stage_sender_for_emitter.send(Some(signal));
     });
     let execution = with_agent_stage_emitter(stage_emitter.clone(), async move {
         match req.network_budget.clone() {
@@ -3827,11 +3809,9 @@ async fn execute_attribution_step(
         }
     });
     tokio::pin!(execution);
-    let primary_deadline = attribution_primary_attempt_deadline(deadline);
     let response = loop {
         tokio::select! {
             result = &mut execution => break Some(result),
-            _ = tokio::time::sleep_until(primary_deadline.into()) => break None,
             _ = tokio::time::sleep(Duration::from_millis(250)) => {
                 if task_manager().is_cancelled(task_id).await {
                     break None;
@@ -3839,20 +3819,24 @@ async fn execute_attribution_step(
             }
         }
     };
-    // Never launch a fallback while the original future is still in flight.
-    // Cancelling a client-side future does not guarantee that the remote Trino
-    // statement has stopped, so a second recovery query could overlap it and
-    // multiply load. A timeout is terminal for this step; retain the timeout
-    // evidence and let the caller decide whether any already-completed steps
-    // are sufficient for a partial report.
+    // The executor emits stages synchronously into this queue. Flush every
+    // queued SQL/status/result event before publishing the step observation so
+    // live and historical timelines cannot be reordered by task scheduling.
+    let _ = stage_sender.send(None);
+    if let Err(error) = stage_persist_task.await {
+        tracing::warn!(
+            task_id,
+            step_id = %step.id,
+            error = %error,
+            "data-attribution progress persistence worker failed"
+        );
+    }
+    // A running statement is governed by connector inactivity, explicit
+    // cancellation, and the per-user concurrency limit. Finite planning rounds
+    // bound further drill-downs; wall-clock time alone must not drop a healthy
+    // statement that continues to report progress.
     let Some(response) = response else {
         let mut observation = cancelled_attribution_observation(step, conversation_id);
-        if !task_manager().is_cancelled(task_id).await {
-            observation.error = Some(
-                "该查询在允许的慢数据源执行窗口内仍未完成，系统已停止本分支以保护数据源；这不代表没有数据或没有绑定数据源，可稍后重试或提高归因查询预算。"
-                    .to_string(),
-            );
-        }
         observation.elapsed_ms = start.elapsed().as_millis() as u64;
         return observation;
     };
@@ -4664,7 +4648,7 @@ fn fallback_report(question: &str, observations: &[AttributionObservation]) -> A
     let failed_count = observations.len().saturating_sub(success_count);
     let timed_out = observations.iter().any(attribution_observation_timed_out);
     let executive_summary = if success_count == 0 && timed_out {
-        format!("本次对“{question}”的主查询在慢数据源执行窗口内仍未完成，因此没有形成可验证的归因结论。系统已停止该分支以保护数据源；这不是无数据或数据源未绑定。可在数据源负载较低时重试，或由管理员提高归因查询预算。")
+        format!("本次对“{question}”的查询在连接或轮询长期没有返回进展后结束，因此没有形成可验证的归因结论。这不是无数据或数据源未绑定；已生成的 SQL、查询标识和执行状态会保留在执行记录中，可据此排查数据源响应。")
     } else if success_count == 0 {
         format!("这次没有成功拿到可用于归因的数据结果，因此不能对“{question}”给出确定原因。建议先检查指标口径、数据源权限、相关表结构和 SQL 知识库是否完整。")
     } else {
@@ -4826,7 +4810,16 @@ mod tests {
             .await
             .expect("task should be created");
         task_manager()
-            .publish_stage_progress(&task_id, "plan", "planning", Some(18), None, None, None)
+            .publish_stage_progress(
+                &task_id,
+                "plan",
+                "planning",
+                Some(18),
+                None,
+                None,
+                None,
+                None,
+            )
             .await;
 
         let first_page =
@@ -4883,6 +4876,7 @@ mod tests {
             progress_percent: Some(50),
             step_index: Some(1),
             step_total: Some(2),
+            detail: None,
             observation: Some(AttributionObservation {
                 step_id: "main_metric".to_string(),
                 title: "main".to_string(),
@@ -5651,18 +5645,6 @@ mod tests {
         assert!(main.question.contains("不要写死固定阈值"));
         assert!(decomposition.question.contains("分子、分母"));
         assert!(drilldown.question.contains("先定位哪些对象真正异常"));
-        assert!(
-            attribution_step_budget_for(AttributionDepth::Deep, main)
-                > attribution_step_budget(AttributionDepth::Deep)
-        );
-    }
-
-    #[test]
-    fn step_timeout_uses_the_full_window_when_no_fallback_is_allowed() {
-        let deadline = Instant::now() + Duration::from_secs(150);
-        let primary_deadline = attribution_primary_attempt_deadline(deadline);
-
-        assert_eq!(primary_deadline, deadline);
     }
 
     #[test]
@@ -5854,6 +5836,7 @@ mod tests {
             progress_percent: Some(60),
             step_index: Some(1),
             step_total: Some(1),
+            detail: None,
             observation: Some(observation),
             response: None,
             error: None,

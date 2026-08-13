@@ -95,6 +95,8 @@ pub struct SuperAssistantNl2sqlAuditDto {
     pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub progress_events: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]

@@ -28,6 +28,7 @@
     "echarts": "^6.1.0",
     "echarts-for-react": "^3.0.0",
     "fastest-levenshtein": "^1.0.16",
+    "fflate": "^0.8.3",
     "i18next": "^26.0.5",
     "i18next-browser-languagedetector": "^8.2.1",
     "marked": "^18.0.3",

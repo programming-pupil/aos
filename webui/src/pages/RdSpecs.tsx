@@ -3,6 +3,7 @@ import {
   Alert,
   Button,
   Card,
+  Collapse,
   Drawer,
   Empty,
   Form,
@@ -20,6 +21,7 @@ import type { ColumnsType } from 'antd/es/table';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import dayjs from 'dayjs';
+import { strToU8, zipSync } from 'fflate';
 import { apiKeysApi, rdApi } from '@/api';
 import { queryKeys } from '@/api/queryKeys';
 import { Markdown } from '@/components/chat';
@@ -50,9 +52,14 @@ function modelOptions(keys: ApiKeyRecord[]) {
 
 function SpecSection({ title, children, emptyText }: { title: string; children?: string | null; emptyText: string }) {
   return (
-    <Card size="small" title={title}>
-      {children?.trim() ? <Markdown>{children}</Markdown> : <Text type="secondary">{emptyText}</Text>}
-    </Card>
+    <Collapse
+      size="small"
+      items={[{
+        key: title,
+        label: <Text strong>{title}</Text>,
+        children: children?.trim() ? <Markdown>{children}</Markdown> : <Text type="secondary">{emptyText}</Text>,
+      }]}
+    />
   );
 }
 
@@ -196,21 +203,35 @@ export default function RdSpecs() {
   }, [selectedSpecId]);
 
   const downloadSpecPackage = (spec: RdSpec) => {
-    const sections = [
-      `# ${spec.title}`,
-      `\n## 原始需求\n\n${spec.prompt}`,
-      `\n## 需求方案\n\n${spec.requirementsMd || '待生成'}`,
-      `\n## 代码研发方案\n\n${spec.designMd || '待生成'}`,
-      `\n## 任务拆解\n\n${spec.tasksMd || '待生成'}`,
-      `\n## 验收标准\n\n${spec.acceptanceMd || '待生成'}`,
-    ].join('\n');
-    const url = URL.createObjectURL(new Blob([sections], { type: 'text/markdown;charset=utf-8' }));
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = `${spec.title.replace(/[^\p{L}\p{N}._-]+/gu, '-').slice(0, 80) || 'aos-engineering-plan'}.md`;
-    anchor.click();
-    URL.revokeObjectURL(url);
-    message.success(t('rd.specPackageDownloaded', '方案已下载，可交给 Codex、Kiro 或 Claude Code 执行'));
+    try {
+      const pending = t('rd.documentPending', '待生成');
+      const files = {
+        '01-requirements-and-core-design.md': strToU8([
+          `# ${spec.title}`,
+          `\n## ${t('rd.originalRequirement', '原始需求')}\n\n${spec.prompt}`,
+          `\n## ${t('rd.coreDesign', '核心设计')}\n\n${spec.requirementsMd || pending}`,
+        ].join('\n')),
+        '02-engineering-design.md': strToU8([
+          `# ${spec.title}`,
+          `\n## ${t('rd.engineeringDesign', '代码研发方案')}\n\n${spec.designMd || pending}`,
+        ].join('\n')),
+        '03-tasks-and-acceptance.md': strToU8([
+          `# ${spec.title}`,
+          `\n## ${t('rd.taskBreakdown', 'Task 任务拆解')}\n\n${spec.tasksMd || pending}`,
+          `\n## ${t('rd.acceptanceCriteria', '验收标准')}\n\n${spec.acceptanceMd || pending}`,
+        ].join('\n')),
+      };
+      const archive = zipSync(files, { level: 6 });
+      const url = URL.createObjectURL(new Blob([archive as BlobPart], { type: 'application/zip' }));
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `${spec.title.replace(/[^\p{L}\p{N}._-]+/gu, '-').slice(0, 80) || 'aos-engineering-plan'}.zip`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+      message.success(t('rd.specPackageDownloaded', '方案 ZIP 已下载，包含 3 个 Markdown 文件'));
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : t('rd.specPackageDownloadFailed', '方案下载失败'));
+    }
   };
 
   const copyHandoffPrompt = async (spec: RdSpec) => {
@@ -469,9 +490,9 @@ export default function RdSpecs() {
                 </Space>
               </Card>
             ) : null}
-            <SpecSection title={t('rd.requirementsDoc', '需求文档')} children={selectedSpec.requirementsMd} emptyText={t('common.noData')} />
-            <SpecSection title={t('rd.designDoc', '技术设计')} children={selectedSpec.designMd} emptyText={t('common.noData')} />
-            <SpecSection title={t('rd.tasksDoc', '任务清单')} children={selectedSpec.tasksMd} emptyText={t('common.noData')} />
+            <SpecSection title={t('rd.coreDesign', '核心设计')} children={selectedSpec.requirementsMd} emptyText={t('common.noData')} />
+            <SpecSection title={t('rd.engineeringDesign', '代码研发方案')} children={selectedSpec.designMd} emptyText={t('common.noData')} />
+            <SpecSection title={t('rd.taskBreakdown', 'Task 任务拆解')} children={selectedSpec.tasksMd} emptyText={t('common.noData')} />
             <SpecSection title={t('rd.acceptanceDoc', '验收标准')} children={selectedSpec.acceptanceMd} emptyText={t('common.noData')} />
           </Space>
         )}

@@ -1014,8 +1014,21 @@ pub(crate) async fn execute_trino_query_bounded(
     let client = Arc::new(client);
     let unresolved_hold = std::time::Duration::from_secs(timeout_secs.max(1));
     let mut guard = TrinoSubmissionGuard::new(client.clone(), user_permit, unresolved_hold);
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.max(1));
+    // This is an inactivity window, not a wall-clock query lifetime. Slow
+    // Trino statements may legitimately run for minutes while every response
+    // still reports progress. Renew the window after each server response and
+    // cancel only when the server becomes silent.
+    let inactivity_timeout = std::time::Duration::from_secs(timeout_secs.max(1));
+
+    super::agent_async::emit_agent_stage_detail(
+        "execute_sql",
+        "SQL 已生成，正在提交到数据源",
+        serde_json::json!({
+            "kind": "sql",
+            "sql": sql.clone(),
+            "status": "submitting",
+        }),
+    );
 
     tracing::info!(
         tenant_id,
@@ -1024,18 +1037,40 @@ pub(crate) async fn execute_trino_query_bounded(
         "submitting bounded Trino query"
     );
 
-    let mut response =
-        match tokio::time::timeout_at(deadline, client.get::<trino_rust_client::Row>(sql)).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => return Err(anyhow::anyhow!("trino query failed: {error}")),
-            Err(_) => {
-                guard.cancel("initial response timeout").await;
-                return Err(anyhow::anyhow!(
-                    "Query execution timed out after {timeout_secs}s"
-                ));
-            }
-        };
+    let mut response = match tokio::time::timeout(
+        inactivity_timeout,
+        client.get::<trino_rust_client::Row>(sql),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => return Err(anyhow::anyhow!("trino query failed: {error}")),
+        Err(_) => {
+            guard.cancel("initial response timeout").await;
+            return Err(anyhow::anyhow!(
+                "Query execution timed out after {timeout_secs}s"
+            ));
+        }
+    };
     guard.record_query_id(&response.id);
+    super::agent_async::emit_agent_stage_detail(
+        "execute_sql",
+        "数据源已接受查询，正在运行",
+        serde_json::json!({
+            "kind": "query_progress",
+            "queryId": response.id.clone(),
+            "status": response.stats.state.clone(),
+            "queued": response.stats.queued,
+            "scheduled": response.stats.scheduled,
+            "totalSplits": response.stats.total_splits,
+            "queuedSplits": response.stats.queued_splits,
+            "runningSplits": response.stats.running_splits,
+            "completedSplits": response.stats.completed_splits,
+            "processedRows": response.stats.processed_rows,
+            "processedBytes": response.stats.processed_bytes,
+            "elapsedMs": response.stats.elapsed_time_millis,
+        }),
+    );
     tracing::info!(
         tenant_id,
         user_id,
@@ -1046,6 +1081,7 @@ pub(crate) async fn execute_trino_query_bounded(
 
     let mut columns = response.columns.take();
     let mut rows = Vec::new();
+    let mut last_progress_emit = std::time::Instant::now();
     loop {
         if let Some(error) = response.error.take() {
             guard.complete();
@@ -1065,8 +1101,8 @@ pub(crate) async fn execute_trino_query_bounded(
         let Some(next_uri) = response.next_uri.take() else {
             break;
         };
-        response = match tokio::time::timeout_at(
-            deadline,
+        response = match tokio::time::timeout(
+            inactivity_timeout,
             client.get_next::<trino_rust_client::Row>(&next_uri),
         )
         .await
@@ -1086,8 +1122,43 @@ pub(crate) async fn execute_trino_query_bounded(
         if columns.is_none() {
             columns = response.columns.take();
         }
+        if last_progress_emit.elapsed() >= std::time::Duration::from_secs(5)
+            || response.next_uri.is_none()
+        {
+            super::agent_async::emit_agent_stage_detail(
+                "execute_sql",
+                "查询仍在运行，已收到最新进度",
+                serde_json::json!({
+                    "kind": "query_progress",
+                    "queryId": response.id.clone(),
+                    "status": response.stats.state.clone(),
+                    "queued": response.stats.queued,
+                    "scheduled": response.stats.scheduled,
+                    "totalSplits": response.stats.total_splits,
+                    "queuedSplits": response.stats.queued_splits,
+                    "runningSplits": response.stats.running_splits,
+                    "completedSplits": response.stats.completed_splits,
+                    "processedRows": response.stats.processed_rows,
+                    "processedBytes": response.stats.processed_bytes,
+                    "elapsedMs": response.stats.elapsed_time_millis,
+                    "receivedRows": rows.len(),
+                }),
+            );
+            last_progress_emit = std::time::Instant::now();
+        }
     }
 
+    super::agent_async::emit_agent_stage_detail(
+        "execute_sql",
+        "SQL 执行完成，正在整理结果",
+        serde_json::json!({
+            "kind": "query_result",
+            "queryId": response.id.clone(),
+            "status": "completed",
+            "rowCount": rows.len(),
+            "columns": columns.as_ref().map(|items| items.iter().map(|column| column.name.clone()).collect::<Vec<_>>()).unwrap_or_default(),
+        }),
+    );
     guard.complete();
     trino_rust_client::build_dataset(rows, columns)
         .map_err(|error| anyhow::anyhow!("trino query failed: {error}"))
@@ -1529,6 +1600,16 @@ impl Nl2SqlAgent {
                 used_references,
             )));
         }
+
+        super::agent_async::emit_agent_stage_detail(
+            "generated_sql",
+            "联邦 SQL 已生成",
+            serde_json::json!({
+                "kind": "sql",
+                "sql": current_sql.clone(),
+                "status": "generated",
+            }),
+        );
 
         if !self.bounded {
             super::agent_async::emit_agent_stage("explain_sql", "正在 EXPLAIN 校验联邦 SQL");
@@ -2481,6 +2562,16 @@ impl Nl2SqlAgent {
             ));
         }
 
+        super::agent_async::emit_agent_stage_detail(
+            "generated_sql",
+            "SQL 已生成",
+            serde_json::json!({
+                "kind": "sql",
+                "sql": current_sql.clone(),
+                "status": "generated",
+            }),
+        );
+
         if !self.bounded && matches!(schema.db_type.as_str(), "presto" | "trino") {
             super::agent_async::emit_agent_stage("explain_sql", "正在 EXPLAIN 校验 SQL");
             if let Err(e) = self
@@ -3141,6 +3232,19 @@ impl Nl2SqlAgent {
 
         loop {
             let attempt_started = std::time::Instant::now();
+            let attempt_number = execution_attempts.len() + 1;
+            super::agent_async::emit_agent_stage_detail(
+                "execute_sql",
+                &format!("正在执行步骤 {step_id} 的第 {attempt_number} 次 SQL 尝试"),
+                serde_json::json!({
+                    "kind": "sql_attempt",
+                    "stepId": step_id,
+                    "attempt": attempt_number,
+                    "datasourceId": datasource_id,
+                    "sql": current_sql.clone(),
+                    "status": "running",
+                }),
+            );
             let result =
                 if let Some(preflight_error) = dialect_preflight_error(&db_type, &current_sql) {
                     Err(anyhow::anyhow!(preflight_error))
@@ -3194,6 +3298,23 @@ impl Nl2SqlAgent {
                             },
                         );
                     }
+                    super::agent_async::emit_agent_stage_detail(
+                        "execute_sql",
+                        &format!("步骤 {step_id} 执行完成，返回 {} 行", rows.len()),
+                        serde_json::json!({
+                            "kind": "query_result",
+                            "stepId": step_id,
+                            "attempt": attempt_number,
+                            "datasourceId": datasource_id,
+                            "sql": current_sql.clone(),
+                            "status": "completed",
+                            "rowCount": rows.len(),
+                            "columns": columns.iter().take(40).cloned().collect::<Vec<_>>(),
+                            "rowsPreview": rows.iter().take(12).cloned().collect::<Vec<_>>(),
+                            "elapsedMs": u64::try_from(attempt_started.elapsed().as_millis())
+                                .unwrap_or(u64::MAX),
+                        }),
+                    );
                     return Ok(crate::nl2sql::StepResult {
                         step_id,
                         output_name: output_name.to_owned(),
@@ -3211,6 +3332,21 @@ impl Nl2SqlAgent {
                 Err(e) => {
                     let err_msg = e.to_string();
                     let err_kind = SqlExecErrorKind::new(&err_msg);
+                    super::agent_async::emit_agent_stage_detail(
+                        "execute_sql_failed",
+                        &format!("步骤 {step_id} 的第 {attempt_number} 次 SQL 尝试未通过"),
+                        serde_json::json!({
+                            "kind": "sql_attempt",
+                            "stepId": step_id,
+                            "attempt": attempt_number,
+                            "datasourceId": datasource_id,
+                            "sql": current_sql.clone(),
+                            "status": "failed",
+                            "error": err_msg.clone(),
+                            "elapsedMs": u64::try_from(attempt_started.elapsed().as_millis())
+                                .unwrap_or(u64::MAX),
+                        }),
+                    );
                     execution_attempts.push(crate::nl2sql::SqlExecutionAttempt {
                         attempt: execution_attempts.len() + 1,
                         status: "failed".to_string(),
@@ -4227,6 +4363,36 @@ mod tests {
         assert!(error.to_string().contains("timed out"));
         assert_eq!(state.submissions.load(Ordering::SeqCst), 1);
         assert_eq!(state.cancellations.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn responsive_trino_query_may_outlive_each_inactivity_window() {
+        // Submission and polling each respond within one second, but their
+        // combined wall-clock duration exceeds one second. The old absolute
+        // deadline cancelled this healthy query during the poll.
+        let (state, port, server) = start_fake_trino(
+            std::time::Duration::from_millis(700),
+            Some(std::time::Duration::from_millis(700)),
+        )
+        .await;
+        let tenant = format!("tenant-{}", uuid::Uuid::new_v4());
+        let user = format!("user-{}", uuid::Uuid::new_v4());
+        let dataset = execute_trino_query_bounded(
+            fake_trino_client(port),
+            "SELECT 'slow-but-responsive' AS value".to_string(),
+            1,
+            &tenant,
+            &user,
+            "responsive slow query",
+            DatasourceRequestBudget::new(1),
+        )
+        .await
+        .expect("responsive query must not be cancelled by total wall time");
+
+        assert_eq!(dataset.len(), 1);
+        assert_eq!(state.submissions.load(Ordering::SeqCst), 1);
+        assert_eq!(state.cancellations.load(Ordering::SeqCst), 0);
         server.abort();
     }
 

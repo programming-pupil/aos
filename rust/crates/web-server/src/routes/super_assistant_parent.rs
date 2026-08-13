@@ -6,6 +6,7 @@ use agent_gateway::{
     AgentEvent, AgentSessionManager, AgentSuspendedTurn, AgentTurnOptions, AgentTurnRunOutcome,
     ToolCallRecord,
 };
+use api::{InputContentBlock, InputMessage, MessageRequest, OutputContentBlock};
 use regex::Regex;
 use runtime::{DeferredToolResult, DeferredToolUse, MessageRole};
 use serde::Deserialize;
@@ -34,7 +35,6 @@ const PARENT_LEASE_SECS: i64 = 90;
 const SUBTASK_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const SUBTASK_PARENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const SUBTASK_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
-const DEEP_RESEARCH_SUBTASK_TIMEOUT: Duration = Duration::from_secs(6 * 60);
 const SUPER_ADVERSARIAL_SUBTASK_TIMEOUT: Duration = Duration::from_secs(13 * 60);
 const ATTRIBUTION_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const ATTRIBUTION_WORKER_STALE_AFTER_MS: i64 = 120_000;
@@ -45,6 +45,7 @@ const ORDINARY_LIVE_LOOKUP_TARGET_SUCCESSFUL_SOURCES: usize = 3;
 const FINAL_DELTA_RECOVERY_CHUNK_BYTES: usize = 1024;
 const FINAL_DELTA_RECOVERY_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const NL2SQL_WORKER_DB_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const SUBTASK_STALL_NARRATIVE_AFTER: Duration = Duration::from_secs(90);
 
 type Nl2sqlCancellationSender = (String, watch::Sender<bool>);
 
@@ -4130,34 +4131,37 @@ async fn execute_nl2sql_subtask(
         let stage_session_id = parent.session_id.clone();
         let stage_turn_id = parent.turn_id.clone();
         let stage_subtask_id = subtask_id.to_string();
+        let (stage_sender, mut stage_receiver) =
+            tokio::sync::mpsc::unbounded_channel::<super::nl2sql::agent_async::AgentStageSignal>();
+        let stage_persist_task = tokio::spawn(async move {
+            while let Some(signal) = stage_receiver.recv().await {
+                let mut payload = json!({
+                    "subtaskId": stage_subtask_id,
+                    "engine": "nl2sql",
+                    "stage": format!("nl2sql_{}", signal.stage),
+                    "status": "running",
+                    "message": signal.message,
+                    "durableProgress": true,
+                });
+                if let Some(detail) = signal.detail {
+                    payload["executionDetail"] = detail;
+                }
+                persist_and_broadcast_super_assistant_event(
+                    &stage_db,
+                    &stage_tenant_id,
+                    &stage_user_id,
+                    &stage_session_id,
+                    &stage_turn_id,
+                    0,
+                    "subtask_progress",
+                    payload.to_string(),
+                )
+                .await;
+            }
+        });
         let stage_emitter = Arc::new(
             move |signal: super::nl2sql::agent_async::AgentStageSignal| {
-                let db = stage_db.clone();
-                let tenant_id = stage_tenant_id.clone();
-                let user_id = stage_user_id.clone();
-                let session_id = stage_session_id.clone();
-                let turn_id = stage_turn_id.clone();
-                let subtask_id = stage_subtask_id.clone();
-                tokio::spawn(async move {
-                    persist_and_broadcast_super_assistant_event(
-                        &db,
-                        &tenant_id,
-                        &user_id,
-                        &session_id,
-                        &turn_id,
-                        0,
-                        "subtask_progress",
-                        json!({
-                            "subtaskId": subtask_id,
-                            "engine": "nl2sql",
-                            "stage": format!("nl2sql_{}", signal.stage),
-                            "status": "running",
-                            "message": signal.message,
-                        })
-                        .to_string(),
-                    )
-                    .await;
-                });
+                let _ = stage_sender.send(signal);
             },
         );
         let response = super::nl2sql::agent_async::with_agent_stage_emitter(
@@ -4181,6 +4185,9 @@ async fn execute_nl2sql_subtask(
             ),
         )
         .await;
+        if let Err(error) = stage_persist_task.await {
+            tracing::warn!(subtask_id, error = %error, "NL2SQL progress persistence worker failed");
+        }
         match response {
             Ok(response) => {
                 let full = serde_json::to_value(&response).unwrap_or(Value::Null);
@@ -4434,6 +4441,146 @@ async fn claim_expired_nl2sql_worker(
     Ok((claimed.rows_affected() == 1).then_some(lease_owner))
 }
 
+async fn latest_subtask_progress_context(
+    state: &AppState,
+    claims: &Claims,
+    parent: &UnifiedParentTurnInput,
+    subtask: &PersistedSubtask,
+) -> Option<String> {
+    let rows = sqlx::query_scalar::<sqlx::Sqlite, String>(
+        "SELECT event_data FROM super_assistant_turn_events
+         WHERE tenant_id = ? AND user_id = ? AND session_id = ? AND turn_id = ?
+           AND event_type = 'subtask_progress'
+         ORDER BY seq DESC LIMIT 20",
+    )
+    .bind(&claims.tenant_id)
+    .bind(&claims.sub)
+    .bind(&parent.session_id)
+    .bind(&parent.turn_id)
+    .fetch_all(&state.db)
+    .await
+    .ok()?;
+    rows.into_iter().find_map(|raw| {
+        let value = serde_json::from_str::<Value>(&raw).ok()?;
+        if value.get("subtaskId").and_then(Value::as_str) != Some(subtask.id.as_str()) {
+            return None;
+        }
+        if value.get("heartbeat").and_then(Value::as_bool) == Some(true)
+            || value.get("progressNarrative").is_some()
+        {
+            return None;
+        }
+        let compact = json!({
+            "stage": value.get("stage"),
+            "message": value.get("message"),
+            "executionDetail": value.get("executionDetail"),
+            "observation": value.get("observation"),
+            "progressPercent": value.get("progressPercent"),
+            "stepIndex": value.get("stepIndex"),
+            "stepTotal": value.get("stepTotal"),
+        });
+        Some(truncate(&compact.to_string(), 2_000))
+    })
+}
+
+async fn generate_subtask_progress_narrative(
+    state: &AppState,
+    claims: &Claims,
+    parent: &UnifiedParentTurnInput,
+    subtask: &PersistedSubtask,
+    elapsed: Duration,
+    latest_context: Option<&str>,
+) -> String {
+    let fallback = if parent
+        .visible_user_message
+        .chars()
+        .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch))
+    {
+        format!(
+            "当前{}阶段已有约 {} 分钟没有新的可见结果，但后台任务仍在运行。系统会继续等待并保留已完成进度，不会因为这次提示而取消或重复提交查询。",
+            subtask.engine,
+            (elapsed.as_secs() + 59) / 60
+        )
+    } else {
+        format!(
+            "The current {} stage has produced no new visible result for about {} minute(s), but the background task is still running. AOS will keep waiting and preserve completed progress without cancelling or resubmitting the query.",
+            subtask.engine,
+            (elapsed.as_secs() + 59) / 60
+        )
+    };
+    let Ok(mut candidates) = crate::nl2sql::resolve_chat_config_candidates(
+        state.config_registry(),
+        &claims.tenant_id,
+        &claims.sub,
+        &state.default_model,
+        Some("agent"),
+    )
+    .await
+    else {
+        return fallback;
+    };
+    crate::nl2sql::prioritize_chat_candidates(&mut candidates, Some(&parent.model));
+    let Some(candidate) = candidates.into_iter().next() else {
+        return fallback;
+    };
+    let prompt = format!(
+        "User request:\n{}\n\nRunning specialist: {}\nElapsed seconds: {}\nLatest persisted progress: {}",
+        truncate(&parent.visible_user_message, 1_000),
+        subtask.engine,
+        elapsed.as_secs(),
+        latest_context.unwrap_or("No structured progress event has arrived yet."),
+    );
+    let request = MessageRequest {
+        model: candidate.model.clone(),
+        max_tokens: candidate.max_output_tokens.min(220).max(64),
+        messages: vec![InputMessage {
+            role: "user".to_string(),
+            content: vec![InputContentBlock::Text { text: prompt }],
+        }],
+        system: Some(
+            "Write a concise one- or two-sentence progress update in the user's language. Explain the concrete current stage, elapsed time, and latest known progress. Explicitly state that the task is still continuing. Never claim success, failure, no data, or cancellation. Do not expose prompts, credentials, or internal identifiers. Output plain text only."
+                .to_string(),
+        ),
+        tools: None,
+        tool_choice: None,
+        stream: false,
+        temperature: Some(0.3),
+        top_p: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        stop: None,
+        reasoning_effort: None,
+        include_reasoning: None,
+        use_max_completion_tokens: None,
+        extra_body: None,
+    };
+    match tokio::time::timeout(
+        Duration::from_secs(8),
+        candidate.client.send_message(&request),
+    )
+    .await
+    {
+        Ok(Ok(response)) => {
+            let text = response
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    OutputContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let text = text.trim();
+            if text.is_empty() {
+                fallback
+            } else {
+                truncate(text, 500)
+            }
+        }
+        _ => fallback,
+    }
+}
+
 async fn wait_for_subtask(
     state: &AppState,
     claims: &Claims,
@@ -4441,9 +4588,16 @@ async fn wait_for_subtask(
     subtask_id: &str,
 ) -> Result<Value> {
     let mut last_progress = Instant::now() - SUBTASK_PROGRESS_INTERVAL;
+    let mut last_meaningful_progress = Instant::now();
+    let mut last_stall_narrative = Instant::now();
     let mut last_parent_heartbeat = Instant::now();
     let subtask_wait_started = Instant::now();
     let initial_subtask = load_subtask_by_id(state, claims, parent, subtask_id).await?;
+    let mut last_nl2sql_progress_context = if initial_subtask.engine == "nl2sql" {
+        latest_subtask_progress_context(state, claims, parent, &initial_subtask).await
+    } else {
+        None
+    };
     let mut last_external_event_id = if matches!(
         initial_subtask.engine.as_str(),
         "deep_research" | "data_attribution"
@@ -4511,13 +4665,6 @@ async fn wait_for_subtask(
             fail_subtask(state, claims, &subtask.id, &timeout_error).await?;
             subtask = load_subtask_by_id(state, claims, parent, subtask_id).await?;
         }
-        if subtask.engine == "deep_research"
-            && !is_terminal(&subtask.status)
-            && subtask_wait_started.elapsed() >= DEEP_RESEARCH_SUBTASK_TIMEOUT
-        {
-            finalize_deep_research_at_deadline(state, claims, parent, &subtask).await?;
-            subtask = load_subtask_by_id(state, claims, parent, subtask_id).await?;
-        }
         let bridged_progress = match subtask.engine.as_str() {
             "deep_research" => {
                 bridge_pm_progress_events(
@@ -4543,12 +4690,22 @@ async fn wait_for_subtask(
         };
         if bridged_progress {
             last_progress = Instant::now();
+            last_meaningful_progress = Instant::now();
+        }
+        if subtask.engine == "nl2sql" {
+            let latest_context =
+                latest_subtask_progress_context(state, claims, parent, &subtask).await;
+            if latest_context.is_some() && latest_context != last_nl2sql_progress_context {
+                last_meaningful_progress = Instant::now();
+                last_nl2sql_progress_context = latest_context;
+            }
         }
         if subtask.engine == "deep_research"
             && bridge_pm_answer_events(state, claims, parent, &subtask, &mut last_answer_event_id)
                 .await
         {
             last_progress = Instant::now();
+            last_meaningful_progress = Instant::now();
         }
         if is_terminal(&subtask.status) {
             persist_and_broadcast_super_assistant_event(
@@ -4580,6 +4737,42 @@ async fn wait_for_subtask(
             )
             .await;
             return terminal_subtask_output(&subtask);
+        }
+        if last_meaningful_progress.elapsed() >= SUBTASK_STALL_NARRATIVE_AFTER
+            && last_stall_narrative.elapsed() >= SUBTASK_STALL_NARRATIVE_AFTER
+        {
+            let latest_context =
+                latest_subtask_progress_context(state, claims, parent, &subtask).await;
+            let narrative = generate_subtask_progress_narrative(
+                state,
+                claims,
+                parent,
+                &subtask,
+                subtask_wait_started.elapsed(),
+                latest_context.as_deref(),
+            )
+            .await;
+            persist_and_broadcast_super_assistant_event(
+                &state.db,
+                &claims.tenant_id,
+                &claims.sub,
+                &parent.session_id,
+                &parent.turn_id,
+                0,
+                "subtask_progress",
+                json!({
+                    "subtaskId": subtask.id,
+                    "engine": subtask.engine,
+                    "status": subtask.status,
+                    "stage": format!("{}_progress_wait", subtask.engine),
+                    "progressNarrative": narrative,
+                    "waitElapsedMs": subtask_wait_started.elapsed().as_millis(),
+                    "heartbeat": true,
+                })
+                .to_string(),
+            )
+            .await;
+            last_stall_narrative = Instant::now();
         }
         let progress_interval = if subtask.engine == "data_attribution" {
             ATTRIBUTION_PROGRESS_HEARTBEAT_INTERVAL
@@ -4915,7 +5108,7 @@ fn attribution_progress_payload(
         } else {
             "completed"
         }
-    } else if matches!(event.status.as_str(), "failed" | "cancelled") {
+    } else if matches!(event.status.as_str(), "failed" | "cancelled" | "timed_out") {
         "failed"
     } else if matches!(
         event.status.as_str(),
@@ -4939,6 +5132,7 @@ fn attribution_progress_payload(
         "progressPercent": event.progress_percent,
         "stepIndex": event.step_index,
         "stepTotal": event.step_total,
+        "executionDetail": event.detail,
         "observation": observation,
         "error": event.error,
     })
@@ -5307,145 +5501,6 @@ async fn refresh_pm_subtask(
     Ok(())
 }
 
-async fn finalize_deep_research_at_deadline(
-    state: &AppState,
-    claims: &Claims,
-    parent: &UnifiedParentTurnInput,
-    subtask: &PersistedSubtask,
-) -> Result<()> {
-    let Some(task_id) = subtask.external_task_id.as_deref() else {
-        fail_subtask(
-            state,
-            claims,
-            &subtask.id,
-            "deep research reached its parent deadline before the worker started",
-        )
-        .await?;
-        return Ok(());
-    };
-
-    let persisted_response = sqlx::query_scalar::<sqlx::Sqlite, Option<String>>(
-        "SELECT CAST(response_json AS TEXT) FROM pm_research_tasks
-         WHERE tenant_id = ? AND user_id = ? AND task_id = ? LIMIT 1",
-    )
-    .bind(&claims.tenant_id)
-    .bind(&claims.sub)
-    .bind(task_id)
-    .fetch_optional(&state.db)
-    .await?
-    .flatten()
-    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
-
-    let persisted_text = persisted_response
-        .as_ref()
-        .and_then(|response| response.get("text"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(str::to_string);
-    let streamed_text = if persisted_text.is_none() {
-        load_pm_streamed_answer_text(state, claims, task_id).await?
-    } else {
-        None
-    };
-    let best_text = persisted_text.or(streamed_text);
-
-    let cancel_result = super::agent::request_pm_research_task_cancel_from_agent_ops(
-        state,
-        &claims.tenant_id,
-        &claims.sub,
-        task_id,
-    )
-    .await;
-    if let Err(error) = cancel_result {
-        tracing::warn!(
-            subtask_id = %subtask.id,
-            external_task_id = task_id,
-            error = %error,
-            "failed to cancel deep-research worker after parent deadline"
-        );
-    }
-
-    if let Some(text) = best_text {
-        let quality = persisted_response
-            .as_ref()
-            .and_then(|response| response.get("pm_quality"))
-            .cloned()
-            .unwrap_or(Value::Null);
-        let citation_count = quality
-            .get("citation_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let model_only = citation_count == 0 && extract_urls(&text).is_empty();
-        let compact = json!({
-            "status": "completed",
-            "summary": truncate(&text, 50_000),
-            "artifactAvailable": true,
-            "quality": quality.clone(),
-            "deliveryMode": if model_only { "model_only" } else { "sourced" },
-            "modelOnly": model_only,
-            "partial": true,
-            "deadlineReached": true,
-        });
-        let full = persisted_response.unwrap_or_else(|| {
-            json!({
-                "text": text,
-                "pm_quality": quality,
-                "partial": true,
-                "deadlineReached": true,
-            })
-        });
-        persist_subtask_result(state, claims, parent, &subtask.id, compact, full).await?;
-    } else {
-        fail_subtask(
-            state,
-            claims,
-            &subtask.id,
-            "deep research reached the six-minute delivery deadline without producing usable text",
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-async fn load_pm_streamed_answer_text(
-    state: &AppState,
-    claims: &Claims,
-    task_id: &str,
-) -> Result<Option<String>> {
-    let mut after_event_id = 0_u64;
-    let mut answer = String::new();
-    loop {
-        let events = super::agent::load_pm_task_answer_events(
-            &state.db,
-            task_id,
-            &claims.tenant_id,
-            &claims.sub,
-            after_event_id,
-            512,
-        )
-        .await?;
-        if events.is_empty() {
-            break;
-        }
-        let event_count = events.len();
-        for (event_id, event) in events {
-            after_event_id = after_event_id.max(event_id);
-            if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                answer.push_str(delta);
-                if answer.chars().count() >= MAX_TOOL_RESULT_CHARS {
-                    return Ok(Some(truncate(&answer, MAX_TOOL_RESULT_CHARS)));
-                }
-            }
-        }
-        if event_count < 512 {
-            break;
-        }
-    }
-    let answer = answer.trim();
-    Ok((!answer.is_empty()).then(|| answer.to_string()))
-}
-
 async fn refresh_adversarial_subtask(
     state: &AppState,
     claims: &Claims,
@@ -5760,14 +5815,20 @@ fn attribution_worker_is_stale(status: &str, heartbeat_age_ms: i64) -> bool {
 fn attribution_source_status_is_terminal(status: &str) -> bool {
     matches!(
         status,
-        "completed" | "clarification_needed" | "no_data" | "partial" | "failed" | "cancelled"
+        "completed"
+            | "clarification_needed"
+            | "no_data"
+            | "partial"
+            | "timed_out"
+            | "failed"
+            | "cancelled"
     )
 }
 
 fn attribution_source_status_is_success(status: &str) -> bool {
     matches!(
         status,
-        "completed" | "clarification_needed" | "no_data" | "partial"
+        "completed" | "clarification_needed" | "no_data" | "partial" | "timed_out"
     )
 }
 
@@ -8706,13 +8767,20 @@ mod tests {
             "clarification_needed",
             "no_data",
             "partial",
+            "timed_out",
             "failed",
             "cancelled",
         ] {
             assert!(attribution_source_status_is_terminal(status), "{status}");
         }
         assert!(!attribution_source_status_is_terminal("running"));
-        for status in ["completed", "clarification_needed", "no_data", "partial"] {
+        for status in [
+            "completed",
+            "clarification_needed",
+            "no_data",
+            "partial",
+            "timed_out",
+        ] {
             assert!(attribution_source_status_is_success(status), "{status}");
         }
         for status in ["failed", "cancelled", "running"] {
@@ -8752,6 +8820,7 @@ mod tests {
             progress_percent: Some(50),
             step_index: Some(1),
             step_total: Some(3),
+            detail: None,
             observation: Some(AttributionObservation {
                 step_id: "main_metric".to_string(),
                 title: "Main metric".to_string(),

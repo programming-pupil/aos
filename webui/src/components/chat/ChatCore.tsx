@@ -109,6 +109,7 @@ import {
   hasNl2sqlAuditToolCalls,
   isNl2sqlAuditTool,
   nl2sqlAuditToolCallsFromHistory,
+  nl2sqlProgressEventsFromStageEvents,
   Nl2sqlAuditPanel,
 } from "./Nl2sqlAuditPanel";
 import {
@@ -187,7 +188,10 @@ async function registerUploadedDocumentsForSession(
   }
   return indexed;
 }
-import { PmFinalDeliveryPanel } from "./PmFinalDeliveryPanel";
+import {
+  PmFinalDeliveryPanel,
+  shouldShowPmFinalDelivery,
+} from "./PmFinalDeliveryPanel";
 import { extractMarkdownTableBlocks } from "./markdownRenderer";
 import { PmInlineEvidencePanel } from "./PmInlineEvidencePanel";
 import { PmInlineNarrativePanel } from "./PmInlineNarrativePanel";
@@ -842,6 +846,7 @@ function normalizeAttributionDetail(
 ): Record<string, unknown> {
   const observation = event.observation;
   return {
+    ...(event.detail ?? {}),
     source: "data_attribution",
     message: event.message ?? undefined,
     error: event.error ?? undefined,
@@ -1520,6 +1525,40 @@ function toReadableStageDetail(
     typeof detail.error === "string" && detail.error.trim().length > 0
       ? detail.error.trim()
       : null;
+
+  const progressNarrative =
+    typeof detail.progressNarrative === "string" &&
+    detail.progressNarrative.trim().length > 0
+      ? shortHumanText(detail.progressNarrative.trim(), 220)
+      : null;
+  if (progressNarrative) return withBudget(progressNarrative);
+
+  const executionDetail =
+    detail.executionDetail &&
+    typeof detail.executionDetail === "object" &&
+    !Array.isArray(detail.executionDetail)
+      ? (detail.executionDetail as Record<string, unknown>)
+      : null;
+  if (stage.startsWith("nl2sql_") && executionDetail) {
+    const queryId = typeof executionDetail.queryId === "string"
+      ? executionDetail.queryId
+      : null;
+    const queryStatus = typeof executionDetail.status === "string"
+      ? executionDetail.status
+      : null;
+    const processedRows = typeof executionDetail.processedRows === "number"
+      ? executionDetail.processedRows
+      : null;
+    const rowCount = typeof executionDetail.rowCount === "number"
+      ? executionDetail.rowCount
+      : null;
+    return withBudget([
+      queryStatus ? `状态 ${queryStatus}` : "",
+      queryId ? `Query ${queryId}` : "",
+      processedRows != null ? `已处理 ${processedRows} 行` : "",
+      rowCount != null ? `返回 ${rowCount} 行` : "",
+    ].filter(Boolean).join(" · "));
+  }
 
   if ((stage === "understand" || stage === "task_plan") && humanSummary) {
     return withBudget(humanSummary);
@@ -4824,6 +4863,8 @@ export function ChatCore({
       if (stageName === "native_web_search") return "联网检索";
       if (stageName === "runtime_wait") return "执行等待";
       if (stageName === "verification_repair") return "回答校验";
+      if (stageName.startsWith("nl2sql_"))
+        return t("chat.nl2sqlAuditTitle", "NL2SQL 执行记录");
       if (stageName === "super_adversarial")
         return t("chat.adversarialMode", "超级对抗");
       if (stageName === "synthesize")
@@ -5066,7 +5107,7 @@ export function ChatCore({
             detail: stage?.detail,
             at,
           },
-        ].slice(-30);
+        ].slice(-120);
         pmStageEventsRef.current = merged;
         return merged;
       });
@@ -6424,7 +6465,7 @@ export function ChatCore({
               : restoredStates;
             setPmStageStates(normalizedStates);
             pmStageStatesRef.current = normalizedStates;
-            const tailEvents = restoredEvents.slice(-30);
+            const tailEvents = restoredEvents.slice(-120);
             setPmStageEvents(tailEvents);
             pmStageEventsRef.current = tailEvents;
             pmActiveInlineSegmentIdRef.current = null;
@@ -7527,7 +7568,7 @@ export function ChatCore({
             detail,
             at,
           },
-        ].slice(-30);
+        ].slice(-120);
         pmStageEventsRef.current = merged;
         return merged;
       });
@@ -9159,7 +9200,7 @@ export function ChatCore({
             at,
           }));
         if (synthetic.length === 0) return prev;
-        const merged = [...prev, ...synthetic].slice(-30);
+        const merged = [...prev, ...synthetic].slice(-120);
         pmStageEventsRef.current = merged;
         return merged;
       });
@@ -9268,7 +9309,7 @@ export function ChatCore({
             detail: normalizedDetail,
             at,
           },
-        ].slice(-30);
+        ].slice(-120);
         pmStageEventsRef.current = merged;
         return merged;
       });
@@ -10993,43 +11034,17 @@ export function ChatCore({
   }, [latestAssistantMessage]);
 
   const pmFinalDeliveryReady = useMemo(() => {
-    if (
-      sessionSource !== "pm" ||
-      !pmExecutionUiEnabled ||
-      pmSuppressExecutionUi
-    ) {
-      return false;
-    }
-    if (isStreaming || !latestAssistantMessage) return false;
-    const synthStatus = pmStageStates.synthesize?.status;
-    const hasSynthesize =
-      synthStatus === "completed" ||
-      (pmBackgroundTaskStatus === "completed" &&
-        (pmStageStates.retrieve?.status === "completed" ||
-          pmStageStates.verify?.status === "completed" ||
-          // Historical sessions may have only the persisted terminal event;
-          // replay does not always contain the live retrieve/verify stages.
-          latestAssistantMessage.pmTaskStatus?.toLowerCase() === "completed"));
-    if (!hasSynthesize) return false;
-    const text = latestAssistantPlainText.trim();
-    if (!text) return false;
-    if (text.startsWith("研究任务失败：")) return false;
-    if (
-      text.startsWith("深度分析已启动") ||
-      text.toLowerCase().startsWith("deep analysis started")
-    ) {
-      return false;
-    }
-    const latestTaskStatus = latestAssistantMessage.pmTaskStatus?.toLowerCase();
-    if (
-      latestTaskStatus &&
-      ["queued", "running", "cancelling", "interrupted"].includes(
-        latestTaskStatus,
-      )
-    ) {
-      return false;
-    }
-    return true;
+    return shouldShowPmFinalDelivery({
+      sessionSource,
+      executionUiEnabled: pmExecutionUiEnabled,
+      suppressExecutionUi: pmSuppressExecutionUi,
+      isStreaming,
+      hasAssistantMessage: Boolean(latestAssistantMessage),
+      synthStatus: pmStageStates.synthesize?.status,
+      backgroundTaskStatus: pmBackgroundTaskStatus,
+      latestTaskStatus: latestAssistantMessage?.pmTaskStatus,
+      body: latestAssistantPlainText,
+    });
   }, [
     isStreaming,
     latestAssistantMessage,
@@ -11679,8 +11694,14 @@ export function ChatCore({
                           live
                         />
                       ) : null}
-                      {hasNl2sqlAuditToolCalls(Object.values(toolCalls)) ? (
-                        <Nl2sqlAuditPanel toolCalls={Object.values(toolCalls)} />
+                      {hasNl2sqlAuditToolCalls(Object.values(toolCalls)) ||
+                      Object.values(pmStageStates).some((state) =>
+                        state.stage.startsWith("nl2sql_"),
+                      ) ? (
+                        <Nl2sqlAuditPanel
+                          toolCalls={Object.values(toolCalls)}
+                          progressEvents={nl2sqlProgressEventsFromStageEvents(pmStageEvents)}
+                        />
                       ) : null}
                     </>
                   ) : undefined

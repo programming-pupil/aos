@@ -44,6 +44,56 @@ export interface Nl2sqlAuditResult {
   error?: string;
 }
 
+export interface Nl2sqlProgressEvent {
+  stage?: string;
+  status?: string;
+  message?: string;
+  executionDetail?: Record<string, unknown>;
+  progressNarrative?: string;
+  waitElapsedMs?: number;
+}
+
+export function nl2sqlProgressEventsFromStageEvents(
+  events: Array<{
+    stage: string;
+    status: string;
+    detail?: Record<string, unknown>;
+  }>,
+): Nl2sqlProgressEvent[] {
+  return events
+    .filter((event) => event.stage.startsWith("nl2sql_"))
+    .map((event) => ({
+      stage: event.stage,
+      status: event.status,
+      message: typeof event.detail?.message === "string" ? event.detail.message : undefined,
+      executionDetail:
+        event.detail?.executionDetail &&
+        typeof event.detail.executionDetail === "object" &&
+        !Array.isArray(event.detail.executionDetail)
+          ? event.detail.executionDetail as Record<string, unknown>
+          : undefined,
+      progressNarrative:
+        typeof event.detail?.progressNarrative === "string"
+          ? event.detail.progressNarrative
+          : undefined,
+      waitElapsedMs:
+        typeof event.detail?.waitElapsedMs === "number"
+          ? event.detail.waitElapsedMs
+          : undefined,
+    }));
+}
+
+function progressEventsFromArgs(args: string): Nl2sqlProgressEvent[] {
+  try {
+    const value = JSON.parse(args) as Record<string, unknown>;
+    return Array.isArray(value.__progressEvents)
+      ? value.__progressEvents.filter((item): item is Nl2sqlProgressEvent => Boolean(item && typeof item === "object"))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -209,7 +259,10 @@ export function nl2sqlAuditToolCallsFromHistory(
       index: 100_000 + index,
       name: "nl2sql_analyze",
       source: "builtin",
-      args: audit.input == null ? "{}" : JSON.stringify(audit.input),
+      args: JSON.stringify({
+        ...(audit.input && typeof audit.input === "object" && !Array.isArray(audit.input) ? audit.input : {}),
+        __progressEvents: audit.progress_events ?? [],
+      }),
       result:
         typeof resultPayload === "string"
           ? resultPayload
@@ -234,15 +287,100 @@ function referenceLabel(value: unknown): string {
     JSON.stringify(record);
 }
 
-function Nl2sqlAuditPanelImpl({ toolCalls }: { toolCalls?: ToolCallInfo[] }) {
+function progressEventKey(event: Nl2sqlProgressEvent): string {
+  return JSON.stringify([
+    event.stage,
+    event.status,
+    event.message,
+    event.executionDetail,
+    event.progressNarrative,
+    event.waitElapsedMs,
+  ]);
+}
+
+function uniqueProgressEvents(events: Nl2sqlProgressEvent[]): Nl2sqlProgressEvent[] {
+  const seen = new Set<string>();
+  return events.filter((event) => {
+    const key = progressEventKey(event);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function stageLabel(stage: string | undefined, t: ReturnType<typeof useTranslation>["t"]): string {
+  const normalized = (stage ?? "").replace(/^nl2sql_/, "");
+  const labels: Record<string, string> = {
+    request_validation: t("chat.nl2sqlAuditStageRequestValidation", "校验请求"),
+    sql_knowledge_probe: t("chat.nl2sqlAuditStageKnowledge", "检索 SQL 知识"),
+    federated_workspace: t("chat.nl2sqlAuditStageWorkspace", "构建联邦工作区"),
+    load_context: t("chat.nl2sqlAuditStageContext", "检索数据上下文"),
+    load_schema: t("chat.nl2sqlAuditStageSchema", "加载 Schema"),
+    route_selected: t("chat.nl2sqlAuditStageRoute", "选择数据源"),
+    query_understanding: t("chat.nl2sqlAuditStageUnderstanding", "理解查询"),
+    generate_sql: t("chat.nl2sqlAuditStageGenerating", "生成 SQL"),
+    generated_sql: t("chat.nl2sqlAuditStageGenerated", "SQL 已生成"),
+    explain_sql: t("chat.nl2sqlAuditStageValidating", "验证 SQL"),
+    execute_sql: t("chat.nl2sqlAuditStageExecuting", "执行 SQL"),
+    execute_sql_failed: t("chat.nl2sqlAuditStageExecutionFailed", "SQL 执行未通过"),
+    retry_sql: t("chat.nl2sqlAuditStageRetrying", "重试 SQL"),
+    repair_sql: t("chat.nl2sqlAuditStageRepairing", "修复 SQL"),
+    persist_result: t("chat.nl2sqlAuditStageResult", "整理结果"),
+    progress_wait: t("chat.nl2sqlAuditStageWaiting", "等待数据源进展"),
+  };
+  return labels[normalized] ?? (
+    normalized.replaceAll("_", " ") ||
+    t("chat.nl2sqlAuditRunning", "正在生成并验证 SQL...")
+  );
+}
+
+function statusLabel(status: string | undefined, t: ReturnType<typeof useTranslation>["t"]): string {
+  const normalized = (status ?? "running").toLowerCase();
+  const labels: Record<string, string> = {
+    pending: t("chat.nl2sqlAuditStatusPending", "等待执行"),
+    queued: t("chat.nl2sqlAuditStatusPending", "等待执行"),
+    running: t("chat.nl2sqlAuditStatusRunning", "运行中"),
+    generated: t("chat.nl2sqlAuditStatusGenerated", "已生成"),
+    submitting: t("chat.nl2sqlAuditStatusSubmitting", "提交中"),
+    completed: t("chat.nl2sqlAuditStatusCompleted", "已完成"),
+    success: t("chat.nl2sqlAuditStatusCompleted", "已完成"),
+    failed: t("chat.nl2sqlAuditStatusFailed", "失败"),
+    error: t("chat.nl2sqlAuditStatusFailed", "失败"),
+  };
+  return labels[normalized] ?? status ?? normalized;
+}
+
+function Nl2sqlAuditPanelImpl({
+  toolCalls,
+  progressEvents = [],
+}: {
+  toolCalls?: ToolCallInfo[];
+  progressEvents?: Nl2sqlProgressEvent[];
+}) {
   const { t } = useTranslation();
   const calls = useMemo(
     () => (toolCalls ?? []).filter(isNl2sqlAuditTool),
     [toolCalls],
   );
-  if (calls.length === 0) return null;
+  const visibleCalls = useMemo<ToolCallInfo[]>(
+    () => calls.length > 0
+      ? calls
+      : progressEvents.length > 0
+        ? [{
+            index: -1,
+            name: "nl2sql_analyze",
+            source: "builtin",
+            args: "{}",
+            result: "",
+            isError: false,
+            status: "running",
+          }]
+        : [],
+    [calls, progressEvents.length],
+  );
+  if (visibleCalls.length === 0) return null;
 
-  const latest = calls.at(-1)!;
+  const latest = visibleCalls.at(-1)!;
   const latestAudit = parseNl2sqlAuditResult(latest.result);
   const latestStatus = latest.isError
     ? "failed"
@@ -258,19 +396,51 @@ function Nl2sqlAuditPanelImpl({ toolCalls }: { toolCalls?: ToolCallInfo[] }) {
           label: (
             <Space size={[6, 4]} wrap>
               <Text strong>{t("chat.nl2sqlAuditTitle", "NL2SQL 执行记录")}</Text>
-              <Tag color={statusColor(latestStatus, latest.isError)}>{latestStatus}</Tag>
-              {latestAudit?.rowCount != null ? <Tag>{`${latestAudit.rowCount} rows`}</Tag> : null}
+              <Tag color={statusColor(latestStatus, latest.isError)}>{statusLabel(latestStatus, t)}</Tag>
+              {latestAudit?.rowCount != null ? <Tag>{t("chat.nl2sqlAuditRows", "{{count}} 行", { count: latestAudit.rowCount })}</Tag> : null}
             </Space>
           ),
           children: (
             <div style={{ display: "grid", gap: 12, minWidth: 0 }}>
-              {calls.map((call, callIndex) => {
+              {visibleCalls.map((call, callIndex) => {
                 const audit = parseNl2sqlAuditResult(call.result);
+                const restoredProgressEvents = progressEventsFromArgs(call.args);
+                const visibleProgressEvents = uniqueProgressEvents(callIndex === visibleCalls.length - 1
+                  ? [...restoredProgressEvents, ...progressEvents]
+                  : restoredProgressEvents);
                 const running = call.status === "pending" || call.status === "running";
                 return (
                   <div key={`${call.index}-${callIndex}`} style={{ display: "grid", gap: 10, minWidth: 0 }}>
                     {audit?.summary ? <Text>{audit.summary}</Text> : null}
-                    {running ? <Text type="secondary">{t("chat.nl2sqlAuditRunning", "正在生成并验证 SQL...")}</Text> : null}
+                    {running && visibleProgressEvents.length === 0 ? <Text type="secondary">{t("chat.nl2sqlAuditRunning", "正在生成并验证 SQL...")}</Text> : null}
+                    {visibleProgressEvents.map((event, eventIndex) => {
+                      const detail = event.executionDetail;
+                      const sql = typeof detail?.sql === "string" ? detail.sql : undefined;
+                      const queryId = typeof detail?.queryId === "string" ? detail.queryId : undefined;
+                      const queryStatus = typeof detail?.status === "string" ? detail.status : undefined;
+                      const processedRows = typeof detail?.processedRows === "number" ? detail.processedRows : undefined;
+                      const rowCount = typeof detail?.rowCount === "number" ? detail.rowCount : undefined;
+                      return (
+                        <div key={`${event.stage}-${eventIndex}`} style={{ display: "grid", gap: 6, padding: 10, background: "var(--bg-surface)", border: "1px solid var(--border-subtle)", borderRadius: 6 }}>
+                          <Space size={[6, 4]} wrap>
+                            <Text strong>{stageLabel(event.stage, t)}</Text>
+                            {queryStatus ? <Tag color="processing">{statusLabel(queryStatus, t)}</Tag> : null}
+                            {queryId ? <Tag>{t("chat.nl2sqlAuditQueryId", "查询 ID")}: {queryId}</Tag> : null}
+                            {processedRows != null ? <Tag>{t("chat.nl2sqlAuditProcessedRows", "已处理 {{count}} 行", { count: processedRows })}</Tag> : null}
+                            {rowCount != null ? <Tag color="success">{t("chat.nl2sqlAuditResultRows", "返回 {{count}} 行", { count: rowCount })}</Tag> : null}
+                          </Space>
+                          {event.progressNarrative ? <Text type="secondary">{event.progressNarrative}</Text> : null}
+                          {!event.progressNarrative && event.message ? <Text type="secondary">{event.message}</Text> : null}
+                          {sql ? <pre style={{ margin: 0, padding: 10, overflowX: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere", border: "1px solid var(--border-subtle)", borderRadius: 6, fontSize: 12 }}>{sql}</pre> : null}
+                          {Array.isArray(detail?.rowsPreview) && detail.rowsPreview.length > 0 ? (
+                            <pre style={{ margin: 0, padding: 10, maxHeight: 280, overflow: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere", border: "1px solid var(--border-subtle)", borderRadius: 6, fontSize: 12 }}>
+                              {JSON.stringify(detail.rowsPreview, null, 2)}
+                            </pre>
+                          ) : null}
+                          {typeof detail?.error === "string" ? <Text type="danger">{detail.error}</Text> : null}
+                        </div>
+                      );
+                    })}
                     <Space size={[6, 4]} wrap>
                       {audit?.schemaChecked != null ? (
                         <Tag color={audit.schemaChecked ? "success" : "warning"}>
@@ -297,7 +467,7 @@ function Nl2sqlAuditPanelImpl({ toolCalls }: { toolCalls?: ToolCallInfo[] }) {
                           </Tag>
                           {step.datasourceId ? <Tag>{step.datasourceId}</Tag> : null}
                           {step.executionMs != null ? <Tag>{`${step.executionMs} ms`}</Tag> : null}
-                          {step.rowCount != null ? <Tag>{`${step.rowCount} rows`}</Tag> : null}
+                          {step.rowCount != null ? <Tag>{t("chat.nl2sqlAuditRows", "{{count}} 行", { count: step.rowCount })}</Tag> : null}
                         </Space>
                         {step.sql ? (
                           <div style={{ marginTop: 8 }}>

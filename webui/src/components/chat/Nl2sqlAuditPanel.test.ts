@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   hasNl2sqlAuditToolCalls,
+  nl2sqlProgressEventsFromStageEvents,
   nl2sqlAuditToolCallsFromHistory,
   parseNl2sqlAuditResult,
 } from "./Nl2sqlAuditPanel";
@@ -133,5 +134,83 @@ describe("Nl2sqlAuditPanel", () => {
     expect(calls[0].isError).toBe(true);
     expect(calls[1].isError).toBe(false);
     expect(parseNl2sqlAuditResult(calls[1].result)?.executionSucceeded).toBe(true);
+  });
+
+  it("keeps every ordered NL2SQL stage event for the live execution log", () => {
+    const events = nl2sqlProgressEventsFromStageEvents([
+      {
+        stage: "nl2sql_generated_sql",
+        status: "running",
+        detail: {
+          message: "SQL generated",
+          executionDetail: { sql: "SELECT 1", status: "generated" },
+        },
+      },
+      {
+        stage: "nl2sql_execute_sql",
+        status: "running",
+        detail: {
+          message: "Query accepted",
+          executionDetail: { queryId: "query-1", status: "RUNNING" },
+        },
+      },
+      {
+        stage: "retrieve",
+        status: "running",
+        detail: { message: "unrelated deep-research event" },
+      },
+      {
+        stage: "nl2sql_execute_sql",
+        status: "running",
+        detail: {
+          message: "Query completed",
+          executionDetail: {
+            queryId: "query-1",
+            status: "completed",
+            rowCount: 1,
+            rowsPreview: [{ value: 1 }],
+          },
+        },
+      },
+    ]);
+
+    expect(events).toHaveLength(3);
+    expect(events[0].executionDetail?.sql).toBe("SELECT 1");
+    expect(events[1].executionDetail?.queryId).toBe("query-1");
+    expect(events[2].executionDetail?.rowsPreview).toEqual([{ value: 1 }]);
+  });
+
+  it("embeds durable SQL progress in history tool calls", () => {
+    const calls = nl2sqlAuditToolCallsFromHistory([{
+      tool_call_id: "call-history",
+      status: "completed",
+      result: {
+        status: "completed",
+        executionSucceeded: true,
+        sqlRecorded: true,
+        schemaChecked: true,
+        steps: [],
+      },
+      progress_events: [{
+        stage: "nl2sql_execute_sql",
+        executionDetail: {
+          sql: "SELECT app_id, roi FROM metrics",
+          queryId: "query-history",
+          status: "completed",
+          rowCount: 2,
+        },
+      }],
+    }]);
+
+    const args = JSON.parse(calls[0].args);
+    expect(args.__progressEvents).toEqual([
+      expect.objectContaining({
+        executionDetail: expect.objectContaining({
+          sql: "SELECT app_id, roi FROM metrics",
+          queryId: "query-history",
+          rowCount: 2,
+        }),
+      }),
+    ]);
   });
 });

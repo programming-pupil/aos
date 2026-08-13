@@ -2,7 +2,10 @@ import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 import type { TFunction } from 'i18next';
-import { PmFinalDeliveryPanel } from './PmFinalDeliveryPanel';
+import {
+  PmFinalDeliveryPanel,
+  shouldShowPmFinalDelivery,
+} from './PmFinalDeliveryPanel';
 
 describe('PmFinalDeliveryPanel', () => {
   it('renders table highlights through the production Markdown component', () => {
@@ -38,5 +41,33 @@ describe('PmFinalDeliveryPanel', () => {
 
     expect(html).toMatch(/<h1[^>]*>完整交付结论<\/h1>/);
     expect(html).toContain('历史正文仍然可见。');
+  });
+
+  it('shows a completed historical delivery without live stage state', () => {
+    expect(shouldShowPmFinalDelivery({
+      sessionSource: 'pm',
+      executionUiEnabled: true,
+      suppressExecutionUi: false,
+      isStreaming: false,
+      hasAssistantMessage: true,
+      synthStatus: null,
+      backgroundTaskStatus: null,
+      latestTaskStatus: 'completed',
+      body: '# 已持久化的研究结论\n\n历史会话正文。',
+    })).toBe(true);
+  });
+
+  it('does not show a delivery card for a historical task that is still running', () => {
+    expect(shouldShowPmFinalDelivery({
+      sessionSource: 'pm',
+      executionUiEnabled: true,
+      suppressExecutionUi: false,
+      isStreaming: false,
+      hasAssistantMessage: true,
+      synthStatus: null,
+      backgroundTaskStatus: null,
+      latestTaskStatus: 'running',
+      body: '仍在研究中。',
+    })).toBe(false);
   });
 });

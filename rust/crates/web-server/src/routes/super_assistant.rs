@@ -4492,6 +4492,10 @@ mod tests {
             "subtask_progress",
             r#"{"status":"running","externalEventId":42}"#,
         ));
+        assert!(super_assistant_event_should_persist(
+            "subtask_progress",
+            r#"{"status":"running","executionDetail":{"kind":"sql","sql":"SELECT 1"}}"#,
+        ));
         assert!(super_assistant_event_should_persist("usage", "{}"));
     }
 
@@ -10715,8 +10719,18 @@ fn super_assistant_event_should_persist(event_type: &str, event_data: &str) -> b
     event_type == "subtask_progress"
         && serde_json::from_str::<Value>(event_data)
             .ok()
-            .and_then(|value| value.get("externalEventId").cloned())
-            .is_some_and(|value| !value.is_null())
+            .is_some_and(|value| {
+                value
+                    .get("externalEventId")
+                    .is_some_and(|value| !value.is_null())
+                    || value
+                        .get("executionDetail")
+                        .is_some_and(|value| !value.is_null())
+                    || value
+                        .get("progressNarrative")
+                        .is_some_and(|value| !value.is_null())
+                    || value.get("durableProgress").and_then(Value::as_bool) == Some(true)
+            })
 }
 
 #[cfg(feature = "bot-agents")]

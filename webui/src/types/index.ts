@@ -1632,6 +1632,7 @@ export interface SuperAssistantNl2sqlAudit {
   input?: unknown;
   result?: unknown;
   error_message?: string | null;
+  progress_events?: Array<Record<string, unknown>>;
 }
 
 export interface AgentSessionHistoryPage {
@@ -2517,6 +2518,7 @@ export interface AttributionTaskEvent {
   progress_percent?: number | null;
   step_index?: number | null;
   step_total?: number | null;
+  detail?: Record<string, unknown> | null;
   observation?: AttributionObservation | null;
   response?: AttributionAnalyzeResponse | null;
   error?: string | null;

@@ -13,6 +13,74 @@ import { Markdown } from "./markdownRenderer";
 
 const { Text } = Typography;
 
+type Translate = ReturnType<typeof useTranslation>["t"];
+
+function translatedStatus(status: string, t: Translate): string {
+  const key = status.toLowerCase();
+  const fallbacks: Record<string, string> = {
+    queued: "排队中",
+    running: "运行中",
+    completed: "已完成",
+    partial: "部分完成",
+    no_data: "无数据",
+    clarification_needed: "需要澄清",
+    timed_out: "无进展超时",
+    failed: "失败",
+    cancelled: "已取消",
+    generated: "已生成",
+    submitting: "提交中",
+    finished: "已完成",
+  };
+  return t(`chat.attributionAuditStatuses.${key}`, fallbacks[key] ?? status);
+}
+
+function translatedStage(stage: string | null | undefined, t: Translate): string {
+  const value = (stage ?? "queued").toLowerCase();
+  const suffixes: Array<[string, string, string]> = [
+    ["generated_sql", "sqlGenerated", "SQL 已生成"],
+    ["execute_sql", "sqlExecuting", "正在执行 SQL"],
+    ["generate_sql", "sqlGenerating", "正在生成 SQL"],
+    ["explain_sql", "sqlValidating", "正在验证 SQL"],
+    ["load_schema", "schemaLoading", "正在加载 Schema"],
+    ["load_context", "contextLoading", "正在检索数据上下文"],
+    ["request_validation", "requestValidating", "正在校验请求"],
+    ["synthesize", "synthesizing", "正在汇总结论"],
+    ["understand", "understanding", "正在理解归因问题"],
+    ["plan", "planning", "正在规划下钻路径"],
+    ["diagnose", "diagnosing", "正在继续下钻"],
+    ["queued", "queued", "等待执行"],
+    ["completed", "completed", "归因完成"],
+    ["partial", "partial", "基于现有证据完成"],
+    ["no_data", "noData", "未取得可用数据"],
+    ["timed_out", "timedOut", "查询长期无响应"],
+    ["failed", "failed", "归因失败"],
+    ["cancelled", "cancelled", "归因已取消"],
+  ];
+  const matched = suffixes.find(([suffix]) => value.includes(suffix));
+  return matched
+    ? t(`chat.attributionAuditStages.${matched[1]}`, matched[2])
+    : t("chat.attributionAuditStages.running", "正在执行归因分析");
+}
+
+function translatedConfidence(value: string, t: Translate): string {
+  const normalized = value.trim().toLowerCase();
+  const key = normalized === "高" || normalized === "high"
+    ? "high"
+    : normalized === "中" || normalized === "medium"
+      ? "medium"
+      : normalized === "低" || normalized === "low"
+        ? "low"
+        : "unknown";
+  return t(`chat.attributionAuditConfidenceLevels.${key}`, value);
+}
+
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
 function observationKey(observation: AttributionObservation): string {
   return observation.stepId || `${observation.title}:${observation.question}`;
 }
@@ -62,6 +130,14 @@ export function isAttributionTaskTerminalStatus(status: string): boolean {
     "failed",
     "cancelled",
   ].includes(status.toLowerCase());
+}
+
+export function shouldShowAttributionPreparing(
+  running: boolean,
+  observationCount: number,
+  executionDetailCount: number,
+): boolean {
+  return running && observationCount === 0 && executionDetailCount === 0;
 }
 
 function attributionEventKey(event: AttributionTaskEvent): string {
@@ -118,6 +194,9 @@ function reportMarkdown(
     recommendations: string;
     caveats: string;
     nextQuestions: string;
+    coverage: string;
+    confidence: string;
+    confidenceValue: (value: string) => string;
   },
 ): string {
   const sections = [
@@ -143,7 +222,10 @@ function reportMarkdown(
     report.nextQuestions?.length
       ? `### ${labels.nextQuestions}\n\n${report.nextQuestions.map((item) => `- ${item}`).join("\n")}`
       : "",
-    [report.coverage, report.confidence].filter(Boolean).join(" · "),
+    report.coverage ? `**${labels.coverage}**: ${report.coverage}` : "",
+    report.confidence
+      ? `**${labels.confidence}**: ${labels.confidenceValue(report.confidence)}`
+      : "",
   ];
   return sections.filter((section) => section.trim()).join("\n\n");
 }
@@ -217,7 +299,7 @@ function AttributionObservationBlock({
                     ? t("chat.attributionAuditCompleted", "已执行")
                     : t("chat.attributionAuditNoData", "无数据")}
               </Tag>
-              <Tag>{`${observation.rowCount ?? rows.length} rows`}</Tag>
+              <Tag>{t("chat.attributionAuditRows", "{{count}} 行", { count: observation.rowCount ?? rows.length })}</Tag>
               {observation.sampled ? <Tag>{t("chat.attributionAuditSampled", "预览")}</Tag> : null}
             </Space>
           ),
@@ -338,6 +420,12 @@ function AttributionAuditPanelImpl({
       return Boolean(event.message || event.stage);
     }).slice(-40);
   }, [events]);
+  const executionDetails = useMemo(() => events.flatMap((event, index) => {
+    const detail = event.detail;
+    if (!detail || typeof detail !== "object") return [];
+    const kind = typeof detail.kind === "string" ? detail.kind : "progress";
+    return [{ event, detail, kind, index }];
+  }), [events]);
   const currentStatus = status?.status ?? events.at(-1)?.status ?? "queued";
   const running = ["queued", "running"].includes(currentStatus);
   const taskError = status?.error ?? error;
@@ -354,8 +442,8 @@ function AttributionAuditPanelImpl({
           label: (
             <Space size={[6, 4]} wrap>
               <Text strong>{t("chat.attributionAuditTitle", "数据归因执行记录")}</Text>
-              <Tag color={statusColor(currentStatus)}>{currentStatus}</Tag>
-              {observations.length ? <Tag>{`${observations.length} steps`}</Tag> : null}
+              <Tag color={statusColor(currentStatus)}>{translatedStatus(currentStatus, t)}</Tag>
+              {observations.length ? <Tag>{t("chat.attributionAuditSteps", "{{count}} 个步骤", { count: observations.length })}</Tag> : null}
             </Space>
           ),
           children: taskError && observations.length === 0 ? (
@@ -365,13 +453,38 @@ function AttributionAuditPanelImpl({
               {timeline.length > 0 ? (
                 <div style={{ display: "grid", gap: 4 }}>
                   {timeline.map((event, index) => (
-                    <AttributionMarkdownDetail key={`${event.stage}-${index}`}>
-                      {event.message || event.stage || ""}
-                    </AttributionMarkdownDetail>
+                    <Space key={`${event.stage}-${index}`} size={8} wrap>
+                      <Tag color={statusColor(event.status)}>{translatedStage(event.stage, t)}</Tag>
+                      {event.elapsed_ms > 0 ? <Text type="secondary">{t("chat.attributionAuditElapsed", "已用时 {{seconds}} 秒", { seconds: Math.round(event.elapsed_ms / 1000) })}</Text> : null}
+                    </Space>
                   ))}
                 </div>
               ) : null}
-              {running && observations.length === 0 ? <Text type="secondary">{t("chat.attributionAuditRunning", "正在准备 Schema、SQL 和执行结果...")}</Text> : null}
+              {executionDetails.map(({ event, detail, kind, index }) => {
+                const sql = typeof detail.sql === "string" ? detail.sql : undefined;
+                const queryId = typeof detail.queryId === "string" ? detail.queryId : undefined;
+                const queryStatus = typeof detail.status === "string" ? detail.status : undefined;
+                const processedRows = typeof detail.processedRows === "number" ? detail.processedRows : undefined;
+                const processedBytes = typeof detail.processedBytes === "number" ? detail.processedBytes : undefined;
+                const completedSplits = typeof detail.completedSplits === "number" ? detail.completedSplits : undefined;
+                const totalSplits = typeof detail.totalSplits === "number" ? detail.totalSplits : undefined;
+                const rowCount = typeof detail.rowCount === "number" ? detail.rowCount : undefined;
+                return (
+                  <div key={`${event.stage}-${kind}-${index}`} style={{ display: "grid", gap: 6, padding: 10, background: "var(--bg-surface)", border: "1px solid var(--border-subtle)", borderRadius: 6 }}>
+                    <Space size={[6, 4]} wrap>
+                      <Text strong>{translatedStage(event.stage, t)}</Text>
+                      {queryStatus ? <Tag color={statusColor(queryStatus.toLowerCase())}>{translatedStatus(queryStatus, t)}</Tag> : null}
+                      {queryId ? <Tag>{t("chat.attributionAuditQueryId", "查询 ID")}: {queryId}</Tag> : null}
+                      {completedSplits != null && totalSplits != null ? <Tag>{t("chat.attributionAuditSplits", "分片 {{completed}} / {{total}}", { completed: completedSplits, total: totalSplits })}</Tag> : null}
+                      {processedRows != null ? <Tag>{t("chat.attributionAuditProcessedRows", "已处理 {{count}} 行", { count: processedRows })}</Tag> : null}
+                      {processedBytes != null ? <Tag>{t("chat.attributionAuditProcessedBytes", "已处理 {{size}}", { size: formatBytes(processedBytes) })}</Tag> : null}
+                      {rowCount != null ? <Tag color="success">{t("chat.attributionAuditResultRows", "返回 {{count}} 行", { count: rowCount })}</Tag> : null}
+                    </Space>
+                    {sql ? <pre style={{ margin: 0, padding: 10, overflowX: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere", border: "1px solid var(--border-subtle)", borderRadius: 6, fontSize: 12 }}>{sql}</pre> : null}
+                  </div>
+                );
+              })}
+              {shouldShowAttributionPreparing(running, observations.length, executionDetails.length) ? <Text type="secondary">{t("chat.attributionAuditRunning", "正在准备 Schema、SQL 和执行结果...")}</Text> : null}
               {observations.map((observation) => <AttributionObservationBlock key={observationKey(observation)} observation={observation} />)}
               {response?.report ? (
                 <AttributionMarkdownDetail>
@@ -381,6 +494,9 @@ function AttributionAuditPanelImpl({
                     recommendations: t("dataAttribution.recommendations", "建议动作"),
                     caveats: t("dataAttribution.caveats", "注意事项"),
                     nextQuestions: t("dataAttribution.nextQuestions", "建议继续追问"),
+                    coverage: t("chat.attributionAuditCoverage", "证据覆盖"),
+                    confidence: t("chat.attributionAuditConfidence", "结论置信度"),
+                    confidenceValue: (value) => translatedConfidence(value, t),
                   })}
                 </AttributionMarkdownDetail>
               ) : null}
