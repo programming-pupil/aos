@@ -1917,7 +1917,7 @@ export interface SqlKnowledgeImportTask {
   id: string;
   packId: string;
   datasourceId: string;
-  status: 'pending' | 'running' | 'completed' | 'partial' | 'failed';
+  status: 'pending' | 'running' | 'completed' | 'partial' | 'timed_out' | 'failed';
   totalFiles: number;
   processedFiles: number;
   failedFiles: number;

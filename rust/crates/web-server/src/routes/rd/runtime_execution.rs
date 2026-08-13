@@ -150,6 +150,7 @@ pub(super) async fn run_rd_runtime_completion(
         provider: "agent-gateway".to_string(),
         api_key_id: None,
         usage: Some(RdTokenUsageSnapshot::from_gateway(&turn.usage)),
+        stop_reason: None,
     })
 }
 
@@ -668,6 +669,7 @@ pub(super) async fn run_rd_candidate_worktree_completion(
         provider: "agent-gateway".to_string(),
         api_key_id: None,
         usage: Some(RdTokenUsageSnapshot::from_gateway(&turn.usage)),
+        stop_reason: None,
     })
 }
 

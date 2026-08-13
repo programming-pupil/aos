@@ -1676,6 +1676,7 @@ export function streamNl2sqlAttributionTask(
             payload.status === 'clarification_needed' ||
             payload.status === 'no_data' ||
             payload.status === 'partial' ||
+            payload.status === 'timed_out' ||
             payload.status === 'failed' ||
             payload.status === 'cancelled'
           ) {

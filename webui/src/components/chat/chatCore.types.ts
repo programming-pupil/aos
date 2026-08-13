@@ -140,7 +140,7 @@ export interface ChatCoreProps {
   noSessionPlaceholder?: {
     title: string;
     description: string;
-    emoji: string;
+    emoji: ReactNode;
   };
   topBarExtra?: ReactNode;
   topBarActions?: ReactNode;

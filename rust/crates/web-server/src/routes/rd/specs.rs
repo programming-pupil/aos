@@ -855,6 +855,7 @@ pub(super) async fn final_report_spec(
         STAGE_FINAL,
         string_json_field(&parsed, "finalReportMd"),
         &completion.text,
+        "finalReportMd",
     )
     .await?;
     let implementation_summary = json!({
@@ -1893,10 +1894,13 @@ fn row_to_spec(row: &sqlx::sqlite::SqliteRow) -> RdSpecDto {
         repository_ids,
         title: row.get("title"),
         prompt: row.get("prompt"),
-        requirements_md: row.get("requirements_md"),
-        design_md: row.get("design_md"),
-        tasks_md: row.get("tasks_md"),
-        acceptance_md: row.get("acceptance_md"),
+        requirements_md: normalize_persisted_plan_document(
+            row.get("requirements_md"),
+            "requirementsMd",
+        ),
+        design_md: normalize_persisted_plan_document(row.get("design_md"), "designMd"),
+        tasks_md: normalize_persisted_plan_document(row.get("tasks_md"), "tasksMd"),
+        acceptance_md: normalize_persisted_plan_document(row.get("acceptance_md"), "acceptanceMd"),
         status: row.get("status"),
         mode: row.get("mode"),
         current_stage: row.get("current_stage"),
@@ -2037,11 +2041,44 @@ fn string_json_field(value: &Value, key: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn normalize_persisted_plan_document(raw: Option<String>, output_field: &str) -> Option<String> {
+    raw.map(|value| {
+        let parsed = parse_json_object(&value);
+        let normalized = string_json_field(&parsed, output_field)
+            .map(|nested| unwrap_nested_plan_document(nested, output_field))
+            .unwrap_or(value);
+        strip_provider_tool_protocol(&normalized)
+    })
+}
+
+fn unwrap_nested_plan_document(raw: String, output_field: &str) -> String {
+    let mut current = raw;
+    for _ in 0..3 {
+        let parsed = parse_json_object(&current);
+        let Some(nested) = string_json_field(&parsed, output_field) else {
+            break;
+        };
+        if nested.trim() == current.trim() {
+            break;
+        }
+        current = nested;
+    }
+    current
+}
+
 fn sanitize_plan_markdown(
     structured_value: Option<String>,
     fallback: &str,
     stage: &str,
+    output_field: &str,
 ) -> Result<String, AppError> {
+    // Providers sometimes return a nearly-valid JSON envelope (for example a
+    // missing final brace after a long design). Recover the document field
+    // before declaring the stage malformed; the document itself is still
+    // useful Markdown and can be validated/rendered independently of the
+    // envelope.
+    let structured_value =
+        structured_value.or_else(|| extract_jsonish_string_field(fallback, output_field));
     if structured_value.is_none()
         && fallback.trim_start().starts_with('{')
         && [
@@ -2058,7 +2095,10 @@ fn sanitize_plan_markdown(
             "model returned malformed structured output for {stage}; retry this stage"
         )));
     }
-    let raw = structured_value.unwrap_or_else(|| fallback.to_string());
+    let raw = unwrap_nested_plan_document(
+        structured_value.unwrap_or_else(|| fallback.to_string()),
+        output_field,
+    );
     let sanitized = strip_provider_tool_protocol(&raw);
     if sanitized.trim().is_empty() {
         return Err(AppError::ValidationError(format!(
@@ -2075,8 +2115,9 @@ async fn sanitize_plan_stage_output(
     stage: &str,
     structured_value: Option<String>,
     fallback: &str,
+    output_field: &str,
 ) -> Result<String, AppError> {
-    match sanitize_plan_markdown(structured_value, fallback, stage) {
+    match sanitize_plan_markdown(structured_value, fallback, stage, output_field) {
         Ok(document) => Ok(document),
         Err(error) => {
             mark_spec_stage_failed(state, claims, spec_id, stage, &error).await?;
@@ -2097,12 +2138,21 @@ async fn recover_plan_stage_completion(
     completion: RdCompletionResult,
 ) -> Result<(RdCompletionResult, Value, String), AppError> {
     let parsed = parse_json_object(&completion.text);
-    if let Ok(document) = sanitize_plan_markdown(
-        string_json_field(&parsed, output_field),
-        &completion.text,
-        stage,
-    ) {
-        return Ok((completion, parsed, document));
+    let output_was_truncated = completion.stop_reason.as_deref().is_some_and(|reason| {
+        matches!(
+            reason.to_ascii_lowercase().as_str(),
+            "length" | "max_tokens" | "max_output_tokens"
+        )
+    });
+    if !output_was_truncated {
+        if let Ok(document) = sanitize_plan_markdown(
+            string_json_field(&parsed, output_field),
+            &completion.text,
+            stage,
+            output_field,
+        ) {
+            return Ok((completion, parsed, document));
+        }
     }
 
     tracing::warn!(
@@ -2110,12 +2160,18 @@ async fn recover_plan_stage_completion(
         stage,
         model = %completion.model,
         output_chars = completion.text.chars().count(),
-        "plan stage returned no usable document; retrying with a strict recovery prompt"
+        stop_reason = completion.stop_reason.as_deref().unwrap_or("unknown"),
+        "plan stage returned an unusable or truncated document; retrying with a strict recovery prompt"
     );
+    let recovery_format = if stage == STAGE_DESIGN {
+        "Return the complete engineering design as Markdown only. Do not wrap it in JSON or a Markdown fence."
+    } else {
+        "Return one complete JSON object only. Do not emit tool calls, XML, analysis, apologies, or Markdown fences."
+    };
     let recovery_prompt = format!(
-        "The previous response did not contain a usable {stage} document. Retry the original task now. \
-Return one JSON object only, with a non-empty string field named \"{output_field}\". \
-Do not emit tool calls, XML, analysis, apologies, or Markdown fences.\n\n\
+        "The previous response did not contain a complete usable {stage} document. Retry the original task now. \
+The result must be complete, internally consistent, and must not end mid-section. {recovery_format} \
+For JSON output, include a non-empty string field named \"{output_field}\".\n\n\
 Original task:\n{}\n\nPrevious unusable response:\n{}",
         truncate_text(&original_prompt, 24_000),
         truncate_text(&completion.text, 8_000),
@@ -2129,10 +2185,23 @@ Original task:\n{}\n\nPrevious unusable response:\n{}",
     )
     .await?;
     let parsed = parse_json_object(&recovered.text);
+    if recovered.stop_reason.as_deref().is_some_and(|reason| {
+        matches!(
+            reason.to_ascii_lowercase().as_str(),
+            "length" | "max_tokens" | "max_output_tokens"
+        )
+    }) {
+        let error = AppError::ValidationError(format!(
+            "model output for {stage} reached the output limit twice; retry this stage"
+        ));
+        mark_spec_stage_failed(state, claims, spec_id, stage, &error).await?;
+        return Err(error);
+    }
     match sanitize_plan_markdown(
         string_json_field(&parsed, output_field),
         &recovered.text,
         stage,
+        output_field,
     ) {
         Ok(document) => Ok((recovered, parsed, document)),
         Err(error) => {
@@ -2662,8 +2731,8 @@ fn json_to_string(value: &Value) -> Result<String, AppError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_repository_ids, parse_json_object, sanitize_plan_markdown,
-        strip_provider_tool_protocol,
+        normalize_persisted_plan_document, normalize_repository_ids, parse_json_object,
+        sanitize_plan_markdown, strip_provider_tool_protocol,
     };
 
     #[test]
@@ -2709,21 +2778,50 @@ mod tests {
     }
 
     #[test]
-    fn plan_markdown_rejects_tool_only_output_but_keeps_plain_markdown() {
+    fn plan_markdown_rejects_tool_only_output_and_recovers_malformed_json_envelope() {
         assert!(sanitize_plan_markdown(
             None,
             "<tool_calls><tool_call>noop</tool_call></tool_calls>",
             "design",
+            "designMd",
         )
         .is_err());
         assert_eq!(
-            sanitize_plan_markdown(None, "# Design\n\nReal content", "design")
+            sanitize_plan_markdown(None, "# Design\n\nReal content", "design", "designMd")
                 .expect("plain markdown"),
             "# Design\n\nReal content"
         );
-        assert!(
-            sanitize_plan_markdown(None, "{\"designMd\":\"# Design\nraw newline\"}", "design",)
-                .is_err()
+        assert_eq!(
+            sanitize_plan_markdown(
+                None,
+                "{\"designMd\":\"# Design\nraw newline\"}",
+                "design",
+                "designMd"
+            )
+            .expect("recover a document field from malformed JSON"),
+            "# Design\nraw newline"
+        );
+    }
+
+    #[test]
+    fn plan_markdown_unwraps_model_double_encoded_json() {
+        let nested =
+            "```json\n{\"requirementsMd\":\"# Scoped plan\\n\\nOnly the requested bucket\"}\n```";
+        assert_eq!(
+            sanitize_plan_markdown(Some(nested.to_string()), nested, "spec", "requirementsMd",)
+                .expect("nested plan markdown"),
+            "# Scoped plan\n\nOnly the requested bucket"
+        );
+    }
+
+    #[test]
+    fn persisted_plan_json_is_normalized_for_existing_installations() {
+        let stored = Some(
+            "```json\n{\"requirementsMd\":\"# Existing plan\\n\\nRecovered\"}\n```".to_string(),
+        );
+        assert_eq!(
+            normalize_persisted_plan_document(stored, "requirementsMd").as_deref(),
+            Some("# Existing plan\n\nRecovered")
         );
     }
 }

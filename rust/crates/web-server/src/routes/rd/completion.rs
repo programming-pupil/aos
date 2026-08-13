@@ -9,6 +9,22 @@ pub(super) struct RdCompletionResult {
     pub(super) provider: String,
     pub(super) api_key_id: Option<String>,
     pub(super) usage: Option<RdTokenUsageSnapshot>,
+    pub(super) stop_reason: Option<String>,
+}
+
+fn rd_output_limit_for_model(entry: &agent_gateway::ApiKeyEntry) -> u32 {
+    entry
+        .capabilities_json
+        .as_ref()
+        .and_then(|value| {
+            ["max_output_tokens", "maxOutputTokens"]
+                .iter()
+                .find_map(|key| value.get(*key).and_then(serde_json::Value::as_u64))
+        })
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value >= 1024)
+        .unwrap_or(16_384)
+        .min(32_768)
 }
 
 pub(super) async fn run_rd_completion(
@@ -25,7 +41,7 @@ pub(super) async fn run_rd_completion(
         selected_model,
         prompt,
         "You are AOS Code Studio, a careful coding agent. Prefer safe patches, precise plans, and verifiable tests.".to_string(),
-        8192,
+        16_384,
         None,
     )
     .await
@@ -86,7 +102,7 @@ pub(super) async fn run_rd_completion_with_options(
         };
         let req = api::MessageRequest {
             model: model.clone(),
-            max_tokens,
+            max_tokens: max_tokens.min(rd_output_limit_for_model(&entry)),
             messages: vec![api::InputMessage {
                 role: "user".to_string(),
                 content: vec![api::InputContentBlock::Text {
@@ -143,6 +159,7 @@ pub(super) async fn run_rd_completion_with_options(
                         provider: entry.provider,
                         api_key_id: Some(entry.id),
                         usage: Some(RdTokenUsageSnapshot::from_api(&usage, &model)),
+                        stop_reason: response.stop_reason,
                     });
                 }
                 Err(error) => {

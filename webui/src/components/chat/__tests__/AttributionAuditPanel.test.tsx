@@ -48,6 +48,7 @@ describe("AttributionAuditPanel", () => {
       "clarification_needed",
       "no_data",
       "partial",
+      "timed_out",
       "failed",
       "cancelled",
     ]) {

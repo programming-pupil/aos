@@ -287,10 +287,7 @@ const LEGACY_PLAN_GENERATE_DESIGN: &str = r#"你是 AOS Code Studio 的 Plan Mod
 
 任务：基于已确认规格生成技术设计，不要实现代码，不要生成 Diff。
 
-输出必须是 JSON：
-{
-  "designMd": string
-}
+直接输出完整 Markdown 技术设计正文，不要套 JSON，不要使用 Markdown 代码围栏包裹全文。该阶段只有一份文档，避免 JSON 转义导致长文截断或解析失败。
 
 要求：
 - designMd 包含架构方案、受影响模块、数据/API变化、执行流程、风险与测试策略。

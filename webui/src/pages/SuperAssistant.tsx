@@ -9,11 +9,12 @@
 //
 // This reuses the shared ChatCore component (the `sessionSource="pm"` deep-dialogue
 // variant, which carries the richest capability set: streaming, stages, evidence,
-// sources, attachments, memory and session management). No parallel chat UI is
+// sources, attachments, context continuity and session management). No parallel chat UI is
 // built here — all shared logic lives in ChatCore.
 
 import { ChatCore } from '@/components/chat/ChatCore';
 import { ContextStatusPanel } from '@/components/chat/ContextStatusPanel';
+import { BulbOutlined } from '@ant-design/icons';
 import { Space, Tag, Typography } from 'antd';
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -22,8 +23,8 @@ const { Text } = Typography;
 
 export default function SuperAssistant() {
   const { t } = useTranslation();
-  // Track the active session so the Context_Status panel can surface memory
-  // state (usage / compaction / remembered items) for the current session.
+  // Track the active session so the Context_Status panel can surface context
+  // usage and compaction state for the current session.
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
 
   return (
@@ -52,7 +53,7 @@ export default function SuperAssistant() {
               'superAssistant.welcomeDescription',
               'One entry for everything — chat, live lookup, deep research, data analysis, SQL, attachments and code. Just ask; the assistant routes your question automatically.',
             ),
-            emoji: '🤖',
+            emoji: <BulbOutlined style={{ color: 'var(--accent-ai)' }} />,
           }}
           showConfigTags={true}
           showMemoryButton={false}
@@ -79,9 +80,9 @@ export default function SuperAssistant() {
                 {t('superAssistant.tagAutoRoute', 'Auto intent routing')}
               </Tag>
               <Tag style={{ marginRight: 0 }}>
-                {t('superAssistant.tagMemory', 'Context memory')}
+                {t('superAssistant.tagMemory', 'Context continuity')}
               </Tag>
-              {/* Context_Status: usage / compaction / remembered items (Req 4.8, 8.5) */}
+              {/* Context_Status: usage and compaction state (Req 4.8, 8.5) */}
               <ContextStatusPanel sessionId={activeSessionId} sessionSource="pm" />
             </Space>
           }

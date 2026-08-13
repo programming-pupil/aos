@@ -1016,6 +1016,32 @@ pub(crate) async fn create_sql_knowledge_import_task(
         return Err(AppError::ValidationError("missing file field".into()));
     }
 
+    let mut tx = state.db.begin().await?;
+    crate::acquire_sqlite_write_lock(&mut tx).await?;
+    let active_task_id = sqlx::query_scalar::<sqlx::Sqlite, String>(
+        "SELECT id FROM nl2sql_reference_import_tasks \
+         WHERE tenant_id = ? AND user_id = ? AND pack_id = ? \
+           AND status IN ('pending', 'running') \
+         ORDER BY created_at ASC LIMIT 1",
+    )
+    .bind(&claims.tenant_id)
+    .bind(&claims.sub)
+    .bind(&space_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(active_task_id) = active_task_id {
+        tx.rollback().await?;
+        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        tracing::warn!(
+            tenant_id = %claims.tenant_id,
+            pack_id = %space_id,
+            active_task_id,
+            "duplicate SQL knowledge import rejected while another batch is active"
+        );
+        return Err(AppError::Conflict(
+            "another SQL knowledge import is already running for this space".into(),
+        ));
+    }
     let insert_result = sqlx::query::<sqlx::Sqlite>(
         "INSERT INTO nl2sql_reference_import_tasks \
          (id, tenant_id, user_id, pack_id, datasource_id, status, total_files, manifest_json, staging_dir) \
@@ -1029,12 +1055,14 @@ pub(crate) async fn create_sql_knowledge_import_task(
     .bind(i64::try_from(manifest.len()).unwrap_or(i64::MAX))
     .bind(serde_json::to_string(&manifest)?)
     .bind(staging_dir.to_string_lossy().as_ref())
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await;
     if let Err(error) = insert_result {
+        let _ = tx.rollback().await;
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
         return Err(error.into());
     }
+    tx.commit().await?;
     tracing::info!(
         tenant_id = %claims.tenant_id,
         pack_id = %space_id,

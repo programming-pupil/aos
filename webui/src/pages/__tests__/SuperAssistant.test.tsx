@@ -101,7 +101,7 @@ describe('SuperAssistant unified shell', () => {
     // Menu merge → a single "Unified entry" surface with auto intent routing.
     expect(html).toContain('Unified entry');
     expect(html).toContain('Auto intent routing');
-    expect(html).toContain('Context memory');
+    expect(html).toContain('Context continuity');
   });
 
   it('advertises chat, SQL and attachment handling plus evidence in the hint bar', () => {

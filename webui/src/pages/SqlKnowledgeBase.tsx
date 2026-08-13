@@ -129,8 +129,8 @@ export default function SqlKnowledgeBase() {
   const [previewFile, setPreviewFile] = useState<Nl2sqlReferenceFile | null>(null);
   const [editFile, setEditFile] = useState<Nl2sqlReferenceFile | null>(null);
   const [editContent, setEditContent] = useState('');
+  const [optimisticImportTask, setOptimisticImportTask] = useState<SqlKnowledgeImportTask | null>(null);
   const [createForm] = Form.useForm();
-  const uploadBatchKeyRef = useRef<string | null>(null);
   const completedImportRefreshRef = useRef<string | null>(null);
 
   const spacesQuery = useQuery({
@@ -264,6 +264,11 @@ export default function SqlKnowledgeBase() {
       nl2sqlApi.createSqlKnowledgeImportTask(spaceId, files),
     onSuccess: (task) => {
       message.success(t('sqlKnowledge.messages.importQueued', { count: task.totalFiles }));
+      setOptimisticImportTask(task);
+      qc.setQueryData<SqlKnowledgeImportTask[]>(
+        queryKeys.nl2sql.sqlKnowledge.importTasks(task.packId),
+        (current = []) => [task, ...current.filter((item) => item.id !== task.id)],
+      );
       refresh(selectedSpace ? spaceBindings(selectedSpace) : undefined);
       qc.invalidateQueries({ queryKey: queryKeys.nl2sql.sqlKnowledge.importTasks(task.packId) });
     },
@@ -279,8 +284,31 @@ export default function SqlKnowledgeBase() {
     ) ? 2000 : 15_000,
   });
   const activeImportTask = useMemo(() => {
-    return selectActiveSqlKnowledgeImportTask(importTasksQuery.data ?? []);
-  }, [importTasksQuery.data]);
+    const active = selectActiveSqlKnowledgeImportTask(importTasksQuery.data ?? []);
+    if (!active && optimisticImportTask && ['pending', 'running'].includes(optimisticImportTask.status)) {
+      return optimisticImportTask;
+    }
+    if (active && optimisticImportTask && active.id === optimisticImportTask.id) {
+      return active;
+    }
+    return active;
+  }, [importTasksQuery.data, optimisticImportTask]);
+
+  useEffect(() => {
+    if (!optimisticImportTask) return;
+    const current = (importTasksQuery.data ?? []).find((task) => task.id === optimisticImportTask.id);
+    if (current) {
+      const changed = current.status !== optimisticImportTask.status
+        || current.processedFiles !== optimisticImportTask.processedFiles
+        || current.failedFiles !== optimisticImportTask.failedFiles
+        || current.currentFilename !== optimisticImportTask.currentFilename
+        || current.updatedAt !== optimisticImportTask.updatedAt;
+      if (changed) setOptimisticImportTask(current);
+    }
+    if (current && !['pending', 'running'].includes(current.status)) {
+      setOptimisticImportTask(null);
+    }
+  }, [importTasksQuery.data, optimisticImportTask]);
 
   useEffect(() => {
     const latest = importTasksQuery.data?.[0];
@@ -379,16 +407,11 @@ export default function SqlKnowledgeBase() {
         return Upload.LIST_IGNORE;
       }
       const batchFiles = fileList.length > 0 ? fileList : [file];
-      const batchKey = batchFiles.map((item) => item.uid).join('|');
-      if (uploadBatchKeyRef.current === batchKey) {
+      // Ant Design invokes beforeUpload once per selected file. Submit the
+      // directory as one batch from the first callback only.
+      if (batchFiles[0]?.uid !== file.uid) {
         return Upload.LIST_IGNORE;
       }
-      uploadBatchKeyRef.current = batchKey;
-      window.setTimeout(() => {
-        if (uploadBatchKeyRef.current === batchKey) {
-          uploadBatchKeyRef.current = null;
-        }
-      }, 0);
       uploadMutation.mutate({
         spaceId: selectedSpace.id,
         files: batchFiles.map((item) => item as File),

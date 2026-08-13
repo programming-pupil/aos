@@ -23,7 +23,7 @@ import dayjs from 'dayjs';
 import { apiKeysApi, rdApi } from '@/api';
 import { queryKeys } from '@/api/queryKeys';
 import { Markdown } from '@/components/chat';
-import type { ApiKeyRecord, RdSpec } from '@/types';
+import type { ApiKeyRecord, RdSpec, RdSpecEvent } from '@/types';
 
 const { Text, Title, Paragraph } = Typography;
 
@@ -76,6 +76,15 @@ export default function RdSpecs() {
   const repositories = repositoriesQuery.data?.repositories ?? [];
   const specs = specsQuery.data ?? [];
   const selectedSpec = specs.find((spec) => spec.id === selectedSpecId) ?? null;
+  const specEventsQuery = useQuery({
+    queryKey: selectedSpecId ? queryKeys.rd.specEvents(selectedSpecId) : ['rd', 'specs', 'events', 'none'],
+    queryFn: () => rdApi.specEvents(selectedSpecId!),
+    enabled: Boolean(selectedSpecId),
+    refetchInterval: selectedSpec && ['queued', 'running'].includes(selectedSpec.status) ? 3000 : false,
+  });
+  const revisionEvents = useMemo(() => (specEventsQuery.data ?? []).filter((event: RdSpecEvent) =>
+    event.eventType.endsWith('.revision_queued') && typeof event.metadataJson?.feedback === 'string'
+  ), [specEventsQuery.data]);
   const repoNameMap = useMemo(() => new Map(repositories.map((repo) => [repo.id, repo.name])), [repositories]);
   const statusLabel = (value?: string | null) => {
     const raw = value?.trim();
@@ -116,8 +125,9 @@ export default function RdSpecs() {
   });
 
   const stageMutation = useMutation({
-    mutationFn: async ({ id, action }: { id: string; action: 'generateDesign' | 'approveDesign' | 'generateTasks' | 'approveTasks' }) => {
+    mutationFn: async ({ id, action }: { id: string; action: 'generateSpec' | 'generateDesign' | 'approveDesign' | 'generateTasks' | 'approveTasks' }) => {
       switch (action) {
+        case 'generateSpec': return rdApi.generateSpec(id);
         case 'generateDesign': return rdApi.generateDesign(id);
         case 'approveDesign': return rdApi.approveDesign(id);
         case 'generateTasks': return rdApi.generateTasks(id);
@@ -127,6 +137,7 @@ export default function RdSpecs() {
     onSuccess: async (spec) => {
       message.success(t('rd.planStageCompleted', '阶段操作已完成'));
       await queryClient.invalidateQueries({ queryKey: queryKeys.rd.specs() });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.rd.specEvents(spec.id) });
       setSelectedSpecId(spec.id);
     },
     onError: (error: Error) => message.error(error.message || t('rd.planStageActionFailed', '阶段操作失败')),
@@ -139,6 +150,7 @@ export default function RdSpecs() {
       setRevisionFeedback('');
       message.success(t('rd.planRevisionQueued', '修改意见已提交，AI 正在后台修订当前文档'));
       await queryClient.invalidateQueries({ queryKey: queryKeys.rd.specs() });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.rd.specEvents(spec.id) });
       setSelectedSpecId(spec.id);
     },
     onError: (error: Error) => message.error(error.message || t('rd.planRevisionFailed', '提交修改意见失败')),
@@ -169,6 +181,14 @@ export default function RdSpecs() {
     if (spec.designMd?.trim()) return 'design';
     if (spec.requirementsMd?.trim()) return 'spec';
     return null;
+  };
+
+  const retryStageAction = (spec: RdSpec) => {
+    switch (spec.currentStage) {
+      case 'design': return 'generateDesign' as const;
+      case 'tasks': return 'generateTasks' as const;
+      default: return 'generateSpec' as const;
+    }
   };
 
   useEffect(() => {
@@ -363,7 +383,42 @@ export default function RdSpecs() {
                 description={t('rd.planRunningDesc', '已保存到计划列表，当前阶段：{{stage}}。页面会自动刷新，生成完成前可以离开此页面。', { stage: statusLabel(selectedSpec.currentStage) || selectedSpec.currentStage || 'spec' })}
               />
             ) : null}
-            {selectedSpec.lastError ? <Alert type="error" showIcon message={t('rd.planFailed', '计划生成失败')} description={selectedSpec.lastError} /> : null}
+            {selectedSpec.lastError ? (
+              <Alert
+                type="error"
+                showIcon
+                message={t('rd.planFailed', '计划生成失败')}
+                description={selectedSpec.lastError}
+                action={
+                  <Button
+                    danger
+                    loading={stageMutation.isPending}
+                    onClick={() => stageMutation.mutate({
+                      id: selectedSpec.id,
+                      action: retryStageAction(selectedSpec),
+                    })}
+                  >
+                    {t('rd.retryCurrentStage', '重试当前阶段')}
+                  </Button>
+                }
+              />
+            ) : null}
+            {revisionEvents.length > 0 ? (
+              <Card size="small" title={t('rd.planRevisionHistory', '修改意见记录')}>
+                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                  {revisionEvents.map((event) => (
+                    <div key={event.id}>
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        {dayjs(event.createdAt).format('YYYY-MM-DD HH:mm:ss')} · {statusLabel(event.stage)}
+                      </Text>
+                      <Paragraph style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }}>
+                        {String(event.metadataJson?.feedback ?? '')}
+                      </Paragraph>
+                    </div>
+                  ))}
+                </Space>
+              </Card>
+            ) : null}
             {nextStageAction(selectedSpec) ? (
               <Alert
                 type="info"

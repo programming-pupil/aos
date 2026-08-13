@@ -165,9 +165,13 @@ fn attribution_step_budget_for(depth: AttributionDepth, step: &AttributionPlanSt
     let base = attribution_step_budget(depth);
     let extra_secs = match step.id.as_str() {
         "main_metric" => match depth {
-            AttributionDepth::Fast => 30,
-            AttributionDepth::Standard => 45,
-            AttributionDepth::Deep => 60,
+            AttributionDepth::Fast => 105,
+            AttributionDepth::Standard => 180,
+            // Deep attribution may spend roughly a minute on SQL-knowledge
+            // routing, schema hydration and SQL generation before Trino
+            // accepts the statement. Keep a full five-minute connector window
+            // available without extending every auxiliary drill-down.
+            AttributionDepth::Deep => 210,
         },
         "metric_decomposition" | "dimension_drilldown" => 20,
         _ => 0,
@@ -176,14 +180,12 @@ fn attribution_step_budget_for(depth: AttributionDepth, step: &AttributionPlanSt
 }
 
 fn attribution_primary_attempt_deadline(step_deadline: Instant) -> Instant {
-    let remaining = remaining_attribution_budget(step_deadline);
-    if remaining <= Duration::from_secs(45) {
-        return step_deadline;
-    }
-    let reserve = (remaining / 3)
-        .max(Duration::from_secs(35))
-        .min(Duration::from_secs(70));
-    step_deadline.checked_sub(reserve).unwrap_or(step_deadline)
+    // The former implementation reserved one third of every step for a
+    // lightweight fallback. That fallback was removed to prevent overlapping
+    // remote Trino statements, but the reserve remained and cut a 165-second
+    // standard step off at 110 seconds. Give the one bounded execution its full
+    // window; connector cancellation still runs when this deadline is reached.
+    step_deadline
 }
 
 fn attribution_synthesis_reserve() -> Duration {
@@ -790,7 +792,7 @@ impl AttributionTaskManager {
                 "clarification_needed"
             } else if matches!(
                 response.status.as_str(),
-                "completed" | "partial" | "no_data"
+                "completed" | "partial" | "no_data" | "timed_out"
             ) {
                 response.status.as_str()
             } else {
@@ -801,6 +803,7 @@ impl AttributionTaskManager {
                 "failed" => "数据归因失败",
                 "partial" => "数据归因已基于现有证据完成",
                 "no_data" => "数据归因未取得可用数据",
+                "timed_out" => "数据归因查询超时，已保留进度和已验证证据",
                 _ => "数据归因完成",
             };
             let evt = AttributionTaskEvent {
@@ -2057,7 +2060,7 @@ async fn start_attribution_task_inner(
                     &terminal_message,
                     &resp.observations,
                     archive_had_shared_context,
-                    "completed",
+                    &resp.status,
                 )
                 .await;
                 persist_attribution_terminal_message_to_super_assistant_session(
@@ -2337,7 +2340,13 @@ pub(crate) async fn cancel_attribution_task(
 fn attribution_status_is_terminal(status: &str) -> bool {
     matches!(
         status,
-        "completed" | "clarification_needed" | "no_data" | "partial" | "failed" | "cancelled"
+        "completed"
+            | "clarification_needed"
+            | "no_data"
+            | "partial"
+            | "timed_out"
+            | "failed"
+            | "cancelled"
     )
 }
 
@@ -3675,7 +3684,10 @@ async fn analyze_attribution(
             .caveats
             .push("已达到本次归因的总时间预算，报告基于截止时已经验证的证据生成。".to_string());
     }
-    let status = if success_count == 0 {
+    let status = if success_count == 0 && observations.iter().any(attribution_observation_timed_out)
+    {
+        "timed_out".to_string()
+    } else if success_count == 0 {
         "no_data".to_string()
     } else if deadline_reached || success_count < observations.len() {
         "partial".to_string()
@@ -3837,7 +3849,7 @@ async fn execute_attribution_step(
         let mut observation = cancelled_attribution_observation(step, conversation_id);
         if !task_manager().is_cancelled(task_id).await {
             observation.error = Some(
-                "该分支的完整查询和单 SQL 轻量恢复均未在预算内完成；系统已保留其它已验证证据并继续综合。"
+                "该查询在允许的慢数据源执行窗口内仍未完成，系统已停止本分支以保护数据源；这不代表没有数据或没有绑定数据源，可稍后重试或提高归因查询预算。"
                     .to_string(),
             );
         }
@@ -3964,6 +3976,14 @@ fn deadline_attribution_observation(
     observation.error =
         Some("本步骤未在归因查询预算内启动；系统已保留其它已完成证据并进入总结。".to_string());
     observation
+}
+
+fn attribution_observation_timed_out(observation: &AttributionObservation) -> bool {
+    observation.error.as_deref().is_some_and(|error| {
+        error.contains("执行窗口内仍未完成")
+            || error.contains("未在归因查询预算内启动")
+            || error.to_ascii_lowercase().contains("timed out")
+    })
 }
 
 async fn load_agent_result_snapshot(
@@ -4642,7 +4662,10 @@ fn fallback_report(question: &str, observations: &[AttributionObservation]) -> A
         .filter(|observation| observation.has_usable_evidence())
         .count();
     let failed_count = observations.len().saturating_sub(success_count);
-    let executive_summary = if success_count == 0 {
+    let timed_out = observations.iter().any(attribution_observation_timed_out);
+    let executive_summary = if success_count == 0 && timed_out {
+        format!("本次对“{question}”的主查询在慢数据源执行窗口内仍未完成，因此没有形成可验证的归因结论。系统已停止该分支以保护数据源；这不是无数据或数据源未绑定。可在数据源负载较低时重试，或由管理员提高归因查询预算。")
+    } else if success_count == 0 {
         format!("这次没有成功拿到可用于归因的数据结果，因此不能对“{question}”给出确定原因。建议先检查指标口径、数据源权限、相关表结构和 SQL 知识库是否完整。")
     } else {
         format!("这次成功完成了 {success_count} 个归因查询，失败 {failed_count} 个。可以先参考成功查询的结果判断方向，但由于报告整理模型失败，下面结论只做保守汇总。")
@@ -4666,9 +4689,11 @@ fn fallback_report(question: &str, observations: &[AttributionObservation]) -> A
                 confidence: Some("低".to_string()),
             })
             .collect(),
-        recommendations: vec![
+        recommendations: vec![if timed_out {
+            "在数据源负载较低时重试；若慢查询通常需要更长时间，可调整 NL2SQL_ATTRIBUTION_STEP_TIMEOUT_SECS，但仍应保留总预算与每用户并发上限。".to_string()
+        } else {
             "补齐指标口径和常用归因维度后重新运行，能显著提升准确性。".to_string()
-        ],
+        }],
         caveats: observations
             .iter()
             .filter_map(|o| o.error.as_ref().map(|e| format!("{}：{}", o.title, e)))
@@ -5633,14 +5658,11 @@ mod tests {
     }
 
     #[test]
-    fn step_timeout_reserves_time_for_single_sql_recovery() {
+    fn step_timeout_uses_the_full_window_when_no_fallback_is_allowed() {
         let deadline = Instant::now() + Duration::from_secs(150);
         let primary_deadline = attribution_primary_attempt_deadline(deadline);
-        let recovery_budget = deadline.saturating_duration_since(primary_deadline);
 
-        assert!(primary_deadline < deadline);
-        assert!(recovery_budget >= Duration::from_secs(35));
-        assert!(recovery_budget <= Duration::from_secs(70));
+        assert_eq!(primary_deadline, deadline);
     }
 
     #[test]
@@ -5676,6 +5698,7 @@ mod tests {
             "clarification_needed",
             "no_data",
             "partial",
+            "timed_out",
             "failed",
             "cancelled",
         ] {

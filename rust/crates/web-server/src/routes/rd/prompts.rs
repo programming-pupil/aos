@@ -53,11 +53,19 @@ pub(super) fn plan_revise_stage_prompt(
     feedback: &str,
     repo_context: &str,
 ) -> String {
+    let (output_contract, schema_hint) = if stage.eq_ignore_ascii_case("design") {
+        (
+            "Return the complete revised design as Markdown only. Do not wrap it in JSON or a Markdown code fence.",
+            "",
+        )
+    } else {
+        ("Return JSON only using this schema:\n", output_schema)
+    };
     format!(
         "You are the AOS Code Studio Spec Mode revision agent.\n\n\
 Revise the current {stage} document according to the user's feedback. Preserve correct content, \
 resolve every actionable feedback item, and keep the result grounded in real repository evidence. \
-Do not implement code. Return JSON only using this schema:\n{output_schema}\n\n\
+Do not implement code. {output_contract}{schema_hint}\n\n\
 Original requirement:\n{requirement}\n\nCurrent document:\n{current_document}\n\n\
 User feedback:\n{feedback}\n\nRepository context:\n{repo_context}"
     )
@@ -111,7 +119,7 @@ mod tests {
         assert!(spec.contains("你是 AOS Code Studio 的 Plan Mode"));
 
         let design = plan_generate_design_prompt("需求", "规格", "验收", "上下文");
-        assert!(design.contains("\"designMd\""));
+        assert!(design.contains("Markdown"));
 
         let tasks = plan_generate_tasks_prompt("需求", "规格", "设计", "验收", "上下文");
         assert!(tasks.contains("\"tasksMd\""));
@@ -126,7 +134,7 @@ mod tests {
             "仓库上下文",
         );
         assert!(revision.contains("补充回滚方案"));
-        assert!(revision.contains("\"designMd\""));
+        assert!(revision.contains("Markdown only"));
 
         let report = plan_final_report_prompt("标题", "规格", "设计", "任务", "{}");
         assert!(report.contains("\"finalReportMd\""));

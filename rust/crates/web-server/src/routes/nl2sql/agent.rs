@@ -240,7 +240,7 @@ async fn ensure_queryable_datasource_exists(state: &AppState, claims: &Claims) -
     const EXECUTABLE_TYPES: &str =
         "'mysql','tidb','postgres','clickhouse','presto','trino','mongodb'";
     let total_sql = format!(
-        "SELECT COUNT(*) FROM data_sources WHERE tenant_id = ? AND db_type IN ({EXECUTABLE_TYPES})"
+        "SELECT COUNT(*) FROM data_sources WHERE tenant_id = ? AND deleted_at IS NULL AND db_type IN ({EXECUTABLE_TYPES})"
     );
     let total = sqlx::query_scalar::<_, i64>(&total_sql)
         .bind(&claims.tenant_id)
@@ -257,7 +257,7 @@ async fn ensure_queryable_datasource_exists(state: &AppState, claims: &Claims) -
         return Ok(());
     }
     let accessible_sql = format!(
-        "SELECT COUNT(*) FROM data_sources WHERE tenant_id = ? AND user_id = ? AND db_type IN ({EXECUTABLE_TYPES})"
+        "SELECT COUNT(*) FROM data_sources WHERE tenant_id = ? AND deleted_at IS NULL AND db_type IN ({EXECUTABLE_TYPES}) AND (visibility = 'tenant' OR user_id = ?)"
     );
     let accessible = sqlx::query_scalar::<_, i64>(&accessible_sql)
         .bind(&claims.tenant_id)

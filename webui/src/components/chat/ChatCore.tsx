@@ -628,6 +628,7 @@ function isPmTaskTerminalStatus(status: string | null | undefined): boolean {
     normalized === "clarification_needed" ||
     normalized === "no_data" ||
     normalized === "partial" ||
+    normalized === "timed_out" ||
     normalized === "failed" ||
     normalized === "cancelled"
   );
@@ -641,7 +642,8 @@ function normalizeAttributionTaskStatus(
     normalized === "completed" ||
     normalized === "clarification_needed" ||
     normalized === "no_data" ||
-    normalized === "partial"
+    normalized === "partial" ||
+    normalized === "timed_out"
   ) {
     return normalized;
   }
@@ -823,7 +825,7 @@ function normalizeAttributionStageStatus(
   ) {
     return "completed";
   }
-  if (status === "failed" || status === "cancelled") return "failed";
+  if (status === "timed_out" || status === "failed" || status === "cancelled") return "failed";
   if (status === "queued") return "pending";
   return "running";
 }
@@ -861,7 +863,7 @@ function normalizeAttributionDetail(
 
 function formatAttributionTerminalMessage(event: AttributionTaskEvent): string {
   const response = event.response;
-  if (event.status === "failed") {
+  if (event.status === "failed" || event.status === "timed_out") {
     return event.error || event.message || "数据归因执行失败。";
   }
   if (!response) {

@@ -42,7 +42,7 @@ function observationFromEvent(
 
 function statusColor(status: string): string {
   if (status === "completed") return "success";
-  if (status === "failed" || status === "cancelled") return "error";
+  if (status === "failed" || status === "timed_out" || status === "cancelled") return "error";
   if (
     status === "partial" ||
     status === "no_data" ||
@@ -58,6 +58,7 @@ export function isAttributionTaskTerminalStatus(status: string): boolean {
     "clarification_needed",
     "no_data",
     "partial",
+    "timed_out",
     "failed",
     "cancelled",
   ].includes(status.toLowerCase());

@@ -79,12 +79,16 @@ const STAGE_PERCENT: Record<string, number> = {
   completed: 100,
   clarification_needed: 100,
   failed: 100,
+  timed_out: 100,
 };
 
 function isTerminalAttributionStatus(status?: string | null): boolean {
   return (
     status === "completed" ||
     status === "clarification_needed" ||
+    status === "no_data" ||
+    status === "partial" ||
+    status === "timed_out" ||
     status === "failed"
   );
 }
@@ -347,6 +351,8 @@ export default function DataAttribution() {
           return t("dataAttribution.status_partial");
         case "no_data":
           return t("dataAttribution.status_no_data");
+        case "timed_out":
+          return t("dataAttribution.status_timed_out");
         case "clarification_needed":
           return t("dataAttribution.stageClarification");
         case "failed":

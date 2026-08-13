@@ -64,6 +64,15 @@ fn agent_trino_query_timeout_secs() -> u64 {
         .unwrap_or_else(federated_trino_query_timeout_secs)
 }
 
+fn datasource_visible_to_user(
+    is_admin: bool,
+    user_id: &str,
+    owner_user_id: Option<&str>,
+    visibility: &str,
+) -> bool {
+    is_admin || visibility.eq_ignore_ascii_case("tenant") || owner_user_id == Some(user_id)
+}
+
 fn federated_trino_explain_timeout_secs() -> u64 {
     std::env::var("NL2SQL_FEDERATED_TRINO_EXPLAIN_TIMEOUT_SECS")
         .ok()
@@ -2791,10 +2800,11 @@ impl Nl2SqlAgent {
                 Option<serde_json::Value>,
                 serde_json::Value,
                 Option<String>,
+                String,
             ),
         >(
-            "SELECT id, name, db_type, schema_info, config, user_id \
-             FROM data_sources WHERE tenant_id = ?",
+            "SELECT id, name, db_type, schema_info, config, user_id, visibility \
+             FROM data_sources WHERE tenant_id = ? AND deleted_at IS NULL",
         )
         .bind(tenant_id)
         .fetch_all(&self.state.db)
@@ -2829,7 +2839,7 @@ impl Nl2SqlAgent {
         };
 
         let mut schemas = Vec::new();
-        for (ds_id, ds_name, db_type, schema_info, config, owner_user_id) in rows {
+        for (ds_id, ds_name, db_type, schema_info, config, owner_user_id, visibility) in rows {
             // Filter to executable db_types only
             if !matches!(
                 db_type.as_str(),
@@ -2838,8 +2848,10 @@ impl Nl2SqlAgent {
                 continue;
             }
 
-            // Non-admin users can only see their own datasources
-            if !is_admin && owner_user_id.as_ref() != Some(&user_id.to_string()) {
+            // Members can use their own private sources and tenant-shared
+            // sources. Admins retain access to all tenant sources.
+            if !datasource_visible_to_user(is_admin, user_id, owner_user_id.as_deref(), &visibility)
+            {
                 continue;
             }
 
@@ -3863,9 +3875,9 @@ impl Nl2SqlAgent {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_trino_user_permit, contextual_agent_question, deterministic_dialect_repair,
-        dialect_preflight_error, execute_trino_query_bounded, merge_input_error,
-        DatasourceRequestBudget, AGENT_SHARED_CONTEXT_MAX_CHARS,
+        acquire_trino_user_permit, contextual_agent_question, datasource_visible_to_user,
+        deterministic_dialect_repair, dialect_preflight_error, execute_trino_query_bounded,
+        merge_input_error, DatasourceRequestBudget, AGENT_SHARED_CONTEXT_MAX_CHARS,
     };
     use axum::extract::State;
     use axum::http::StatusCode;
@@ -3873,6 +3885,34 @@ mod tests {
     use axum::{Json, Router};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn datasource_visibility_includes_tenant_shared_sources_for_members() {
+        assert!(datasource_visible_to_user(
+            false,
+            "member-a",
+            Some("owner-b"),
+            "tenant"
+        ));
+        assert!(datasource_visible_to_user(
+            false,
+            "member-a",
+            Some("member-a"),
+            "private"
+        ));
+        assert!(!datasource_visible_to_user(
+            false,
+            "member-a",
+            Some("owner-b"),
+            "private"
+        ));
+        assert!(datasource_visible_to_user(
+            true,
+            "admin-a",
+            Some("owner-b"),
+            "private"
+        ));
+    }
 
     #[derive(Clone)]
     struct FakeTrinoState {
