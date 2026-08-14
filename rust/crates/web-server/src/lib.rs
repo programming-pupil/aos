@@ -8,6 +8,7 @@ mod error;
 #[cfg(feature = "nl2sql")]
 pub mod nl2sql;
 mod routes;
+mod semantic_kernel_store;
 mod state;
 mod telemetry;
 

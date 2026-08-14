@@ -227,6 +227,176 @@ pub struct PmSubtaskAttemptRow {
     pub updated_at: Option<String>,
 }
 
+async fn reserve_pm_resource_budget(
+    db: &sqlx::SqlitePool,
+    run_id: &str,
+    tenant_id: &str,
+    user_id: &str,
+    config: &PmRunConfigSnapshot,
+) -> Result<(), sqlx::Error> {
+    let owner_scope = format!("user:{user_id}:pm:{run_id}");
+    let reservations = [
+        (
+            "wall_time_ms",
+            config.pipeline_timeout_secs.saturating_mul(1_000),
+        ),
+        (
+            "tool_calls",
+            u64::try_from(config.retrieve_max_tool_calls).unwrap_or(u64::MAX),
+        ),
+        (
+            "web_queries",
+            u64::try_from(config.retrieve_max_tool_calls).unwrap_or(u64::MAX),
+        ),
+    ];
+    let mut transaction = db.begin().await?;
+    for (dimension, amount) in reservations {
+        let amount = i64::try_from(amount).unwrap_or(i64::MAX);
+        sqlx::query::<Sqlite>(
+            "INSERT INTO resource_budget_accounts
+                (tenant_id, owner_scope, dimension, available, reserved, committed)
+             VALUES (?, ?, ?, 0, ?, 0)
+             ON CONFLICT(tenant_id, owner_scope, dimension) DO UPDATE SET
+                 available = 0,
+                 reserved = excluded.reserved,
+                 committed = 0",
+        )
+        .bind(tenant_id)
+        .bind(&owner_scope)
+        .bind(dimension)
+        .bind(amount)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query::<Sqlite>(
+            "INSERT INTO resource_budget_entries
+                (id, tenant_id, owner_scope, reservation_id, dimension, amount, state, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'reserved', CURRENT_TIMESTAMP)
+             ON CONFLICT(id) DO UPDATE SET
+                 amount = excluded.amount,
+                 state = 'reserved'",
+        )
+        .bind(format!("pm-budget:{run_id}:{dimension}:reserve"))
+        .bind(tenant_id)
+        .bind(&owner_scope)
+        .bind(run_id)
+        .bind(dimension)
+        .bind(amount)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
+async fn settle_pm_resource_budget(
+    db: &sqlx::SqlitePool,
+    run_id: &str,
+    payload: &PmRunFinishPayload,
+) -> Result<(), sqlx::Error> {
+    let Some(run) = sqlx::query::<Sqlite>(
+        "SELECT tenant_id, user_id, total_elapsed_ms
+         FROM pm_research_runs WHERE run_id = ? LIMIT 1",
+    )
+    .bind(run_id)
+    .fetch_optional(db)
+    .await?
+    else {
+        return Ok(());
+    };
+    let tenant_id = run.try_get::<String, _>(0)?;
+    let user_id = run.try_get::<String, _>(1)?;
+    let elapsed_ms = payload
+        .total_elapsed_ms
+        .or_else(|| {
+            run.try_get::<Option<i64>, _>(2)
+                .ok()
+                .flatten()
+                .and_then(|value| u64::try_from(value).ok())
+        })
+        .unwrap_or_default();
+    let tool_calls = sqlx::query_scalar::<Sqlite, i64>(
+        "SELECT COUNT(*) FROM pm_research_tool_call_ledger WHERE run_id = ?",
+    )
+    .bind(run_id)
+    .fetch_one(db)
+    .await
+    .unwrap_or_default()
+    .max(0) as u64;
+    let web_queries = sqlx::query_scalar::<Sqlite, i64>(
+        "SELECT COUNT(*) FROM pm_research_tool_call_ledger
+         WHERE run_id = ? AND (
+             LOWER(tool_name) LIKE '%search%' OR LOWER(tool_name) LIKE '%fetch%'
+             OR LOWER(tool_name) LIKE '%browser%' OR LOWER(tool_name) LIKE '%web%'
+         )",
+    )
+    .bind(run_id)
+    .fetch_one(db)
+    .await
+    .unwrap_or_default()
+    .max(0) as u64;
+    let owner_scope = format!("user:{user_id}:pm:{run_id}");
+    let actuals = [
+        ("wall_time_ms", elapsed_ms),
+        ("tool_calls", tool_calls),
+        ("web_queries", web_queries),
+    ];
+    let mut transaction = db.begin().await?;
+    for (dimension, actual) in actuals {
+        let reserved = sqlx::query_scalar::<Sqlite, i64>(
+            "SELECT reserved FROM resource_budget_accounts
+             WHERE tenant_id = ? AND owner_scope = ? AND dimension = ?",
+        )
+        .bind(&tenant_id)
+        .bind(&owner_scope)
+        .bind(dimension)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .unwrap_or_default()
+        .max(0);
+        let actual_i64 = i64::try_from(actual).unwrap_or(i64::MAX);
+        let committed = actual_i64.min(reserved);
+        let available = reserved.saturating_sub(committed);
+        let settlement_state = if actual_i64 > reserved {
+            "overrun_blocked"
+        } else if payload.status == "cancelled" && committed == 0 {
+            "released"
+        } else {
+            "committed"
+        };
+        sqlx::query::<Sqlite>(
+            "UPDATE resource_budget_accounts
+             SET available = ?, reserved = 0, committed = ?
+             WHERE tenant_id = ? AND owner_scope = ? AND dimension = ?",
+        )
+        .bind(available)
+        .bind(committed)
+        .bind(&tenant_id)
+        .bind(&owner_scope)
+        .bind(dimension)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query::<Sqlite>(
+            "INSERT INTO resource_budget_entries
+                (id, tenant_id, owner_scope, reservation_id, dimension, amount, state, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+             ON CONFLICT(id) DO UPDATE SET
+                 amount = excluded.amount,
+                 state = excluded.state",
+        )
+        .bind(format!("pm-budget:{run_id}:{dimension}:settle"))
+        .bind(&tenant_id)
+        .bind(&owner_scope)
+        .bind(run_id)
+        .bind(dimension)
+        .bind(actual_i64)
+        .bind(settlement_state)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
 pub async fn persist_pm_run_start(
     db: &sqlx::SqlitePool,
     run_id: &str,
@@ -289,6 +459,14 @@ pub async fn persist_pm_run_start(
             session_id = %session_id,
             error = %error,
             "persist_pm_run_start failed"
+        );
+    }
+    if let Err(error) = reserve_pm_resource_budget(db, run_id, tenant_id, user_id, config).await {
+        tracing::warn!(
+            run_id = %run_id,
+            tenant_id = %tenant_id,
+            error = %error,
+            "failed to reserve PM semantic-kernel resource budget"
         );
     }
 }
@@ -791,6 +969,14 @@ pub async fn persist_pm_run_finish(
                 );
             }
         }
+    }
+    if let Err(error) = settle_pm_resource_budget(db, run_id, payload).await {
+        tracing::warn!(
+            run_id = %run_id,
+            status = %payload.status,
+            error = %error,
+            "failed to settle PM semantic-kernel resource budget"
+        );
     }
 }
 
@@ -2168,6 +2354,7 @@ pub async fn upsert_pm_retry_not_before_ms(
 mod tests {
     use super::{
         persist_pm_run_finish, protect_pm_ledger_value, protected_persistence_json,
+        reserve_pm_resource_budget, settle_pm_resource_budget, PmRunConfigSnapshot,
         PmRunFinishPayload,
     };
     use sqlx::Row;
@@ -2202,6 +2389,39 @@ mod tests {
                 .execute(&db)
                 .await
                 .expect("create PM finish test table");
+        }
+        db
+    }
+
+    async fn pm_budget_test_db() -> sqlx::SqlitePool {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+        for statement in [
+            "CREATE TABLE resource_budget_accounts (
+                tenant_id TEXT NOT NULL, owner_scope TEXT NOT NULL, dimension TEXT NOT NULL,
+                available INTEGER NOT NULL, reserved INTEGER NOT NULL, committed INTEGER NOT NULL,
+                PRIMARY KEY (tenant_id, owner_scope, dimension)
+            )",
+            "CREATE TABLE resource_budget_entries (
+                id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, owner_scope TEXT NOT NULL,
+                reservation_id TEXT NOT NULL, dimension TEXT NOT NULL, amount INTEGER NOT NULL,
+                state TEXT NOT NULL, created_at TEXT NOT NULL
+            )",
+            "CREATE TABLE pm_research_runs (
+                run_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, user_id TEXT NOT NULL,
+                total_elapsed_ms INTEGER
+            )",
+            "CREATE TABLE pm_research_tool_call_ledger (
+                run_id TEXT NOT NULL, call_seq INTEGER NOT NULL, tool_name TEXT NOT NULL
+            )",
+        ] {
+            sqlx::query(statement)
+                .execute(&db)
+                .await
+                .expect("create PM budget test table");
         }
         db
     }
@@ -2270,6 +2490,82 @@ mod tests {
                 assert!(row.get::<Option<String>, _>(3).is_some());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn pm_resource_budget_reserves_and_settles_without_oversell() {
+        let db = pm_budget_test_db().await;
+        let config = PmRunConfigSnapshot {
+            budget_profile: "test".to_string(),
+            pipeline_timeout_secs: 10,
+            deadline_timeout_secs: 15,
+            max_attempts: 2,
+            source_slot_search_secs: 2,
+            source_slot_browser_secs: 2,
+            source_slot_api_fetch_secs: 2,
+            retrieve_max_tool_calls: 5,
+            max_calls_per_source: 2,
+        };
+        reserve_pm_resource_budget(&db, "run-1", "tenant", "user", &config)
+            .await
+            .expect("reserve PM budget");
+        sqlx::query(
+            "INSERT INTO pm_research_runs (run_id, tenant_id, user_id, total_elapsed_ms)
+             VALUES ('run-1', 'tenant', 'user', 1200)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO pm_research_tool_call_ledger (run_id, call_seq, tool_name)
+             VALUES ('run-1', 1, 'WebSearch'), ('run-1', 2, 'REPL')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        settle_pm_resource_budget(
+            &db,
+            "run-1",
+            &PmRunFinishPayload {
+                status: "completed".to_string(),
+                current_stage: Some("done".to_string()),
+                attempt: Some(1),
+                total_elapsed_ms: Some(1_200),
+                error_code: None,
+                error_message: None,
+                final_quality_score: Some(0.9),
+                metadata: None,
+            },
+        )
+        .await
+        .expect("settle PM budget");
+
+        let wall = sqlx::query(
+            "SELECT available, reserved, committed FROM resource_budget_accounts
+             WHERE tenant_id = 'tenant' AND dimension = 'wall_time_ms'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(wall.get::<i64, _>(0), 8_800);
+        assert_eq!(wall.get::<i64, _>(1), 0);
+        assert_eq!(wall.get::<i64, _>(2), 1_200);
+        let tool_committed: i64 = sqlx::query_scalar(
+            "SELECT committed FROM resource_budget_accounts
+             WHERE tenant_id = 'tenant' AND dimension = 'tool_calls'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let web_committed: i64 = sqlx::query_scalar(
+            "SELECT committed FROM resource_budget_accounts
+             WHERE tenant_id = 'tenant' AND dimension = 'web_queries'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(tool_committed, 2);
+        assert_eq!(web_committed, 1);
     }
 
     #[test]

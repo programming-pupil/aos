@@ -46,4 +46,27 @@ describe("reconcilePmHistoryTerminalAssistant", () => {
 
     expect(result[0].content).toBe("最终完整答案");
   });
+
+  it("keeps the durable final-delivery projection on the historical reply", () => {
+    const artifact = {
+      schemaVersion: "pm-final-delivery-v1",
+      taskId: "task-1",
+      taskStatus: "completed",
+      qualityStatus: "passed",
+      deliveryStatus: "persisted",
+      response: { text: "最终完整答案" },
+      stages: [],
+      contentHash: "hash",
+    };
+    const result = reconcilePmHistoryTerminalAssistant(
+      [assistant("最终完整答案")],
+      "最终完整答案",
+      {
+        taskId: "task-1",
+        taskStatus: "completed",
+        pmFinalDelivery: artifact,
+      },
+    );
+    expect(result[0].pmFinalDelivery).toBe(artifact);
+  });
 });

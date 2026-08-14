@@ -1664,6 +1664,16 @@ export interface PmSessionHistoryReplay {
   task_id: string;
   status: string;
   events: PmSessionHistoryReplayEvent[];
+  delivery_artifacts?: Array<{
+    schemaVersion: string;
+    taskId: string;
+    taskStatus: string;
+    qualityStatus: string;
+    deliveryStatus: string;
+    response?: Record<string, unknown> | null;
+    stages: Array<Record<string, unknown>>;
+    contentHash: string;
+  }>;
 }
 
 // Tenant types

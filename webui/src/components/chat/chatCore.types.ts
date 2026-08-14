@@ -6,6 +6,7 @@ import type {
   PmConflictGraph,
   PmConflictRow,
   PmEvidenceTreeNode,
+  PmFinalDeliveryArtifact,
   PmReportArtifact,
   PmSearchUsageSummary,
 } from './chatCore.pmTypes';
@@ -30,6 +31,7 @@ export interface DisplayMessage {
   pmTaskId?: string;
   pmTaskStatus?: string;
   pmReport?: PmReportArtifact;
+  pmFinalDelivery?: PmFinalDeliveryArtifact;
   pmSearchUsage?: PmSearchUsageSummary;
   traceEvents?: Record<string, unknown>[];
   modelName?: string;

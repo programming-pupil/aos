@@ -144,6 +144,8 @@ export function PmResearchStatusCard({
 
 function stageStatusText(t: TFunction, status: PmStageStatus): string {
   if (status === "completed") return t("operations.statusCompleted", "已完成");
+  if (status === "degraded") return t("operations.statusDegraded", "降级完成");
+  if (status === "skipped") return t("operations.statusSkipped", "不适用");
   if (status === "failed") return t("operations.statusFailed", "失败");
   if (status === "running") return t("operations.statusRunning", "运行中");
   return t("common.pending", "待处理");
@@ -151,6 +153,7 @@ function stageStatusText(t: TFunction, status: PmStageStatus): string {
 
 function stageStatusColor(status: PmStageStatus): string {
   if (status === "completed") return "success";
+  if (status === "degraded") return "warning";
   if (status === "failed") return "error";
   if (status === "running") return "processing";
   return "default";

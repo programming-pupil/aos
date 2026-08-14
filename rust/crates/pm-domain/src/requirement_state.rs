@@ -227,17 +227,16 @@ pub fn apply_delta(
     if let Some(frame) = delta.problem_frame {
         next.problem_frame = frame;
     }
-    next.stakeholders.extend(delta.add_stakeholders);
-    next.jobs.extend(delta.add_jobs);
-    next.pains.extend(delta.add_pains);
-    next.desired_outcomes.extend(delta.add_outcomes);
-    next.constraints.extend(delta.add_constraints);
-    next.assumptions.extend(delta.add_assumptions);
-    next.open_questions.extend(delta.add_questions);
-    next.acceptance_criteria
-        .extend(delta.add_acceptance_criteria);
-    next.evidence_links.extend(delta.add_evidence_links);
-    next.experiments.extend(delta.add_experiments);
+    extend_unique(&mut next.stakeholders, delta.add_stakeholders);
+    extend_unique(&mut next.jobs, delta.add_jobs);
+    extend_unique(&mut next.pains, delta.add_pains);
+    extend_unique(&mut next.desired_outcomes, delta.add_outcomes);
+    extend_unique(&mut next.constraints, delta.add_constraints);
+    extend_unique(&mut next.assumptions, delta.add_assumptions);
+    extend_unique(&mut next.open_questions, delta.add_questions);
+    extend_unique(&mut next.acceptance_criteria, delta.add_acceptance_criteria);
+    extend_unique(&mut next.evidence_links, delta.add_evidence_links);
+    extend_unique(&mut next.experiments, delta.add_experiments);
     if let Some(readiness) = delta.readiness {
         if matches!(
             readiness,
@@ -249,6 +248,14 @@ pub fn apply_delta(
         next.readiness = readiness;
     }
     Ok(next)
+}
+
+fn extend_unique<T: PartialEq>(target: &mut Vec<T>, values: Vec<T>) {
+    for value in values {
+        if !target.contains(&value) {
+            target.push(value);
+        }
+    }
 }
 
 pub fn is_ready_for_review(state: &RequirementState) -> bool {
@@ -287,6 +294,7 @@ mod tests {
     fn state_delta_is_incremental_and_gated() {
         let state = RequirementState::default();
         let mut delta = RequirementStateDelta::default();
+        delta.source_event_ids = vec!["event-1".into()];
         delta.problem_frame = Some(Some(ProblemFrame {
             statement: "reduce latency".into(),
             confirmed: true,
@@ -313,7 +321,10 @@ mod tests {
         let next = apply_delta(&state, delta.clone(), &[]).unwrap();
         assert_eq!(next.version, 1);
         assert!(is_ready_for_review(&next));
-        assert!(apply_delta(&next, delta, &[].as_ref()).is_ok());
+        assert!(matches!(
+            apply_delta(&next, delta, &["event-1".to_string()]),
+            Err(RequirementDeltaError::DuplicateEvent(id)) if id == "event-1"
+        ));
     }
     #[test]
     fn next_question_uses_information_value_not_fixed_order() {

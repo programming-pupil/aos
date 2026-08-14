@@ -2261,6 +2261,37 @@ impl runtime::CompactionHook for RuntimeCompactionHook {
         )
         .await;
 
+        // Keep the compaction boundary in the semantic-kernel store as well as
+        // the runtime session log. The checkpoint contains only protected
+        // summary metadata and source coverage; the exact archived messages
+        // remain in the session archive and can be re-read by their owner.
+        let source_event_sequences = (0..archived_messages.len())
+            .map(|index| u64::try_from(index.saturating_add(1)).unwrap_or(u64::MAX))
+            .collect::<Vec<_>>();
+        let checkpoint = serde_json::json!({
+            "schemaVersion": "compaction-checkpoint-v1",
+            "threadId": self.session_id.as_str(),
+            "archivedMessageCount": archived_messages.len(),
+            "summary": default_summary,
+            "sourceCoverage": source_event_sequences.clone(),
+        });
+        if let Err(error) = crate::semantic_kernel_store::persist_compaction_checkpoint(
+            &self.db,
+            &self.tenant_id,
+            &self.session_id,
+            &source_event_sequences,
+            &checkpoint,
+        )
+        .await
+        {
+            tracing::warn!(
+                tenant_id = %self.tenant_id,
+                session_id = %self.session_id,
+                error = %error,
+                "semantic compaction checkpoint persistence degraded; runtime archive remains authoritative"
+            );
+        }
+
         // 2. Protect pinned items: append their contents verbatim to the summary
         //    so summarization can never drop them (Req 4.9). The runtime commits
         //    with `compact_session_with_summary` using this returned summary.

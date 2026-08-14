@@ -1690,6 +1690,8 @@
     "detail": "详情",
     "statusRunning": "运行中",
     "statusCompleted": "已完成",
+    "statusDegraded": "降级完成",
+    "statusSkipped": "不适用",
     "statusFailed": "失败",
     "statusQueued": "排队中",
     "statusCancelling": "取消中",

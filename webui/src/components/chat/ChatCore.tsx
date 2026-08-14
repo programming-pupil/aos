@@ -243,6 +243,7 @@ import type {
   PmConflictGraph,
   PmConflictRow,
   PmEvidenceTreeNode,
+  PmFinalDeliveryArtifact,
   PmInlineAction,
   PmInlineSegment,
   PmLiveToolEvent,
@@ -761,11 +762,26 @@ function isPmLightweightChatDetail(
 }
 
 function normalizePmStageStatus(input?: string): PmStageStatus {
-  if (input === "completed" || input === "failed" || input === "pending") {
+  if (
+    input === "completed" ||
+    input === "degraded" ||
+    input === "skipped" ||
+    input === "failed" ||
+    input === "pending"
+  ) {
     return input;
   }
   if (input === "cancelled") return "failed";
   return "running";
+}
+
+function isPmStageTerminal(status: PmStageStatus | undefined): boolean {
+  return (
+    status === "completed" ||
+    status === "degraded" ||
+    status === "skipped" ||
+    status === "failed"
+  );
 }
 
 function normalizePmTaskEventStage(event: ApiPmResearchTaskEvent): string {
@@ -786,6 +802,8 @@ function normalizePmTaskEventStageStatus(
 ): PmStageStatus {
   const status = (event.status ?? "").toLowerCase();
   if (status === "completed") return "completed";
+  if (status === "degraded") return "degraded";
+  if (status === "skipped") return "skipped";
   if (status === "failed" || status === "cancelled") return "failed";
   if (status === "running" || status === "cancelling") return "running";
   return "pending";
@@ -1852,9 +1870,11 @@ function toReadableStageDetail(
       detail.qualityGatePassed === true || detail.qualityGatePassed === false
         ? qualityGatePassed
           ? "质量通过"
-          : answerLength != null && answerLength > 0
-            ? "质量未通过（已生成保守结论）"
-            : "质量未通过（正在生成保守结论）"
+          : deliverable || qualityLevel === "partial" || (answerLength ?? 0) > 0
+            ? "证据覆盖部分达标（结论已降级交付）"
+            : stageStatus === "running"
+              ? "正在补齐证据并校验结论"
+              : "质量校验未达到交付标准"
         : "",
     ].filter(Boolean);
     if (parts.length > 0) return withBudget(parts.join(" · "));
@@ -2924,7 +2944,8 @@ function mergeHistoryAssistantMessages(
     ),
     pmTaskId: incoming.pmTaskId ?? base.pmTaskId,
     pmTaskStatus: incoming.pmTaskStatus ?? base.pmTaskStatus,
-      pmReport: incoming.pmReport ?? base.pmReport,
+    pmReport: incoming.pmReport ?? base.pmReport,
+    pmFinalDelivery: incoming.pmFinalDelivery ?? base.pmFinalDelivery,
     attributionTaskId: incoming.attributionTaskId ?? base.attributionTaskId,
     superAssistantTurnId:
       incoming.superAssistantTurnId ?? base.superAssistantTurnId,
@@ -3739,6 +3760,9 @@ function mapHistoryMessages(
       if (!last.pmReport && msg.pmReport) {
         last.pmReport = msg.pmReport;
       }
+      if (!last.pmFinalDelivery && msg.pmFinalDelivery) {
+        last.pmFinalDelivery = msg.pmFinalDelivery;
+      }
       if (last.timestamp == null && msg.timestamp != null) {
         last.timestamp = msg.timestamp;
       }
@@ -3770,6 +3794,7 @@ function mapHistoryMessages(
         pmTaskId: msg.pmTaskId ?? last.pmTaskId,
         pmTaskStatus: msg.pmTaskStatus ?? last.pmTaskStatus,
         pmReport: msg.pmReport ?? last.pmReport,
+        pmFinalDelivery: msg.pmFinalDelivery ?? last.pmFinalDelivery,
         pmSearchUsage: mergeDisplayMessageSearchUsage(
           last.pmSearchUsage,
           msg.pmSearchUsage,
@@ -3786,6 +3811,74 @@ function mapHistoryMessages(
   }
 
   return normalized;
+}
+
+export function attachPmFinalDeliveryArtifacts(
+  messages: DisplayMessage[],
+  rawArtifacts: unknown,
+): DisplayMessage[] {
+  if (!Array.isArray(rawArtifacts) || rawArtifacts.length === 0) return messages;
+  const byTaskId = new Map<string, PmFinalDeliveryArtifact>();
+  for (const raw of rawArtifacts) {
+    if (!raw || typeof raw !== "object") continue;
+    const value = raw as Partial<PmFinalDeliveryArtifact>;
+    if (typeof value.taskId !== "string" || !value.taskId.trim()) continue;
+    if (typeof value.contentHash !== "string") continue;
+    byTaskId.set(value.taskId, value as PmFinalDeliveryArtifact);
+  }
+  if (byTaskId.size === 0) return messages;
+  const attached = new Set<string>();
+  const next = messages.map((message) => {
+    if (message.role !== "assistant") return message;
+    const taskId = message.pmTaskId;
+    let artifact = taskId ? byTaskId.get(taskId) : undefined;
+    // Older history rows may not carry pm_task_id even though the backend
+    // reconstructed a durable task binding. Match the persisted terminal text
+    // before creating a synthetic row, so refresh never loses the report card.
+    if (!artifact) {
+      const messageText = historyContentToPlain(message.content).trim();
+      if (messageText) {
+        artifact = [...byTaskId.values()].find(
+          (candidate) =>
+            !attached.has(candidate.taskId) &&
+            candidate.response?.text?.trim() === messageText,
+        );
+      }
+    }
+    if (!artifact) return message;
+    attached.add(artifact.taskId);
+    const restoredReport = normalizePmReportArtifact(
+      artifact.response?.pm_report,
+    );
+    return {
+      ...message,
+      pmTaskId: message.pmTaskId ?? artifact.taskId,
+      pmTaskStatus: message.pmTaskStatus ?? artifact.taskStatus,
+      pmReport: message.pmReport ?? restoredReport,
+      pmFinalDelivery: artifact,
+    };
+  });
+
+  // A legacy session can contain a task row without a visible assistant row
+  // (for example after a crash between task persistence and chat projection).
+  // Materialize the durable response so the user can still read the complete
+  // delivery and its report after reload.
+  for (const artifact of byTaskId.values()) {
+    if (attached.has(artifact.taskId)) continue;
+    const text = artifact.response?.text?.trim();
+    if (!text) continue;
+    next.push({
+      id: `pm-delivery-${artifact.taskId}`,
+      role: "assistant",
+      content: text,
+      pmTaskId: artifact.taskId,
+      pmTaskStatus: artifact.taskStatus,
+      pmReport: normalizePmReportArtifact(artifact.response?.pm_report),
+      pmFinalDelivery: artifact,
+    });
+    attached.add(artifact.taskId);
+  }
+  return next;
 }
 
 function attachSuperAssistantTurnMetadata(
@@ -3857,6 +3950,9 @@ function mergeHistoryPages(
         last.pmTaskStatus = msg.pmTaskStatus;
       }
       if (!last.pmReport && msg.pmReport) last.pmReport = msg.pmReport;
+      if (!last.pmFinalDelivery && msg.pmFinalDelivery) {
+        last.pmFinalDelivery = msg.pmFinalDelivery;
+      }
       if (last.timestamp == null && msg.timestamp != null) {
         last.timestamp = msg.timestamp;
       }
@@ -6276,6 +6372,12 @@ export function ChatCore({
           }),
           res.super_assistant_turns,
         );
+        if (sessionSource === "pm" && res.pm_research) {
+          merged = attachPmFinalDeliveryArtifacts(
+            merged,
+            res.pm_research.delivery_artifacts,
+          );
+        }
         merged = attachMemoryCitationsToMessages(
           merged,
           memoryCitationsResp.items ?? [],
@@ -6291,10 +6393,43 @@ export function ChatCore({
           },
         );
         if (sessionSource === "pm" && res.pm_research) {
+          const latestDeliveryArtifact = Array.isArray(
+            res.pm_research.delivery_artifacts,
+          )
+            ? res.pm_research.delivery_artifacts.find(
+                (artifact) => artifact.taskId === res.pm_research?.task_id,
+              )
+            : undefined;
+          const durableStageEvents = Array.isArray(
+            latestDeliveryArtifact?.stages,
+          )
+            ? latestDeliveryArtifact.stages
+                .filter((raw) => {
+                  const stage = String(raw.stage ?? "").toLowerCase();
+                  return !["done", "failed", "cancelled"].includes(stage);
+                })
+                .map((raw) => ({
+                  task_id: res.pm_research!.task_id,
+                  session_id: sessionId,
+                  status: String(raw.status ?? "completed"),
+                  stage: String(raw.stage ?? ""),
+                  attempt:
+                    typeof raw.attempt === "number" ? raw.attempt : 1,
+                  elapsed_ms: 0,
+                  detail:
+                    raw.detail && typeof raw.detail === "object"
+                      ? (raw.detail as Record<string, unknown>)
+                      : undefined,
+                }))
+            : [];
           const replayEvents = Array.isArray(res.pm_research.events)
             ? res.pm_research.events
             : [];
-          const normalizedReplayDetails = replayEvents.map((event) => {
+          const replayEventsWithProjection = [
+            ...replayEvents,
+            ...durableStageEvents,
+          ];
+          const normalizedReplayDetails = replayEventsWithProjection.map((event) => {
             const detail = normalizePmTaskEventDetail(
               event as ApiPmResearchTaskEvent,
             );
@@ -6310,7 +6445,7 @@ export function ChatCore({
           const replaySearchUsage = buildPmSearchUsageFromEvents(
             normalizedReplayDetails,
           );
-          const replayLooksLikeLightChat = replayEvents.some((event) => {
+          const replayLooksLikeLightChat = replayEventsWithProjection.some((event) => {
             const detail =
               event.detail &&
               typeof event.detail === "object" &&
@@ -6401,11 +6536,11 @@ export function ChatCore({
               ? effectiveTaskStatus
               : null,
           );
-          if (replayEvents.length > 0) {
+          if (replayEventsWithProjection.length > 0) {
             const replayBase = Date.now();
             const restoredStates: Record<string, PmStageState> = {};
             const restoredEvents: PmStageEvent[] = [];
-            replayEvents.forEach((event, idx) => {
+            replayEventsWithProjection.forEach((event, idx) => {
               const stageName = normalizePmTaskEventStage(
                 event as ApiPmResearchTaskEvent,
               );
@@ -9174,9 +9309,14 @@ export function ChatCore({
         let changed = false;
         for (const [key, value] of Object.entries(merged)) {
           if (value.status === "running" || value.status === "pending") {
+            const closedStatus: PmStageStatus = failed
+              ? "failed"
+              : value.status === "pending"
+                ? "skipped"
+                : "completed";
             merged[key] = {
               ...value,
-              status: finalStageStatus,
+              status: closedStatus,
               updatedAt: at,
               detail: {
                 ...(value.detail && typeof value.detail === "object"
@@ -9206,27 +9346,34 @@ export function ChatCore({
           .filter(
             (stage) => stage.status === "running" || stage.status === "pending",
           )
-          .map((stage) => ({
-            stage: stage.stage,
-            status: finalStageStatus,
-            attempt: stage.attempt,
-            detail: {
-              ...(stage.detail && typeof stage.detail === "object"
-                ? (stage.detail as Record<string, unknown>)
-                : {}),
-              terminalTaskStatus: terminalStatus,
-              message: failed
-                ? t(
-                    "operations.pmStageClosedByTerminalFailure",
-                    "任务已结束，阶段已停止",
-                  )
-                : t(
-                    "operations.pmStageClosedByTerminalSuccess",
-                    "任务已完成，阶段已收口",
-                  ),
-            },
-            at,
-          }));
+          .map((stage) => {
+            const closedStatus: PmStageStatus = failed
+              ? "failed"
+              : stage.status === "pending"
+                ? "skipped"
+                : finalStageStatus;
+            return {
+              stage: stage.stage,
+              status: closedStatus,
+              attempt: stage.attempt,
+              detail: {
+                ...(stage.detail && typeof stage.detail === "object"
+                  ? (stage.detail as Record<string, unknown>)
+                  : {}),
+                terminalTaskStatus: terminalStatus,
+                message: failed
+                  ? t(
+                      "operations.pmStageClosedByTerminalFailure",
+                      "任务已结束，阶段已停止",
+                    )
+                  : t(
+                      "operations.pmStageClosedByTerminalSuccess",
+                      "任务已完成，阶段已收口",
+                    ),
+              },
+              at,
+            };
+          });
         if (synthetic.length === 0) return prev;
         const merged = [...prev, ...synthetic].slice(-120);
         pmStageEventsRef.current = merged;
@@ -9271,9 +9418,7 @@ export function ChatCore({
         if (!previousStageState) return false;
         if (attempt < previousStageState.attempt) return true;
         if (attempt > previousStageState.attempt) return false;
-        const prevTerminal =
-          previousStageState.status === "completed" ||
-          previousStageState.status === "failed";
+        const prevTerminal = isPmStageTerminal(previousStageState.status);
         const nextNonTerminal = status === "running" || status === "pending";
         return prevTerminal && nextNonTerminal;
       })();
@@ -9471,6 +9616,31 @@ export function ChatCore({
       }
 
       const pmReport = normalizePmReportArtifact(responseAny?.pm_report);
+      const pmFinalDelivery: PmFinalDeliveryArtifact | undefined =
+        event.task_id && responseAny
+          ? {
+              schemaVersion: "pm-final-delivery-v1",
+              taskId: event.task_id,
+              taskStatus: event.status,
+              qualityStatus: pmQuality?.passed ? "passed" : "degraded",
+              deliveryStatus: "persisted",
+              response: {
+                ...responseAny,
+                pm_report: pmReport,
+              },
+              stages: Object.values(pmStageStatesRef.current).map(
+                (stage, index) => ({
+                  stage: stage.stage,
+                  status: stage.status,
+                  attempt: stage.attempt,
+                  detail: stage.detail,
+                  lastEventSeq: index + 1,
+                  updatedAt: new Date(stage.updatedAt).toISOString(),
+                }),
+              ),
+              contentHash: event.task_id,
+            }
+          : undefined;
       const finalText = resolvePmTerminalMessageText(
         event,
         t("chat.unknownError", "未知错误"),
@@ -9500,6 +9670,7 @@ export function ChatCore({
             taskId: event.task_id,
             taskStatus: event.status,
             pmReport,
+            pmFinalDelivery,
             userMessageId: event.task_id
               ? pmUserMessageIdByTaskIdRef.current[event.task_id]
               : undefined,
@@ -10346,8 +10517,8 @@ export function ChatCore({
       (stage) => stage.id !== "deep_loop" || stage.status !== "pending",
     );
     const denominator = Math.max(visibleStages.length, 1);
-    const terminalCount = visibleStages.filter(
-      (stage) => stage.status === "completed" || stage.status === "failed",
+    const terminalCount = visibleStages.filter((stage) =>
+      isPmStageTerminal(stage.status),
     ).length;
     const hasRunning = visibleStages.some(
       (stage) => stage.status === "running",
@@ -10355,7 +10526,7 @@ export function ChatCore({
     const synthesizeDone = visibleStages.some(
       (stage) =>
         stage.id === "synthesize" &&
-        (stage.status === "completed" || stage.status === "failed"),
+        isPmStageTerminal(stage.status),
     );
     if (!hasRunning && synthesizeDone) {
       return 100;
@@ -11062,6 +11233,10 @@ export function ChatCore({
 
   const latestAssistantPlainText = useMemo(() => {
     if (!latestAssistantMessage) return "";
+    const persistedText = latestAssistantMessage.pmFinalDelivery?.response?.text;
+    if (typeof persistedText === "string" && persistedText.trim()) {
+      return persistedText;
+    }
     return typeof latestAssistantMessage.content === "string"
       ? latestAssistantMessage.content
       : contentToPlain(latestAssistantMessage.content);
@@ -11077,6 +11252,7 @@ export function ChatCore({
       synthStatus: pmStageStates.synthesize?.status,
       backgroundTaskStatus: pmBackgroundTaskStatus,
       latestTaskStatus: latestAssistantMessage?.pmTaskStatus,
+      deliveryArtifact: latestAssistantMessage?.pmFinalDelivery,
       body: latestAssistantPlainText,
     });
   }, [
@@ -11104,12 +11280,21 @@ export function ChatCore({
     [latestAssistantPlainText],
   );
 
+  const pmPersistedDeliveryQuality = useMemo(
+    () =>
+      normalizePmQualitySnapshot(
+        latestAssistantMessage?.pmFinalDelivery?.response?.pm_quality,
+      ),
+    [latestAssistantMessage?.pmFinalDelivery?.response?.pm_quality],
+  );
+
   const pmFinalDeliverySources = useMemo(() => {
     const merged: string[] = [];
     merged.push(...(pmQualitySnapshot?.citations ?? []));
+    merged.push(...(pmPersistedDeliveryQuality?.citations ?? []));
     merged.push(...extractAllUrls(latestAssistantPlainText));
     return sanitizeEvidenceUrls(merged, { dedupeByDomain: true, limit: 8 });
-  }, [latestAssistantPlainText, pmQualitySnapshot?.citations]);
+  }, [latestAssistantPlainText, pmPersistedDeliveryQuality?.citations, pmQualitySnapshot?.citations]);
 
   const pmQualityCitationUrls = useMemo(
     () =>
@@ -11480,8 +11665,43 @@ export function ChatCore({
               msg.role === "assistant" && hasNl2sqlAuditToolCalls(msg.toolCalls) ? (
                 <Nl2sqlAuditPanel toolCalls={msg.toolCalls} />
               ) : undefined;
-            const attachPmTailPanel =
+            const persistedDeliveryBody =
+              msg.pmFinalDelivery?.response?.text?.trim() ||
+              (msg.role === "assistant" ? contentToPlain(msg.content).trim() : "");
+            const persistedDeliveryQuality = normalizePmQualitySnapshot(
+              msg.pmFinalDelivery?.response?.pm_quality,
+            );
+            const persistedDeliveryUrls = sanitizeEvidenceUrls(
+              [
+                ...(persistedDeliveryQuality?.citations ?? []),
+                ...extractAllUrls(persistedDeliveryBody),
+              ],
+              { dedupeByDomain: true, limit: 8 },
+            );
+            const persistedPmDeliveryPanel =
               msg.role === "assistant" &&
+              msg.pmFinalDelivery?.deliveryStatus === "persisted" &&
+              persistedDeliveryBody ? (
+                <PmFinalDeliveryPanel
+                  t={t}
+                  title={extractPmDeliveryTitle(
+                    persistedDeliveryBody,
+                    t("operations.pmFinalDeliveryTitle", "研究交付总结"),
+                  )}
+                  highlights={extractPmDeliveryHighlights(
+                    persistedDeliveryBody,
+                    4,
+                  )}
+                  sources={persistedDeliveryUrls.map((url) => ({
+                    url,
+                    label: extractUrlDomain(url) ?? url,
+                  }))}
+                  body={persistedDeliveryBody}
+                />
+              ) : undefined;
+            const attachPmTailPanel =
+              persistedPmDeliveryPanel ??
+              (msg.role === "assistant" &&
               latestAssistantMessage?.id === msg.id ? (
                 pmFinalDeliveryPanel && pmEvidenceInlinePanel ? (
                   <div style={{ display: "grid", gap: 10 }}>
@@ -11491,7 +11711,7 @@ export function ChatCore({
                 ) : (
                   (pmFinalDeliveryPanel ?? pmEvidenceInlinePanel ?? undefined)
                 )
-              ) : undefined;
+              ) : undefined);
             const pmReplyExecutionAction =
               sessionSource === "pm" &&
               msg.role === "assistant" &&

@@ -17,6 +17,7 @@ full = ["agent", "pm", "nl2sql", "rd", "bot-agents", "projects"]
 
 [dependencies]
 agent-gateway = { path = "../agent-gateway" }
+agent-protocol = { path = "../agent-protocol" }
 api = { path = "../api" }
 billing = { path = "../billing" }
 pm-domain = { path = "../pm-domain" }

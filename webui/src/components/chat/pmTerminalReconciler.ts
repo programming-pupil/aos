@@ -1,4 +1,4 @@
-import type { PmReportArtifact } from "./chatCore.pmTypes";
+import type { PmFinalDeliveryArtifact, PmReportArtifact } from "./chatCore.pmTypes";
 import type { DisplayMessage } from "./chatCore.types";
 import { contentToPlain } from "./chatCore.utils";
 
@@ -26,7 +26,8 @@ export function compactPmDuplicateTaskReplies(messages: DisplayMessage[]): Displ
           (!incomingPlain.startsWith("研究任务失败：") &&
             (existingPlain.startsWith("研究任务失败：") ||
               incomingPlain.length > existingPlain.length)) ||
-          (!!msg.pmReport && !existing.pmReport);
+          (!!msg.pmReport && !existing.pmReport) ||
+          (!!msg.pmFinalDelivery && !existing.pmFinalDelivery);
         if (incomingIsRicher) {
           out[existingIdx] = {
             ...existing,
@@ -38,6 +39,7 @@ export function compactPmDuplicateTaskReplies(messages: DisplayMessage[]): Displ
               msg.thinkingDurationMs ?? existing.thinkingDurationMs,
             pmTaskStatus: msg.pmTaskStatus ?? existing.pmTaskStatus,
             pmReport: msg.pmReport ?? existing.pmReport,
+            pmFinalDelivery: msg.pmFinalDelivery ?? existing.pmFinalDelivery,
             pmSearchUsage: msg.pmSearchUsage ?? existing.pmSearchUsage,
             traceEvents: msg.traceEvents ?? existing.traceEvents,
           };
@@ -60,6 +62,7 @@ export function reconcilePmHistoryTerminalAssistant(
     taskId?: string | null;
     taskStatus?: string | null;
     pmReport?: PmReportArtifact;
+    pmFinalDelivery?: PmFinalDeliveryArtifact;
     userMessageId?: string | null;
     preserveRicherContent?: boolean;
   },
@@ -83,6 +86,7 @@ export function reconcilePmHistoryTerminalAssistant(
     pmTaskId: taskId ?? existing?.pmTaskId,
     pmTaskStatus: taskStatus ?? existing?.pmTaskStatus,
     pmReport: taskMeta?.pmReport ?? existing?.pmReport,
+    pmFinalDelivery: taskMeta?.pmFinalDelivery ?? existing?.pmFinalDelivery,
     pmSearchUsage: existing?.pmSearchUsage,
     traceEvents: existing?.traceEvents,
   });
@@ -93,7 +97,9 @@ export function reconcilePmHistoryTerminalAssistant(
       const hasFreshMeta =
         (!!taskId && current.pmTaskId !== taskId) ||
         (!!taskStatus && current.pmTaskStatus !== taskStatus) ||
-        (!!taskMeta?.pmReport && current.pmReport !== taskMeta.pmReport);
+        (!!taskMeta?.pmReport && current.pmReport !== taskMeta.pmReport) ||
+        (!!taskMeta?.pmFinalDelivery &&
+          current.pmFinalDelivery !== taskMeta.pmFinalDelivery);
       if (!hasFreshMeta) return compactPmDuplicateTaskReplies(next);
     }
     if (
@@ -106,6 +112,8 @@ export function reconcilePmHistoryTerminalAssistant(
         pmTaskId: taskId ?? current.pmTaskId,
         pmTaskStatus: taskStatus ?? current.pmTaskStatus,
         pmReport: taskMeta.pmReport ?? current.pmReport,
+        pmFinalDelivery:
+          taskMeta.pmFinalDelivery ?? current.pmFinalDelivery,
       };
       return compactPmDuplicateTaskReplies(next);
     }

@@ -1,6 +1,7 @@
 import { Space, Typography } from "antd";
 import type { TFunction } from "i18next";
 import { Markdown } from "./markdownRenderer";
+import type { PmFinalDeliveryArtifact } from "./chatCore.pmTypes";
 
 const { Text } = Typography;
 
@@ -26,6 +27,7 @@ export function shouldShowPmFinalDelivery({
   synthStatus,
   backgroundTaskStatus,
   latestTaskStatus,
+  deliveryArtifact,
   body,
 }: {
   sessionSource: string;
@@ -36,6 +38,7 @@ export function shouldShowPmFinalDelivery({
   synthStatus?: string | null;
   backgroundTaskStatus?: string | null;
   latestTaskStatus?: string | null;
+  deliveryArtifact?: PmFinalDeliveryArtifact;
   body: string;
 }): boolean {
   if (
@@ -48,7 +51,13 @@ export function shouldShowPmFinalDelivery({
     return false;
   }
   const normalizedLatestStatus = latestTaskStatus?.toLowerCase() ?? null;
+  const artifactReady =
+    deliveryArtifact?.deliveryStatus === "persisted" &&
+    ["completed", "degraded"].includes(
+      deliveryArtifact.taskStatus.toLowerCase(),
+    );
   const completed =
+    artifactReady ||
     synthStatus === "completed" ||
     backgroundTaskStatus === "completed" ||
     normalizedLatestStatus === "completed";

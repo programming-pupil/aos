@@ -1690,6 +1690,8 @@
     "detail": "Detail",
     "statusRunning": "Running",
     "statusCompleted": "Completed",
+    "statusDegraded": "Completed with limitations",
+    "statusSkipped": "Not applicable",
     "statusFailed": "Failed",
     "statusQueued": "Queued",
     "statusCancelling": "Cancelling",

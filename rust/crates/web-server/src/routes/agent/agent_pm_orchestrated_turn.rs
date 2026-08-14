@@ -1072,7 +1072,7 @@ async fn enrich_pm_report_strategy_with_semantic_extraction(
     if !pm_should_run_report_semantic_extraction(user_message, plan) {
         on_stage(
             "report_extract",
-            "completed",
+            "skipped",
             1,
             Some(serde_json::json!({
                 "mode": "business_report_strategy",
@@ -1105,7 +1105,7 @@ async fn enrich_pm_report_strategy_with_semantic_extraction(
     let Some(handle) = manager.get_session(session_id).await else {
         on_stage(
             "report_extract",
-            "completed",
+            "degraded",
             1,
             Some(serde_json::json!({
                 "mode": "business_report_strategy",
@@ -1141,7 +1141,7 @@ async fn enrich_pm_report_strategy_with_semantic_extraction(
         Err(error) => {
             on_stage(
                 "report_extract",
-                "completed",
+                "degraded",
                 1,
                 Some(serde_json::json!({
                     "mode": "business_report_strategy",
@@ -1193,7 +1193,7 @@ async fn enrich_pm_report_strategy_with_semantic_extraction(
                 );
                 on_stage(
                     "report_extract",
-                    "completed",
+                    "degraded",
                     1,
                     Some(serde_json::json!({
                         "mode": "business_report_strategy",
@@ -1210,7 +1210,7 @@ async fn enrich_pm_report_strategy_with_semantic_extraction(
                 let applied = apply_pm_report_semantic_extraction(plan, &extraction);
                 on_stage(
                     "report_extract",
-                    "completed",
+                    if applied { "completed" } else { "degraded" },
                     1,
                     Some(serde_json::json!({
                         "mode": "business_report_strategy",
@@ -1236,7 +1236,7 @@ async fn enrich_pm_report_strategy_with_semantic_extraction(
             } else {
                 on_stage(
                     "report_extract",
-                    "completed",
+                    "degraded",
                     1,
                     Some(serde_json::json!({
                         "mode": "business_report_strategy",
@@ -1253,7 +1253,7 @@ async fn enrich_pm_report_strategy_with_semantic_extraction(
         Err(error) => {
             on_stage(
                 "report_extract",
-                "completed",
+                "degraded",
                 1,
                 Some(serde_json::json!({
                     "mode": "business_report_strategy",
@@ -1318,6 +1318,28 @@ pub(super) async fn run_pm_orchestrated_turn(
     let run_id = run_id_hint
         .map(std::string::ToString::to_string)
         .unwrap_or_else(|| format!("pm-run-{}", uuid::Uuid::new_v4()));
+    let memory_instruction = match crate::semantic_kernel_store::load_pm_requirement_state_context(
+        db, tenant_id, session_id,
+    )
+    .await
+    {
+        Ok(Some(requirement_context)) => Some(match memory_instruction {
+            Some(existing) if !existing.trim().is_empty() => {
+                format!("{existing}\n\n{requirement_context}")
+            }
+            _ => requirement_context,
+        }),
+        Ok(None) => memory_instruction,
+        Err(error) => {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                session_id = %session_id,
+                error = %error,
+                "failed to load PM requirement-state context"
+            );
+            memory_instruction
+        }
+    };
     let (runtime_budget, budget_snapshot) = resolve_pm_budget_snapshot(db, tenant_id).await;
     persist_pm_run_start(
         db,
@@ -1373,6 +1395,27 @@ pub(super) async fn run_pm_orchestrated_turn(
             )
         })
         .unwrap_or_default();
+    if let Err(error) = crate::semantic_kernel_store::persist_pm_prompt_context_manifest(
+        db,
+        tenant_id,
+        session_id,
+        &run_id,
+        model,
+        session_source,
+        &primary_message,
+        memory_instruction.as_deref(),
+        &session_mcp_servers,
+        &session_skills,
+    )
+    .await
+    {
+        tracing::warn!(
+            run_id = %run_id,
+            tenant_id = %tenant_id,
+            error = %error,
+            "failed to persist PM prompt/context manifest"
+        );
+    }
     let prepared = prepare_pm_orchestration_plan(
         manager.clone(),
         db,
@@ -1391,6 +1434,23 @@ pub(super) async fn run_pm_orchestrated_turn(
     .await?;
 
     let mut plan = prepared.plan;
+    if let Err(error) = crate::semantic_kernel_store::persist_pm_requirement_state_delta(
+        db,
+        tenant_id,
+        session_id,
+        &run_id,
+        user_message,
+        &plan,
+    )
+    .await
+    {
+        tracing::warn!(
+            run_id = %run_id,
+            tenant_id = %tenant_id,
+            error = %error,
+            "failed to persist PM requirement-state delta"
+        );
+    }
     let runtime_budget = prepared.runtime_budget;
     let resume_detail = prepared.resume_detail;
     let resume_skip_planner = prepared.resume_skip_planner;
@@ -1717,6 +1777,7 @@ pub(super) async fn run_pm_orchestrated_turn(
             }
         };
         let mut quality = evaluate_pm_answer_quality(&turn);
+        apply_pm_first_party_quality_policy(&mut quality, &turn.text);
         let _ =
             apply_pm_report_strategy_quality_gate(&mut quality, &plan, user_message, &turn.text);
         on_stage(

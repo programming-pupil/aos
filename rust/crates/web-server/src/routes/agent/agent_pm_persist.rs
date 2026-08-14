@@ -73,6 +73,102 @@ async fn upsert_pm_evidence_graph_edges(
     Ok(())
 }
 
+async fn upsert_semantic_evidence_ledger(
+    db: &sqlx::SqlitePool,
+    rows: &[PmEvidenceGraphEdge],
+) -> Result<(), sqlx::Error> {
+    for row in rows {
+        let excerpt = row.evidence_excerpt.as_deref().unwrap_or_default();
+        let evidence_id = format!(
+            "pm-evidence-{}",
+            sha256_hex(&format!(
+                "{}\n{}\n{}\n{}",
+                row.tenant_id, row.session_id, row.claim_key, row.url
+            ))
+        );
+        let content_hash = sha256_hex(&format!("{}\n{}", row.claim_text, excerpt));
+        let authority = row
+            .domain
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("unknown");
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO evidence_ledger
+                (evidence_id, tenant_id, source_type, source_locator, content_hash,
+                 event_seq, range_json, authority, collected_at)
+             VALUES (?, ?, 'web', ?, ?, NULL, ?, ?, CURRENT_TIMESTAMP)
+             ON CONFLICT(evidence_id) DO UPDATE SET
+                 content_hash = excluded.content_hash,
+                 range_json = excluded.range_json,
+                 authority = excluded.authority,
+                 collected_at = CURRENT_TIMESTAMP",
+        )
+        .bind(evidence_id)
+        .bind(&row.tenant_id)
+        .bind(&row.url)
+        .bind(content_hash)
+        .bind(
+            serde_json::json!({
+                "sessionId": row.session_id,
+                "claimKey": row.claim_key,
+                "relation": row.relation,
+                "excerpt": excerpt,
+                "sourceTool": row.source_tool,
+                "sourceRoute": row.source_route,
+                "confidence": row.confidence,
+            })
+            .to_string(),
+        )
+        .bind(authority)
+        .execute(db)
+        .await?;
+
+        let assertion_id = format!(
+            "pm-assertion-{}",
+            sha256_hex(&format!(
+                "{}\n{}\n{}",
+                row.tenant_id, row.session_id, row.claim_key
+            ))
+        );
+        let assertion_status = match row.relation.as_str() {
+            "supports" => "confirmed",
+            "contradicts" => "contested",
+            _ => "proposed",
+        };
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO semantic_assertions
+                (id, tenant_id, scope_json, subject_json, predicate, value_json,
+                 status, confidence, observed_at, valid_time_json, sensitivity,
+                 retention_policy, version)
+             VALUES (?, ?, ?, ?, 'research_claim', ?, ?, ?, CURRENT_TIMESTAMP,
+                     NULL, 'internal', 'tenant_default', 1)
+             ON CONFLICT(id) DO UPDATE SET
+                 value_json = excluded.value_json,
+                 status = excluded.status,
+                 confidence = excluded.confidence,
+                 observed_at = CURRENT_TIMESTAMP,
+                 version = semantic_assertions.version + 1",
+        )
+        .bind(assertion_id)
+        .bind(&row.tenant_id)
+        .bind(serde_json::json!({"sessionId": row.session_id}).to_string())
+        .bind(serde_json::json!({"claimKey": row.claim_key}).to_string())
+        .bind(
+            serde_json::json!({
+                "text": row.claim_text,
+                "relation": row.relation,
+                "source": row.url,
+            })
+            .to_string(),
+        )
+        .bind(assertion_status)
+        .bind(row.confidence.clamp(0.0, 1.0))
+        .execute(db)
+        .await?;
+    }
+    Ok(())
+}
+
 pub(super) async fn persist_pm_evidence_graph(
     db: &sqlx::SqlitePool,
     tenant_id: &str,
@@ -175,7 +271,8 @@ pub(super) async fn persist_pm_evidence_graph(
             });
         }
     }
-    upsert_pm_evidence_graph_edges(db, &rows).await
+    upsert_pm_evidence_graph_edges(db, &rows).await?;
+    upsert_semantic_evidence_ledger(db, &rows).await
 }
 
 pub(super) fn score_pm_probe_quality(quality: &PmAnswerQualityDto) -> i64 {
@@ -1124,7 +1221,48 @@ pub(crate) async fn persist_pm_source_tool_ledger_batch_direct(
         row.source_slot_id = Some(source_slot_id);
     }
     pm_orchestrator::persistence::upsert_pm_tool_call_ledger_batch_result(db, &batch.ledger_rows)
-        .await
+        .await?;
+    let tenant_id = sqlx::query_scalar::<sqlx::Sqlite, String>(
+        "SELECT tenant_id FROM pm_research_runs WHERE run_id = ? LIMIT 1",
+    )
+    .bind(&batch.source_slot.run_id)
+    .fetch_optional(db)
+    .await?;
+    if let Some(tenant_id) = tenant_id {
+        for row in &batch.ledger_rows {
+            let invocation_id = format!(
+                "pm-tool-{}",
+                sha256_hex(&format!(
+                    "{}:{}:{}",
+                    row.run_id, row.call_seq, row.tool_name
+                ))
+            );
+            let idempotency_key = format!("pm:{}:{}", row.run_id, row.call_seq);
+            let lifecycle_state = if row.is_error { "failed" } else { "completed" };
+            sqlx::query::<sqlx::Sqlite>(
+                "INSERT INTO tool_invocations
+                    (id, tenant_id, thread_id, turn_id, tool_name, lifecycle_state,
+                     idempotency_key, capability_token_id, artifact_id, outcome,
+                     created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                 ON CONFLICT(id) DO UPDATE SET
+                     lifecycle_state = excluded.lifecycle_state,
+                     outcome = excluded.outcome,
+                     updated_at = CURRENT_TIMESTAMP",
+            )
+            .bind(invocation_id)
+            .bind(&tenant_id)
+            .bind(&row.run_id)
+            .bind(&row.run_id)
+            .bind(&row.tool_name)
+            .bind(lifecycle_state)
+            .bind(&idempotency_key)
+            .bind(if row.is_error { "error" } else { "success" })
+            .execute(db)
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) async fn persist_pm_source_slot_and_tool_ledger(

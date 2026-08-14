@@ -5977,6 +5977,7 @@ version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "agent-gateway",
+ "agent-protocol",
  "anyhow",
  "api",
  "async-stream",

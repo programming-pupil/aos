@@ -68,6 +68,19 @@ pub(super) fn evaluate_pm_answer_quality(turn: &agent_gateway::TurnResult) -> Pm
         .filter(|url| is_pm_high_signal_source_url(url))
         .filter(|url| pm_is_citable_url_by_content_chars(url, &websearch_content_chars))
         .collect::<Vec<_>>();
+    // Native Responses search and several MCP providers return citation
+    // metadata in tool results rather than replaying literal URLs into model
+    // text. Those are still real references: the content admission map only
+    // contains URLs with a non-trivial retrieved excerpt. Persist them in the
+    // evidence/quality projection so provider wire differences do not make a
+    // well-grounded report fail every quality gate.
+    citations.extend(
+        websearch_content_chars
+            .keys()
+            .filter(|url| is_pm_high_signal_source_url(url))
+            .filter(|url| pm_is_citable_url_by_content_chars(url, &websearch_content_chars))
+            .cloned(),
+    );
     citations.sort();
     citations.dedup();
     let citation_count = citations.len();

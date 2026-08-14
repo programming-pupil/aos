@@ -180,9 +180,10 @@ pub(super) use super::agent_pm_prompts::{
     build_pm_understand_plan_prompt, extract_pm_preface_visible_text,
 };
 pub(super) use super::agent_pm_quality::{
-    build_pm_direct_answer_quality, build_pm_direct_answer_timeout_fallback,
-    pick_preferred_pm_result, pm_is_deliverable_quality, pm_is_soft_deliverable_quality,
-    pm_quality_delivery_score, pm_synthesize_stage_status, update_best_pm_turn_quality,
+    apply_pm_first_party_quality_policy, build_pm_direct_answer_quality,
+    build_pm_direct_answer_timeout_fallback, pick_preferred_pm_result, pm_is_deliverable_quality,
+    pm_is_soft_deliverable_quality, pm_quality_delivery_score, pm_synthesize_stage_status,
+    update_best_pm_turn_quality,
 };
 pub(super) use super::agent_pm_route_planning::{
     blocked_domains_from_usage, collect_pm_domain_tool_outcomes, collect_pm_turn_domains,

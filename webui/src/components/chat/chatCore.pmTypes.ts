@@ -37,7 +37,13 @@ export type PmStageId =
   | "runtime_wait"
   | "verification_repair";
 
-export type PmStageStatus = "pending" | "running" | "completed" | "failed";
+export type PmStageStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "degraded"
+  | "skipped"
+  | "failed";
 
 export interface PmStageState {
   stage: string;
@@ -112,6 +118,32 @@ export interface PmReportArtifact {
   reportHtml?: string;
   reportJsonV3?: Record<string, unknown>;
   reportHtmlV3?: string;
+}
+
+/** Durable projection written by the PM task finalizer.  It is deliberately
+ * separate from the chat text so a history reload cannot lose the delivery
+ * card when the latest assistant message is reconstructed. */
+export interface PmFinalDeliveryArtifact {
+  schemaVersion: string;
+  taskId: string;
+  taskStatus: string;
+  qualityStatus: string;
+  deliveryStatus: string;
+  response?: {
+    text?: string;
+    pm_quality?: Record<string, unknown>;
+    pm_report?: PmReportArtifact;
+    [key: string]: unknown;
+  } | null;
+  stages: Array<{
+    stage: string;
+    status: string;
+    attempt: number;
+    detail?: Record<string, unknown> | null;
+    lastEventSeq: number;
+    updatedAt: string;
+  }>;
+  contentHash: string;
 }
 
 export interface PmToolSummarySample {

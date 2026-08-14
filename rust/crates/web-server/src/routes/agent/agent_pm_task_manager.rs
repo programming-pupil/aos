@@ -223,6 +223,37 @@ impl PmResearchTaskManager {
         message: Option<&str>,
         detail: Option<serde_json::Value>,
     ) {
+        // Synthesis can produce a usable candidate while the deep loop is
+        // still checking evidence.  Treat that as candidate-ready, not as a
+        // completed stage; the canonical terminal event closes both stages in
+        // one durable projection update.
+        let mut normalized_status = status.to_string();
+        let mut normalized_detail = detail;
+        if stage == "synthesize" && status == "completed" {
+            let deep_loop_running =
+                crate::semantic_kernel_store::load_pm_stage_status(db, task_id, "deep_loop")
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|value| value == "running");
+            if deep_loop_running {
+                normalized_status = "running".to_string();
+                let mut value = normalized_detail.unwrap_or_else(|| serde_json::json!({}));
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "deliveryState".to_string(),
+                        serde_json::Value::String("candidate_ready".to_string()),
+                    );
+                    object.insert(
+                        "humanSummary".to_string(),
+                        serde_json::Value::String(
+                            "候选结论已生成，深度循环仍在完成证据校验。".to_string(),
+                        ),
+                    );
+                }
+                normalized_detail = Some(value);
+            }
+        }
         let evt_opt = {
             let mut guard = self.inner.lock().await;
             guard.get_mut(task_id).and_then(|rec| {
@@ -237,10 +268,10 @@ impl PmResearchTaskManager {
                 }
                 let next_message = message.map(std::string::ToString::to_string);
                 if rec.last_event.stage.as_deref() == Some(stage)
-                    && rec.last_event.status == status
+                    && rec.last_event.status == normalized_status
                     && rec.last_event.attempt == Some(attempt)
                     && rec.last_event.message == next_message
-                    && rec.last_event.detail == detail
+                    && rec.last_event.detail == normalized_detail
                 {
                     return None;
                 }
@@ -260,13 +291,13 @@ impl PmResearchTaskManager {
                 let evt = PmResearchTaskEvent {
                     task_id: task_id.to_string(),
                     session_id: rec.session_id.clone(),
-                    status: status.to_string(),
+                    status: normalized_status.clone(),
                     stage: Some(stage.to_string()),
                     attempt: Some(attempt),
                     message: next_message,
                     elapsed_ms: now_elapsed,
                     stage_elapsed_ms: Some(stage_elapsed),
-                    detail,
+                    detail: normalized_detail.clone(),
                     response: None,
                     error: None,
                 };
@@ -440,7 +471,25 @@ impl PmResearchTaskManager {
         if let Some((evt, rec)) = evt_opt {
             let tx = self.ensure_sender(task_id).await;
             let _ = tx.send(evt);
+            let response_json = rec.last_event.response.clone();
             persist_pm_task_record_and_event(db, telemetry, &rec, &rec.last_event).await;
+            if let Err(error) = crate::semantic_kernel_store::persist_pm_final_delivery(
+                db,
+                &rec.tenant_id,
+                &rec.user_id,
+                &rec.session_id,
+                task_id,
+                normalized_status,
+                response_json.as_ref(),
+            )
+            .await
+            {
+                tracing::warn!(
+                    task_id = %task_id,
+                    error = %error,
+                    "failed to persist PM final delivery artifact"
+                );
+            }
         }
     }
 
@@ -482,6 +531,23 @@ impl PmResearchTaskManager {
             let tx = self.ensure_sender(task_id).await;
             let _ = tx.send(evt);
             persist_pm_task_record_and_event(db, telemetry, &rec, &rec.last_event).await;
+            if let Err(error) = crate::semantic_kernel_store::persist_pm_final_delivery(
+                db,
+                &rec.tenant_id,
+                &rec.user_id,
+                &rec.session_id,
+                task_id,
+                "cancelled",
+                None,
+            )
+            .await
+            {
+                tracing::warn!(
+                    task_id = %task_id,
+                    error = %error,
+                    "failed to persist cancelled PM delivery artifact"
+                );
+            }
         }
     }
 

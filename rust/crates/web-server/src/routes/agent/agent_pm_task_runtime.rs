@@ -22,11 +22,18 @@ pub(super) struct PmTaskRuntimeRow {
 }
 
 fn pm_json_to_opt_string(value: Option<&serde_json::Value>) -> Option<String> {
-    value.map(serde_json::Value::to_string)
+    value.map(serde_json::Value::to_string).map(|value| {
+        runtime::protect_sensitive_text(&value, runtime::configured_data_protection_mode()).value
+    })
 }
 
 fn pm_input_context_to_opt_string(value: Option<&PmTaskInputContext>) -> Option<String> {
-    value.and_then(|ctx| serde_json::to_string(ctx).ok())
+    value
+        .and_then(|ctx| serde_json::to_string(ctx).ok())
+        .map(|value| {
+            runtime::protect_sensitive_text(&value, runtime::configured_data_protection_mode())
+                .value
+        })
 }
 
 pub(super) fn pm_task_worker_id() -> &'static str {
@@ -84,7 +91,11 @@ pub(super) async fn persist_pm_task_record_and_event(
     let detail_json = pm_json_to_opt_string(evt.detail.as_ref());
     let response_json = pm_json_to_opt_string(evt.response.as_ref());
     let input_context_json = pm_input_context_to_opt_string(rec.input_context.as_ref());
-    let checkpoint_json = build_pm_task_checkpoint(evt, rec.cancel_requested, rec.done).to_string();
+    let checkpoint_json = runtime::protect_sensitive_text(
+        &build_pm_task_checkpoint(evt, rec.cancel_requested, rec.done).to_string(),
+        runtime::configured_data_protection_mode(),
+    )
+    .value;
     let attempt_i32 = evt.attempt.and_then(|v| i32::try_from(v).ok());
     let elapsed_i64 = i64::try_from(evt.elapsed_ms).unwrap_or(i64::MAX);
     let stage_elapsed_i64 = evt.stage_elapsed_ms.and_then(|v| i64::try_from(v).ok());
@@ -152,6 +163,32 @@ pub(super) async fn persist_pm_task_record_and_event(
             error
         );
         return;
+    }
+
+    // The PM legacy snapshot remains available for compatibility, but every
+    // event also enters the durable semantic-kernel ledger and the stage
+    // projection.  A migration race must not make an otherwise usable answer
+    // disappear, so legacy persistence is retained as a guarded fallback.
+    if let Err(error) = crate::semantic_kernel_store::append_pm_stage_event(
+        db,
+        &rec.tenant_id,
+        &rec.user_id,
+        &rec.session_id,
+        &evt.task_id,
+        rec.event_seq,
+        serde_json::to_value(evt).unwrap_or(serde_json::Value::Null),
+        evt.stage.as_deref().unwrap_or("running"),
+        &evt.status,
+        evt.attempt.unwrap_or(1),
+        evt.detail.clone(),
+    )
+    .await
+    {
+        tracing::warn!(
+            task_id = %evt.task_id,
+            error = %error,
+            "semantic-kernel PM event append failed; legacy PM snapshot remains authoritative for recovery"
+        );
     }
 
     telemetry
@@ -509,9 +546,38 @@ pub(super) async fn load_claimable_pm_task_runtime_rows(
     .fetch_all(db)
     .await?;
 
-    rows.iter()
+    let candidates = rows
+        .iter()
         .map(|row| pm_task_runtime_row_from_sql(row).map_err(AppError::Database))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut claimable = Vec::with_capacity(candidates.len());
+    for row in candidates {
+        match crate::semantic_kernel_store::repair_ledger_thread(db, &row.tenant_id, &row.task_id)
+            .await
+        {
+            Ok(_) => claimable.push(row),
+            Err(error) => {
+                tracing::error!(
+                    task_id = %row.task_id,
+                    tenant_id = %row.tenant_id,
+                    error = %error,
+                    "quarantining PM task with a corrupt semantic-kernel ledger"
+                );
+                sqlx::query::<sqlx::Sqlite>(
+                    "UPDATE pm_research_tasks
+                     SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
+                         error_message = ?, updated_at = CURRENT_TIMESTAMP
+                     WHERE task_id = ? AND tenant_id = ?",
+                )
+                .bind(format!("semantic-kernel ledger corruption: {error}"))
+                .bind(&row.task_id)
+                .bind(&row.tenant_id)
+                .execute(db)
+                .await?;
+            }
+        }
+    }
+    Ok(claimable)
 }
 
 pub(super) async fn try_claim_pm_task_lease(
@@ -1392,10 +1458,52 @@ pub(super) async fn load_pm_session_history_replay_from_db(
         }
     }
 
+    let task_rows = sqlx::query::<sqlx::Sqlite>(
+        "SELECT task_id, status, response_json FROM pm_research_tasks
+         WHERE tenant_id = ? AND user_id = ? AND session_id = ?
+         ORDER BY created_at ASC, task_id ASC",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_all(db)
+    .await?;
+    let mut delivery_artifacts = Vec::new();
+    for task_row in task_rows {
+        let task_id = task_row.try_get::<String, _>(0)?;
+        let task_status = task_row.try_get::<String, _>(1)?;
+        let response = try_get_optional_json_field(&task_row, 2)?;
+        let mut artifact =
+            crate::semantic_kernel_store::load_pm_final_delivery(db, &task_id, tenant_id, user_id)
+                .await
+                .map_err(|error| AppError::Database(sqlx::Error::Protocol(error.to_string())))?;
+        // Backfill pre-0018 completed tasks lazily. This keeps upgrades
+        // lossless without rewriting every tenant during startup.
+        if artifact.is_none() && pm_task_is_terminal_status(&task_status) {
+            artifact = Some(
+                crate::semantic_kernel_store::persist_pm_final_delivery(
+                    db,
+                    tenant_id,
+                    user_id,
+                    session_id,
+                    &task_id,
+                    &task_status,
+                    response.as_ref(),
+                )
+                .await
+                .map_err(|error| AppError::Database(sqlx::Error::Protocol(error.to_string())))?,
+            );
+        }
+        if let Some(artifact) = artifact {
+            delivery_artifacts.push(artifact);
+        }
+    }
+
     Ok(Some(PmSessionHistoryReplayDto {
         task_id,
         status,
         events,
+        delivery_artifacts,
     }))
 }
 
@@ -1938,6 +2046,58 @@ mod tests {
             .await
             .expect("reject heartbeat after deadline"));
         db.close().await;
+    }
+
+    #[tokio::test]
+    async fn pm_history_backfills_delivery_for_every_completed_task_in_session() {
+        let db = crate::test_sqlite_pool().await;
+        for (task_id, message, answer) in [
+            ("pm-history-1", "first question", "first answer"),
+            ("pm-history-2", "second question", "second answer"),
+        ] {
+            sqlx::query::<sqlx::Sqlite>(
+                "INSERT INTO pm_research_tasks
+                    (task_id, tenant_id, user_id, session_id, message, status,
+                     stage, event_seq, response_json, completed_at)
+                 VALUES (?, 'tenant', 'user', 'session', ?, 'completed', 'done', 1, ?, CURRENT_TIMESTAMP)",
+            )
+            .bind(task_id)
+            .bind(message)
+            .bind(
+                serde_json::json!({
+                    "text": answer,
+                    "pm_quality": {"passed": true}
+                })
+                .to_string(),
+            )
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+
+        let replay = load_pm_session_history_replay_from_db(&db, "session", "tenant", "user")
+            .await
+            .unwrap()
+            .expect("PM history replay");
+        assert_eq!(replay.delivery_artifacts.len(), 2);
+        assert_eq!(replay.delivery_artifacts[0].task_id, "pm-history-1");
+        assert_eq!(replay.delivery_artifacts[1].task_id, "pm-history-2");
+        assert_eq!(
+            replay.delivery_artifacts[0]
+                .response
+                .as_ref()
+                .and_then(|value| value.get("text"))
+                .and_then(serde_json::Value::as_str),
+            Some("first answer")
+        );
+        let persisted_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pm_final_delivery_artifacts
+             WHERE tenant_id = 'tenant' AND user_id = 'user' AND session_id = 'session'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(persisted_count, 2);
     }
 
     #[test]

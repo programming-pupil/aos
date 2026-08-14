@@ -116,6 +116,11 @@ pub struct PmSessionHistoryReplayDto {
     pub task_id: String,
     pub status: String,
     pub events: Vec<PmResearchTaskEvent>,
+    /// Durable delivery projections for every PM task in this session.  The
+    /// latest-task replay above remains for compatibility with existing
+    /// clients; cards are keyed by task id and no longer depend on it.
+    #[serde(rename = "delivery_artifacts", default)]
+    pub delivery_artifacts: Vec<crate::semantic_kernel_store::PmFinalDeliveryArtifactV1>,
 }
 
 // `Deserialize` + `PartialEq` are derived on the session-history message DTOs so

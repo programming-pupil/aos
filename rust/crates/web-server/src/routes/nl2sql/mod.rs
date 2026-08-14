@@ -308,6 +308,7 @@ pub mod reference;
 pub mod result_masking;
 pub mod routing;
 pub mod schema_changes;
+pub mod semantic_audit;
 pub mod semantics;
 pub mod stream_results;
 pub mod synonyms;
@@ -5951,6 +5952,68 @@ pub(crate) async fn query(
         "nl2sql /query policy enforcement finished"
     );
     self::query_async::emit_stage("policy_enforcement", "策略校验通过");
+
+    // Semantic compiler gate: parse the final policy-rewritten SQL and persist
+    // the deterministic intent/verifier result before the legacy query row is
+    // exposed as a releasable candidate.  Missing semantic evidence is kept as
+    // NeedsClarification for audit/UX; only an explicit verifier rejection is
+    // allowed to stop the request.
+    if let Some(audit) = semantic_audit::compile_and_verify(
+        &claims.tenant_id,
+        &req.data_source_id,
+        &semantic_question,
+        &sql,
+        &matched_metrics,
+    ) {
+        let intent_json = semantic_audit::intent_json(&audit);
+        let verification_json = semantic_audit::verification_json(&audit);
+        let release_decision = serde_json::to_string(&audit.verification.release_decision)
+            .unwrap_or_else(|_| "\"NeedsClarification\"".to_string())
+            .trim_matches('"')
+            .to_string();
+        let calibrated_score = f64::from(audit.verification.confidence_basis.calibrated_score);
+        if let Err(error) = crate::semantic_kernel_store::persist_nl2sql_semantic_audit(
+            &state.db,
+            &claims.tenant_id,
+            &req.data_source_id,
+            &conversation_id,
+            &query_id,
+            &intent_json,
+            &verification_json,
+            &release_decision,
+            calibrated_score,
+        )
+        .await
+        {
+            tracing::error!(
+                tenant_id = %claims.tenant_id,
+                datasource_id = %req.data_source_id,
+                query_id = %query_id,
+                error = %error,
+                "failed to persist NL2SQL semantic audit; query remains on legacy path"
+            );
+            push_rule_hit(
+                &mut applied_rules,
+                "semantic_audit_persistence_failed",
+                "Semantic Audit",
+                Some("semantic IR was computed but could not be persisted".to_string()),
+            );
+        } else {
+            push_rule_hit(
+                &mut applied_rules,
+                "semantic_verifier_release_decision",
+                "Semantic Verifier",
+                Some(format!(
+                    "decision={release_decision}; calibrated_score={calibrated_score:.3}"
+                )),
+            );
+        }
+        if release_decision == "Reject" {
+            return Err(AppError::ValidationError(
+                "Semantic verification rejected this SQL candidate because its safety or join-cardinality contract failed. Please retry with a narrower, read-only request.".to_string(),
+            ));
+        }
+    }
 
     let persist_started = std::time::Instant::now();
     self::query_async::emit_stage("persist_result", "正在持久化查询结果");
