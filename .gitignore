@@ -4,6 +4,8 @@ rust/target-*/
 webui/dist/
 /dist/
 /dist-final/
+/dist-local/
+/dist-semantic-local/
 webui/node_modules/
 webui/.vite/
 *.tsbuildinfo
