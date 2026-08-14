@@ -63,6 +63,7 @@ describe("AttributionAuditPanel", () => {
     expect(shouldShowAttributionPreparing(true, 0, 0)).toBe(true);
     expect(shouldShowAttributionPreparing(true, 0, 1)).toBe(false);
     expect(shouldShowAttributionPreparing(true, 1, 0)).toBe(false);
+    expect(shouldShowAttributionPreparing(true, 0, 0, 1)).toBe(false);
     expect(shouldShowAttributionPreparing(false, 0, 0)).toBe(false);
   });
 });

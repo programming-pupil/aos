@@ -28,6 +28,7 @@ function translatedStatus(status: string, t: Translate): string {
     failed: "失败",
     cancelled: "已取消",
     generated: "已生成",
+    diagnostic: "仅诊断验证",
     submitting: "提交中",
     finished: "已完成",
   };
@@ -72,6 +73,66 @@ function translatedConfidence(value: string, t: Translate): string {
         ? "low"
         : "unknown";
   return t(`chat.attributionAuditConfidenceLevels.${key}`, value);
+}
+
+function containsCjk(value: string): boolean {
+  return /[\u3400-\u9fff]/u.test(value);
+}
+
+function localizedAttributionEventMessage(
+  event: AttributionTaskEvent,
+  t: Translate,
+  language: string,
+): string | null {
+  const message = event.message?.trim();
+  if (!message) return null;
+  if (language.toLowerCase().startsWith("zh") || !containsCjk(message)) {
+    return message;
+  }
+
+  const index = event.step_index;
+  const total = event.step_total;
+  if (event.observation) {
+    if (event.observation.error) {
+      return t(
+        "chat.attributionAuditStepFailed",
+        "Attribution step {{index}} / {{total}} did not complete; other verified evidence is preserved",
+        { index: index ?? "-", total: total ?? "-" },
+      );
+    }
+    return t(
+      "chat.attributionAuditStepCompleted",
+      "Attribution step {{index}} / {{total}} completed with {{rows}} rows",
+      {
+        index: index ?? "-",
+        total: total ?? "-",
+        rows: event.observation.rowCount ?? 0,
+      },
+    );
+  }
+  const stage = event.stage ?? "running";
+  if (stage.includes("_wait_")) {
+    return t(
+      "chat.attributionAuditStillRunning",
+      "{{stage}} is still running; the task remains active",
+      { stage: translatedStage(stage.replace(/^.*_wait_/, ""), t) },
+    );
+  }
+  if (stage.includes("diagnose")) {
+    return t(
+      "chat.attributionAuditDiagnosticStepRunning",
+      "Running diagnostic drill-down {{index}} / {{total}}",
+      { index: index ?? "-", total: total ?? "-" },
+    );
+  }
+  if (stage.includes("execute")) {
+    return t(
+      "chat.attributionAuditStepRunning",
+      "Executing attribution step {{index}} / {{total}}",
+      { index: index ?? "-", total: total ?? "-" },
+    );
+  }
+  return translatedStage(stage, t);
 }
 
 function formatBytes(value: number): string {
@@ -136,8 +197,14 @@ export function shouldShowAttributionPreparing(
   running: boolean,
   observationCount: number,
   executionDetailCount: number,
+  timelineCount = 0,
 ): boolean {
-  return running && observationCount === 0 && executionDetailCount === 0;
+  return (
+    running &&
+    observationCount === 0 &&
+    executionDetailCount === 0 &&
+    timelineCount === 0
+  );
 }
 
 function attributionEventKey(event: AttributionTaskEvent): string {
@@ -295,12 +362,17 @@ function AttributionObservationBlock({
               <Tag color={observation.error ? "error" : hasRows ? "success" : "warning"}>
                 {observation.error
                   ? t("chat.attributionAuditFailed", "失败")
+                  : observation.diagnosticOnly
+                    ? t("chat.attributionAuditDiagnosticOnly", "仅诊断验证")
                   : hasRows
                     ? t("chat.attributionAuditCompleted", "已执行")
                     : t("chat.attributionAuditNoData", "无数据")}
               </Tag>
               <Tag>{t("chat.attributionAuditRows", "{{count}} 行", { count: observation.rowCount ?? rows.length })}</Tag>
               {observation.sampled ? <Tag>{t("chat.attributionAuditSampled", "预览")}</Tag> : null}
+              {observation.diagnosticOnly ? (
+                <Tag color="warning">{t("chat.attributionAuditScopeChanged", "查询范围已调整")}</Tag>
+              ) : null}
             </Space>
           ),
           children: (
@@ -317,6 +389,11 @@ function AttributionObservationBlock({
               {observation.timeContext ? (
                 <Text type="secondary">
                   {t("chat.attributionAuditTimeContext", "时间口径")}: {observation.timeContext}
+                </Text>
+              ) : null}
+              {observation.recoveryNote ? (
+                <Text type="secondary">
+                  {t("chat.attributionAuditRecoveryNote", "恢复说明")}: {observation.recoveryNote}
                 </Text>
               ) : null}
               {observation.error ? <Text type="danger">{observation.error}</Text> : null}
@@ -356,7 +433,7 @@ function AttributionAuditPanelImpl({
   taskId: string;
   live?: boolean;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [status, setStatus] = useState<AttributionTaskStatusResponse | null>(null);
   const [events, setEvents] = useState<AttributionTaskEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -429,6 +506,7 @@ function AttributionAuditPanelImpl({
   const currentStatus = status?.status ?? events.at(-1)?.status ?? "queued";
   const running = ["queued", "running"].includes(currentStatus);
   const taskError = status?.error ?? error;
+  const interfaceLanguage = i18n.resolvedLanguage ?? i18n.language ?? "zh-CN";
 
   return (
     <div style={{ marginTop: 8, border: "1px solid var(--border-subtle)", borderRadius: 8, overflow: "hidden", background: "var(--bg-elevated)" }}>
@@ -455,6 +533,9 @@ function AttributionAuditPanelImpl({
                   {timeline.map((event, index) => (
                     <Space key={`${event.stage}-${index}`} size={8} wrap>
                       <Tag color={statusColor(event.status)}>{translatedStage(event.stage, t)}</Tag>
+                      {localizedAttributionEventMessage(event, t, interfaceLanguage) ? (
+                        <Text>{localizedAttributionEventMessage(event, t, interfaceLanguage)}</Text>
+                      ) : null}
                       {event.elapsed_ms > 0 ? <Text type="secondary">{t("chat.attributionAuditElapsed", "已用时 {{seconds}} 秒", { seconds: Math.round(event.elapsed_ms / 1000) })}</Text> : null}
                     </Space>
                   ))}
@@ -469,6 +550,13 @@ function AttributionAuditPanelImpl({
                 const completedSplits = typeof detail.completedSplits === "number" ? detail.completedSplits : undefined;
                 const totalSplits = typeof detail.totalSplits === "number" ? detail.totalSplits : undefined;
                 const rowCount = typeof detail.rowCount === "number" ? detail.rowCount : undefined;
+                const strategy = typeof detail.strategy === "string" ? detail.strategy : undefined;
+                const rationale = typeof detail.rationale === "string" ? detail.rationale : undefined;
+                const latestMessage = typeof detail.latestMessage === "string" ? detail.latestMessage : undefined;
+                const latestStage = typeof detail.latestStage === "string" ? detail.latestStage : event.stage;
+                const elapsedMs = typeof detail.elapsedMs === "number" ? detail.elapsedMs : undefined;
+                const scopeChanged = detail.scopeChanged === true;
+                const diagnosticOnly = detail.diagnosticOnly === true;
                 return (
                   <div key={`${event.stage}-${kind}-${index}`} style={{ display: "grid", gap: 6, padding: 10, background: "var(--bg-surface)", border: "1px solid var(--border-subtle)", borderRadius: 6 }}>
                     <Space size={[6, 4]} wrap>
@@ -479,12 +567,28 @@ function AttributionAuditPanelImpl({
                       {processedRows != null ? <Tag>{t("chat.attributionAuditProcessedRows", "已处理 {{count}} 行", { count: processedRows })}</Tag> : null}
                       {processedBytes != null ? <Tag>{t("chat.attributionAuditProcessedBytes", "已处理 {{size}}", { size: formatBytes(processedBytes) })}</Tag> : null}
                       {rowCount != null ? <Tag color="success">{t("chat.attributionAuditResultRows", "返回 {{count}} 行", { count: rowCount })}</Tag> : null}
+                      {strategy ? <Tag color="blue">{t("chat.attributionAuditRecoveryStrategy", "模型恢复策略")}: {strategy}</Tag> : null}
+                      {scopeChanged ? <Tag color="warning">{t("chat.attributionAuditScopeChanged", "查询范围已调整")}</Tag> : null}
+                      {diagnosticOnly ? <Tag color="warning">{t("chat.attributionAuditDiagnosticOnly", "仅诊断验证")}</Tag> : null}
                     </Space>
+                    {latestMessage ? (
+                      <Text type="secondary">
+                        {localizedAttributionEventMessage(
+                          { ...event, stage: latestStage, message: latestMessage },
+                          t,
+                          interfaceLanguage,
+                        )}
+                        {elapsedMs != null
+                          ? ` · ${t("chat.attributionAuditElapsed", "已用时 {{seconds}} 秒", { seconds: Math.round(elapsedMs / 1000) })}`
+                          : ""}
+                      </Text>
+                    ) : null}
+                    {rationale ? <Text type="secondary">{rationale}</Text> : null}
                     {sql ? <pre style={{ margin: 0, padding: 10, overflowX: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere", border: "1px solid var(--border-subtle)", borderRadius: 6, fontSize: 12 }}>{sql}</pre> : null}
                   </div>
                 );
               })}
-              {shouldShowAttributionPreparing(running, observations.length, executionDetails.length) ? <Text type="secondary">{t("chat.attributionAuditRunning", "正在准备 Schema、SQL 和执行结果...")}</Text> : null}
+              {shouldShowAttributionPreparing(running, observations.length, executionDetails.length, timeline.length) ? <Text type="secondary">{t("chat.attributionAuditRunning", "正在准备 Schema、SQL 和执行结果...")}</Text> : null}
               {observations.map((observation) => <AttributionObservationBlock key={observationKey(observation)} observation={observation} />)}
               {response?.report ? (
                 <AttributionMarkdownDetail>

@@ -7,7 +7,7 @@ use super::{
     should_enable_result_validation, validate_data_source_access, ColumnInfo, ExecuteRequest,
     ExecuteResponse, ForeignKeyPrompt, InputContentBlock, InputMessage, MessageRequest,
     OutputContentBlock, PaginationParams, QueryHistoryItem, QueryHistoryResponse,
-    SelfCorrectContext, SqlExecErrorKind, SqlSafetyResult,
+    SelfCorrectContext, SqlExecErrorKind, SqlRepairDecision, SqlSafetyResult,
 };
 use crate::auth::Claims;
 use crate::error::{AppError, Result};
@@ -242,6 +242,7 @@ pub(crate) async fn correct_sql(
     preferred_model: Option<&str>,
     deadline_bounded: bool,
 ) -> String {
+    context.set_last_decision(None);
     let repair_timeout_secs = std::env::var("NL2SQL_SQL_REPAIR_TOTAL_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -444,6 +445,7 @@ async fn correct_sql_bounded(
             foreign_keys,
             join_paths,
             conversation_id,
+            &context.history_text(),
             clarification_ctx,
             db_type,
             qu_result.as_ref(),
@@ -456,13 +458,20 @@ async fn correct_sql_bounded(
         .await;
 
         match result {
-            Ok(corrected) if !corrected.is_empty() => {
+            Ok(candidate) => {
                 super::clear_nl2sql_candidate_suppression(&claims.tenant_id, &chat_cfg);
-                context.add(corrected.clone(), error_msg.to_string());
-                return corrected;
-            }
-            Ok(_) => {
-                tracing::warn!("correct_sql: LLM returned empty on attempt {}", attempt + 1);
+                let decision = candidate.decision;
+                context.set_last_decision(decision.clone());
+                if candidate.sql.is_empty() {
+                    tracing::info!(
+                        datasource_id,
+                        strategy = ?decision.as_ref().and_then(|value| value.strategy.clone()),
+                        "correct_sql: model chose to stop data-availability recovery"
+                    );
+                    return String::new();
+                }
+                context.add(candidate.sql.clone(), error_msg.to_string());
+                return candidate.sql;
             }
             Err(e) => {
                 let error_text = e.to_string();
@@ -489,6 +498,94 @@ async fn correct_sql_bounded(
     failed_sql.to_string()
 }
 
+#[derive(Debug)]
+pub(crate) struct SqlRepairCandidate {
+    sql: String,
+    decision: Option<SqlRepairDecision>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelRecoveryDecision {
+    action: String,
+    #[serde(default)]
+    sql: Option<String>,
+    #[serde(default)]
+    strategy: Option<String>,
+    #[serde(default)]
+    scope_changed: bool,
+    #[serde(default)]
+    diagnostic_only: bool,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+fn parse_model_recovery_decision(text: &str) -> anyhow::Result<SqlRepairCandidate> {
+    let unfenced = text
+        .trim()
+        .strip_prefix("```json")
+        .or_else(|| text.trim().strip_prefix("```JSON"))
+        .unwrap_or(text.trim())
+        .trim()
+        .strip_suffix("```")
+        .unwrap_or_else(|| {
+            text.trim()
+                .strip_prefix("```json")
+                .or_else(|| text.trim().strip_prefix("```JSON"))
+                .unwrap_or(text.trim())
+                .trim()
+        })
+        .trim();
+    let json = if serde_json::from_str::<serde_json::Value>(unfenced).is_ok() {
+        unfenced
+    } else {
+        let start = unfenced
+            .find('{')
+            .ok_or_else(|| anyhow::anyhow!("model recovery decision did not contain JSON"))?;
+        let end = unfenced
+            .rfind('}')
+            .ok_or_else(|| anyhow::anyhow!("model recovery decision JSON was incomplete"))?;
+        &unfenced[start..=end]
+    };
+    let parsed: ModelRecoveryDecision = serde_json::from_str(json)
+        .map_err(|error| anyhow::anyhow!("invalid model recovery decision: {error}"))?;
+    let action = parsed.action.trim().to_ascii_lowercase();
+    if action == "stop" {
+        return Ok(SqlRepairCandidate {
+            sql: String::new(),
+            decision: Some(SqlRepairDecision {
+                strategy: parsed.strategy,
+                scope_changed: parsed.scope_changed,
+                diagnostic_only: true,
+                rationale: parsed.rationale,
+            }),
+        });
+    }
+    if action != "retry" {
+        anyhow::bail!("model recovery action must be retry or stop");
+    }
+    let sql = parsed.sql.unwrap_or_default();
+    let sql = extract_sql_from_llm_output(&sql);
+    if sql.is_empty() {
+        anyhow::bail!("model recovery retry did not contain SQL");
+    }
+    match classify_sql(&sql) {
+        SqlSafetyResult::Safe => Ok(SqlRepairCandidate {
+            sql,
+            decision: Some(SqlRepairDecision {
+                strategy: parsed.strategy,
+                scope_changed: parsed.scope_changed,
+                // Any changed scope is diagnostic even if a model forgot the
+                // flag. The model chooses the strategy; the server enforces
+                // evidence honesty.
+                diagnostic_only: parsed.diagnostic_only || parsed.scope_changed,
+                rationale: parsed.rationale,
+            }),
+        }),
+        other => anyhow::bail!("model recovery SQL not safe: {other:?}"),
+    }
+}
+
 /// Single-shot LLM correction call. Does not retry — retry is handled by `correct_sql`.
 /// P2-5 + P1-2 BUG-FIX: Accepts qu_result and metrics so corrections respect
 /// structured constraints and metric definitions from the original generation attempt.
@@ -503,6 +600,7 @@ pub(crate) async fn correct_sql_once(
     foreign_keys: &[ForeignKeyPrompt],
     join_paths: &[(String, String)],
     conversation_id: &str,
+    prior_attempts: &str,
     clarification_ctx: Option<&crate::nl2sql::ClarificationContext>,
     db_type: &str,
     qu_result: Option<&crate::nl2sql::query_understanding::QueryUnderstandingResult>,
@@ -511,7 +609,7 @@ pub(crate) async fn correct_sql_once(
     reference_snippets: &[super::reference::ReferencePromptSnippet],
     datasource_id: &str,
     deadline_bounded: bool,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<SqlRepairCandidate> {
     let history = load_conversation_history(&state.db, &claims.tenant_id, conversation_id, 3).await;
     // R-9: weave coreference resolution against the most recent turn into the
     // summary slot so follow-ups like "上月呢" / "排除退货的" carry their
@@ -531,12 +629,27 @@ pub(crate) async fn correct_sql_once(
         _selected_tables,
         reference_snippets,
     );
-    system_prompt.push_str(
-        "\n\nSQL REPAIR MODE: The original question has already passed clarification. \
-         Never return CLARIFICATION_NEEDED, prose, Markdown, or an explanation. \
-         Correct the failed query using only the supplied schema and evidence, and return exactly one safe executable SELECT or WITH statement. \
-         When a referenced column is missing, choose a verified schema column with matching semantics; never invent identifiers.",
-    );
+    let recovery_strategy_allowed =
+        SqlExecErrorKind::new(error_msg).allows_model_recovery_strategy();
+    if recovery_strategy_allowed {
+        system_prompt.push_str(
+            "\n\nDATA AVAILABILITY RECOVERY MODE: The original question has already passed clarification. Never return CLARIFICATION_NEEDED. \
+             The SQL is valid but the engine reports unavailable partition/file data. \
+             Decide from the user question, failed SQL, engine error, schema, SQL knowledge, and prior attempts whether a safe retry is useful. \
+             You may preserve the requested scope, narrow or shift partitions, exclude a broken partition, or use a recent available sample only when justified by the evidence. \
+             No particular time window or strategy is mandatory. Do not invent an available date. \
+             If the retry changes the user's requested business/time scope, set scopeChanged=true and diagnosticOnly=true; that result may validate the query path but cannot answer the original metric. \
+             If no honest bounded retry exists, choose action=stop. \
+             Return JSON only: {\"action\":\"retry|stop\",\"sql\":\"SELECT ... or null\",\"strategy\":\"short label\",\"scopeChanged\":true|false,\"diagnosticOnly\":true|false,\"rationale\":\"concise reason\"}.",
+        );
+    } else {
+        system_prompt.push_str(
+            "\n\nSQL REPAIR MODE: The original question has already passed clarification. \
+             Never return CLARIFICATION_NEEDED, prose, Markdown, or an explanation. \
+             Correct the failed query using only the supplied schema and evidence, and return exactly one safe executable SELECT or WITH statement. \
+             When a referenced column is missing, choose a verified schema column with matching semantics; never invent identifiers.",
+        );
+    }
 
     let history_section = if history.messages.is_empty() {
         String::new()
@@ -553,12 +666,14 @@ pub(crate) async fn correct_sql_once(
     #[derive(serde::Serialize)]
     struct CorrectionPrompt<'a> {
         history: &'a str,
+        prior_attempts: String,
         error_msg: &'a str,
         failed_sql: &'a str,
         question: &'a str,
     }
     let correction_prompt = serde_json::to_string(&CorrectionPrompt {
         history: &history_section,
+        prior_attempts: prior_attempts.to_string(),
         error_msg: &error_msg,
         failed_sql: &failed_sql,
         question: &question,
@@ -639,13 +754,20 @@ pub(crate) async fn correct_sql_once(
 
     let text_content = super::collect_output_text(&response.content);
 
+    if recovery_strategy_allowed {
+        return parse_model_recovery_decision(&text_content);
+    }
+
     let corrected = extract_sql_from_llm_output(&text_content);
     if corrected.is_empty() {
         anyhow::bail!("LLM returned empty response");
     }
 
     match classify_sql(&corrected) {
-        SqlSafetyResult::Safe => Ok(corrected),
+        SqlSafetyResult::Safe => Ok(SqlRepairCandidate {
+            sql: corrected,
+            decision: None,
+        }),
         other => {
             tracing::warn!("correct_sql: corrected SQL not safe: {:?}", other);
             anyhow::bail!("corrected SQL not safe: {:?}", other)
@@ -681,6 +803,8 @@ pub(crate) async fn execute(
                 )),
                 corrected_sql: None,
                 self_correct_failed: None,
+                diagnostic_only: false,
+                recovery_note: None,
                 result_score: None,
                 warnings: None,
                 suggestions: None,
@@ -702,6 +826,8 @@ pub(crate) async fn execute(
                 )),
                 corrected_sql: None,
                 self_correct_failed: None,
+                diagnostic_only: false,
+                recovery_note: None,
                 result_score: None,
                 warnings: None,
                 suggestions: None,
@@ -725,6 +851,8 @@ pub(crate) async fn execute(
                 ),
                 corrected_sql: None,
                 self_correct_failed: None,
+                diagnostic_only: false,
+                recovery_note: None,
                 result_score: None,
                 warnings: None,
                 suggestions: None,
@@ -746,6 +874,8 @@ pub(crate) async fn execute(
                 )),
                 corrected_sql: None,
                 self_correct_failed: None,
+                diagnostic_only: false,
+                recovery_note: None,
                 result_score: None,
                 warnings: None,
                 suggestions: None,
@@ -768,6 +898,8 @@ pub(crate) async fn execute(
                 ),
                 corrected_sql: None,
                 self_correct_failed: None,
+                diagnostic_only: false,
+                recovery_note: None,
                 result_score: None,
                 warnings: None,
                 suggestions: None,
@@ -894,6 +1026,8 @@ pub(crate) async fn execute(
             error: Some(error),
             corrected_sql: None,
             self_correct_failed: None,
+            diagnostic_only: false,
+            recovery_note: None,
             result_score: None,
             warnings: None,
             suggestions: None,
@@ -1033,6 +1167,7 @@ pub(crate) async fn execute(
     };
     let mut corrected_sql: Option<String> = None;
     let mut self_correct_failed = false;
+    let mut current_repair_decision: Option<SqlRepairDecision> = None;
     let mut attempts = 0;
     let mut operational_attempts = 0;
     // COUNT, SELECT, and any repair attempts share one concurrency gate. A
@@ -1334,6 +1469,15 @@ pub(crate) async fn execute(
                     } else {
                         None
                     },
+                    diagnostic_only: current_repair_decision
+                        .as_ref()
+                        .is_some_and(|decision| decision.diagnostic_only),
+                    recovery_note: current_repair_decision.as_ref().and_then(|decision| {
+                        decision
+                            .rationale
+                            .clone()
+                            .or_else(|| decision.strategy.clone())
+                    }),
                     result_score: val_score,
                     warnings: val_warnings,
                     suggestions: val_suggestions,
@@ -1409,8 +1553,10 @@ pub(crate) async fn execute(
                         false,
                     )
                     .await;
+                    let repair_decision = correct_context.take_last_decision();
+                    current_repair_decision = repair_decision;
 
-                    if new_sql != current_sql {
+                    if !new_sql.trim().is_empty() && new_sql != current_sql {
                         current_sql = match policy_row_filter.as_deref() {
                             Some(row_filter) => {
                                 super::inject_query_policy_row_filter(&new_sql, row_filter)
@@ -1462,6 +1608,13 @@ pub(crate) async fn execute(
                     } else {
                         None
                     },
+                    diagnostic_only: false,
+                    recovery_note: current_repair_decision.as_ref().and_then(|decision| {
+                        decision
+                            .rationale
+                            .clone()
+                            .or_else(|| decision.strategy.clone())
+                    }),
                     result_score: None,
                     warnings: None,
                     suggestions: None,
@@ -2895,6 +3048,60 @@ JOIN `hive`.`ods`.`order_item` oi ON oi.order_id = bo.order_id
             "iceberg.mps_prod.business_order",
             &denied
         ));
+    }
+
+    #[test]
+    fn recovery_scope_change_is_always_diagnostic() {
+        let candidate = parse_model_recovery_decision(
+            r#"{
+                "action": "retry",
+                "sql": "SELECT app_id, roi FROM metrics WHERE dt = DATE '2026-08-13'",
+                "strategy": "validate with a recent available partition",
+                "scopeChanged": true,
+                "diagnosticOnly": false,
+                "rationale": "the requested partition is missing"
+            }"#,
+        )
+        .expect("valid recovery protocol");
+        let decision = candidate.decision.expect("decision");
+        assert!(decision.scope_changed);
+        assert!(decision.diagnostic_only);
+        assert!(candidate.sql.contains("2026-08-13"));
+    }
+
+    #[test]
+    fn recovery_can_preserve_scope_as_formal_query() {
+        let candidate = parse_model_recovery_decision(
+            r#"{
+                "action": "retry",
+                "sql": "SELECT app_id, roi FROM metrics WHERE dt BETWEEN DATE '2026-08-01' AND DATE '2026-08-07' AND dt <> DATE '2026-08-03'",
+                "strategy": "exclude an unavailable partition while preserving the requested interval",
+                "scopeChanged": false,
+                "diagnosticOnly": false,
+                "rationale": "the metric definition permits excluding the corrupt duplicate partition"
+            }"#,
+        )
+        .expect("valid recovery protocol");
+        let decision = candidate.decision.expect("decision");
+        assert!(!decision.scope_changed);
+        assert!(!decision.diagnostic_only);
+    }
+
+    #[test]
+    fn recovery_stop_does_not_submit_another_sql() {
+        let candidate = parse_model_recovery_decision(
+            r#"{
+                "action": "stop",
+                "sql": null,
+                "strategy": "no honest bounded retry",
+                "scopeChanged": false,
+                "diagnosticOnly": true,
+                "rationale": "available partitions cannot be inferred"
+            }"#,
+        )
+        .expect("valid stop protocol");
+        assert!(candidate.sql.is_empty());
+        assert!(candidate.decision.expect("decision").diagnostic_only);
     }
 
     #[tokio::test]

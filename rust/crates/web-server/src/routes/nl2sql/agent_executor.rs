@@ -24,7 +24,7 @@ use super::{
     parse_multi_step_plan, right_join, should_enable_qu, union_all, union_distinct,
     validate_data_source_access, CrossDatasourceRelation, DatasourceSchemaInfo, ForeignKeyPrompt,
     MetricMatchCandidate, ReferencePromptSnippet, ReferenceUsageDto, SelfCorrectContext,
-    SqlExecErrorKind,
+    SqlExecErrorKind, SqlRepairDecision,
 };
 
 fn max_agent_steps() -> usize {
@@ -539,6 +539,38 @@ For boss-facing report analysis, aggregate before joining when possible, keep jo
 
 fn strip_trailing_semicolon(sql: &str) -> String {
     sql.trim().trim_end_matches(';').trim().to_string()
+}
+
+fn repair_decision_note(decision: &SqlRepairDecision) -> Option<String> {
+    decision
+        .rationale
+        .clone()
+        .or_else(|| decision.strategy.clone())
+}
+
+fn sql_attempt_decision_fields(
+    decision: Option<&SqlRepairDecision>,
+) -> (Option<String>, bool, bool, Option<String>) {
+    decision.map_or((None, false, false, None), |decision| {
+        (
+            decision.strategy.clone(),
+            decision.scope_changed,
+            decision.diagnostic_only,
+            decision.rationale.clone(),
+        )
+    })
+}
+
+fn annotate_attempt_with_decision(
+    attempt: &mut crate::nl2sql::SqlExecutionAttempt,
+    decision: &SqlRepairDecision,
+) {
+    let (strategy, scope_changed, diagnostic_only, rationale) =
+        sql_attempt_decision_fields(Some(decision));
+    attempt.repair_strategy = strategy;
+    attempt.scope_changed = scope_changed;
+    attempt.diagnostic_only = diagnostic_only;
+    attempt.repair_rationale = rationale;
 }
 
 fn dialect_preflight_error(db_type: &str, sql: &str) -> Option<String> {
@@ -1198,6 +1230,10 @@ pub struct StepExecutionDetail {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub execution_attempts: Vec<crate::nl2sql::SqlExecutionAttempt>,
+    #[serde(default)]
+    pub diagnostic_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1673,6 +1709,15 @@ impl Nl2SqlAgent {
         {
             Ok((columns, rows, execution_attempts)) => {
                 let row_count = rows.len();
+                let diagnostic_only = execution_attempts
+                    .last()
+                    .is_some_and(|attempt| attempt.diagnostic_only);
+                let recovery_note = execution_attempts.last().and_then(|attempt| {
+                    attempt
+                        .repair_rationale
+                        .clone()
+                        .or_else(|| attempt.repair_strategy.clone())
+                });
                 let step = StepExecutionDetail {
                     step_id: 0,
                     step_type: "federated_trino_query".to_string(),
@@ -1689,6 +1734,8 @@ impl Nl2SqlAgent {
                     execution_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
                     error: None,
                     execution_attempts,
+                    diagnostic_only,
+                    recovery_note,
                 };
                 Ok(Some(AgentExecuteResponse {
                     steps: vec![step],
@@ -1826,7 +1873,13 @@ impl Nl2SqlAgent {
                     return Ok(());
                 }
                 Err(e) if attempt < max_attempts => {
-                    if !SqlExecErrorKind::new(&e).is_retryable() {
+                    let error_kind = SqlExecErrorKind::new(&e);
+                    if error_kind.allows_model_recovery_strategy() {
+                        return Err(format!(
+                            "federated Trino EXPLAIN encountered unavailable data; deferring model-guided recovery to the audited execution stage: {e}"
+                        ));
+                    }
+                    if !error_kind.is_retryable() {
                         suppress_trino_explain(datasource_id).await;
                         return Err(format!(
                             "federated Trino EXPLAIN preflight was unavailable; SQL repair skipped because the failure was not caused by repairable SQL: {e}"
@@ -1901,6 +1954,7 @@ impl Nl2SqlAgent {
         let mut context = SelfCorrectContext::default();
         let mut execution_attempts = Vec::new();
         let mut next_retry_reason: Option<String> = None;
+        let mut current_repair_decision: Option<SqlRepairDecision> = None;
         loop {
             let attempt_started = std::time::Instant::now();
             match self
@@ -1914,6 +1968,8 @@ impl Nl2SqlAgent {
                 .await
             {
                 Ok((columns, rows)) => {
+                    let (repair_strategy, scope_changed, diagnostic_only, repair_rationale) =
+                        sql_attempt_decision_fields(current_repair_decision.as_ref());
                     execution_attempts.push(crate::nl2sql::SqlExecutionAttempt {
                         attempt: execution_attempts.len() + 1,
                         status: "succeeded".to_string(),
@@ -1922,6 +1978,10 @@ impl Nl2SqlAgent {
                             .unwrap_or(u64::MAX),
                         error: None,
                         retry_reason: next_retry_reason.take(),
+                        repair_strategy,
+                        scope_changed,
+                        diagnostic_only,
+                        repair_rationale,
                     });
                     if operational_attempts > 0 {
                         tracing::info!(
@@ -1939,6 +1999,8 @@ impl Nl2SqlAgent {
                 Err(e) => {
                     let error = e.to_string();
                     let error_kind = SqlExecErrorKind::new(&error);
+                    let (repair_strategy, scope_changed, diagnostic_only, repair_rationale) =
+                        sql_attempt_decision_fields(current_repair_decision.as_ref());
                     execution_attempts.push(crate::nl2sql::SqlExecutionAttempt {
                         attempt: execution_attempts.len() + 1,
                         status: "failed".to_string(),
@@ -1947,6 +2009,10 @@ impl Nl2SqlAgent {
                             .unwrap_or(u64::MAX),
                         error: Some(error.clone()),
                         retry_reason: next_retry_reason.take(),
+                        repair_strategy,
+                        scope_changed,
+                        diagnostic_only,
+                        repair_rationale,
                     });
                     if error_kind.is_transient_operational()
                         && operational_attempts < max_operational_attempts
@@ -2008,8 +2074,14 @@ impl Nl2SqlAgent {
                         self.bounded,
                     )
                     .await;
+                    let repair_decision = context.take_last_decision();
                     let repaired = strip_trailing_semicolon(&repaired);
                     if repaired.is_empty() || repaired == *sql {
+                        if let (Some(attempt), Some(decision)) =
+                            (execution_attempts.last_mut(), repair_decision.as_ref())
+                        {
+                            annotate_attempt_with_decision(attempt, decision);
+                        }
                         return Err((
                             format!(
                                 "federated Trino execution failed and repair produced no better SQL: {error}"
@@ -2018,6 +2090,20 @@ impl Nl2SqlAgent {
                         ));
                     }
                     *sql = repaired;
+                    current_repair_decision = repair_decision;
+                    if let Some(decision) = current_repair_decision.as_ref() {
+                        super::agent_async::emit_agent_stage_detail(
+                            "repair_sql",
+                            "模型已选择数据可用性恢复策略，正在执行验证",
+                            serde_json::json!({
+                                "kind": "model_recovery_decision",
+                                "strategy": decision.strategy,
+                                "scopeChanged": decision.scope_changed,
+                                "diagnosticOnly": decision.diagnostic_only,
+                                "rationale": decision.rationale,
+                            }),
+                        );
+                    }
                     if let Some(attempt) = execution_attempts.last_mut() {
                         attempt.retry_reason = Some("sql_repair:model".to_string());
                     }
@@ -2086,6 +2172,8 @@ impl Nl2SqlAgent {
                 execution_ms: elapsed,
                 error: Some(error.clone()),
                 execution_attempts: Vec::new(),
+                diagnostic_only: false,
+                recovery_note: None,
             }],
             final_result: FinalAgentResult {
                 columns: Vec::new(),
@@ -2124,6 +2212,8 @@ impl Nl2SqlAgent {
                 execution_ms: elapsed,
                 error: Some(error.clone()),
                 execution_attempts: Vec::new(),
+                diagnostic_only: false,
+                recovery_note: None,
             }],
             final_result: FinalAgentResult {
                 columns: Vec::new(),
@@ -2664,6 +2754,8 @@ impl Nl2SqlAgent {
                 execution_ms: step.execution_ms,
                 error: step.error.clone(),
                 execution_attempts: step.execution_attempts.clone(),
+                diagnostic_only: step.diagnostic_only,
+                recovery_note: step.recovery_note.clone(),
             }],
             final_result,
             total_execution_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -2851,6 +2943,8 @@ impl Nl2SqlAgent {
                 execution_ms: r.execution_ms,
                 error: r.error.clone(),
                 execution_attempts: r.execution_attempts.clone(),
+                diagnostic_only: r.diagnostic_only,
+                recovery_note: r.recovery_note.clone(),
             })
             .collect();
         let error = step_results
@@ -3155,6 +3249,8 @@ impl Nl2SqlAgent {
                     error: Some(format!("access denied: {}", e)),
                     datasource_id: Some(datasource_id.to_owned()),
                     execution_attempts: Vec::new(),
+                    diagnostic_only: false,
+                    recovery_note: None,
                 });
             }
         };
@@ -3183,6 +3279,8 @@ impl Nl2SqlAgent {
                     error: Some("datasource not found".to_owned()),
                     datasource_id: Some(datasource_id.to_owned()),
                     execution_attempts: Vec::new(),
+                    diagnostic_only: false,
+                    recovery_note: None,
                 });
             }
         };
@@ -3229,6 +3327,7 @@ impl Nl2SqlAgent {
         let mut last_repair_method: Option<&'static str> = None;
         let mut execution_attempts = Vec::new();
         let mut next_retry_reason: Option<String> = None;
+        let mut current_repair_decision: Option<SqlRepairDecision> = None;
 
         loop {
             let attempt_started = std::time::Instant::now();
@@ -3262,6 +3361,8 @@ impl Nl2SqlAgent {
 
             match result {
                 Ok((columns, rows)) => {
+                    let (repair_strategy, scope_changed, diagnostic_only, repair_rationale) =
+                        sql_attempt_decision_fields(current_repair_decision.as_ref());
                     execution_attempts.push(crate::nl2sql::SqlExecutionAttempt {
                         attempt: execution_attempts.len() + 1,
                         status: "succeeded".to_string(),
@@ -3270,6 +3371,10 @@ impl Nl2SqlAgent {
                             .unwrap_or(u64::MAX),
                         error: None,
                         retry_reason: next_retry_reason.take(),
+                        repair_strategy,
+                        scope_changed,
+                        diagnostic_only,
+                        repair_rationale,
                     });
                     if attempts > 0 || operational_attempts > 0 {
                         tracing::info!(
@@ -3313,8 +3418,15 @@ impl Nl2SqlAgent {
                             "rowsPreview": rows.iter().take(12).cloned().collect::<Vec<_>>(),
                             "elapsedMs": u64::try_from(attempt_started.elapsed().as_millis())
                                 .unwrap_or(u64::MAX),
+                            "diagnosticOnly": diagnostic_only,
+                            "recoveryNote": current_repair_decision
+                                .as_ref()
+                                .and_then(repair_decision_note),
                         }),
                     );
+                    let recovery_note = current_repair_decision
+                        .as_ref()
+                        .and_then(repair_decision_note);
                     return Ok(crate::nl2sql::StepResult {
                         step_id,
                         output_name: output_name.to_owned(),
@@ -3327,6 +3439,8 @@ impl Nl2SqlAgent {
                         error: None,
                         datasource_id: Some(datasource_id.to_owned()),
                         execution_attempts,
+                        diagnostic_only,
+                        recovery_note,
                     });
                 }
                 Err(e) => {
@@ -3347,6 +3461,8 @@ impl Nl2SqlAgent {
                                 .unwrap_or(u64::MAX),
                         }),
                     );
+                    let (repair_strategy, scope_changed, diagnostic_only, repair_rationale) =
+                        sql_attempt_decision_fields(current_repair_decision.as_ref());
                     execution_attempts.push(crate::nl2sql::SqlExecutionAttempt {
                         attempt: execution_attempts.len() + 1,
                         status: "failed".to_string(),
@@ -3355,6 +3471,10 @@ impl Nl2SqlAgent {
                             .unwrap_or(u64::MAX),
                         error: Some(err_msg.clone()),
                         retry_reason: next_retry_reason.take(),
+                        repair_strategy,
+                        scope_changed,
+                        diagnostic_only,
+                        repair_rationale,
                     });
                     if err_kind.is_transient_operational()
                         && operational_attempts < max_operational_attempts
@@ -3416,32 +3536,31 @@ impl Nl2SqlAgent {
                                 format!("User question: {}\nOriginal step SQL:\n{}", question_context, sql)
                             });
 
-                        let (new_sql, repair_method) = if let Some(repaired) =
+                        let (new_sql, repair_method, repair_decision) = if let Some(repaired) =
                             deterministic_dialect_repair(&db_type, &current_sql, &err_msg)
                         {
-                            (repaired, "deterministic")
+                            (repaired, "deterministic", None)
                         } else {
-                            (
-                                correct_sql(
-                                    &self.state,
-                                    claims,
-                                    &current_sql,
-                                    &err_msg,
-                                    &question,
-                                    &schema_tables,
-                                    &foreign_keys,
-                                    join_paths,
-                                    "",
-                                    &mut correct_context,
-                                    None,
-                                    &db_type,
-                                    datasource_id,
-                                    self.preferred_model.as_deref(),
-                                    self.bounded,
-                                )
-                                .await,
-                                "model",
+                            let repaired = correct_sql(
+                                &self.state,
+                                claims,
+                                &current_sql,
+                                &err_msg,
+                                &question,
+                                &schema_tables,
+                                &foreign_keys,
+                                join_paths,
+                                "",
+                                &mut correct_context,
+                                None,
+                                &db_type,
+                                datasource_id,
+                                self.preferred_model.as_deref(),
+                                self.bounded,
                             )
+                            .await;
+                            let decision = correct_context.take_last_decision();
+                            (repaired, "model", decision)
                         };
 
                         let new_sql = strip_trailing_semicolon(&new_sql);
@@ -3460,12 +3579,35 @@ impl Nl2SqlAgent {
                                 &format!("步骤 {step_id} 已生成修正版 SQL，正在重新执行验证"),
                             );
                             current_sql = new_sql;
+                            current_repair_decision = repair_decision;
+                            if let Some(decision) = current_repair_decision.as_ref() {
+                                super::agent_async::emit_agent_stage_detail(
+                                    "repair_sql",
+                                    &format!(
+                                        "步骤 {step_id} 已选择数据可用性恢复策略，正在执行验证"
+                                    ),
+                                    serde_json::json!({
+                                        "kind": "model_recovery_decision",
+                                        "stepId": step_id,
+                                        "datasourceId": datasource_id,
+                                        "strategy": decision.strategy,
+                                        "scopeChanged": decision.scope_changed,
+                                        "diagnosticOnly": decision.diagnostic_only,
+                                        "rationale": decision.rationale,
+                                    }),
+                                );
+                            }
                             last_repair_method = Some(repair_method);
                             if let Some(attempt) = execution_attempts.last_mut() {
                                 attempt.retry_reason = Some(format!("sql_repair:{repair_method}"));
                             }
                             next_retry_reason = Some(format!("sql_repair:{repair_method}"));
                             continue;
+                        }
+                        if let (Some(attempt), Some(decision)) =
+                            (execution_attempts.last_mut(), repair_decision.as_ref())
+                        {
+                            annotate_attempt_with_decision(attempt, decision);
                         }
                         tracing::warn!(
                             step_id,
@@ -3503,6 +3645,8 @@ impl Nl2SqlAgent {
                         error: Some(err_msg),
                         datasource_id: Some(datasource_id.to_owned()),
                         execution_attempts,
+                        diagnostic_only: false,
+                        recovery_note: None,
                     });
                 }
             }
@@ -3956,8 +4100,21 @@ impl Nl2SqlAgent {
                 error: Some(format!("merge step blocked: {error}")),
                 datasource_id: None,
                 execution_attempts: Vec::new(),
+                diagnostic_only: false,
+                recovery_note: None,
             });
         }
+
+        let diagnostic_only = inputs.iter().any(|input| {
+            intermediate
+                .get(&input.input_name)
+                .is_some_and(|result| result.diagnostic_only)
+        });
+        let recovery_note = inputs.iter().find_map(|input| {
+            intermediate
+                .get(&input.input_name)
+                .and_then(|result| result.recovery_note.clone())
+        });
 
         let result: anyhow::Result<(Vec<String>, Vec<serde_json::Value>)> = match strategy {
             crate::nl2sql::MergeStrategy::UnionAll => union_all(inputs, intermediate),
@@ -3990,6 +4147,8 @@ impl Nl2SqlAgent {
                     error: None,
                     datasource_id: None,
                     execution_attempts: Vec::new(),
+                    diagnostic_only,
+                    recovery_note,
                 })
             }
             Err(e) => Ok(crate::nl2sql::StepResult {
@@ -4003,6 +4162,8 @@ impl Nl2SqlAgent {
                 error: Some(format!("merge step failed: {}", e)),
                 datasource_id: None,
                 execution_attempts: Vec::new(),
+                diagnostic_only,
+                recovery_note,
             }),
         }
     }
@@ -4515,6 +4676,8 @@ mod tests {
                 error: Some("syntax error".to_string()),
                 datasource_id: Some("ds-1".to_string()),
                 execution_attempts: Vec::new(),
+                diagnostic_only: false,
+                recovery_note: None,
             },
         )]);
 

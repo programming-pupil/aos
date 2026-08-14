@@ -12,25 +12,132 @@
 
 use super::ForeignKeyPrompt;
 
+fn starts_with_sql_statement(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let prefix = trimmed
+        .chars()
+        .take(24)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    prefix.starts_with("select ")
+        || prefix.starts_with("select\n")
+        || prefix.starts_with("select\t")
+        || prefix.starts_with("with ")
+        || prefix.starts_with("with\n")
+        || prefix.starts_with("with\t")
+}
+
+fn first_sql_line_offset(text: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        let leading = line.len().saturating_sub(line.trim_start().len());
+        if starts_with_sql_statement(&line[leading..]) {
+            return Some(offset + leading);
+        }
+        offset = offset.saturating_add(line.len());
+    }
+    let trailing = text.get(offset..).unwrap_or_default();
+    let leading = trailing.len().saturating_sub(trailing.trim_start().len());
+    starts_with_sql_statement(&trailing[leading..]).then_some(offset + leading)
+}
+
+fn through_first_statement_terminator(text: &str) -> &str {
+    let mut single_quote = false;
+    let mut double_quote = false;
+    let mut backtick = false;
+    let mut previous = None;
+    let mut chars = text.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '\'' if !double_quote && !backtick => {
+                if single_quote && chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                    chars.next();
+                    previous = Some('\'');
+                    continue;
+                }
+                if previous != Some('\\') {
+                    single_quote = !single_quote;
+                }
+            }
+            '"' if !single_quote && !backtick && previous != Some('\\') => {
+                double_quote = !double_quote;
+            }
+            '`' if !single_quote && !double_quote && previous != Some('\\') => {
+                backtick = !backtick;
+            }
+            ';' if !single_quote && !double_quote && !backtick => {
+                return &text[..index];
+            }
+            _ => {}
+        }
+        previous = Some(ch);
+    }
+    text
+}
+
+fn normalize_sql_candidate(text: &str) -> Option<String> {
+    let offset = first_sql_line_offset(text)?;
+    let statement = through_first_statement_terminator(&text[offset..]);
+    let statement = statement.trim().trim_end_matches("```").trim();
+    (!statement.is_empty()).then(|| statement.to_string())
+}
+
+fn fenced_sql_candidate(text: &str) -> Option<String> {
+    let mut remaining = text;
+    while let Some(open) = remaining.find("```") {
+        let after_open = &remaining[open + 3..];
+        let Some(close) = after_open.find("```") else {
+            break;
+        };
+        let mut body = &after_open[..close];
+        let first_line_end = body.find('\n').unwrap_or(body.len());
+        let language = body[..first_line_end].trim().to_ascii_lowercase();
+        if matches!(
+            language.as_str(),
+            "sql" | "trino" | "presto" | "mysql" | "postgresql"
+        ) {
+            body = body.get(first_line_end..).unwrap_or_default();
+        }
+        if let Some(candidate) = normalize_sql_candidate(body) {
+            return Some(candidate);
+        }
+        remaining = &after_open[close + 3..];
+    }
+    None
+}
+
 /// Strip markdown code fences and leading "sql" markers from the LLM's
 /// text output. Extracted so tests can cover the parsing behaviour
 /// independently of the LLM call.
 pub(crate) fn extract_sql_from_llm_output(text: &str) -> String {
-    let mut out = text.trim();
-    if let Some(stripped) = out.strip_prefix("```") {
-        out = stripped.trim_start();
-        if let Some(rest) = out.strip_prefix("sql") {
-            out = rest.trim_start();
-        } else if let Some(rest) = out.strip_prefix("SQL") {
-            out = rest.trim_start();
+    let out = text.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(out) {
+        for key in ["sql", "query", "statement"] {
+            if let Some(sql) = value.get(key).and_then(serde_json::Value::as_str) {
+                if let Some(candidate) = normalize_sql_candidate(sql) {
+                    return candidate;
+                }
+            }
         }
-        if let Some((body, _)) = out.rsplit_once("```") {
-            out = body;
-        }
-    } else if out.starts_with('`') && out.ends_with('`') {
-        out = out.trim_matches('`');
     }
-    out.trim().to_owned()
+    if let Some(candidate) = fenced_sql_candidate(out) {
+        return candidate;
+    }
+    if out.starts_with('`') && out.ends_with('`') {
+        if let Some(candidate) = normalize_sql_candidate(out.trim_matches('`')) {
+            return candidate;
+        }
+    }
+    if let Some(candidate) = normalize_sql_candidate(out) {
+        return candidate;
+    }
+    if let Some(rest) = out.strip_prefix("CLARIFICATION_NEEDED:") {
+        return format!(
+            "CLARIFICATION_NEEDED: {}",
+            rest.lines().next().unwrap_or_default().trim()
+        );
+    }
+    out.to_string()
 }
 
 #[cfg(test)]
@@ -67,6 +174,42 @@ mod generate_sql_tests {
     fn strips_fenced_sql_without_touching_statement() {
         let out = extract_sql_from_llm_output("```sql\nselect * from orders\n```");
         assert_eq!(out, "select * from orders");
+    }
+
+    #[test]
+    fn extracts_sql_after_model_analysis_and_ignores_trailing_commentary() {
+        let out = extract_sql_from_llm_output(
+            "Looking at the schema, revenue comes from dwd_revenue.\n\nSELECT app_id, SUM(revenue) AS revenue\nFROM dwd_revenue\nGROUP BY app_id;\n\nThis query ranks apps.",
+        );
+        assert_eq!(
+            out,
+            "SELECT app_id, SUM(revenue) AS revenue\nFROM dwd_revenue\nGROUP BY app_id"
+        );
+        assert!(is_safe_sql(&out));
+    }
+
+    #[test]
+    fn extracts_embedded_fenced_sql_instead_of_leading_analysis() {
+        let out = extract_sql_from_llm_output(
+            "I will use the fact table.\n```sql\nWITH daily AS (SELECT app_id, revenue FROM facts)\nSELECT * FROM daily;\n```\nDone.",
+        );
+        assert!(out.starts_with("WITH daily"));
+        assert!(is_safe_sql(&out));
+    }
+
+    #[test]
+    fn extracts_sql_from_structured_model_output() {
+        let out = extract_sql_from_llm_output(r#"{"sql":"SELECT 1;","explanation":"ok"}"#);
+        assert_eq!(out, "SELECT 1");
+    }
+
+    #[test]
+    fn sql_wins_over_clarification_protocol_mentioned_in_analysis() {
+        let out = extract_sql_from_llm_output(
+            "I do not need CLARIFICATION_NEEDED: because ROI is defined.\nSELECT app_id, SUM(revenue) / SUM(cost) AS roi FROM facts GROUP BY app_id;",
+        );
+        assert!(out.starts_with("SELECT app_id"));
+        assert!(is_safe_sql(&out));
     }
 
     #[test]

@@ -27,6 +27,7 @@
 pub mod dataset;
 pub mod parity;
 pub mod positioning;
+pub mod replay;
 pub mod report;
 pub mod runner;
 pub mod scenario;

@@ -11,6 +11,8 @@ serde_json.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
 sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

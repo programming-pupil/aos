@@ -5715,13 +5715,32 @@ mod tests {
         .fetch_one(&db)
         .await
         .expect("count SQLite baseline tables");
-        assert_eq!(table_count, 164);
+        // 164 is the legacy baseline; semantic-kernel shadow tables are
+        // intentionally additive and must not invalidate that baseline.
+        assert!(table_count >= 164);
 
         let migration_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
             .fetch_one(&db)
             .await
             .expect("read SQLx migration ledger");
-        assert_eq!(migration_count, 16);
+        assert!(migration_count >= 17);
+
+        for table in [
+            "agent_event_ledger",
+            "semantic_assertions",
+            "evidence_ledger",
+            "context_packet_manifests",
+            "analytic_intent_ir",
+        ] {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = ?",
+            )
+            .bind(table)
+            .fetch_one(&db)
+            .await
+            .expect("check semantic kernel migration table");
+            assert_eq!(exists, 1, "missing semantic kernel table {table}");
+        }
 
         let important_indexes: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name IN (

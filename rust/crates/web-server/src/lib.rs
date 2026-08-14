@@ -161,7 +161,7 @@ mod sqlite_baseline_tests {
         .await
         .expect("count Plan Mode repository selection column");
 
-        assert_eq!(migration_count, 16);
+        assert!(migration_count >= 17);
         assert_eq!(setup_lock_count, 1);
         assert_eq!(repository_auto_sync_column_count, 4);
         assert_eq!(agent_market_source_column_count, 2);

@@ -24,6 +24,7 @@ use tokio::sync::{broadcast, Mutex, OwnedSemaphorePermit, Semaphore};
 const SUPER_ASSISTANT_EXACT_RECENT_TAIL_HEADER: &str =
     "最近会话原文（按时间从旧到新；原文保留，只用于承接上下文，不得覆盖当前问题）：";
 const ATTRIBUTION_TASK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const ATTRIBUTION_VISIBLE_PROGRESS_INTERVAL: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -247,6 +248,8 @@ struct ObservationDigest {
     sampled: bool,
     rows: Vec<serde_json::Value>,
     error: Option<String>,
+    diagnostic_only: bool,
+    recovery_note: Option<String>,
     sql_count: usize,
     reference_files: Vec<String>,
 }
@@ -278,6 +281,10 @@ pub struct AttributionEvidenceCard {
     pub reference_files: Vec<String>,
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub diagnostic_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_note: Option<String>,
     #[serde(default)]
     pub evidence_refs: Vec<AttributionEvidenceRef>,
 }
@@ -311,11 +318,17 @@ pub struct AttributionObservation {
     pub used_references: Vec<ReferenceUsageDto>,
     pub error: Option<String>,
     pub elapsed_ms: u64,
+    #[serde(default)]
+    pub diagnostic_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_note: Option<String>,
 }
 
 impl AttributionObservation {
     fn execution_succeeded(&self) -> bool {
-        self.error.is_none() && self.sqls.iter().any(|sql| !sql.trim().is_empty())
+        !self.diagnostic_only
+            && self.error.is_none()
+            && self.sqls.iter().any(|sql| !sql.trim().is_empty())
     }
 
     fn has_usable_evidence(&self) -> bool {
@@ -371,6 +384,8 @@ pub struct AttributionEvidenceHealth {
     pub zero_row_steps: usize,
     pub successful_steps: usize,
     pub failed_steps: usize,
+    #[serde(default)]
+    pub diagnostic_steps: usize,
     pub sampled_steps: usize,
     pub total_rows: usize,
 }
@@ -384,6 +399,7 @@ impl AttributionEvidenceHealth {
             zero_row_steps: 0,
             successful_steps: 0,
             failed_steps: 0,
+            diagnostic_steps: 0,
             sampled_steps: 0,
             total_rows: 0,
         }
@@ -402,15 +418,29 @@ impl AttributionEvidenceHealth {
             .iter()
             .filter(|observation| observation.execution_succeeded() && observation.row_count == 0)
             .count();
+        let diagnostic_steps = observations
+            .iter()
+            .filter(|observation| observation.diagnostic_only && observation.error.is_none())
+            .count();
         Self {
             total_steps: observations.len(),
             execution_succeeded_steps,
             usable_evidence_steps,
             zero_row_steps,
             successful_steps: usable_evidence_steps,
-            failed_steps: observations.len().saturating_sub(execution_succeeded_steps),
-            sampled_steps: observations.iter().filter(|o| o.sampled).count(),
-            total_rows: observations.iter().map(|o| o.row_count).sum(),
+            failed_steps: observations
+                .len()
+                .saturating_sub(execution_succeeded_steps + diagnostic_steps),
+            diagnostic_steps,
+            sampled_steps: observations
+                .iter()
+                .filter(|o| !o.diagnostic_only && o.sampled)
+                .count(),
+            total_rows: observations
+                .iter()
+                .filter(|observation| observation.execution_succeeded())
+                .map(|o| o.row_count)
+                .sum(),
         }
     }
 }
@@ -2734,6 +2764,8 @@ fn observation_digests(observations: &[AttributionObservation]) -> Vec<Observati
                 sampled: obs.sampled,
                 rows: obs.rows.iter().take(row_limit).cloned().collect(),
                 error: obs.error.clone(),
+                diagnostic_only: obs.diagnostic_only,
+                recovery_note: obs.recovery_note.clone(),
                 sql_count: obs.sqls.len(),
                 reference_files,
             }
@@ -2830,6 +2862,8 @@ fn build_evidence_cards(observations: &[AttributionObservation]) -> Vec<Attribut
                 time_context: obs.time_context.clone(),
                 status: if obs.error.is_some() {
                     "failed".to_string()
+                } else if obs.diagnostic_only {
+                    "diagnostic".to_string()
                 } else if !obs.has_usable_evidence() {
                     "no_data".to_string()
                 } else {
@@ -2843,6 +2877,8 @@ fn build_evidence_cards(observations: &[AttributionObservation]) -> Vec<Attribut
                 sql_count: obs.sqls.len(),
                 reference_files,
                 error: obs.error.clone(),
+                diagnostic_only: obs.diagnostic_only,
+                recovery_note: obs.recovery_note.clone(),
                 evidence_refs: attribution_evidence_refs(obs),
             }
         })
@@ -3402,6 +3438,8 @@ async fn analyze_attribution(
             .as_deref()
             .and_then(extract_clarification_from_error);
         let core_failed = observation.error.is_some();
+        let core_failed_before_submission =
+            attribution_failure_before_datasource_submission(&observation);
         observations.push(observation);
         if let Some(question) = core_clarification {
             let evidence_health = AttributionEvidenceHealth::from_observations(&observations);
@@ -3420,11 +3458,25 @@ async fn analyze_attribution(
                 error: None,
             });
         }
-        // A failed or timed-out core query is terminal for this request. Do
-        // not start auxiliary branches while the remote statement may still
-        // be unwinding; this is the key protection against fan-out storms.
-        if core_failed {
+        // A failed or timed-out statement is terminal for this request while
+        // the remote engine may still be unwinding. A model-shape failure that
+        // produced no SQL and no query id never reached the datasource, so the
+        // remaining sequential branches may still recover useful evidence.
+        if core_failed && !core_failed_before_submission {
             indexed_steps.clear();
+        } else if core_failed_before_submission {
+            publish(
+                state,
+                claims,
+                task_id,
+                "execute_recover_generation",
+                "核心 SQL 未通过生成校验且尚未提交数据源，正在顺序尝试其它归因方向",
+                Some(execute_progress_percent(1, total_steps)),
+                Some(step_index),
+                Some(total_steps),
+                None,
+            )
+            .await;
         }
     }
 
@@ -3471,7 +3523,8 @@ async fn analyze_attribution(
             Some(total_steps),
         )
         .await;
-        let stop_after_step = observation.error.is_some();
+        let stop_after_step = observation.error.is_some()
+            && !attribution_failure_before_datasource_submission(&observation);
         let completed_count = observations.len() + completed.len() + 1;
         let step_summary = if observation.error.is_some() {
             format!(
@@ -3758,15 +3811,18 @@ async fn execute_attribution_step(
     let claims_for_stage = claims.clone();
     let stage_prefix = format!("execute_{}", attribution_stage_component(&step.id));
     let step_title = step.title.clone();
+    let persist_stage_prefix = stage_prefix.clone();
+    let persist_step_title = step_title.clone();
     let (stage_sender, mut stage_receiver) =
         tokio::sync::mpsc::unbounded_channel::<Option<AgentStageSignal>>();
+    let latest_stage_signal = Arc::new(std::sync::Mutex::new(None::<AgentStageSignal>));
     let stage_persist_task = tokio::spawn(async move {
         while let Some(Some(signal)) = stage_receiver.recv().await {
             let stage = format!(
-                "{stage_prefix}_{}",
+                "{persist_stage_prefix}_{}",
                 attribution_stage_component(&signal.stage)
             );
-            let message = format!("{}：{}", step_title, signal.message);
+            let message = format!("{}：{}", persist_step_title, signal.message);
             if let Some(detail) = signal.detail {
                 publish_detail(
                     &state_for_stage,
@@ -3797,7 +3853,11 @@ async fn execute_attribution_step(
         }
     });
     let stage_sender_for_emitter = stage_sender.clone();
+    let latest_stage_for_emitter = latest_stage_signal.clone();
     let stage_emitter = Arc::new(move |signal: AgentStageSignal| {
+        if let Ok(mut latest) = latest_stage_for_emitter.lock() {
+            *latest = Some(signal.clone());
+        }
         let _ = stage_sender_for_emitter.send(Some(signal));
     });
     let execution = with_agent_stage_emitter(stage_emitter.clone(), async move {
@@ -3809,9 +3869,58 @@ async fn execute_attribution_step(
         }
     });
     tokio::pin!(execution);
+    let mut visible_progress = tokio::time::interval(ATTRIBUTION_VISIBLE_PROGRESS_INTERVAL);
+    visible_progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    visible_progress.tick().await;
     let response = loop {
         tokio::select! {
             result = &mut execution => break Some(result),
+            _ = visible_progress.tick() => {
+                let elapsed = start.elapsed();
+                let latest = latest_stage_signal
+                    .lock()
+                    .ok()
+                    .and_then(|signal| signal.clone());
+                let latest_stage = latest
+                    .as_ref()
+                    .map(|signal| attribution_stage_component(&signal.stage))
+                    .unwrap_or_else(|| "preparing".to_string());
+                let latest_message = latest
+                    .as_ref()
+                    .map(|signal| signal.message.trim())
+                    .filter(|message| !message.is_empty())
+                    .unwrap_or("正在准备 Schema、SQL 和执行上下文")
+                    .to_string();
+                let mut detail = latest
+                    .as_ref()
+                    .and_then(|signal| signal.detail.clone())
+                    .and_then(|detail| detail.as_object().cloned())
+                    .unwrap_or_default();
+                detail.insert("kind".to_string(), serde_json::json!("heartbeat"));
+                detail.insert("latestStage".to_string(), serde_json::json!(latest_stage));
+                detail.insert("latestMessage".to_string(), serde_json::json!(&latest_message));
+                detail.insert(
+                    "elapsedMs".to_string(),
+                    serde_json::json!(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)),
+                );
+                publish_detail(
+                    state,
+                    claims,
+                    task_id,
+                    &format!("{stage_prefix}_wait_{latest_stage}"),
+                    &format!(
+                        "{}：{}；后台仍在执行，已用时 {} 秒",
+                        step_title,
+                        latest_message,
+                        elapsed.as_secs()
+                    ),
+                    Some(48),
+                    step_index,
+                    step_total,
+                    serde_json::Value::Object(detail),
+                )
+                .await;
+            }
             _ = tokio::time::sleep(Duration::from_millis(250)) => {
                 if task_manager().is_cancelled(task_id).await {
                     break None;
@@ -3842,6 +3951,11 @@ async fn execute_attribution_step(
     };
     match response {
         Ok(resp) => {
+            let diagnostic_only = resp.steps.iter().any(|step| step.diagnostic_only);
+            let recovery_note = resp
+                .steps
+                .iter()
+                .find_map(|step| step.recovery_note.clone());
             let query_id = resp.query_id.clone();
             let mut datasource_ids = resp
                 .steps
@@ -3885,6 +3999,8 @@ async fn execute_attribution_step(
                 used_references: resp.used_references,
                 error: resp.error,
                 elapsed_ms: start.elapsed().as_millis() as u64,
+                diagnostic_only,
+                recovery_note,
             }
         }
         Err(e) => AttributionObservation {
@@ -3904,6 +4020,8 @@ async fn execute_attribution_step(
             used_references: Vec::new(),
             error: Some(e.to_string()),
             elapsed_ms: start.elapsed().as_millis() as u64,
+            diagnostic_only: false,
+            recovery_note: None,
         },
     }
 }
@@ -3949,6 +4067,8 @@ fn cancelled_attribution_observation(
         used_references: Vec::new(),
         error: Some("cancelled".to_string()),
         elapsed_ms: 0,
+        diagnostic_only: false,
+        recovery_note: None,
     }
 }
 
@@ -3967,6 +4087,22 @@ fn attribution_observation_timed_out(observation: &AttributionObservation) -> bo
         error.contains("执行窗口内仍未完成")
             || error.contains("未在归因查询预算内启动")
             || error.to_ascii_lowercase().contains("timed out")
+    })
+}
+
+fn attribution_failure_before_datasource_submission(observation: &AttributionObservation) -> bool {
+    if observation.error.is_none()
+        || observation.query_id.is_some()
+        || observation.sqls.iter().any(|sql| !sql.trim().is_empty())
+    {
+        return false;
+    }
+    observation.error.as_deref().is_some_and(|error| {
+        let normalized = error.to_ascii_lowercase();
+        normalized.contains("sql generation failed")
+            || normalized.contains("sql generation returned empty sql")
+            || normalized.contains("llm returned unparseable sql")
+            || normalized.contains("llm returned empty response")
     })
 }
 
@@ -4894,6 +5030,8 @@ mod tests {
                 used_references: Vec::new(),
                 error: None,
                 elapsed_ms: 40,
+                diagnostic_only: false,
+                recovery_note: None,
             }),
             response: None,
             error: None,
@@ -4981,6 +5119,69 @@ mod tests {
     }
 
     #[test]
+    fn generation_shape_failure_is_known_to_precede_datasource_submission() {
+        let observation = AttributionObservation {
+            step_id: "main_metric".to_string(),
+            title: "核心指标".to_string(),
+            purpose: "establish baseline".to_string(),
+            question: "ROI trend".to_string(),
+            datasource_ids: vec!["ds-1".to_string()],
+            time_context: None,
+            query_id: None,
+            conversation_id: Some("conversation-1".to_string()),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            sampled: false,
+            sqls: Vec::new(),
+            used_references: Vec::new(),
+            error: Some(
+                "single datasource SQL generation failed: [syntax_error] LLM returned unparseable SQL"
+                    .to_string(),
+            ),
+            elapsed_ms: 1,
+            diagnostic_only: false,
+            recovery_note: None,
+        };
+        assert!(attribution_failure_before_datasource_submission(
+            &observation
+        ));
+    }
+
+    #[test]
+    fn generated_or_accepted_sql_failure_must_stop_auxiliary_fanout() {
+        let mut generated = AttributionObservation {
+            step_id: "main_metric".to_string(),
+            title: "核心指标".to_string(),
+            purpose: "establish baseline".to_string(),
+            question: "ROI trend".to_string(),
+            datasource_ids: vec!["ds-1".to_string()],
+            time_context: None,
+            query_id: None,
+            conversation_id: Some("conversation-1".to_string()),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            sampled: false,
+            sqls: vec!["SELECT app_id, roi FROM facts".to_string()],
+            used_references: Vec::new(),
+            error: Some("trino query failed: timeout".to_string()),
+            elapsed_ms: 1,
+            diagnostic_only: false,
+            recovery_note: None,
+        };
+        assert!(!attribution_failure_before_datasource_submission(
+            &generated
+        ));
+
+        generated.sqls.clear();
+        generated.query_id = Some("trino-query-1".to_string());
+        assert!(!attribution_failure_before_datasource_submission(
+            &generated
+        ));
+    }
+
+    #[test]
     fn obvious_ambiguity_guard_catches_empty_signal() {
         assert!(is_obviously_ambiguous("???"));
         assert!(is_obviously_ambiguous("？"));
@@ -5024,6 +5225,8 @@ mod tests {
             used_references: Vec::new(),
             error: Some("query timeout".to_string()),
             elapsed_ms: 1234,
+            diagnostic_only: false,
+            recovery_note: None,
         }];
 
         let calls = attribution_observation_tool_calls(&observations);
@@ -5125,6 +5328,7 @@ mod tests {
                 zero_row_steps: 0,
                 successful_steps: 2,
                 failed_steps: 1,
+                diagnostic_steps: 0,
                 sampled_steps: 0,
                 total_rows: 42,
             },
@@ -5173,6 +5377,8 @@ mod tests {
             used_references: Vec::new(),
             error: Some("needs input".to_string()),
             elapsed_ms: 1,
+            diagnostic_only: false,
+            recovery_note: None,
         };
         let observations = vec![
             failed_observation("metric_decomposition"),
@@ -5217,6 +5423,8 @@ mod tests {
             used_references: Vec::new(),
             error: Some("failed".to_string()),
             elapsed_ms: 1,
+            diagnostic_only: false,
+            recovery_note: None,
         };
         assert!(!should_run_diagnostic_loop(&[failed]));
         let success = AttributionObservation {
@@ -5241,6 +5449,8 @@ mod tests {
                 used_references: Vec::new(),
                 error: None,
                 elapsed_ms: 1,
+                diagnostic_only: false,
+                recovery_note: None,
             }
         };
         assert!(should_run_diagnostic_loop(&[success]));
@@ -5264,6 +5474,8 @@ mod tests {
                 used_references: Vec::new(),
                 error: None,
                 elapsed_ms: 1,
+                diagnostic_only: false,
+                recovery_note: None,
             })
             .collect::<Vec<_>>();
         assert!(should_run_diagnostic_loop(&complete));
@@ -5286,6 +5498,8 @@ mod tests {
             used_references: Vec::new(),
             error: Some("connector does not expose the optional field".to_string()),
             elapsed_ms: 1,
+            diagnostic_only: false,
+            recovery_note: None,
         });
         assert!(should_run_diagnostic_loop(&complete_with_optional_failure));
         complete_with_optional_failure.push(AttributionObservation {
@@ -5305,6 +5519,8 @@ mod tests {
             used_references: Vec::new(),
             error: None,
             elapsed_ms: 1,
+            diagnostic_only: false,
+            recovery_note: None,
         });
         assert!(!should_run_diagnostic_loop(&complete_with_optional_failure));
     }
@@ -5328,6 +5544,8 @@ mod tests {
             used_references: Vec::new(),
             error: Some("trino query failed: connection refused".to_string()),
             elapsed_ms: 10,
+            diagnostic_only: false,
+            recovery_note: None,
         };
         assert!(should_skip_attribution_synthesis(&[failed]));
 
@@ -5351,6 +5569,30 @@ mod tests {
         assert!(!should_skip_attribution_synthesis(&[usable]));
     }
 
+    #[test]
+    fn changed_scope_result_is_diagnostic_not_attribution_evidence() {
+        let diagnostic = AttributionObservation {
+            error: None,
+            row_count: 1,
+            rows: vec![serde_json::json!({"app_id": "demo", "roi": 0.8})],
+            columns: vec!["app_id".to_string(), "roi".to_string()],
+            sqls: vec!["SELECT app_id, roi FROM metrics WHERE dt = DATE '2026-08-13'".to_string()],
+            diagnostic_only: true,
+            recovery_note: Some(
+                "requested partition was unavailable; recent data only validates the path"
+                    .to_string(),
+            ),
+            ..failed_observation_for_synthesis_test()
+        };
+
+        let health = AttributionEvidenceHealth::from_observations(&[diagnostic.clone()]);
+        assert_eq!(health.execution_succeeded_steps, 0);
+        assert_eq!(health.usable_evidence_steps, 0);
+        assert_eq!(health.diagnostic_steps, 1);
+        assert_eq!(health.failed_steps, 0);
+        assert!(should_skip_attribution_synthesis(&[diagnostic]));
+    }
+
     fn failed_observation_for_synthesis_test() -> AttributionObservation {
         AttributionObservation {
             step_id: "main_metric".to_string(),
@@ -5369,6 +5611,8 @@ mod tests {
             used_references: Vec::new(),
             error: Some("connection failed".to_string()),
             elapsed_ms: 10,
+            diagnostic_only: false,
+            recovery_note: None,
         }
     }
 
@@ -5393,6 +5637,8 @@ mod tests {
             used_references: Vec::new(),
             error: None,
             elapsed_ms: 1,
+            diagnostic_only: false,
+            recovery_note: None,
         };
         let cards = build_evidence_cards(&[obs]);
         assert_eq!(cards.len(), 1);
@@ -5422,6 +5668,8 @@ mod tests {
             used_references: Vec::new(),
             error: None,
             elapsed_ms: 12,
+            diagnostic_only: false,
+            recovery_note: None,
         };
 
         let health = AttributionEvidenceHealth::from_observations(&[observation.clone()]);
@@ -5479,6 +5727,8 @@ mod tests {
                     sql_count: 1,
                     reference_files: Vec::new(),
                     error: None,
+                    diagnostic_only: false,
+                    recovery_note: None,
                     evidence_refs: Vec::new(),
                 }],
                 total_execution_ms: 100,
@@ -5500,6 +5750,8 @@ mod tests {
                 sql_count: 1,
                 reference_files: Vec::new(),
                 error: None,
+                diagnostic_only: false,
+                recovery_note: None,
                 evidence_refs: Vec::new(),
             }],
         };
@@ -5825,6 +6077,8 @@ mod tests {
             used_references: Vec::new(),
             error: None,
             elapsed_ms: 10,
+            diagnostic_only: false,
+            recovery_note: None,
         };
         let progress = serde_json::to_string(&vec![AttributionTaskEvent {
             task_id: "task-legacy".to_string(),
@@ -5879,6 +6133,8 @@ mod tests {
             used_references: Vec::new(),
             error: None,
             elapsed_ms: 1,
+            diagnostic_only: false,
+            recovery_note: None,
         }];
         let report = AttributionReport {
             title: "归因".to_string(),
@@ -5934,6 +6190,8 @@ mod tests {
             used_references: Vec::new(),
             error: Some("table not found".to_string()),
             elapsed_ms: 1,
+            diagnostic_only: false,
+            recovery_note: None,
         }];
         let report = AttributionReport {
             title: "归因".to_string(),

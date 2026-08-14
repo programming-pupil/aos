@@ -10,6 +10,9 @@ default = []
 local-embedding = ["dep:anyhow", "dep:fastembed", "dep:hex", "dep:parking_lot"]
 
 [dependencies]
+agent-protocol = { path = "../agent-protocol" }
+semantic-core = { path = "../semantic-core" }
+memory-engine = { path = "../memory-engine" }
 sha2 = "0.10"
 glob = "0.3"
 async-trait = "0.1"

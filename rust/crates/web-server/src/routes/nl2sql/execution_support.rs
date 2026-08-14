@@ -42,6 +42,10 @@ pub(crate) enum SqlExecErrorKind {
     SyntaxError,
     /// SQL is parseable but violates target-engine semantic rules.
     SemanticError,
+    /// The query is valid, but one or more referenced partitions/files are
+    /// unavailable. The model may choose a narrower diagnostic query, but the
+    /// result must not silently replace the user's requested scope.
+    DataUnavailable,
     /// A generic execution error (network, auth, timeout, etc.).
     Other(String),
 }
@@ -103,13 +107,30 @@ impl SqlExecErrorKind {
         {
             return Self::SemanticError;
         }
+        if [
+            "hive_file_not_found",
+            "partition location does not exist",
+            "partition_location_does_not_exist",
+            "partition not found",
+            "no files found for partition",
+            "cannot open split",
+        ]
+        .iter()
+        .any(|marker| msg_lower.contains(marker))
+        {
+            return Self::DataUnavailable;
+        }
         Self::Other(msg.to_string())
     }
 
     pub(crate) fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Self::TableNotFound | Self::ColumnNotFound | Self::SyntaxError | Self::SemanticError
+            Self::TableNotFound
+                | Self::ColumnNotFound
+                | Self::SyntaxError
+                | Self::SemanticError
+                | Self::DataUnavailable
         ) || matches!(
             self,
             Self::Other(msg) if msg.to_lowercase().contains("only_full_group_by")
@@ -164,9 +185,22 @@ impl SqlExecErrorKind {
             Self::ColumnNotFound => "column_not_found",
             Self::SyntaxError => "syntax_error",
             Self::SemanticError => "semantic_error",
+            Self::DataUnavailable => "data_unavailable",
             Self::Other(_) => "operational_error",
         }
     }
+
+    pub(crate) fn allows_model_recovery_strategy(&self) -> bool {
+        matches!(self, Self::DataUnavailable)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SqlRepairDecision {
+    pub strategy: Option<String>,
+    pub scope_changed: bool,
+    pub diagnostic_only: bool,
+    pub rationale: Option<String>,
 }
 
 /// Tracks a single SQL correction attempt.
@@ -180,6 +214,7 @@ struct CorrectAttempt {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SelfCorrectContext {
     attempts: Vec<CorrectAttempt>,
+    last_decision: Option<SqlRepairDecision>,
 }
 
 impl SelfCorrectContext {
@@ -189,6 +224,7 @@ impl SelfCorrectContext {
                 sql: initial_sql.to_string(),
                 error: initial_error.to_string(),
             }],
+            last_decision: None,
         }
     }
 
@@ -217,6 +253,14 @@ impl SelfCorrectContext {
             .map(|a| a.error.clone())
             .unwrap_or_default()
     }
+
+    pub(crate) fn set_last_decision(&mut self, decision: Option<SqlRepairDecision>) {
+        self.last_decision = decision;
+    }
+
+    pub(crate) fn take_last_decision(&mut self) -> Option<SqlRepairDecision> {
+        self.last_decision.take()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -234,6 +278,10 @@ pub struct ExecuteResponse {
     pub corrected_sql: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub self_correct_failed: Option<bool>,
+    #[serde(default)]
+    pub diagnostic_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_score: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -299,5 +347,33 @@ mod tests {
             !SqlExecErrorKind::new("Query execution timed out after 60s")
                 .is_transient_operational()
         );
+    }
+
+    #[test]
+    fn unavailable_trino_partitions_allow_model_guided_recovery() {
+        for error in [
+            "Query failed (#1): HIVE_FILE_NOT_FOUND: Partition location does not exist: obs://bucket/table/dt=20220307",
+            "Trino query failed: cannot open split for hive.prod.events partition dt=2026-08-01",
+            "no files found for partition ds=20260801",
+        ] {
+            let kind = SqlExecErrorKind::new(error);
+            assert_eq!(kind.label(), "data_unavailable", "{error}");
+            assert!(kind.is_retryable(), "{error}");
+            assert!(kind.allows_model_recovery_strategy(), "{error}");
+            assert!(!kind.is_transient_operational(), "{error}");
+        }
+    }
+
+    #[test]
+    fn permission_and_authentication_errors_never_change_query_scope() {
+        for error in [
+            "Access Denied: Cannot select from columns [revenue]",
+            "HTTP 401 authentication failed",
+            "User does not have permission to query table hive.prod.orders",
+        ] {
+            let kind = SqlExecErrorKind::new(error);
+            assert!(!kind.is_retryable(), "{error}");
+            assert!(!kind.allows_model_recovery_strategy(), "{error}");
+        }
     }
 }

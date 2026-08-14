@@ -2365,6 +2365,20 @@ export interface StepExecutionDetail {
   row_count: number;
   execution_ms: number;
   error: string | null;
+  diagnostic_only?: boolean;
+  recovery_note?: string | null;
+  execution_attempts?: Array<{
+    attempt: number;
+    status: string;
+    sql?: string;
+    execution_ms?: number;
+    error?: string;
+    retry_reason?: string;
+    repair_strategy?: string;
+    scope_changed?: boolean;
+    diagnostic_only?: boolean;
+    repair_rationale?: string;
+  }>;
 }
 
 export interface AgentExecuteResponse {
@@ -2454,6 +2468,8 @@ export interface AttributionObservation {
   usedReferences?: Nl2sqlReferenceUsage[];
   error?: string | null;
   elapsedMs: number;
+  diagnosticOnly?: boolean;
+  recoveryNote?: string | null;
 }
 
 export interface AttributionDriver {
@@ -2483,6 +2499,7 @@ export interface AttributionEvidenceHealth {
   zeroRowSteps?: number;
   successfulSteps: number;
   failedSteps: number;
+  diagnosticSteps?: number;
   sampledSteps: number;
   totalRows: number;
 }
@@ -2500,6 +2517,8 @@ export interface AttributionAnalyzeResponse {
   evidenceCards?: AttributionEvidenceCard[];
   totalExecutionMs: number;
   error?: string | null;
+  diagnosticOnly?: boolean;
+  recoveryNote?: string | null;
 }
 
 export interface AttributionTaskStartResponse {

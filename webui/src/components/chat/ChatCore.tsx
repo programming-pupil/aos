@@ -6375,6 +6375,7 @@ export function ChatCore({
                   taskId: terminalReplayEvent.task_id,
                   taskStatus: terminalReplayEvent.status,
                   pmReport: terminalReport,
+                  preserveRicherContent: true,
                 },
               );
             }
@@ -8869,6 +8870,33 @@ export function ChatCore({
             setThinkingDurationMs(undefined);
             thinkingDurationRef.current = undefined;
             superAssistantAsyncTaskStartedRef.current = false;
+            const completedAt = Date.now();
+            setPmStageStates((prev) => {
+              const normalized = Object.fromEntries(
+                Object.entries(prev).map(([key, value]) => [
+                  key,
+                  value.status === "running" || value.status === "pending"
+                    ? {
+                        ...value,
+                        status: "completed" as const,
+                        updatedAt: completedAt,
+                        detail: {
+                          ...(value.detail && typeof value.detail === "object"
+                            ? (value.detail as Record<string, unknown>)
+                            : {}),
+                          terminalClosure: true,
+                          message: t(
+                            "operations.pmStageClosedByTerminalSuccess",
+                            "任务已完成，阶段已收口",
+                          ),
+                        },
+                      }
+                    : value,
+                ]),
+              );
+              pmStageStatesRef.current = normalized;
+              return normalized;
+            });
 
             onStreamFinished?.(
               assistantMsg,
@@ -10215,7 +10243,13 @@ export function ChatCore({
         (verifyState?.status === "completed" &&
           (verifyDetail.passed === true ||
             verifyDetail.qualityGateSkipped === true)));
-    return PM_STAGE_ORDER.map((stage) => {
+    return PM_STAGE_ORDER.filter(
+      (stage) =>
+        !(
+          (stage === "report_extract" || stage === "deep_loop") &&
+          !pmStageStates[stage]
+        ),
+    ).map((stage) => {
       if (stage === "retry_repair" && retryRepairNotNeeded) {
         return {
           id: stage,

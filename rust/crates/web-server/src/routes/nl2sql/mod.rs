@@ -387,6 +387,7 @@ pub(crate) use self::agent_executor::{
 #[allow(unused_imports)]
 pub(crate) use self::execution_support::{
     ColumnInfo, ExecuteRequest, ExecuteResponse, SelfCorrectContext, SqlExecErrorKind,
+    SqlRepairDecision,
 };
 
 // ── Shared constants ─────────────────────────────────────────────────────────
@@ -3250,7 +3251,11 @@ pub(crate) async fn generate_sql(
         .unwrap_or(24_576);
     let deadline_bounded = !allow_tool_loop;
     let task_max_tokens: u32 = if deadline_bounded {
-        4_096
+        std::env::var("NL2SQL_BOUNDED_SQL_MAX_TOKENS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .map(|value| value.clamp(2_048, 16_384))
+            .unwrap_or(8_192)
     } else if large_schema_mode || table_count > 30 {
         default_complex_tokens
     } else if table_count > 10 {
@@ -3360,10 +3365,26 @@ pub(crate) async fn generate_sql(
         };
 
         let mut move_next_key = false;
+        let mut shape_repair_hint: Option<String> = None;
         for attempt in 0..ATTEMPTS {
             if attempt > 0 {
                 let backoff_secs = 1u64 << (attempt - 1); // 1s, 2s
                 tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+            }
+
+            let mut attempt_request = request.clone();
+            if let Some(hint) = shape_repair_hint.as_deref() {
+                attempt_request.messages.push(InputMessage {
+                    role: "user".to_string(),
+                    content: vec![InputContentBlock::Text {
+                        text: format!(
+                            "Your previous response was rejected before database execution: {hint}\n\
+                             Retry the original request now. Return exactly one complete executable SELECT or WITH statement as plain text. \
+                             Do not include analysis, Markdown fences, JSON, labels, or text before/after the SQL. \
+                             If the request truly cannot be resolved from the supplied evidence, return exactly CLARIFICATION_NEEDED: <specific question>."
+                        ),
+                    }],
+                });
             }
 
             let attempt_started = std::time::Instant::now();
@@ -3374,7 +3395,7 @@ pub(crate) async fn generate_sql(
                 question,
                 schema,
                 &chat_cfg,
-                &request,
+                &attempt_request,
                 allow_tool_loop,
             )
             .await
@@ -3456,6 +3477,10 @@ pub(crate) async fn generate_sql(
                         "LLM asked redundant metric clarification despite explicit metric mention"
                             .to_string(),
                     );
+                    shape_repair_hint = Some(
+                        "the response asked for a metric that is already explicit in the question"
+                            .to_string(),
+                    );
                     continue;
                 }
                 mark_nl2sql_candidate_success(
@@ -3488,6 +3513,10 @@ pub(crate) async fn generate_sql(
                     .collect::<Vec<_>>()
                     .join(",");
                 last_err = Some("LLM returned empty response".to_owned());
+                shape_repair_hint = Some(
+                    "the response contained no usable SQL text; make sure the full statement is present"
+                        .to_string(),
+                );
                 tracing::warn!(
                     candidate_index = candidate_idx + 1,
                     total_candidates,
@@ -3502,6 +3531,16 @@ pub(crate) async fn generate_sql(
                     input_tokens = response.usage.input_tokens,
                     output_tokens = response.usage.output_tokens,
                     "NL2SQL LLM returned empty response"
+                );
+                self::agent_async::emit_agent_stage_detail(
+                    "generate_sql_retry",
+                    "模型未返回可用 SQL，正在收紧输出格式后重试",
+                    serde_json::json!({
+                        "kind": "sql_generation_retry",
+                        "attempt": attempt + 1,
+                        "status": "retrying",
+                        "reason": "empty_response",
+                    }),
                 );
                 if total_candidates > 1 {
                     suppress_nl2sql_candidate(&claims.tenant_id, &chat_cfg);
@@ -3538,11 +3577,21 @@ pub(crate) async fn generate_sql(
                         elapsed_ms = attempt_started.elapsed().as_millis() as u64,
                         "NL2SQL LLM returned syntactically invalid SQL"
                     );
-                    if total_candidates > 1 {
-                        suppress_nl2sql_candidate(&claims.tenant_id, &chat_cfg);
-                        move_next_key = true;
-                        break;
-                    }
+                    self::agent_async::emit_agent_stage_detail(
+                        "generate_sql_retry",
+                        "模型返回的 SQL 未通过语法校验，正在携带解析错误重试",
+                        serde_json::json!({
+                            "kind": "sql_generation_retry",
+                            "attempt": attempt + 1,
+                            "status": "retrying",
+                            "reason": "syntax_error",
+                            "error": message.clone(),
+                            "sql": sql.chars().take(12_000).collect::<String>(),
+                        }),
+                    );
+                    shape_repair_hint = Some(format!(
+                        "the SQL parser reported {message}; return a complete statement with balanced quotes and parentheses"
+                    ));
                     continue;
                 }
                 SqlSafetyResult::ForbiddenOperation { statement_type } => {
@@ -3558,11 +3607,20 @@ pub(crate) async fn generate_sql(
                         elapsed_ms = attempt_started.elapsed().as_millis() as u64,
                         "NL2SQL LLM returned a forbidden statement type"
                     );
-                    if total_candidates > 1 {
-                        suppress_nl2sql_candidate(&claims.tenant_id, &chat_cfg);
-                        move_next_key = true;
-                        break;
-                    }
+                    self::agent_async::emit_agent_stage_detail(
+                        "generate_sql_retry",
+                        "模型返回了非只读语句，正在按只读 SQL 约束重试",
+                        serde_json::json!({
+                            "kind": "sql_generation_retry",
+                            "attempt": attempt + 1,
+                            "status": "retrying",
+                            "reason": "forbidden_operation",
+                            "statementType": statement_type.clone(),
+                        }),
+                    );
+                    shape_repair_hint = Some(format!(
+                        "the response used forbidden statement type {statement_type}; only a read-only SELECT or WITH statement is allowed"
+                    ));
                     continue;
                 }
                 SqlSafetyResult::MultipleStatements => {
@@ -3579,11 +3637,20 @@ pub(crate) async fn generate_sql(
                         elapsed_ms = attempt_started.elapsed().as_millis() as u64,
                         "NL2SQL LLM returned multiple statements"
                     );
-                    if total_candidates > 1 {
-                        suppress_nl2sql_candidate(&claims.tenant_id, &chat_cfg);
-                        move_next_key = true;
-                        break;
-                    }
+                    self::agent_async::emit_agent_stage_detail(
+                        "generate_sql_retry",
+                        "模型返回了多条 SQL，正在合并为单条只读查询后重试",
+                        serde_json::json!({
+                            "kind": "sql_generation_retry",
+                            "attempt": attempt + 1,
+                            "status": "retrying",
+                            "reason": "multiple_statements",
+                        }),
+                    );
+                    shape_repair_hint = Some(
+                        "the response contained multiple SQL statements; combine the analysis into one SELECT or WITH statement"
+                            .to_string(),
+                    );
                     continue;
                 }
                 SqlSafetyResult::ForbiddenFunction { function_name } => {
@@ -3600,11 +3667,20 @@ pub(crate) async fn generate_sql(
                         elapsed_ms = attempt_started.elapsed().as_millis() as u64,
                         "NL2SQL LLM emitted a forbidden function"
                     );
-                    if total_candidates > 1 {
-                        suppress_nl2sql_candidate(&claims.tenant_id, &chat_cfg);
-                        move_next_key = true;
-                        break;
-                    }
+                    self::agent_async::emit_agent_stage_detail(
+                        "generate_sql_retry",
+                        "模型 SQL 使用了受限函数，正在改写为安全只读查询",
+                        serde_json::json!({
+                            "kind": "sql_generation_retry",
+                            "attempt": attempt + 1,
+                            "status": "retrying",
+                            "reason": "forbidden_function",
+                            "functionName": function_name.clone(),
+                        }),
+                    );
+                    shape_repair_hint = Some(format!(
+                        "the response used forbidden function {function_name}; rewrite the query using safe read-only SQL functions"
+                    ));
                     continue;
                 }
                 SqlSafetyResult::ForbiddenIntoClause => {
@@ -3621,11 +3697,20 @@ pub(crate) async fn generate_sql(
                         elapsed_ms = attempt_started.elapsed().as_millis() as u64,
                         "NL2SQL LLM emitted INTO OUTFILE / INTO DUMPFILE"
                     );
-                    if total_candidates > 1 {
-                        suppress_nl2sql_candidate(&claims.tenant_id, &chat_cfg);
-                        move_next_key = true;
-                        break;
-                    }
+                    self::agent_async::emit_agent_stage_detail(
+                        "generate_sql_retry",
+                        "模型 SQL 包含写出语句，正在移除写操作后重试",
+                        serde_json::json!({
+                            "kind": "sql_generation_retry",
+                            "attempt": attempt + 1,
+                            "status": "retrying",
+                            "reason": "forbidden_into_clause",
+                        }),
+                    );
+                    shape_repair_hint = Some(
+                        "the response attempted to write a file with an INTO clause; return a read-only query without INTO"
+                            .to_string(),
+                    );
                     continue;
                 }
             }
@@ -5662,7 +5747,9 @@ pub(crate) async fn query(
                 }
                 Err(e)
                     if attempt < max_self_correct_attempts().max(1)
-                        && execution_support::SqlExecErrorKind::new(&e).is_retryable() =>
+                        && execution_support::SqlExecErrorKind::new(&e).is_retryable()
+                        && !execution_support::SqlExecErrorKind::new(&e)
+                            .allows_model_recovery_strategy() =>
                 {
                     tracing::warn!(
                         datasource_id = %req.data_source_id,

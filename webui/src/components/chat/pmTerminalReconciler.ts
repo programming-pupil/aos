@@ -61,6 +61,7 @@ export function reconcilePmHistoryTerminalAssistant(
     taskStatus?: string | null;
     pmReport?: PmReportArtifact;
     userMessageId?: string | null;
+    preserveRicherContent?: boolean;
   },
 ): DisplayMessage[] {
   const normalized = terminalText.trim();
@@ -94,6 +95,19 @@ export function reconcilePmHistoryTerminalAssistant(
         (!!taskStatus && current.pmTaskStatus !== taskStatus) ||
         (!!taskMeta?.pmReport && current.pmReport !== taskMeta.pmReport);
       if (!hasFreshMeta) return compactPmDuplicateTaskReplies(next);
+    }
+    if (
+      taskMeta?.preserveRicherContent === true &&
+      !pmTerminalTextIsFailure(normalized) &&
+      currentPlain.length > normalized.length
+    ) {
+      next[idx] = {
+        ...current,
+        pmTaskId: taskId ?? current.pmTaskId,
+        pmTaskStatus: taskStatus ?? current.pmTaskStatus,
+        pmReport: taskMeta.pmReport ?? current.pmReport,
+      };
+      return compactPmDuplicateTaskReplies(next);
     }
     if (
       pmTerminalTextIsFailure(normalized) &&
@@ -188,6 +202,18 @@ export function reconcilePmHistoryTerminalAssistant(
     currentPlain.length > 0
   ) {
     return messages;
+  }
+  if (
+    taskMeta?.preserveRicherContent === true &&
+    currentPlain.length > normalized.length
+  ) {
+    next[lastAssistantIdx] = {
+      ...current,
+      pmTaskId: taskId ?? current.pmTaskId,
+      pmTaskStatus: taskStatus ?? current.pmTaskStatus,
+      pmReport: taskMeta.pmReport ?? current.pmReport,
+    };
+    return compactPmDuplicateTaskReplies(next);
   }
   next[lastAssistantIdx] = {
     ...current,

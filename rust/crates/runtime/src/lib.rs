@@ -46,6 +46,7 @@ pub mod egress;
 pub mod isolation;
 #[cfg(feature = "local-embedding")]
 pub mod local_embedding;
+pub mod semantic_kernel;
 mod sse;
 pub mod stale_base;
 pub mod stale_branch;

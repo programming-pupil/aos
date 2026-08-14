@@ -97,6 +97,12 @@ struct OrdinaryWebEvidenceSummary {
     rejected_reasons: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PmResponseEvidenceSummary {
+    urls: BTreeSet<String>,
+    domains: BTreeSet<String>,
+}
+
 pub(super) fn ensure_parent_recovery_worker(state: AppState) {
     static STARTED: OnceLock<()> = OnceLock::new();
     if STARTED.set(()).is_err() {
@@ -1265,6 +1271,32 @@ async fn parent_resume_options(
         .iter()
         .any(|call| provider_native_search_verified(call));
     let mut options = suppress_repeated_native_web_search_options(current, native_search_completed);
+    let completed_deep_research = sqlx::query_scalar::<sqlx::Sqlite, i64>(
+        "SELECT EXISTS(
+             SELECT 1 FROM super_assistant_subtasks
+             WHERE tenant_id = ? AND user_id = ? AND parent_turn_id = ?
+               AND engine = 'deep_research' AND status = 'completed'
+         )",
+    )
+    .bind(&claims.tenant_id)
+    .bind(&claims.sub)
+    .bind(&input.turn_id)
+    .fetch_one(&state.db)
+    .await?
+        != 0;
+    if completed_deep_research {
+        options.blocked_tools.extend([
+            "deep_research_start".to_string(),
+            "WebSearch".to_string(),
+            "WebFetch".to_string(),
+            "web_search".to_string(),
+            "web_fetch".to_string(),
+        ]);
+        options.system_instructions.push(
+            "The required deep-research specialist has already completed. Do not start another specialist or perform parent-level web retrieval. Use the completed specialist result already present in this turn and finish the answer now."
+                .to_string(),
+        );
+    }
     if ordinary_web_fallback_allowed(input) {
         options
             .system_instructions
@@ -3162,9 +3194,10 @@ async fn resolve_deferred_batch(
     let mut accepted_completion = None;
     if completions.is_empty() {
         let promotion = promotable_deep_research_summary(input, suspended, &resolved)
-            .map(|summary| {
+            .map(|(summary, evidence_refs)| {
                 (
                     summary,
+                    evidence_refs,
                     "server_verified_deep_research",
                     "server-verified deep research subtask",
                 )
@@ -3173,12 +3206,13 @@ async fn resolve_deferred_batch(
                 promotable_super_adversarial_summary(input, suspended, &resolved).map(|summary| {
                     (
                         summary,
+                        Vec::new(),
                         "server_verified_super_adversarial",
                         "server-verified multi-model adversarial subtask",
                     )
                 })
             });
-        if let Some((summary, completion_source, check)) = promotion {
+        if let Some((summary, evidence_refs, completion_source, check)) = promotion {
             // A server-verified specialist result still re-enters the parent
             // runtime before completion verification. Skipping this step would
             // attempt waiting_subagent -> verifying, which is deliberately not
@@ -3187,7 +3221,7 @@ async fn resolve_deferred_batch(
             let submission = CompleteTurnSubmission {
                 final_answer: summary.clone(),
                 claims: Vec::new(),
-                evidence_refs: extract_urls(&summary),
+                evidence_refs,
                 checks_performed: vec![check.to_string()],
                 remaining_uncertainty: Vec::new(),
                 risk_level: "high".to_string(),
@@ -3432,7 +3466,7 @@ fn promotable_deep_research_summary(
     input: &UnifiedParentTurnInput,
     suspended: &AgentSuspendedTurn,
     resolved: &BTreeMap<String, DeferredToolResult>,
-) -> Option<String> {
+) -> Option<(String, Vec<String>)> {
     if suspended.deferred_tools.len() != 1
         || input.route_hint != "pm_assistant"
         || input.required_evidence.is_empty()
@@ -3459,15 +3493,28 @@ fn promotable_deep_research_summary(
         .get("quality")
         .and_then(|quality| quality.get("citation_count"))
         .and_then(Value::as_u64)
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(
+            output
+                .get("citationCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
     let summary = output.get("summary").and_then(Value::as_str)?.trim();
-    let sourced = citation_count >= 1 || !extract_urls(summary).is_empty();
+    let mut evidence_refs = output
+        .get("evidenceUrls")
+        .map(pm_collect_urls)
+        .unwrap_or_default();
+    evidence_refs.extend(extract_urls(summary));
+    let sourced = output.get("sourced").and_then(Value::as_bool) == Some(true)
+        || citation_count >= 1
+        || !evidence_refs.is_empty();
     let model_only = output.get("modelOnly").and_then(Value::as_bool) == Some(true)
         || output.get("deliveryMode").and_then(Value::as_str) == Some("model_only");
     if summary.chars().count() < 200 || !(sourced || model_only) {
         return None;
     }
-    Some(summary.to_string())
+    Some((summary.to_string(), evidence_refs.into_iter().collect()))
 }
 
 fn promotable_super_adversarial_summary(
@@ -4195,7 +4242,9 @@ async fn execute_nl2sql_subtask(
                 let successful_sql_steps = response
                     .steps
                     .iter()
-                    .filter(|step| step.sql.is_some() && step.error.is_none())
+                    .filter(|step| {
+                        step.sql.is_some() && step.error.is_none() && !step.diagnostic_only
+                    })
                     .count();
                 let failed_step_count = response
                     .steps
@@ -4206,7 +4255,9 @@ async fn execute_nl2sql_subtask(
                     && response
                         .steps
                         .iter()
-                        .filter(|step| step.sql.is_some() && step.error.is_none())
+                        .filter(|step| {
+                            step.sql.is_some() && step.error.is_none() && !step.diagnostic_only
+                        })
                         .all(|step| step.datasource_id.is_some());
                 // The data-exploration endpoint returns usable partial plans when
                 // an optional branch fails but another validated SQL step
@@ -4231,6 +4282,10 @@ async fn execute_nl2sql_subtask(
                                     "executionMs": attempt.execution_ms,
                                     "error": attempt.error,
                                     "retryReason": attempt.retry_reason,
+                                    "repairStrategy": attempt.repair_strategy,
+                                    "scopeChanged": attempt.scope_changed,
+                                    "diagnosticOnly": attempt.diagnostic_only,
+                                    "repairRationale": attempt.repair_rationale,
                                 })
                             })
                             .collect::<Vec<_>>();
@@ -4245,6 +4300,8 @@ async fn execute_nl2sql_subtask(
                             "executionMs": step.execution_ms,
                             "error": step.error,
                             "executionAttempts": execution_attempts,
+                            "diagnosticOnly": step.diagnostic_only,
+                            "recoveryNote": step.recovery_note,
                         })
                     })
                     .collect::<Vec<_>>();
@@ -5155,6 +5212,8 @@ fn attribution_observation_payload(
         "referenceCount": observation.used_references.len(),
         "elapsedMs": observation.elapsed_ms,
         "error": observation.error,
+        "diagnosticOnly": observation.diagnostic_only,
+        "recoveryNote": observation.recovery_note,
     })
 }
 
@@ -5182,6 +5241,8 @@ fn attribution_audit_observation_payload(
         "usedReferences": observation.used_references.iter().take(20).cloned().collect::<Vec<_>>(),
         "elapsedMs": observation.elapsed_ms,
         "error": observation.error,
+        "diagnosticOnly": observation.diagnostic_only,
+        "recoveryNote": observation.recovery_note,
     })
 }
 
@@ -5221,7 +5282,10 @@ fn attribution_verification_summary(
                 || !observation.columns.is_empty()
                 || !observation.rows.is_empty()
                 || observation.row_count > 0;
-            observation.error.is_none() && has_sql && has_execution_receipt
+            !observation.diagnostic_only
+                && observation.error.is_none()
+                && has_sql
+                && has_execution_receipt
         })
         .collect::<Vec<_>>();
     let successful_step_ids = successful
@@ -5476,17 +5540,46 @@ async fn refresh_pm_subtask(
             .and_then(|value| serde_json::from_str::<Value>(&value).ok())
             .unwrap_or(Value::Null);
         let text = raw.get("text").and_then(Value::as_str).unwrap_or_default();
-        let citation_count = raw
+        let declared_citation_count = raw
             .get("pm_quality")
             .and_then(|quality| quality.get("citation_count"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        let model_only = citation_count == 0 && extract_urls(text).is_empty();
+        let declared_domain_count = raw
+            .get("pm_quality")
+            .and_then(|quality| quality.get("domain_count"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let evidence = pm_response_evidence_summary(&raw);
+        let citation_count = declared_citation_count.max(evidence.urls.len() as u64);
+        let domain_count = declared_domain_count.max(evidence.domains.len() as u64);
+        let sourced = citation_count > 0 || domain_count > 0;
+        let model_only = !sourced;
+        let mut quality = raw.get("pm_quality").cloned().unwrap_or_else(|| json!({}));
+        if !quality.is_object() {
+            quality = json!({});
+        }
+        if let Some(object) = quality.as_object_mut() {
+            object.insert("citation_count".to_string(), json!(citation_count));
+            object.insert("domain_count".to_string(), json!(domain_count));
+            object.insert(
+                "citations".to_string(),
+                json!(evidence.urls.iter().cloned().collect::<Vec<_>>()),
+            );
+            object.insert(
+                "domains".to_string(),
+                json!(evidence.domains.iter().cloned().collect::<Vec<_>>()),
+            );
+        }
         let compact = json!({
             "status": "completed",
             "summary": truncate(text, 50_000),
             "artifactAvailable": true,
-            "quality": raw.get("pm_quality"),
+            "quality": quality,
+            "citationCount": citation_count,
+            "domainCount": domain_count,
+            "evidenceUrls": evidence.urls.iter().cloned().collect::<Vec<_>>(),
+            "sourced": sourced,
             "deliveryMode": if model_only { "model_only" } else { "sourced" },
             "modelOnly": model_only,
         });
@@ -6586,8 +6679,20 @@ async fn evaluate_server_completion(
                     .get("quality")
                     .and_then(|quality| quality.get("citation_count"))
                     .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                if citation_count > 0 {
+                    .unwrap_or(0)
+                    .max(
+                        result
+                            .get("citationCount")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                    );
+                let sourced = result.get("sourced").and_then(Value::as_bool) == Some(true)
+                    || citation_count > 0
+                    || result
+                        .get("evidenceUrls")
+                        .map(pm_collect_urls)
+                        .is_some_and(|urls| !urls.is_empty());
+                if sourced {
                     checks.insert("research_claims_sourced".to_string());
                 }
             }
@@ -7405,6 +7510,84 @@ fn collect_json_urls(value: &Value, output: &mut BTreeSet<String>) {
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
+}
+
+fn pm_collect_urls(value: &Value) -> BTreeSet<String> {
+    let mut urls = BTreeSet::new();
+    collect_json_urls(value, &mut urls);
+    urls
+}
+
+fn pm_url_domain(url: &str) -> Option<String> {
+    let authority = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?
+        .split('/')
+        .next()?
+        .rsplit('@')
+        .next()?
+        .split(':')
+        .next()?
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    (!authority.is_empty()).then_some(authority)
+}
+
+fn pm_json_tool_call_has_web_evidence(tool_call: &Value) -> bool {
+    if tool_call
+        .get("is_error")
+        .or_else(|| tool_call.get("isError"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let tool_name = tool_call
+        .get("tool_name")
+        .or_else(|| tool_call.get("toolName"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    ["web", "search", "fetch", "browser", "browse", "http", "url"]
+        .iter()
+        .any(|marker| tool_name.contains(marker))
+}
+
+fn pm_response_evidence_summary(raw: &Value) -> PmResponseEvidenceSummary {
+    let mut urls = BTreeSet::new();
+
+    if let Some(citations) = raw
+        .get("pm_quality")
+        .and_then(|quality| quality.get("citations"))
+    {
+        urls.extend(pm_collect_urls(citations));
+    }
+    if let Some(report) = raw.get("pm_report") {
+        // The report artifact is produced server-side from the completed PM
+        // turn. It includes v2 sources and v3 subtask evidence URLs even when
+        // the visible-text quality counter was unable to see those citations.
+        urls.extend(pm_collect_urls(report));
+    }
+    if let Some(tool_calls) = raw.get("tool_calls").and_then(Value::as_array) {
+        for tool_call in tool_calls
+            .iter()
+            .filter(|tool_call| pm_json_tool_call_has_web_evidence(tool_call))
+        {
+            if let Some(input) = tool_call.get("input") {
+                urls.extend(pm_collect_urls(input));
+            }
+            if let Some(output) = tool_call.get("output") {
+                urls.extend(pm_collect_urls(output));
+            }
+        }
+    }
+    if let Some(text) = raw.get("text").and_then(Value::as_str) {
+        urls.extend(extract_urls(text));
+    }
+
+    let domains = urls.iter().filter_map(|url| pm_url_domain(url)).collect();
+    PmResponseEvidenceSummary { urls, domains }
 }
 
 fn extract_urls(value: &str) -> Vec<String> {
@@ -8633,17 +8816,18 @@ mod tests {
         ordinary_web_soft_citation_should_pass, parent_allows_new_subtask,
         parent_reasoning_budget_for, parent_subtask_artifact_id, parent_terminal_public_error,
         parent_tool_artifact_id, parent_turn_options, pm_progress_payload,
-        promotable_deep_research_summary, promotable_super_adversarial_summary,
-        provider_native_search_verified, reconcile_document_delivery_requirements,
-        record_attribution_completion_checks, recovered_execution_user_message,
-        recovery_runtime_ownership_conflict, recovery_runtime_restart_status,
-        register_nl2sql_cancellation, runtime_tool_output_for_event, serialize_bounded_tool_result,
-        signal_nl2sql_cancellation, signed_event_seq, structured_completion_required,
-        summarize_ordinary_web_evidence, suppress_repeated_native_web_search_options,
-        tool_call_attempts_test, tool_call_confirms_successful_test,
-        tool_call_effectively_succeeded, tool_call_modifies_code, tool_evidence_references,
-        truncate, unregister_nl2sql_cancellation, urls_match, verified_web_evidence_urls,
-        ParentLoopFinal, PersistedSubtask, UnifiedParentTurnInput, MAX_TOOL_RESULT_CHARS,
+        pm_response_evidence_summary, promotable_deep_research_summary,
+        promotable_super_adversarial_summary, provider_native_search_verified,
+        reconcile_document_delivery_requirements, record_attribution_completion_checks,
+        recovered_execution_user_message, recovery_runtime_ownership_conflict,
+        recovery_runtime_restart_status, register_nl2sql_cancellation,
+        runtime_tool_output_for_event, serialize_bounded_tool_result, signal_nl2sql_cancellation,
+        signed_event_seq, structured_completion_required, summarize_ordinary_web_evidence,
+        suppress_repeated_native_web_search_options, tool_call_attempts_test,
+        tool_call_confirms_successful_test, tool_call_effectively_succeeded,
+        tool_call_modifies_code, tool_evidence_references, truncate,
+        unregister_nl2sql_cancellation, urls_match, verified_web_evidence_urls, ParentLoopFinal,
+        PersistedSubtask, UnifiedParentTurnInput, MAX_TOOL_RESULT_CHARS,
     };
     use crate::routes::nl2sql::attribution::{
         AttributionAnalyzeResponse, AttributionEvidenceHealth, AttributionObservation,
@@ -8838,6 +9022,8 @@ mod tests {
                 used_references: Vec::new(),
                 error: None,
                 elapsed_ms: 2_500,
+                diagnostic_only: false,
+                recovery_note: None,
             }),
             response: None,
             error: None,
@@ -8884,6 +9070,8 @@ mod tests {
             used_references: Vec::new(),
             error: None,
             elapsed_ms: 1,
+            diagnostic_only: false,
+            recovery_note: None,
         };
         let response = AttributionAnalyzeResponse {
             status: "completed".to_string(),
@@ -8911,6 +9099,7 @@ mod tests {
                 zero_row_steps: 1,
                 successful_steps: 0,
                 failed_steps: 0,
+                diagnostic_steps: 0,
                 sampled_steps: 0,
                 total_rows: 0,
             },
@@ -8934,6 +9123,58 @@ mod tests {
         assert!(verified.execution_succeeded);
         assert!(verified.schema_checked);
         assert!(verified.evidence_linked);
+    }
+
+    #[test]
+    fn attribution_verification_rejects_changed_scope_diagnostic_results() {
+        let response = AttributionAnalyzeResponse {
+            status: "completed".to_string(),
+            question: "Why did ROI fall yesterday?".to_string(),
+            depth: "standard".to_string(),
+            conversation_id: Some("conversation-diagnostic".to_string()),
+            clarification_question: None,
+            report: None,
+            plan: None,
+            observations: vec![AttributionObservation {
+                step_id: "main_metric".to_string(),
+                title: "Recent partition validation".to_string(),
+                purpose: "Validate query path".to_string(),
+                question: "Check ROI".to_string(),
+                datasource_ids: vec!["ds-1".to_string()],
+                time_context: Some("recent available partition".to_string()),
+                query_id: Some("query-diagnostic".to_string()),
+                conversation_id: Some("conversation-diagnostic".to_string()),
+                columns: vec!["roi".to_string()],
+                rows: vec![json!({"roi": 0.8})],
+                row_count: 1,
+                sampled: false,
+                sqls: vec!["SELECT 0.8 AS roi".to_string()],
+                used_references: Vec::new(),
+                error: None,
+                elapsed_ms: 1,
+                diagnostic_only: true,
+                recovery_note: Some("requested partition is unavailable".to_string()),
+            }],
+            evidence_health: AttributionEvidenceHealth {
+                total_steps: 1,
+                execution_succeeded_steps: 0,
+                usable_evidence_steps: 0,
+                zero_row_steps: 0,
+                successful_steps: 0,
+                failed_steps: 0,
+                diagnostic_steps: 1,
+                sampled_steps: 0,
+                total_rows: 0,
+            },
+            evidence_cards: Vec::new(),
+            total_execution_ms: 1,
+            error: None,
+        };
+
+        let verification = attribution_verification_summary(&response);
+        assert_eq!(verification.successful_evidence_count, 0);
+        assert!(!verification.execution_succeeded);
+        assert!(!verification.schema_checked);
     }
 
     fn parent_input(route_hint: &str, required_evidence: &[&str]) -> UnifiedParentTurnInput {
@@ -9259,6 +9500,29 @@ mod tests {
                 tool_use_id: tool.tool_use_id.clone(),
                 output: json!({
                     "status": "completed",
+                    "summary": "正文通过报告工件携带来源，即使正文没有直接展开 URL，也应当作为有来源的研究成果交付。".repeat(20),
+                    "quality": {"citation_count": 0},
+                    "citationCount": 0,
+                    "evidenceUrls": ["https://research.example.org/evidence/1"],
+                    "sourced": true
+                })
+                .to_string(),
+                is_error: false,
+            },
+        );
+        let promoted = promotable_deep_research_summary(&input, &suspended, &resolved)
+            .expect("artifact evidence should promote completed research");
+        assert_eq!(
+            promoted.1,
+            vec!["https://research.example.org/evidence/1".to_string()]
+        );
+
+        resolved.insert(
+            tool.tool_use_id.clone(),
+            DeferredToolResult {
+                tool_use_id: tool.tool_use_id.clone(),
+                output: json!({
+                    "status": "completed",
                     "summary": "在无法取得外部证据时，系统仍应交付完整、分层、可执行且明确披露证据限制的模型综合。".repeat(20),
                     "quality": {"citation_count": 0},
                     "deliveryMode": "model_only",
@@ -9558,6 +9822,37 @@ mod tests {
             vec!["/sql-knowledge/pack/file/roi.sql"]
         );
         assert!(extract_workspace_paths("/etc/passwd").is_empty());
+    }
+
+    #[test]
+    fn pm_report_sources_recover_quality_when_declared_citation_count_is_zero() {
+        let raw = json!({
+            "text": "完整研究正文，但可见文本没有裸 URL。",
+            "pm_quality": {
+                "citation_count": 0,
+                "domain_count": 0,
+                "citations": []
+            },
+            "pm_report": {
+                "report_json_v3": {
+                    "sources": [
+                        {"url": "https://alpha.example.com/report"},
+                        {"url": "https://beta.example.org/data"}
+                    ]
+                }
+            },
+            "tool_calls": [{
+                "tool_name": "WebSearch",
+                "is_error": false,
+                "output": {"source": "https://gamma.example.net/source"}
+            }]
+        });
+
+        let evidence = pm_response_evidence_summary(&raw);
+        assert_eq!(evidence.urls.len(), 3);
+        assert_eq!(evidence.domains.len(), 3);
+        assert!(evidence.urls.contains("https://alpha.example.com/report"));
+        assert!(evidence.domains.contains("beta.example.org"));
     }
 
     #[test]

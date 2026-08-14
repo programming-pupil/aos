@@ -8,6 +8,7 @@ pub mod prompts;
 pub mod query_hygiene;
 pub mod repair;
 pub mod report_strategy;
+pub mod requirement_state;
 pub mod route_plan;
 pub mod route_rank;
 pub mod search_orchestrator;

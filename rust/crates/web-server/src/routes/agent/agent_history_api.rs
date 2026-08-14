@@ -744,8 +744,11 @@ pub(super) async fn get_session_history(
                 .unwrap_or_default()
         }
     };
-    let is_pm_session = session_source.eq_ignore_ascii_case("pm");
     let normalized_source = session_source.trim().to_ascii_lowercase();
+    let supports_pm_research_replay = matches!(
+        normalized_source.as_str(),
+        "pm" | "super_assistant" | "super-assistant"
+    );
     let has_durable_visible_history = matches!(
         normalized_source.as_str(),
         "chat" | "pm" | "dataattribution" | "nl2sql" | "super_assistant" | "super-assistant"
@@ -997,7 +1000,7 @@ pub(super) async fn get_session_history(
                 }
             }
 
-            let pm_research = if is_pm_session {
+            let pm_research = if supports_pm_research_replay {
                 match load_pm_session_history_replay_from_db(
                     &state.db,
                     &session_id,
@@ -1051,7 +1054,7 @@ pub(super) async fn get_session_history(
                 None
             };
 
-            if is_pm_session {
+            if supports_pm_research_replay {
                 match load_pm_session_task_bindings_from_db(
                     &state.db,
                     &session_id,

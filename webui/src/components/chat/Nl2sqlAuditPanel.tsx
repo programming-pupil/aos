@@ -17,6 +17,8 @@ interface Nl2sqlAuditStep {
   executionMs?: number;
   error?: string;
   executionAttempts: Nl2sqlExecutionAttempt[];
+  diagnosticOnly: boolean;
+  recoveryNote?: string;
 }
 
 interface Nl2sqlExecutionAttempt {
@@ -26,6 +28,10 @@ interface Nl2sqlExecutionAttempt {
   executionMs?: number;
   error?: string;
   retryReason?: string;
+  repairStrategy?: string;
+  scopeChanged: boolean;
+  diagnosticOnly: boolean;
+  repairRationale?: string;
 }
 
 export interface Nl2sqlAuditResult {
@@ -174,6 +180,10 @@ export function parseNl2sqlAuditResult(raw: unknown): Nl2sqlAuditResult | null {
                 executionMs: optionalNumber(firstValue(attempt, "executionMs", "execution_ms")),
                 error: optionalString(firstValue(attempt, "error")),
                 retryReason: optionalString(firstValue(attempt, "retryReason", "retry_reason")),
+                repairStrategy: optionalString(firstValue(attempt, "repairStrategy", "repair_strategy")),
+                scopeChanged: optionalBoolean(firstValue(attempt, "scopeChanged", "scope_changed")) ?? false,
+                diagnosticOnly: optionalBoolean(firstValue(attempt, "diagnosticOnly", "diagnostic_only")) ?? false,
+                repairRationale: optionalString(firstValue(attempt, "repairRationale", "repair_rationale")),
               }];
             })
           : [];
@@ -190,6 +200,8 @@ export function parseNl2sqlAuditResult(raw: unknown): Nl2sqlAuditResult | null {
           executionMs: optionalNumber(firstValue(step, "executionMs", "execution_ms")),
           error: optionalString(firstValue(step, "error")),
           executionAttempts,
+          diagnosticOnly: optionalBoolean(firstValue(step, "diagnosticOnly", "diagnostic_only")) ?? false,
+          recoveryNote: optionalString(firstValue(step, "recoveryNote", "recovery_note")),
         }];
       })
     : [];
@@ -468,7 +480,15 @@ function Nl2sqlAuditPanelImpl({
                           {step.datasourceId ? <Tag>{step.datasourceId}</Tag> : null}
                           {step.executionMs != null ? <Tag>{`${step.executionMs} ms`}</Tag> : null}
                           {step.rowCount != null ? <Tag>{t("chat.nl2sqlAuditRows", "{{count}} 行", { count: step.rowCount })}</Tag> : null}
+                          {step.diagnosticOnly ? (
+                            <Tag color="warning">{t("chat.nl2sqlAuditDiagnosticOnly", "仅诊断验证")}</Tag>
+                          ) : null}
                         </Space>
+                        {step.recoveryNote ? (
+                          <Text type="secondary" style={{ display: "block", marginTop: 6 }}>
+                            {t("chat.nl2sqlAuditRecoveryNote", "恢复说明")}: {step.recoveryNote}
+                          </Text>
+                        ) : null}
                         {step.sql ? (
                           <div style={{ marginTop: 8 }}>
                             <Text strong>{t("chat.nl2sqlAuditSql", "SQL")}</Text>
@@ -509,7 +529,23 @@ function Nl2sqlAuditPanelImpl({
                                           : t("chat.nl2sqlAuditTransientRetry", "瞬时故障重试")}
                                       </Tag>
                                     ) : null}
+                                    {attempt.repairStrategy ? (
+                                      <Tag color="blue">
+                                        {t("chat.nl2sqlAuditRecoveryStrategy", "模型恢复策略")}: {attempt.repairStrategy}
+                                      </Tag>
+                                    ) : null}
+                                    {attempt.scopeChanged ? (
+                                      <Tag color="warning">{t("chat.nl2sqlAuditScopeChanged", "查询范围已调整")}</Tag>
+                                    ) : null}
+                                    {attempt.diagnosticOnly ? (
+                                      <Tag color="warning">{t("chat.nl2sqlAuditDiagnosticOnly", "仅诊断验证")}</Tag>
+                                    ) : null}
                                   </Space>
+                                  {attempt.repairRationale ? (
+                                    <Text type="secondary" style={{ display: "block", marginTop: 4 }}>
+                                      {attempt.repairRationale}
+                                    </Text>
+                                  ) : null}
                                   {attempt.sql && attempt.sql !== step.sql ? (
                                     <pre style={{ margin: "6px 0 0", padding: 8, overflowX: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere", border: "1px solid var(--border-subtle)", borderRadius: 6, fontSize: 12 }}>
                                       {attempt.sql}

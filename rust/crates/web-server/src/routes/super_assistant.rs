@@ -9289,6 +9289,8 @@ mod super_assistant_nl2sql_archive_tests {
             execution_ms: 456,
             error: Some("partial query failure".to_string()),
             execution_attempts: Vec::new(),
+            diagnostic_only: false,
+            recovery_note: None,
         }];
 
         let calls = super_assistant_nl2sql_tool_calls(&steps);

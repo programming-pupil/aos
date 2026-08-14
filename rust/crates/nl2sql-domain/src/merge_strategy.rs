@@ -23,6 +23,14 @@ pub struct SqlExecutionAttempt {
     pub execution_ms: u64,
     pub error: Option<String>,
     pub retry_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_strategy: Option<String>,
+    #[serde(default)]
+    pub scope_changed: bool,
+    #[serde(default)]
+    pub diagnostic_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_rationale: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +47,10 @@ pub struct StepResult {
     pub datasource_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub execution_attempts: Vec<SqlExecutionAttempt>,
+    #[serde(default)]
+    pub diagnostic_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_note: Option<String>,
 }
 
 /// Pure in-memory hash join. Takes two step results and join keys.

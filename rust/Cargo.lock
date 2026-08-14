@@ -76,6 +76,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-protocol"
+version = "0.1.2"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "hex",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1410,11 +1425,13 @@ dependencies = [
 name = "eval-harness"
 version = "0.1.2"
 dependencies = [
+ "hex",
  "proptest",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -2809,6 +2826,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
+name = "memory-engine"
+version = "0.1.2"
+dependencies = [
+ "chrono",
+ "hex",
+ "proptest",
+ "regex",
+ "semantic-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3040,6 +3072,7 @@ dependencies = [
  "nl2sql-domain",
  "parking_lot",
  "regex",
+ "semantic-core",
  "serde",
  "serde_json",
  "sha2",
@@ -3502,6 +3535,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -4070,6 +4104,7 @@ dependencies = [
 name = "runtime"
 version = "0.1.2"
 dependencies = [
+ "agent-protocol",
  "anyhow",
  "async-trait",
  "bytes",
@@ -4077,12 +4112,14 @@ dependencies = [
  "glob",
  "hex",
  "http",
+ "memory-engine",
  "notify",
  "parking_lot",
  "plugins",
  "proptest",
  "regex",
  "reqwest 0.12.28",
+ "semantic-core",
  "serde",
  "serde_json",
  "sha2",
@@ -4400,6 +4437,21 @@ dependencies = [
  "rustc-hash",
  "servo_arc",
  "smallvec",
+]
+
+[[package]]
+name = "semantic-core"
+version = "0.1.2"
+dependencies = [
+ "agent-protocol",
+ "chrono",
+ "hex",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]

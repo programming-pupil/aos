@@ -134,7 +134,10 @@ fn pm_llm_review_timeout_secs() -> u64 {
 }
 
 fn pm_llm_final_editor_timeout_secs() -> u64 {
-    pm_env_u64("PM_LLM_FINAL_EDITOR_TIMEOUT_SECS", 300).clamp(60, 600)
+    // Final editing is optional polish over an already deliverable research
+    // answer. It must not consume another full research window or prevent the
+    // preserved answer from reaching the user.
+    pm_env_u64("PM_LLM_FINAL_EDITOR_TIMEOUT_SECS", 90).clamp(30, 180)
 }
 
 fn pm_llm_final_editor_max_attempts() -> usize {
@@ -1105,7 +1108,7 @@ mod tests {
             ],
             || {
                 assert_eq!(pm_llm_final_editor_timeout_for_attempt(180, 1, 3), 55);
-                assert_eq!(pm_llm_final_editor_timeout_for_attempt(600, 1, 2), 300);
+                assert_eq!(pm_llm_final_editor_timeout_for_attempt(600, 1, 2), 180);
             },
         );
     }

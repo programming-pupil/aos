@@ -87,6 +87,37 @@ describe("Nl2sqlAuditPanel", () => {
     expect(result?.steps[0].rowCount).toBe(1);
   });
 
+  it("restores model-guided partition recovery and diagnostic scope", () => {
+    const result = parseNl2sqlAuditResult({
+      status: "completed",
+      executionSucceeded: false,
+      sqlRecorded: true,
+      schemaChecked: false,
+      steps: [{
+        stepId: 1,
+        description: "Validate a recent available partition",
+        sql: "SELECT app_id, roi FROM metrics WHERE dt = DATE '2026-08-13'",
+        rowCount: 2,
+        diagnosticOnly: true,
+        recoveryNote: "The requested partition is unavailable; this sample only validates the query path.",
+        executionAttempts: [{
+          attempt: 2,
+          status: "succeeded",
+          sql: "SELECT app_id, roi FROM metrics WHERE dt = DATE '2026-08-13'",
+          repairStrategy: "recent available partition",
+          scopeChanged: true,
+          diagnosticOnly: true,
+          repairRationale: "Requested partition location does not exist",
+        }],
+      }],
+    });
+
+    expect(result?.executionSucceeded).toBe(false);
+    expect(result?.steps[0].diagnosticOnly).toBe(true);
+    expect(result?.steps[0].executionAttempts[0].scopeChanged).toBe(true);
+    expect(result?.steps[0].executionAttempts[0].repairStrategy).toContain("recent");
+  });
+
   it("only activates for the managed NL2SQL parent tool", () => {
     expect(hasNl2sqlAuditToolCalls([tool()])).toBe(true);
     expect(hasNl2sqlAuditToolCalls([tool({ name: "workspace_read" })])).toBe(false);

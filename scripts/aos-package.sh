@@ -55,6 +55,8 @@ cp "$ROOT_DIR/docs/INSTALL.md" \
   "$ROOT_DIR/docs/OPEN_SOURCE_DEPLOYMENT.zh-CN.md" \
   "$ROOT_DIR/docs/AOS_ENGINEERING_DESIGN_CENTER.zh-CN.md" \
   "$ROOT_DIR/docs/OPEN_SOURCE_TEST_GUIDE.zh-CN.md" \
+  "$ROOT_DIR/docs/AOS_SEMANTIC_KERNEL_IMPLEMENTATION.md" \
+  "$ROOT_DIR/docs/AOS_SEMANTIC_KERNEL_REFACTOR.zh-CN.md" \
   "$stage/docs/"
 cp "$ROOT_DIR/docs/evals/BOT_GATEWAY_COMPLETE_TEST_GUIDE.zh-CN.md" \
   "$ROOT_DIR/docs/evals/DATA_ATTRIBUTION_COMPLETE_TEST_GUIDE.zh-CN.md" \
@@ -109,6 +111,18 @@ sha256_file() {
     return 1
   fi
 }
+
+# The package command is also used with --skip-build in minimal CI images.
+# Do not make archive validation depend on an optional ripgrep installation.
+archive_matches() {
+  local pattern="$1"
+  local file="$2"
+  if command -v rg >/dev/null 2>&1; then
+    rg -q "$pattern" "$file"
+  else
+    grep -q -E "$pattern" "$file"
+  fi
+}
 for model_file in model_optimized.onnx tokenizer.json config.json special_tokens_map.json tokenizer_config.json; do
   [ -f "$model_snapshot/$model_file" ] || {
     echo "package validation failed: pinned local embedding file is missing: $model_file" >&2
@@ -140,16 +154,16 @@ tar -C "$temporary_root" -czf "$archive" "$package_name"
 archive_listing="$temporary_root/archive-contents.txt"
 tar -tzf "$archive" > "$archive_listing"
 
-if rg -q '(^|/)([.]env$|aos[.]db|aos[.]db-wal|aos[.]db-shm|[.]claw/|[.]run/)' "$archive_listing"; then
+if archive_matches '(^|/)([.]env$|aos[.]db|aos[.]db-wal|aos[.]db-shm|[.]claw/|[.]run/)' "$archive_listing"; then
   echo "package validation failed: runtime data or secrets were included" >&2
   exit 1
 fi
 
-if ! rg -q '/models/fastembed/.+' "$archive_listing"; then
+if ! archive_matches '/models/fastembed/.+' "$archive_listing"; then
   echo "package validation failed: built-in embedding model was not included" >&2
   exit 1
 fi
-if ! rg -q '/runtime/onnxruntime/lib/libonnxruntime[.]' "$archive_listing"; then
+if ! archive_matches '/runtime/onnxruntime/lib/libonnxruntime[.]' "$archive_listing"; then
   echo "package validation failed: ONNX Runtime was not included" >&2
   exit 1
 fi
