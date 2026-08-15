@@ -17,6 +17,9 @@ export type {
   ChatFileRecord,
   ChatMemoryRecord,
   ChatTurnOptions,
+  AgentSessionStreamHandlers,
+  RuntimeApprovalPaused,
+  RuntimeApprovalRequest,
   SuperAssistantAnswer,
 } from './agent';
 export { agentOpsApi } from './agentOps';

@@ -68,6 +68,16 @@ pub enum AgentEvent {
         output: String,
         is_error: bool,
     },
+    /// The turn is durably suspended until the authenticated owner resolves
+    /// this request. No raw tool input is exposed to the browser.
+    ApprovalRequired {
+        turn_id: String,
+        invocation_id: String,
+        tool_name: String,
+        current_mode: String,
+        required_mode: String,
+        reason: Option<String>,
+    },
 
     // ── Token usage ─────────────────────────────────────────────────────
     /// Token usage from a completed turn.
@@ -154,6 +164,7 @@ impl AgentEvent {
             Self::ToolUseInput { .. } => "tool_use_input",
             Self::ToolUseEnd { .. } => "tool_use_end",
             Self::ToolResult { .. } => "tool_result",
+            Self::ApprovalRequired { .. } => "approval_required",
             Self::Usage { .. } => "usage",
             Self::SessionCompacted { .. } => "session_compacted",
             Self::Iteration { .. } => "iteration",

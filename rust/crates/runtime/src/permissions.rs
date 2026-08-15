@@ -27,6 +27,24 @@ impl PermissionMode {
     }
 }
 
+#[must_use]
+pub(crate) fn permission_mode_satisfies(current: PermissionMode, required: PermissionMode) -> bool {
+    match current {
+        PermissionMode::Allow => true,
+        PermissionMode::Prompt => false,
+        PermissionMode::ReadOnly
+        | PermissionMode::WorkspaceWrite
+        | PermissionMode::DangerFullAccess => {
+            matches!(
+                required,
+                PermissionMode::ReadOnly
+                    | PermissionMode::WorkspaceWrite
+                    | PermissionMode::DangerFullAccess
+            ) && current >= required
+        }
+    }
+}
+
 /// Hook-provided override applied before standard permission evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionOverride {
@@ -79,7 +97,13 @@ pub struct PermissionRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionPromptDecision {
     Allow,
-    Deny { reason: String },
+    Deny {
+        reason: String,
+    },
+    /// Suspend the current turn and let a durable external approval channel
+    /// resolve the request. Web/server runtimes use this instead of blocking a
+    /// worker or silently auto-allowing the operation.
+    Defer,
 }
 
 /// Prompting interface used when policy requires interactive approval.
@@ -92,6 +116,7 @@ pub trait PermissionPrompter: Send {
 pub enum PermissionOutcome {
     Allow,
     Deny { reason: String },
+    AwaitingApproval { request: PermissionRequest },
 }
 
 /// Evaluates permission mode requirements plus allow/deny/ask rules.
@@ -158,6 +183,22 @@ impl PermissionPolicy {
             .get(tool_name)
             .copied()
             .unwrap_or(PermissionMode::DangerFullAccess)
+    }
+
+    /// Re-evaluate non-bypassable policy after an external approval. The
+    /// approval grants the requested escalation once, but an explicit deny
+    /// rule remains authoritative.
+    #[must_use]
+    pub fn authorize_approved(&self, tool_name: &str, input: &str) -> PermissionOutcome {
+        if let Some(rule) = Self::find_matching_rule(&self.deny_rules, tool_name, input) {
+            return PermissionOutcome::Deny {
+                reason: format!(
+                    "Permission to use {tool_name} has been denied by rule '{}'",
+                    rule.raw
+                ),
+            };
+        }
+        PermissionOutcome::Allow
     }
 
     #[must_use]
@@ -233,7 +274,7 @@ impl PermissionPolicy {
                 }
                 if allow_rule.is_some()
                     || current_mode == PermissionMode::Allow
-                    || current_mode >= required_mode
+                    || permission_mode_satisfies(current_mode, required_mode)
                 {
                     return PermissionOutcome::Allow;
                 }
@@ -258,7 +299,7 @@ impl PermissionPolicy {
 
         if allow_rule.is_some()
             || current_mode == PermissionMode::Allow
-            || current_mode >= required_mode
+            || permission_mode_satisfies(current_mode, required_mode)
         {
             return PermissionOutcome::Allow;
         }
@@ -311,6 +352,7 @@ impl PermissionPolicy {
             Some(prompter) => match prompter.decide(&request) {
                 PermissionPromptDecision::Allow => PermissionOutcome::Allow,
                 PermissionPromptDecision::Deny { reason } => PermissionOutcome::Deny { reason },
+                PermissionPromptDecision::Defer => PermissionOutcome::AwaitingApproval { request },
             },
             None => PermissionOutcome::Deny {
                 reason: reason.unwrap_or_else(|| {
@@ -481,6 +523,14 @@ mod tests {
         allow: bool,
     }
 
+    struct DeferredPrompter;
+
+    impl PermissionPrompter for DeferredPrompter {
+        fn decide(&mut self, _request: &PermissionRequest) -> PermissionPromptDecision {
+            PermissionPromptDecision::Defer
+        }
+    }
+
     impl PermissionPrompter for RecordingPrompter {
         fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
             self.seen.push(request.clone());
@@ -548,6 +598,24 @@ mod tests {
             prompter.seen[0].required_mode,
             PermissionMode::DangerFullAccess
         );
+    }
+
+    #[test]
+    fn prompt_mode_never_satisfies_a_permission_requirement_by_enum_order() {
+        let policy = PermissionPolicy::new(PermissionMode::Prompt)
+            .with_tool_requirement("write_external", PermissionMode::DangerFullAccess);
+        let mut prompter = DeferredPrompter;
+
+        assert!(matches!(
+            policy.authorize("write_external", "{}", Some(&mut prompter)),
+            PermissionOutcome::AwaitingApproval { request }
+                if request.current_mode == PermissionMode::Prompt
+                    && request.required_mode == PermissionMode::DangerFullAccess
+        ));
+        assert!(matches!(
+            policy.authorize("write_external", "{}", None),
+            PermissionOutcome::Deny { .. }
+        ));
     }
 
     #[test]

@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS join_contracts (id TEXT NOT NULL, tenant_id TEXT NOT 
 CREATE TABLE IF NOT EXISTS analytic_intent_ir (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, thread_id TEXT, turn_id TEXT, ir_json TEXT NOT NULL, ir_hash TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS semantic_verifications (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, analytic_intent_id TEXT NOT NULL, verification_json TEXT NOT NULL, release_decision TEXT NOT NULL, calibrated_score REAL NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS feedback_learning_events (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, scope TEXT NOT NULL, correction_json TEXT NOT NULL, approved INTEGER NOT NULL DEFAULT 0, regression_case_id TEXT, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS nl2sql_confidence_observations (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, datasource_id TEXT NOT NULL, analytic_intent_id TEXT NOT NULL, predicted_score REAL NOT NULL, actual_correct INTEGER, feedback_id INTEGER, created_at TEXT NOT NULL, labeled_at TEXT);
 CREATE TABLE IF NOT EXISTS eval_runs (id TEXT PRIMARY KEY, tenant_id TEXT, suite_id TEXT NOT NULL, seed INTEGER NOT NULL, config_hash TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT);
 CREATE TABLE IF NOT EXISTS eval_case_results (run_id TEXT NOT NULL, case_id TEXT NOT NULL, scenario TEXT NOT NULL, result_json TEXT NOT NULL, PRIMARY KEY(run_id, case_id));
 CREATE INDEX IF NOT EXISTS idx_agent_event_ledger_thread_seq ON agent_event_ledger(tenant_id, thread_id, sequence);
@@ -35,3 +36,4 @@ CREATE INDEX IF NOT EXISTS idx_semantic_assertions_scope ON semantic_assertions(
 CREATE INDEX IF NOT EXISTS idx_evidence_ledger_tenant_event ON evidence_ledger(tenant_id, event_seq);
 CREATE INDEX IF NOT EXISTS idx_artifact_objects_retention ON artifact_objects(tenant_id, expires_at, deleted_at);
 CREATE INDEX IF NOT EXISTS idx_requirement_events_version ON requirement_state_events(tenant_id, requirement_id, version);
+CREATE INDEX IF NOT EXISTS idx_nl2sql_confidence_scope ON nl2sql_confidence_observations(tenant_id, datasource_id, actual_correct, created_at);

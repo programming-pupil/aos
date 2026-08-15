@@ -2488,6 +2488,7 @@ export interface AttributionDriver {
   impact?: string | null;
   evidenceStepIds?: string[];
   confidence?: string | null;
+  interpretation?: "contribution_direction" | "candidate_explanation" | string;
 }
 
 export interface AttributionReport {
@@ -2500,6 +2501,7 @@ export interface AttributionReport {
   nextQuestions?: string[];
   confidence?: string | null;
   coverage?: string | null;
+  evidenceLevel?: "L0_descriptive" | "L1_decomposition" | "L2_quasi_experimental" | "L3_randomized_experiment" | string;
 }
 
 export interface AttributionEvidenceHealth {

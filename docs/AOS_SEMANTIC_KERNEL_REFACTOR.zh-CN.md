@@ -1,7 +1,7 @@
 # AOS 语义内核大重构规格
 
-> 状态：Draft for implementation
-> 日期：2026-08-14
+> 状态：Implementation candidate；生产路径已接入，效果门槛仍以第 17 节评测为准
+> 日期：2026-08-15
 > 目标版本：AOS Next
 > 适用对象：架构、Runtime、Memory、PM、NL2SQL、数据归因、评测与前端团队
 
@@ -1559,6 +1559,35 @@ AOS 不应以“我也能调用工具、也能写 SQL、也能研究”与 Codex
 - 在同模型、同工具、同预算盲测中，AOS 在目标领域稳定胜过旧版，并对 Codex/DSH baseline 形成可复现优势。
 
 在这些结果出现前，AOS 可以说“具备更完整的业务工作流和企业治理能力”，但不能说 Memory、需求挖掘或 NL2SQL 已经全面赶超 Codex/DeepSeek Harness。
+
+## 23.1 本次实现自检（2026-08-15）
+
+本节是本次代码交付前的逐项核对，不以“表已创建”或“类型已定义”作为完成依据：只有存在生产调用路径和回归测试才标记为“已接通”。第 17 节中的准确率、召回率、ECE、Brier、延迟和竞品胜率属于需要固定数据集/模型/预算后才能证明的实证门槛，不能由离线单元测试虚报为已达标。
+
+| 规格能力 | 当前实现状态 | 代码/测试证据 |
+| --- | --- | --- |
+| Unified Agent Protocol、事件 hash、sequence、幂等、writer fencing | 已接通 | `agent-protocol` 类型与回放测试；SQLite `agent_event_ledger`、`agent_writer_leases`、中段损坏 fail-closed 测试 |
+| Turn/Tool durable intent、outcome_unknown、取消/异常终结 | 已接通 | `runtime::AgentExecutionKernel` 已挂入 `ConversationRuntime`；SQLite runtime-kernel 测试验证 intent 先于 side effect、重启 synthetic closer |
+| Context Manifest 与敏感投影 | 已接通 | 每次模型迭代在 provider 前由 `semantic-core::ContextCompiler` 生成四层 `ContextPacket`，记录 block/snapshot/hash/预算/截断；结构化保护、hash、PM prompt manifest 测试 |
+| Tool Capability Router 渐进披露 | 已接通 | 普通 Chat 默认核心工具 + `ToolSearch`；命中候选按 registry/permission 再激活；runtime 工具路由测试 |
+| Artifact/Spill 与精确恢复 | 已接通 | oversized tool output 先持久化完整受保护 payload，再按 text/log/search/table/JSON/binary 类型 reducer 生成 model/client/telemetry 投影；只有显式 `source` projection 可 owner 分页恢复，测试覆盖 UTF-8、行/字节计数、租户隔离和泄漏 |
+| 多维资源预算 | 已接通 | `agent-protocol::BudgetLedger`；SQLite 工具调用、web query、datasource scan 和 artifact bytes 记账，父子守恒由纯内核测试覆盖 |
+| Child Thread lineage / settlement / top-down cancel | 已接通（能力协商） | Super Assistant specialist subtask 在执行前写 `child_thread_edges` 和统一 Agent Ledger；完成、失败、取消只结算一次；父任务取消向下传播，tenant lineage 回归测试覆盖。native AOS executor 实际支持 `cancel`，并在重启后恢复 pending cancel；`follow_up`/`steer`/`interrupt`/`resume` 会持久化后按 executor capability 明确拒绝，不伪装成已执行 |
+| Durable capability 与权限只降不升 | 已接通 | Tool intent 在 side effect 前持久化一次性 capability token 并消费，resource scope 仅存 hash；child 使用既有 permission snapshot，`CapabilityScope::intersection` 阻止扩权；权限模式比较使用显式语义，回归测试覆盖 `Prompt` 不能因 enum 顺序而自动满足危险权限 |
+| 通用 Web Approval suspend/resolve/resume | 已接通（Server/Gateway/WebUI） | `DurableDeferPrompter` 在生产 Gateway 路径中写入 durable request 后挂起；SSE 发送脱敏 `approval_paused`，恢复要求租户/用户/session/turn/invocation owner scope、一次性决策、过期检查和当前策略重检；SQLite owner/expiry/单次 dispatch 与重启回归测试通过；WebUI 刷新后从持久化审批列表恢复卡片，并用 reload-safe handlers 继续批准或拒绝，`approvalResume.test.ts` 覆盖实时与刷新两条路径 |
+| Prompt Manifest 与 model/tool lineage | 已接通 | Runtime 每次 provider 调用前持久化 model、active tool set、system prompt hash、message hash 和预算；PM 额外写版本化 `prompt_manifests` |
+| Semantic Assertion/Decision/Evidence/Reducer | 已接通 | `semantic-core` 可重放 reducer；证据缺失、冲突、supersession、context budget 测试 |
+| Memory 双通道与压缩边界 | 已接通 | compaction 生产 hook 使用租户 chat model 做语义抽取，确定性通道仅作 fallback；`memory-engine` 统一 secret admission、continuity/long-term channel 与 source evidence provenance；先写 key info/checkpoint 后替换，exact archive 保留；完整 continuation framing 后的替换内容不小于 source window 时 fail closed，测试覆盖增长门禁；scope cursor 与 `supersedes/conflicts_with` diff 事务已接入 |
+| PM Requirement State / next question | 已接通 | `pm-domain::requirement_state` 增量 delta、确认门禁、信息价值排序；SQLite requirement state/event 持久化和幂等测试 |
+| PM claim-evidence semantic admission | 已接通 | claim 对齐不再只接受 URL：证据 excerpt 必须通过数字、日期/时间单位、金额/百分比/人群单位和方向一致性检查；不一致进入 evidence gap，回归测试覆盖冲突数值/单位 |
+| NL2SQL NL -> IR -> binding -> verifier -> SQL audit | 已接通 | 查询前持久化 `AnalyticIntentIR`；metric contract alias/version binding、join contract loading、语义 verifier release decision 和 audit persistence |
+| NL2SQL feedback learning / calibrated confidence | 已接通 | safe correction 写入 `feedback_learning_events` 和稳定 regression case；仅 approved 且同 tenant/datasource 的 correction 进入检索；feedback 回填 confidence observation，API 报告 ECE/Brier；执行成功后回写 `executionPassed`、行列数和耗时，且按 tenant 隔离回归覆盖 |
+| Attribution evidence level / causal guard | 已接通 | 报告输出 `L0_descriptive`/`L1_decomposition`、主因强制 evidence step、服务端加入不可证明因果 caveat，WebUI 展示证据等级 |
+| Provider replay / fault TCK | 已接通（离线） | `eval-harness::replay` canonical request hash、stable script key、`assert_consumed` 和故障帧测试 |
+| No-leak Memory probe | 已接通（机制） | Zero Loss follow-up 不再包含待召回事全文，expected fact 只用于评分；最终效果数值仍必须由固定数据集实测 |
+| 跨竞品质量、准确率、召回率和效果领先 | 待实证 | 必须按第 17 节固定 case、同模型/工具/预算盲评后才可宣布，代码不伪造该结论；本次代码已提供可复现 fixture/指标记录入口 |
+
+本次交付不再把 legacy JSONL、PM stage 表或 NL2SQL 旧 SQL 行当作第二个事实源：它们保留为兼容 projection；新的运行事件、语义 IR、证据等级和最终交付 artifact 是可恢复路径的事实来源。任何 provider/数据库故障都进入结构化降级或 `outcome_unknown`，不得伪造 completed。
 
 ---
 

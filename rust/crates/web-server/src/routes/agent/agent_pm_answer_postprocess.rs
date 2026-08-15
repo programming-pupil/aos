@@ -556,6 +556,9 @@ fn score_claim_to_tool_hit(claim: &str, hit: &PmToolEvidenceHit) -> f64 {
         hit.domain.to_ascii_lowercase(),
         hit.source_tool.to_ascii_lowercase()
     );
+    if !claim_evidence_semantically_supported(claim, &hit.excerpt) {
+        return 0.0;
+    }
     let matched = claim_terms
         .iter()
         .filter(|term| evidence_text.contains(term.as_str()))
@@ -568,6 +571,81 @@ fn score_claim_to_tool_hit(claim: &str, hit: &PmToolEvidenceHit) -> f64 {
         score += 0.12;
     }
     score.clamp(0.0, 1.0)
+}
+
+/// A URL is only a source locator.  Before a claim can be admitted, hard
+/// evidence fields must survive a lightweight deterministic check. This is
+/// intentionally conservative: numeric/date/unit mismatches become a gap and
+/// are left for the model or a later source to repair.
+fn claim_evidence_semantically_supported(claim: &str, excerpt: &str) -> bool {
+    let claim_lower = claim.to_ascii_lowercase();
+    let evidence_lower = excerpt.to_ascii_lowercase();
+    let number_pattern =
+        regex::Regex::new(r"\b\d+(?:[.,]\d+)?\s*%?\b").expect("static claim number regex");
+    let claim_numbers = number_pattern
+        .find_iter(&claim_lower)
+        .map(|m| m.as_str().replace(',', ""))
+        .collect::<Vec<_>>();
+    if claim_numbers
+        .iter()
+        .any(|number| !evidence_lower.replace(',', "").contains(number))
+    {
+        return false;
+    }
+    let unit_groups: &[&[&str]] = &[
+        &["%", "percent", "percentage", "百分比", "百分点"],
+        &["day", "days", "日", "天", "周", "月", "年"],
+        &["user", "users", "用户", "人次"],
+    ];
+    for group in unit_groups {
+        let claim_has = group.iter().any(|token| claim_lower.contains(token));
+        let evidence_has = group.iter().any(|token| evidence_lower.contains(token));
+        if claim_has && !evidence_has {
+            return false;
+        }
+    }
+    // Currency names are not interchangeable evidence. In particular, `元`
+    // is a CNY marker while `美元` is USD; treating them as one broad group
+    // would admit numerically identical but materially different claims.
+    let currency = |text: &str| {
+        if text.contains("usd") || text.contains('$') || text.contains("美元") {
+            Some("usd")
+        } else if text.contains("rmb")
+            || text.contains("cny")
+            || text.contains("人民币")
+            || text.contains("元")
+        {
+            Some("cny")
+        } else {
+            None
+        }
+    };
+    if currency(&claim_lower).is_some() && currency(&claim_lower) != currency(&evidence_lower) {
+        return false;
+    }
+    let directional_groups: &[(&[&str], &[&str])] = &[
+        (
+            &[
+                "下降", "骤降", "下滑", "decline", "decrease", "drop", "fall",
+            ],
+            &["上升", "增长", "提升", "increase", "grow", "rise"],
+        ),
+        (
+            &["增加", "增长", "提升", "increase", "grow", "rise"],
+            &[
+                "下降", "骤降", "下滑", "decline", "decrease", "drop", "fall",
+            ],
+        ),
+    ];
+    for (positive, opposite) in directional_groups {
+        if positive.iter().any(|token| claim_lower.contains(token))
+            && opposite.iter().any(|token| claim_lower.contains(token)) == false
+            && opposite.iter().any(|token| evidence_lower.contains(token))
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn pm_tool_excerpt_lexical_len(input: &str) -> usize {
@@ -864,6 +942,12 @@ pub(super) fn apply_hard_alignment_from_tool_results(
             .urls
             .iter()
             .filter(|url| pm_is_citable_url_by_content_chars(url, &content_chars_by_url))
+            .filter(|url| {
+                evidence_hits.iter().any(|hit| {
+                    hit.url == **url
+                        && claim_evidence_semantically_supported(&row.claim, &hit.excerpt)
+                })
+            })
             .cloned()
             .collect::<Vec<_>>();
         let mut leaves = Vec::new();
@@ -879,7 +963,7 @@ pub(super) fn apply_hard_alignment_from_tool_results(
         let mut scored_hits = evidence_hits
             .iter()
             .map(|hit| (score_claim_to_tool_hit(&row.claim, hit), hit))
-            .filter(|(score, _)| *score >= 0.28)
+            .filter(|(score, _)| *score >= 0.36)
             .collect::<Vec<_>>();
         scored_hits.sort_by(|a, b| b.0.total_cmp(&a.0));
 
@@ -1230,5 +1314,21 @@ rewarded ads payout threshold\n\
         };
         let hits = build_pm_tool_evidence_hits(&[tc]);
         assert!(hits.iter().all(|hit| !hit.excerpt.contains("durationMs")));
+    }
+
+    #[test]
+    fn claim_evidence_requires_numeric_unit_and_directional_support() {
+        assert!(claim_evidence_semantically_supported(
+            "ROI 12.5% 在 7 天内下降",
+            "ROI 12.5% 在 7 天内下降，主要受留存影响"
+        ));
+        assert!(!claim_evidence_semantically_supported(
+            "ROI 12.5% 在 7 天内下降",
+            "ROI 11.5% 在 7 天内上升"
+        ));
+        assert!(!claim_evidence_semantically_supported(
+            "成本为 10 美元",
+            "成本为 10 元"
+        ));
     }
 }

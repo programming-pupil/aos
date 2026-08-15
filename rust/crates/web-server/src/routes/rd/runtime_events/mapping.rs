@@ -134,6 +134,27 @@ pub(in crate::routes::rd) fn rd_runtime_event_to_task_event(
                 .unwrap_or_else(|| format!("runtime hook: {phase}")),
             json!({"event": "hook_progress", "phase": phase, "detail": detail}),
         )),
+        agent_gateway::AgentEvent::ApprovalRequired {
+            turn_id,
+            invocation_id,
+            tool_name,
+            current_mode,
+            required_mode,
+            reason,
+        } => Some((
+            "runtime_approval".to_string(),
+            "waiting_approval".to_string(),
+            format!("runtime 工具 {tool_name} 等待审批"),
+            json!({
+                "event": "approval_required",
+                "turnId": turn_id,
+                "invocationId": invocation_id,
+                "toolName": tool_name,
+                "currentMode": current_mode,
+                "requiredMode": required_mode,
+                "reason": reason,
+            }),
+        )),
         agent_gateway::AgentEvent::SessionCompacted {
             summary,
             removed_messages,

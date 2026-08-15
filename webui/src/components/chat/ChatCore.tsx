@@ -73,6 +73,8 @@ import {
   type ChatArtifactEvidenceItem,
   type ChatTurnOptions,
   streamPmResearchTask,
+  type AgentSessionStreamHandlers,
+  type RuntimeApprovalPaused,
   type AgentManualCompactionResult,
   type AgentMemoryCitation,
   type PmTaskImageInput,
@@ -202,6 +204,10 @@ import {
   superAssistantSlashRequestOptions,
 } from "./superAssistantSlashCommands";
 import { PmTaskQueuePanel } from "./PmTaskQueuePanel";
+import {
+  approvalResumeHandlers,
+  type SessionStreamHandlers,
+} from "./approvalResume";
 import { useTranslation } from "react-i18next";
 import type {
   ChatCoreProps,
@@ -4124,6 +4130,15 @@ export function ChatCore({
     onActiveSessionChange?.(activeSessionId);
   }, [activeSessionId, onActiveSessionChange]);
   const [displayMessages, setDisplayMessages] = useState<DisplayMessage[]>([]);
+  const [approvalPaused, setApprovalPaused] = useState<RuntimeApprovalPaused | null>(null);
+  const [approvalResolvingId, setApprovalResolvingId] = useState<string | null>(null);
+  const approvalPausedRef = useRef<RuntimeApprovalPaused | null>(null);
+  const streamHandlersRef = useRef<SessionStreamHandlers | null>(null);
+  const loadSessionMessagesRef = useRef<((sessionId: string | null) => Promise<void>) | null>(null);
+  const activeSessionIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    activeSessionIdRef.current = activeSessionId;
+  }, [activeSessionId]);
   const [historyHasMore, setHistoryHasMore] = useState(false);
   const [historyBeforeTurnCursor, setHistoryBeforeTurnCursor] = useState<
     number | null
@@ -4294,6 +4309,91 @@ export function ChatCore({
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messageListRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    approvalPausedRef.current = null;
+    setApprovalPaused(null);
+    setApprovalResolvingId(null);
+    if (streamHandlersRef.current?.sessionId !== activeSessionId) {
+      streamHandlersRef.current = null;
+    }
+    if (!activeSessionId) {
+      return;
+    }
+    let cancelled = false;
+    void agentApi
+      .listSessionApprovals(activeSessionId)
+      .then(({ approvals }) => {
+        if (cancelled || approvals.length === 0) return;
+        const first = approvals[0];
+        const paused: RuntimeApprovalPaused = {
+          sessionId: activeSessionId,
+          runtimeTurnId: first.turnId,
+          approvals,
+        };
+        approvalPausedRef.current = paused;
+        setApprovalPaused(paused);
+        setIsStreaming(false);
+        onStreamingChange?.(false);
+      })
+      .catch(() => {
+        // A missing approval projection must not prevent the normal history view.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSessionId, onStreamingChange]);
+
+  const resolvePendingApproval = useCallback(
+    (requestId: string, decision: "approve" | "deny" | "cancel") => {
+      if (!activeSessionId || approvalResolvingId) return;
+      // After a page reload there is no previous stream handler to reuse. The
+      // durable stream still owns the resume; reload history after its terminal
+      // event so the resumed answer and tool outcome are rendered canonically.
+      const handlers = approvalResumeHandlers(
+        activeSessionId,
+        streamHandlersRef.current,
+        {
+          onApprovalRequired: (paused: RuntimeApprovalPaused) => {
+            if (activeSessionIdRef.current !== activeSessionId) return;
+            approvalPausedRef.current = paused;
+            setApprovalPaused(paused);
+            setApprovalResolvingId(null);
+            setIsStreaming(false);
+            onStreamingChange?.(false);
+          },
+          onStreamEnd: () => {
+            if (activeSessionIdRef.current !== activeSessionId) return;
+            approvalPausedRef.current = null;
+            setApprovalPaused(null);
+            if (streamHandlersRef.current?.sessionId === activeSessionId) {
+              streamHandlersRef.current = null;
+            }
+            setApprovalResolvingId(null);
+            setIsStreaming(false);
+            onStreamingChange?.(false);
+            void loadSessionMessagesRef.current?.(activeSessionId);
+          },
+          onError: () => {
+            if (activeSessionIdRef.current !== activeSessionId) return;
+            if (streamHandlersRef.current?.sessionId === activeSessionId) {
+              streamHandlersRef.current = null;
+            }
+            setApprovalResolvingId(null);
+            setIsStreaming(false);
+            onStreamingChange?.(false);
+          },
+        },
+      );
+      setApprovalResolvingId(requestId);
+      setIsStreaming(true);
+      onStreamingChange?.(true);
+      const abort = streamAgentSession(activeSessionId, "", handlers, {
+        approval: { requestId, decision },
+      });
+      abortRef.current = abort;
+    },
+    [activeSessionId, approvalResolvingId, onStreamingChange],
+  );
   const superAssistantTurnIdRef = useRef<string | null>(null);
   const pmBackgroundTaskIdRef = useRef<string | null>(null);
   const stopTurnInFlightRef = useRef(false);
@@ -4941,6 +5041,8 @@ export function ChatCore({
         return t("operations.pmStageResume", "恢复执行");
       if (stageName === "understand")
         return t("operations.pmStageUnderstand", "任务理解");
+      if (stageName === "requirement_state")
+        return t("operations.pmRequirementState", "需求状态");
       if (stageName === "report_extract")
         return t("operations.pmStageReportExtract", "报告提取");
       if (stageName === "task_plan")
@@ -7251,6 +7353,13 @@ export function ChatCore({
   );
 
   useEffect(() => {
+    loadSessionMessagesRef.current = loadSessionMessages;
+    return () => {
+      loadSessionMessagesRef.current = null;
+    };
+  }, [loadSessionMessages]);
+
+  useEffect(() => {
     if (!superAssistantEndpoint || !isStreaming || !activeSessionId) return;
 
     const recoverIfBackendFinished = async () => {
@@ -8391,13 +8500,19 @@ export function ChatCore({
     if (superAssistantEndpoint) {
       superAssistantTurnIdRef.current = null;
     }
-    const abort = streamAgentSession(
-      sessionId!,
-      finalMessage,
-      {
-        onSuperAssistantTurnId: (turnId) => {
-          superAssistantTurnIdRef.current = turnId;
-        },
+    const streamHandlers: AgentSessionStreamHandlers = {
+      onApprovalRequired: (paused) => {
+        if (activeSessionIdRef.current !== sessionId) return;
+        markStreamActivity();
+        setApprovalResolvingId(null);
+        approvalPausedRef.current = paused;
+        setApprovalPaused(paused);
+        setIsStreaming(false);
+        onStreamingChange?.(false);
+      },
+      onSuperAssistantTurnId: (turnId) => {
+        superAssistantTurnIdRef.current = turnId;
+      },
         onSessionActivated: (meta: any) => {
           markStreamActivity();
           if (meta.mcp_servers) setActiveMcpServers(meta.mcp_servers);
@@ -8875,6 +8990,12 @@ export function ChatCore({
           },
         ) => {
           markStreamActivity();
+          if (streamHandlersRef.current?.sessionId === sessionId) {
+            streamHandlersRef.current = null;
+          }
+          setApprovalResolvingId(null);
+          approvalPausedRef.current = null;
+          setApprovalPaused(null);
           if (superAssistantEndpoint) {
             superAssistantTurnIdRef.current = null;
           }
@@ -9049,6 +9170,9 @@ export function ChatCore({
         },
         onError: (error: string) => {
           markStreamActivity();
+          if (streamHandlersRef.current?.sessionId === sessionId) {
+            streamHandlersRef.current = null;
+          }
           superAssistantAsyncTaskStartedRef.current = false;
           const adversarialNeedsModels =
             isSuperAdversarialNeedsModelsError(error);
@@ -9145,7 +9269,12 @@ export function ChatCore({
           // show a bogus "思考中…" bubble attached to nothing.
           resetThinkingState();
         },
-      },
+      };
+    streamHandlersRef.current = { sessionId: sessionId!, handlers: streamHandlers };
+    const abort = streamAgentSession(
+      sessionId!,
+      finalMessage,
+      streamHandlers,
       superAssistantEndpoint
         ? {
             images: streamImages,
@@ -11852,6 +11981,51 @@ export function ChatCore({
               </div>
             );
           })}
+
+          {approvalPaused && approvalPaused.approvals.length > 0 && (
+            <Card
+              size="small"
+              title={t("chat.approvalRequired", "等待你的工具审批")}
+              style={{ margin: "8px 0", borderColor: "var(--warning-color, #d89614)" }}
+            >
+              <Space direction="vertical" style={{ width: "100%" }} size={8}>
+                {approvalPaused.approvals.map((approval) => (
+                  <div key={approval.requestId} style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                    <div style={{ flex: 1, minWidth: 220 }}>
+                      <Typography.Text strong>{approval.toolName}</Typography.Text>
+                      <div style={{ color: "var(--text-secondary)", fontSize: 12 }}>
+                        {approval.reason || t("chat.approvalReasonDefault", "该工具需要更高权限才能执行")}
+                      </div>
+                      <div style={{ color: "var(--text-muted)", fontSize: 11 }}>
+                        {approval.currentMode} → {approval.requiredMode}
+                        {approval.expired ? ` · ${t("chat.approvalExpired", "已过期")}` : ""}
+                      </div>
+                    </div>
+                    <Space size={6}>
+                      <Button
+                        size="small"
+                        danger
+                        loading={approvalResolvingId === approval.requestId}
+                        disabled={approvalResolvingId !== null}
+                        onClick={() => resolvePendingApproval(approval.requestId, approval.expired ? "deny" : "approve")}
+                      >
+                        {approval.expired ? t("chat.approvalContinue", "继续但不执行") : t("chat.approvalApprove", "批准")}
+                      </Button>
+                      {!approval.expired && (
+                        <Button
+                          size="small"
+                          disabled={approvalResolvingId !== null}
+                          onClick={() => resolvePendingApproval(approval.requestId, "deny")}
+                        >
+                          {t("chat.approvalDeny", "拒绝")}
+                        </Button>
+                      )}
+                    </Space>
+                  </div>
+                ))}
+              </Space>
+            </Card>
+          )}
 
           {pmLiveStageNotice && sessionSource === "pm" && !isStreaming && (
             <div style={{ marginTop: 6, marginBottom: 8 }}>

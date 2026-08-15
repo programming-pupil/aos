@@ -462,6 +462,27 @@ export interface SuperAssistantActiveTurnResponse {
   status?: string;
 }
 
+export interface RuntimeApprovalRequest {
+  requestId: string;
+  turnId: string;
+  invocationId: string;
+  toolName: string;
+  currentMode: string;
+  requiredMode: string;
+  reason?: string | null;
+  status: string;
+  expiresAt: string;
+  expired: boolean;
+}
+
+export interface RuntimeApprovalPaused {
+  sessionId: string;
+  runtimeTurnId: string;
+  approvals: RuntimeApprovalRequest[];
+  partialText?: string;
+  iterations?: number;
+}
+
 export interface ChatFileRecord {
   id: string;
   fileId: string;
@@ -930,6 +951,14 @@ export const agentApi = {
       )
       .then((r) => r.data),
 
+  /** Unresolved approvals owned by the current authenticated session user. */
+  listSessionApprovals: (sessionId: string) =>
+    fastClient
+      .get<{ approvals: RuntimeApprovalRequest[] }>(
+        `/agent/sessions/${encodeURIComponent(sessionId)}/approvals`,
+      )
+      .then((r) => r.data),
+
   /** Toggle pin state of a session */
   togglePinSession: (sessionId: string) =>
     fastClient.post<{ pinned: boolean; is_pinned: boolean }>(
@@ -1148,6 +1177,8 @@ export function streamAgentSession(
     ) => void;
     /** Non-blocking warning emitted when image context couldn't be fully processed. */
     onImageContextWarning?: (payload: { message: string; detail?: string; code?: string }) => void;
+    /** The transport ended cleanly while the durable turn waits for approval. */
+    onApprovalRequired?: (payload: RuntimeApprovalPaused) => void;
     /** Super Assistant route result for non-chat capabilities such as PM research or data attribution. */
     onSuperAssistantAnswer?: (answer: SuperAssistantAnswer) => void;
     /** Available synchronously for durable cancellation before the first SSE event arrives. */
@@ -1158,6 +1189,11 @@ export function streamAgentSession(
     images?: PmTaskImageInput[];
     documents?: PmTaskDocumentInput[];
     turnOptions?: ChatTurnOptions;
+    approval?: {
+      requestId: string;
+      decision: 'approve' | 'deny' | 'cancel';
+      reason?: string;
+    };
     superAssistant?: {
       app?: string;
       model?: string;
@@ -1380,6 +1416,7 @@ export function streamAgentSession(
         images: options?.images ?? [],
         documents: options?.documents ?? [],
         turnOptions: options?.turnOptions ?? {},
+        ...(options?.approval ? { approval: options.approval } : {}),
       };
 
   // POST avoids URL length limits for long messages and hides the prompt from logs.
@@ -1659,6 +1696,16 @@ export function streamAgentSession(
             detail: warningData?.detail,
             code: warningData?.code,
           });
+        } else if (currentEvent === 'approval_required') {
+          // The richer approval_paused event follows after the runtime has
+          // committed the suspended checkpoint. Do not expose tool input here.
+        } else if (currentEvent === 'approval_paused') {
+          terminalEventSeen = true;
+          drainTextQueue();
+          const paused = (typeof data === 'object' && data.data !== undefined)
+            ? data.data
+            : data;
+          handlers.onApprovalRequired?.(paused as RuntimeApprovalPaused);
         } else if (currentEvent === 'super_assistant_answer') {
           const answerData = (typeof data === 'object' && data.data !== undefined) ? data.data : data;
           handlers.onSuperAssistantAnswer?.(answerData as SuperAssistantAnswer);

@@ -1506,9 +1506,9 @@ pub(crate) async fn resolve_query_references(
     bindings: Option<&ReferenceBindingRequest>,
     limit: usize,
 ) -> Result<Vec<ReferencePromptSnippet>> {
-    if let Some(bindings) = bindings {
+    let mut references = if let Some(bindings) = bindings {
         if bindings.is_active() {
-            return resolve_bound_query_references(
+            resolve_bound_query_references(
                 &state.db,
                 tenant_id,
                 datasource_id,
@@ -1516,10 +1516,95 @@ pub(crate) async fn resolve_query_references(
                 bindings,
                 limit,
             )
-            .await;
+            .await?
+        } else {
+            resolve_auto_query_references(state, tenant_id, datasource_id, question, limit).await?
         }
+    } else {
+        resolve_auto_query_references(state, tenant_id, datasource_id, question, limit).await?
+    };
+    append_approved_feedback_references(
+        &state.db,
+        tenant_id,
+        datasource_id,
+        question,
+        &mut references,
+        limit,
+    )
+    .await?;
+    Ok(references)
+}
+
+/// Approved corrections are scoped exemplars, never global prompt text.  They
+/// are appended only after normal lexical/embedding/rg retrieval and remain
+/// bounded by the same prompt snippet limit.
+async fn append_approved_feedback_references(
+    db: &sqlx::SqlitePool,
+    tenant_id: &str,
+    datasource_id: &str,
+    question: &str,
+    references: &mut Vec<ReferencePromptSnippet>,
+    limit: usize,
+) -> Result<()> {
+    if references.len() >= limit.max(1).min(MAX_PROMPT_SNIPPETS) {
+        return Ok(());
     }
-    resolve_auto_query_references(state, tenant_id, datasource_id, question, limit).await
+    let rows = sqlx::query::<sqlx::Sqlite>(
+        "SELECT id, correction_json FROM feedback_learning_events
+         WHERE tenant_id = ? AND scope = ? AND approved = 1
+         ORDER BY created_at DESC LIMIT 20",
+    )
+    .bind(tenant_id)
+    .bind(format!("datasource:{datasource_id}"))
+    .fetch_all(db)
+    .await?;
+    let query_tokens = tokenize_for_reference(question);
+    let max_items = limit.max(1).min(MAX_PROMPT_SNIPPETS);
+    for row in rows {
+        if references.len() >= max_items {
+            break;
+        }
+        let event_id: String = row.try_get("id")?;
+        let raw: String = row.try_get("correction_json")?;
+        let value: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let source_question = value.get("question").and_then(|v| v.as_str()).unwrap_or("");
+        let corrected_sql = value
+            .get("correctedSql")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if corrected_sql.trim().is_empty() {
+            continue;
+        }
+        let overlap = tokenize_for_reference(source_question)
+            .iter()
+            .filter(|token| query_tokens.contains(*token))
+            .count();
+        if !query_tokens.is_empty() && overlap == 0 {
+            continue;
+        }
+        references.push(ReferencePromptSnippet {
+            pack_id: "feedback-learning".into(),
+            pack_name: "Approved NL2SQL corrections".into(),
+            file_id: event_id.clone(),
+            filename: format!("approved-correction-{event_id}.sql"),
+            chunk_id: event_id,
+            language: Some("sql".into()),
+            start_line: 1,
+            end_line: corrected_sql.lines().count().max(1) as u32,
+            score: 1.0 + overlap as f64 * 0.01,
+            reason: "approved tenant/datasource-scoped correction exemplar".into(),
+            chunk_type: "approved_correction".into(),
+            verified: true,
+            stale: false,
+            content: format!(
+                "-- Approved correction for a similar question: {source_question}\n{corrected_sql}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) async fn has_indexed_sql_knowledge_for_datasource(
@@ -6289,5 +6374,44 @@ GROUP BY region
             semantic_candidates[0].embedding.as_deref(),
             Some([0.1, 0.9].as_slice())
         );
+    }
+
+    #[tokio::test]
+    async fn approved_feedback_exemplar_is_tenant_and_datasource_scoped() {
+        let db = crate::test_sqlite_pool().await;
+        sqlx::query(
+            "INSERT INTO feedback_learning_events
+                (id, tenant_id, scope, correction_json, approved, regression_case_id, created_at)
+             VALUES ('f1', 'tenant-a', 'datasource:ds-a', ?, 1, 'case-1', CURRENT_TIMESTAMP)",
+        )
+        .bind(
+            serde_json::json!({
+                "question": "昨天 ROI",
+                "correctedSql": "SELECT app, SUM(revenue) / SUM(cost) AS roi FROM fact GROUP BY app"
+            })
+            .to_string(),
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let mut own = Vec::new();
+        append_approved_feedback_references(
+            &db,
+            "tenant-a",
+            "ds-a",
+            "昨天 ROI 哪个 app 最好",
+            &mut own,
+            6,
+        )
+        .await
+        .unwrap();
+        assert_eq!(own.len(), 1);
+        assert!(own[0].content.contains("SUM(revenue)"));
+
+        let mut other = Vec::new();
+        append_approved_feedback_references(&db, "tenant-b", "ds-a", "昨天 ROI", &mut other, 6)
+            .await
+            .unwrap();
+        assert!(other.is_empty());
     }
 }

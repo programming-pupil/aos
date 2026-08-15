@@ -107,6 +107,8 @@ export function PmResearchStatusCard({
           backgroundTaskStatus={backgroundTaskStatus}
         />
 
+        <PmRequirementStateSection t={t} stages={stages} stageEvents={stageEvents} />
+
         <PmStageGrid t={t} stages={stages} />
 
         <PmDeepLoopSection t={t} stages={stages} events={stageEvents} />
@@ -140,6 +142,96 @@ export function PmResearchStatusCard({
       </Card>
     </div>
   );
+}
+
+function PmRequirementStateSection({
+  t,
+  stages,
+  stageEvents,
+}: {
+  t: TFunction;
+  stages: PmResearchStatusStageView[];
+  stageEvents: PmResearchStatusStageEventView[];
+}) {
+  const view = extractPmRequirementStateView(stages, stageEvents);
+  if (!view) return null;
+  const { problemFrame, jobs, outcomes, openQuestions, readiness, confirmed } = view;
+  return (
+    <StatusSection title={t("operations.pmRequirementState", "需求状态") }>
+      <Space size={[6, 6]} wrap>
+        <Tag color={confirmed ? "success" : "warning"} style={{ marginRight: 0 }}>
+          {confirmed
+            ? t("operations.pmRequirementConfirmed", "问题已确认")
+            : t("operations.pmRequirementNeedsConfirmation", "待确认")}
+        </Tag>
+        <Tag color="default" style={{ marginRight: 0 }}>
+          {`${t("operations.pmRequirementReadiness", "就绪度")}: ${readiness}`}
+        </Tag>
+      </Space>
+      {typeof problemFrame?.statement === "string" && problemFrame.statement.trim() && (
+        <Text style={{ display: "block", marginTop: 6, fontSize: 12, color: "var(--text-secondary)" }}>
+          {problemFrame.statement}
+        </Text>
+      )}
+      {jobs.length > 0 && (
+        <Text style={{ display: "block", marginTop: 6, fontSize: 11, color: "var(--text-muted)" }}>
+          {`${t("operations.pmRequirementJobs", "任务")}: ${jobs.join("；")}`}
+        </Text>
+      )}
+      {outcomes.length > 0 && (
+        <Text style={{ display: "block", marginTop: 4, fontSize: 11, color: "var(--text-muted)" }}>
+          {`${t("operations.pmRequirementOutcomes", "目标")}: ${outcomes.join("；")}`}
+        </Text>
+      )}
+      {openQuestions.length > 0 && (
+        <Text style={{ display: "block", marginTop: 4, fontSize: 11, color: "var(--text-muted)" }}>
+          {`${t("operations.pmRequirementOpenQuestions", "高影响未决问题")}: ${openQuestions.join("；")}`}
+        </Text>
+      )}
+    </StatusSection>
+  );
+}
+
+export function extractPmRequirementStateView(
+  stages: PmResearchStatusStageView[],
+  stageEvents: PmResearchStatusStageEventView[],
+): {
+  problemFrame: Record<string, unknown> | null;
+  jobs: string[];
+  outcomes: string[];
+  openQuestions: string[];
+  readiness: string;
+  confirmed: boolean;
+} | null {
+  const stage = [...stageEvents]
+    .reverse()
+    .find((event) => Boolean(event.rawDetail?.requirementState))
+    ?? [...stages]
+      .reverse()
+      .find((item) => item.id === "requirement_state" || Boolean(item.rawDetail?.requirementState));
+  const detail = stage?.rawDetail;
+  const state = asRecord(detail?.requirementState);
+  if (!state) return null;
+  const problemFrame = asRecord(state.problemFrame);
+  const jobs = Array.isArray(state.jobs)
+    ? state.jobs.filter((item): item is Record<string, unknown> => Boolean(asRecord(item))).slice(0, 4)
+    : [];
+  const outcomes = Array.isArray(state.desiredOutcomes)
+    ? state.desiredOutcomes.filter((item): item is Record<string, unknown> => Boolean(asRecord(item))).slice(0, 4)
+    : [];
+  const openQuestions = Array.isArray(state.openQuestions)
+    ? state.openQuestions.filter((item): item is Record<string, unknown> => Boolean(asRecord(item))).slice(0, 3)
+    : [];
+  const readiness = typeof state.readiness === "string" ? state.readiness : "-";
+  const confirmed = problemFrame?.confirmed === true;
+  return {
+    problemFrame,
+    jobs: jobs.map((job) => String(job.statement ?? "")).filter(Boolean),
+    outcomes: outcomes.map((outcome) => String(outcome.statement ?? "")).filter(Boolean),
+    openQuestions: openQuestions.map((question) => String(question.question ?? "")).filter(Boolean),
+    readiness,
+    confirmed,
+  };
 }
 
 function stageStatusText(t: TFunction, status: PmStageStatus): string {

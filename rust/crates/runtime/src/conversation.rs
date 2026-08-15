@@ -10,6 +10,11 @@ use crate::compact::{
     compact_session, compact_session_with_summary, CompactionConfig, CompactionResult,
 };
 use crate::config::RuntimeFeatureConfig;
+use crate::execution_kernel::{
+    AgentExecutionKernel, RuntimeApprovalDecision, RuntimeApprovalRequest,
+    RuntimeApprovalResolution, RuntimeContextManifestInput, RuntimeToolIntent, RuntimeToolOutcome,
+    RuntimeToolOutcomeKind, RuntimeTurnStart, RuntimeTurnTerminalStatus,
+};
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
@@ -78,6 +83,16 @@ pub struct PromptCacheEvent {
 /// Minimal streaming API contract required by [`ConversationRuntime`].
 #[::async_trait::async_trait]
 pub trait ApiClient: Send + Sync {
+    /// Provider/model identifier and currently exposed tools for the durable
+    /// prompt manifest. Generic clients may omit both.
+    fn model_version(&self) -> Option<String> {
+        None
+    }
+
+    fn active_tool_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Apply a per-iteration request policy before the next model call.
     ///
     /// The default keeps generic clients unchanged. Gateway clients use this
@@ -102,6 +117,10 @@ pub trait ApiClient: Send + Sync {
     /// the current turn. Clients that expose dynamic tool schemas should hide
     /// the tool immediately; the runtime also enforces the block locally.
     fn block_tool_for_turn(&mut self, _tool_name: &str) {}
+
+    /// Activate tools returned by the capability router's discovery call for
+    /// subsequent model iterations in this turn.
+    fn activate_tool_candidates(&mut self, _tool_names: &[String]) {}
 
     async fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError>;
 
@@ -178,6 +197,13 @@ pub struct DeferredToolResult {
     pub tool_use_id: String,
     pub output: String,
     pub is_error: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredApprovalDecision {
+    pub tool_use_id: String,
+    pub decision: RuntimeApprovalDecision,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -329,6 +355,13 @@ pub struct AutoCompactionEvent {
 /// [`compact_session_with_summary`] to commit the pass.
 #[::async_trait::async_trait]
 pub trait CompactionHook: Send + Sync {
+    /// Optional durable execution kernel paired with this session.  Keeping
+    /// this accessor on the injected hook lets gateway adapters construct both
+    /// boundaries without making `runtime` depend on a storage crate.
+    fn execution_kernel(&self) -> Option<Arc<dyn AgentExecutionKernel>> {
+        None
+    }
+
     /// Called once the compaction window has been discovered (via a pure,
     /// non-committing [`compact_session`] pass) but **before** the compacted
     /// session is committed.
@@ -414,6 +447,9 @@ pub struct ConversationRuntime<C, T> {
     /// layers (Req 4.1 / 4.3 / 4.9). `None` preserves the default heuristic
     /// auto-compaction behavior.
     compaction_hook: Option<Arc<dyn CompactionHook>>,
+    /// Authoritative durable execution boundary.  When configured, no tool is
+    /// dispatched until its intent, capability and reservation are committed.
+    execution_kernel: Option<Arc<dyn AgentExecutionKernel>>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -466,6 +502,7 @@ where
             hook_progress_reporter: Arc::new(Mutex::new(None)),
             session_tracer: None,
             compaction_hook: None,
+            execution_kernel: None,
         }
     }
 
@@ -540,6 +577,16 @@ where
     /// [`ConversationRuntime::with_compaction_hook`].
     pub fn set_compaction_hook(&mut self, hook: Option<Arc<dyn CompactionHook>>) {
         self.compaction_hook = hook;
+    }
+
+    #[must_use]
+    pub fn with_execution_kernel(mut self, kernel: Arc<dyn AgentExecutionKernel>) -> Self {
+        self.execution_kernel = Some(kernel);
+        self
+    }
+
+    pub fn set_execution_kernel(&mut self, kernel: Option<Arc<dyn AgentExecutionKernel>>) {
+        self.execution_kernel = kernel;
     }
 
     fn run_pre_tool_use_hook(&mut self, tool_name: &str, input: &str) -> HookRunResult {
@@ -672,6 +719,25 @@ where
             .session
             .begin_turn(user_input.clone())
             .map_err(|error| RuntimeError::new(error.to_string()))?;
+        if let Some(kernel) = self.execution_kernel.clone() {
+            if let Err(error) = kernel
+                .start_turn(RuntimeTurnStart {
+                    turn_id: turn_id.clone(),
+                    user_input: user_input.clone(),
+                })
+                .await
+            {
+                let _ = self.session.rollback_latest_turn_started_at(
+                    self.session
+                        .turns
+                        .last()
+                        .map_or(0, |turn| turn.start_message_count),
+                );
+                return Err(RuntimeError::new(format!(
+                    "durable turn start failed before model execution: {error}"
+                )));
+            }
+        }
         reporter.on_turn_started(&turn_id);
         self.record_turn_started(&user_input);
         self.session.push_user_text(user_input).map_err(|error| {
@@ -680,13 +746,21 @@ where
             runtime_error
         })?;
 
-        self.continue_resumable_turn(
-            &turn_id,
-            prompter,
-            &mut reporter,
-            TurnAccumulator::default(),
-        )
-        .await
+        let outcome = self
+            .continue_resumable_turn(
+                &turn_id,
+                prompter,
+                &mut reporter,
+                TurnAccumulator::default(),
+            )
+            .await;
+        if let Err(error) = outcome.as_ref() {
+            let detail = error.to_string();
+            let _ = self
+                .finish_turn_in_kernel(&turn_id, RuntimeTurnTerminalStatus::Failed, Some(&detail))
+                .await;
+        }
+        outcome
     }
 
     /// Resume the latest suspended runtime turn by supplying every outstanding
@@ -732,12 +806,27 @@ where
             let result = by_id
                 .remove(&tool_use_id)
                 .expect("pending deferred result was validated above");
-            reporter.on_tool_result(&tool_name, &input, &result.output, result.is_error);
+            let projected = self
+                .finish_tool_in_kernel(RuntimeToolOutcome {
+                    turn_id: turn.turn_id.clone(),
+                    invocation_id: tool_use_id.clone(),
+                    tool_name: tool_name.clone(),
+                    input: input.clone(),
+                    output: result.output,
+                    iteration: 0,
+                    outcome: if result.is_error {
+                        RuntimeToolOutcomeKind::Failed
+                    } else {
+                        RuntimeToolOutcomeKind::Completed
+                    },
+                })
+                .await?;
+            reporter.on_tool_result(&tool_name, &input, &projected.model_output, result.is_error);
             reporter.on_tool_use_end();
             let message = ConversationMessage::tool_result(
                 tool_use_id,
                 tool_name,
-                result.output,
+                projected.model_output,
                 result.is_error,
             );
             self.session
@@ -749,8 +838,172 @@ where
             accumulator.tool_results.push(message);
         }
         self.complete_session_turn(&turn.turn_id, SessionTurnStatus::Running);
-        self.continue_resumable_turn(&turn.turn_id, prompter, &mut reporter, accumulator)
-            .await
+        let outcome = self
+            .continue_resumable_turn(&turn.turn_id, prompter, &mut reporter, accumulator)
+            .await;
+        if let Err(error) = outcome.as_ref() {
+            let detail = error.to_string();
+            let _ = self
+                .finish_turn_in_kernel(
+                    &turn.turn_id,
+                    RuntimeTurnTerminalStatus::Failed,
+                    Some(&detail),
+                )
+                .await;
+        }
+        outcome
+    }
+
+    /// Resolve externally approved tool calls and resume the same durable turn.
+    /// Approved calls are executed only after the resolution and the normal
+    /// intent/capability record have both committed. Explicit deny policy and
+    /// current pre-tool hooks are re-evaluated immediately before execution.
+    pub async fn resume_turn_with_approval_decisions<R: RuntimeEventReporter>(
+        &mut self,
+        decisions: Vec<DeferredApprovalDecision>,
+        prompter: Option<&mut (dyn PermissionPrompter + Send)>,
+        mut reporter: R,
+    ) -> Result<ResumableTurnOutcome, RuntimeError> {
+        let turn = self
+            .session
+            .turns
+            .iter()
+            .rev()
+            .find(|turn| matches!(turn.status, SessionTurnStatus::Suspended))
+            .cloned()
+            .ok_or_else(|| RuntimeError::new("no suspended runtime turn to approve"))?;
+        let pending = pending_tool_uses_for_turn(&self.session, &turn);
+        let mut by_id = decisions
+            .into_iter()
+            .map(|decision| (decision.tool_use_id.clone(), decision))
+            .collect::<std::collections::HashMap<_, _>>();
+        if pending.is_empty()
+            || by_id.is_empty()
+            || by_id
+                .keys()
+                .any(|tool_use_id| !pending.iter().any(|pending| &pending.0 == tool_use_id))
+        {
+            return Err(RuntimeError::new(
+                "approval decisions do not exactly match the suspended calls",
+            ));
+        }
+
+        let mut accumulator = TurnAccumulator::default();
+        let mut deferred_tools = Vec::new();
+        for (tool_use_id, tool_name, input) in pending {
+            let Some(decision) = by_id.remove(&tool_use_id) else {
+                deferred_tools.push(DeferredToolUse {
+                    tool_use_id,
+                    tool_name,
+                    input,
+                    metadata: serde_json::json!({"kind":"external_completion"}).to_string(),
+                });
+                continue;
+            };
+            let resolution = RuntimeApprovalResolution {
+                turn_id: turn.turn_id.clone(),
+                invocation_id: tool_use_id.clone(),
+                decision: decision.decision,
+                reason: decision.reason.clone(),
+            };
+            let effective_decision = if let Some(kernel) = self.execution_kernel.clone() {
+                kernel.resolve_approval(&resolution).await?
+            } else {
+                decision.decision
+            };
+
+            let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
+            let effective_input = pre_hook_result
+                .updated_input()
+                .map_or_else(|| input.clone(), ToOwned::to_owned);
+            let permission_outcome =
+                if !matches!(effective_decision, RuntimeApprovalDecision::Approved) {
+                    PermissionOutcome::Deny {
+                        reason: decision.reason.unwrap_or_else(|| match effective_decision {
+                            RuntimeApprovalDecision::Denied => {
+                                "user denied the approval request".to_string()
+                            }
+                            RuntimeApprovalDecision::Expired => {
+                                "the approval request expired before execution".to_string()
+                            }
+                            RuntimeApprovalDecision::Cancelled => {
+                                "the approval request was cancelled".to_string()
+                            }
+                            RuntimeApprovalDecision::Approved => unreachable!(),
+                        }),
+                    }
+                } else if pre_hook_result.is_cancelled()
+                    || pre_hook_result.is_failed()
+                    || pre_hook_result.is_denied()
+                {
+                    PermissionOutcome::Deny {
+                        reason: format_hook_message(
+                            &pre_hook_result,
+                            &format!("current policy blocked approved tool `{tool_name}`"),
+                        ),
+                    }
+                } else {
+                    self.permission_policy
+                        .authorize_approved(&tool_name, &effective_input)
+                };
+            let prepared = PreparedToolUse {
+                tool_use_id,
+                tool_name,
+                effective_input,
+                pre_hook_result,
+                permission_outcome,
+            };
+            match self
+                .execute_prepared_tool_use_outcome(&turn.turn_id, 0, &prepared, &mut reporter)
+                .await?
+            {
+                PreparedToolExecution::Completed(message) => {
+                    self.session
+                        .push_message(message.clone())
+                        .map_err(|error| {
+                            RuntimeError::new(format!(
+                                "failed to persist approved tool result: {error}"
+                            ))
+                        })?;
+                    self.record_tool_finished(0, &message);
+                    self.activate_tools_from_search_result(&message);
+                    accumulator.tool_results.push(message);
+                }
+                PreparedToolExecution::Deferred(deferred) => deferred_tools.push(deferred),
+            }
+        }
+
+        if !deferred_tools.is_empty() {
+            let summary = turn_summary_from_accumulator(self, accumulator);
+            self.complete_session_turn(&turn.turn_id, SessionTurnStatus::Suspended);
+            self.finish_turn_in_kernel(
+                &turn.turn_id,
+                RuntimeTurnTerminalStatus::Suspended,
+                Some("approved tools deferred to external completion"),
+            )
+            .await?;
+            return Ok(ResumableTurnOutcome::Suspended(SuspendedTurn {
+                turn_id: turn.turn_id,
+                deferred_tools,
+                partial_summary: summary,
+            }));
+        }
+
+        self.complete_session_turn(&turn.turn_id, SessionTurnStatus::Running);
+        let outcome = self
+            .continue_resumable_turn(&turn.turn_id, prompter, &mut reporter, accumulator)
+            .await;
+        if let Err(error) = outcome.as_ref() {
+            let detail = error.to_string();
+            let _ = self
+                .finish_turn_in_kernel(
+                    &turn.turn_id,
+                    RuntimeTurnTerminalStatus::Failed,
+                    Some(&detail),
+                )
+                .await;
+        }
+        outcome
     }
 
     /// Finish a suspended turn after a terminal deferred tool (for example
@@ -759,7 +1012,7 @@ where
     /// This appends every outstanding ToolResult in original ToolUse order and
     /// the accepted final assistant text, then marks the same runtime turn
     /// complete without another model request.
-    pub fn finalize_suspended_turn_with_tool_results(
+    pub async fn finalize_suspended_turn_with_tool_results(
         &mut self,
         results: Vec<DeferredToolResult>,
         final_text: impl Into<String>,
@@ -793,10 +1046,25 @@ where
             let result = by_id
                 .remove(&tool_use_id)
                 .expect("terminal deferred result was validated above");
+            let projected = self
+                .finish_tool_in_kernel(RuntimeToolOutcome {
+                    turn_id: turn.turn_id.clone(),
+                    invocation_id: tool_use_id.clone(),
+                    tool_name: tool_name.clone(),
+                    input: String::new(),
+                    output: result.output,
+                    iteration: 0,
+                    outcome: if result.is_error {
+                        RuntimeToolOutcomeKind::Failed
+                    } else {
+                        RuntimeToolOutcomeKind::Completed
+                    },
+                })
+                .await?;
             let message = ConversationMessage::tool_result(
                 tool_use_id,
                 tool_name,
-                result.output,
+                projected.model_output,
                 result.is_error,
             );
             self.session
@@ -831,6 +1099,8 @@ where
             auto_compaction: None,
         };
         self.record_turn_completed(&summary);
+        self.finish_turn_in_kernel(&turn.turn_id, RuntimeTurnTerminalStatus::Completed, None)
+            .await?;
         Ok(summary)
     }
 
@@ -987,6 +1257,35 @@ where
                 system_prompt,
                 messages: request_messages,
             };
+            if let Some(kernel) = self.execution_kernel.clone() {
+                kernel
+                    .record_context_manifest(RuntimeContextManifestInput {
+                        turn_id: turn_id.to_string(),
+                        iteration: accumulator.iterations,
+                        estimated_tokens: request
+                            .messages
+                            .iter()
+                            .map(crate::token_estimator::estimate_message_tokens)
+                            .sum::<usize>()
+                            + request
+                                .system_prompt
+                                .iter()
+                                .map(|section| estimate_text_tokens(section))
+                                .sum::<usize>(),
+                        system_sections: request.system_prompt.clone(),
+                        messages: request.messages.clone(),
+                        model_version: self.api_client.model_version(),
+                        active_tools: self.api_client.active_tool_names(),
+                        semantic_snapshot_version: None,
+                    })
+                    .await
+                    .map_err(|error| {
+                        self.complete_session_turn(turn_id, SessionTurnStatus::Failed);
+                        RuntimeError::new(format!(
+                            "failed to commit model-visible context manifest: {error}"
+                        ))
+                    })?;
+            }
             let events = match self
                 .api_client
                 .stream_with_reporter(request, reporter)
@@ -1029,6 +1328,16 @@ where
                 &assistant_message,
                 pending_tool_uses.len(),
             );
+
+            if let Some(kernel) = self.execution_kernel.clone() {
+                kernel
+                    .record_assistant_message(turn_id, accumulator.iterations, &assistant_message)
+                    .await
+                    .map_err(|error| {
+                        self.complete_session_turn(turn_id, SessionTurnStatus::Failed);
+                        RuntimeError::new(format!("failed to commit assistant event: {error}"))
+                    })?;
+            }
 
             self.session
                 .push_message(assistant_message.clone())
@@ -1137,11 +1446,15 @@ where
             while tool_index < prepared_tool_uses.len() {
                 let prepared = &prepared_tool_uses[tool_index];
                 if !prepared.is_allowed_parallel(&self.tool_executor) {
-                    match self.execute_prepared_tool_use_outcome(
-                        accumulator.iterations,
-                        prepared,
-                        reporter,
-                    ) {
+                    match self
+                        .execute_prepared_tool_use_outcome(
+                            turn_id,
+                            accumulator.iterations,
+                            prepared,
+                            reporter,
+                        )
+                        .await?
+                    {
                         PreparedToolExecution::Completed(result_message) => {
                             self.observe_repeated_tool_failure(
                                 &mut accumulator,
@@ -1156,6 +1469,7 @@ where
                                     runtime_error
                                 })?;
                             self.record_tool_finished(accumulator.iterations, &result_message);
+                            self.activate_tools_from_search_result(&result_message);
                             accumulator.tool_results.push(result_message);
                         }
                         PreparedToolExecution::Deferred(deferred) => {
@@ -1175,6 +1489,10 @@ where
                 }
 
                 for prepared in &prepared_tool_uses[batch_start..batch_end] {
+                    self.authorize_tool_in_kernel(turn_id, accumulator.iterations, prepared)
+                        .await?;
+                    self.start_tool_in_kernel(turn_id, accumulator.iterations, prepared)
+                        .await?;
                     self.record_tool_started(accumulator.iterations, &prepared.tool_name);
                     reporter.on_tool_use_start(&prepared.tool_name);
                     reporter.on_tool_input_delta(&prepared.effective_input);
@@ -1195,8 +1513,15 @@ where
                             "parallel tool executor returned fewer results than requested",
                         ))
                     });
-                    let result_message =
-                        self.finalize_allowed_tool_use(prepared, execution, reporter);
+                    let result_message = self
+                        .finalize_allowed_tool_use(
+                            turn_id,
+                            accumulator.iterations,
+                            prepared,
+                            execution,
+                            reporter,
+                        )
+                        .await?;
                     self.observe_repeated_tool_failure(&mut accumulator, prepared, &result_message);
                     self.session
                         .push_message(result_message.clone())
@@ -1206,6 +1531,7 @@ where
                             runtime_error
                         })?;
                     self.record_tool_finished(accumulator.iterations, &result_message);
+                    self.activate_tools_from_search_result(&result_message);
                     accumulator.tool_results.push(result_message);
                 }
                 if batch_results.next().is_some() {
@@ -1220,6 +1546,12 @@ where
             if !deferred_tools.is_empty() {
                 let summary = turn_summary_from_accumulator(self, accumulator);
                 self.complete_session_turn(turn_id, SessionTurnStatus::Suspended);
+                self.finish_turn_in_kernel(
+                    turn_id,
+                    RuntimeTurnTerminalStatus::Suspended,
+                    Some("deferred tools awaiting external completion"),
+                )
+                .await?;
                 return Ok(ResumableTurnOutcome::Suspended(SuspendedTurn {
                     turn_id: turn_id.to_string(),
                     deferred_tools,
@@ -1231,6 +1563,8 @@ where
         let summary = turn_summary_from_accumulator(self, accumulator);
         self.record_turn_completed(&summary);
         self.complete_session_turn(turn_id, SessionTurnStatus::Completed);
+        self.finish_turn_in_kernel(turn_id, RuntimeTurnTerminalStatus::Completed, None)
+            .await?;
 
         Ok(ResumableTurnOutcome::Completed(summary))
     }
@@ -1278,6 +1612,28 @@ where
         self.session
             .rollback_latest_turn_started_at(len)
             .map_err(|error| RuntimeError::new(error.to_string()))
+    }
+
+    /// Close the latest open durable turn after an outer coordinator observes
+    /// cancellation or an upstream failure that interrupted the runtime task.
+    /// This is intentionally explicit because a `tokio::select!` cancellation
+    /// drops the in-flight future before the normal loop can emit a terminal
+    /// event.
+    pub async fn finish_latest_kernel_turn(
+        &self,
+        status: RuntimeTurnTerminalStatus,
+        detail: Option<&str>,
+    ) -> Result<(), RuntimeError> {
+        let Some(turn) = self.session.turns.iter().rev().find(|turn| {
+            matches!(
+                turn.status,
+                SessionTurnStatus::Running | SessionTurnStatus::Suspended
+            )
+        }) else {
+            return Ok(());
+        };
+        self.finish_turn_in_kernel(&turn.turn_id, status, detail)
+            .await
     }
 
     pub fn rollback_last_turns(&mut self, turn_count: usize) -> Result<(), RuntimeError> {
@@ -1400,6 +1756,24 @@ where
 
         if result.removed_message_count == 0 {
             self.last_auto_compaction_input_tokens = cumulative_input_tokens;
+            return Ok(None);
+        }
+        let source_tokens = result
+            .archived_messages
+            .iter()
+            .map(crate::token_estimator::estimate_message_tokens)
+            .sum::<usize>();
+        let replacement_tokens = result
+            .compacted_session
+            .messages
+            .first()
+            .map(crate::token_estimator::estimate_message_tokens)
+            .unwrap_or_default();
+        if replacement_tokens >= source_tokens {
+            self.last_auto_compaction_input_tokens = cumulative_input_tokens;
+            self.record_in_turn_compaction_failed(&RuntimeError::new(format!(
+                "framed compaction replacement was not smaller than its source window ({replacement_tokens} >= {source_tokens})"
+            )));
             return Ok(None);
         }
 
@@ -1551,14 +1925,52 @@ where
         session_tracer.record("assistant_iteration_completed", attributes);
     }
 
-    fn execute_prepared_tool_use_outcome<R: RuntimeEventReporter>(
+    async fn execute_prepared_tool_use_outcome<R: RuntimeEventReporter>(
         &mut self,
+        turn_id: &str,
         iteration: usize,
         prepared: &PreparedToolUse,
         reporter: &mut R,
-    ) -> PreparedToolExecution {
+    ) -> Result<PreparedToolExecution, RuntimeError> {
+        if let PermissionOutcome::AwaitingApproval { request } = &prepared.permission_outcome {
+            let Some(kernel) = self.execution_kernel.clone() else {
+                return Err(RuntimeError::new(
+                    "interactive approval requires a durable execution kernel",
+                ));
+            };
+            kernel
+                .request_approval(&RuntimeApprovalRequest {
+                    turn_id: turn_id.to_string(),
+                    invocation_id: prepared.tool_use_id.clone(),
+                    tool_name: prepared.tool_name.clone(),
+                    input: prepared.effective_input.clone(),
+                    iteration,
+                    request: request.clone(),
+                })
+                .await?;
+            reporter.on_runtime_status(
+                "waiting_approval",
+                &format!("tool `{}` is waiting for user approval", prepared.tool_name),
+            );
+            return Ok(PreparedToolExecution::Deferred(DeferredToolUse {
+                tool_use_id: prepared.tool_use_id.clone(),
+                tool_name: prepared.tool_name.clone(),
+                input: prepared.effective_input.clone(),
+                metadata: serde_json::json!({
+                    "kind": "approval",
+                    "currentMode": request.current_mode.as_str(),
+                    "requiredMode": request.required_mode.as_str(),
+                    "reason": request.reason,
+                })
+                .to_string(),
+            }));
+        }
+        self.authorize_tool_in_kernel(turn_id, iteration, prepared)
+            .await?;
         match &prepared.permission_outcome {
             PermissionOutcome::Allow => {
+                self.start_tool_in_kernel(turn_id, iteration, prepared)
+                    .await?;
                 self.record_tool_started(iteration, &prepared.tool_name);
                 reporter.on_tool_use_start(&prepared.tool_name);
                 reporter.on_tool_input_delta(&prepared.effective_input);
@@ -1566,16 +1978,32 @@ where
                     .tool_executor
                     .execute_outcome(&prepared.tool_name, &prepared.effective_input)
                 {
-                    ToolExecutionOutcome::Completed(execution) => PreparedToolExecution::Completed(
-                        self.finalize_allowed_tool_use(prepared, execution, reporter),
-                    ),
+                    ToolExecutionOutcome::Completed(execution) => {
+                        Ok(PreparedToolExecution::Completed(
+                            self.finalize_allowed_tool_use(
+                                turn_id, iteration, prepared, execution, reporter,
+                            )
+                            .await?,
+                        ))
+                    }
                     ToolExecutionOutcome::Deferred { metadata } => {
-                        PreparedToolExecution::Deferred(DeferredToolUse {
+                        let _ = self
+                            .finish_tool_in_kernel(RuntimeToolOutcome {
+                                turn_id: turn_id.to_string(),
+                                invocation_id: prepared.tool_use_id.clone(),
+                                tool_name: prepared.tool_name.clone(),
+                                input: prepared.effective_input.clone(),
+                                output: metadata.clone(),
+                                iteration,
+                                outcome: RuntimeToolOutcomeKind::Deferred,
+                            })
+                            .await?;
+                        Ok(PreparedToolExecution::Deferred(DeferredToolUse {
                             tool_use_id: prepared.tool_use_id.clone(),
                             tool_name: prepared.tool_name.clone(),
                             input: prepared.effective_input.clone(),
                             metadata,
-                        })
+                        }))
                     }
                 }
             }
@@ -1592,22 +2020,40 @@ where
                     true,
                 );
                 reporter.on_tool_use_end();
-                PreparedToolExecution::Completed(ConversationMessage::tool_result(
-                    prepared.tool_use_id.clone(),
-                    prepared.tool_name.clone(),
-                    merged,
-                    true,
+                let projected = self
+                    .finish_tool_in_kernel(RuntimeToolOutcome {
+                        turn_id: turn_id.to_string(),
+                        invocation_id: prepared.tool_use_id.clone(),
+                        tool_name: prepared.tool_name.clone(),
+                        input: prepared.effective_input.clone(),
+                        output: merged,
+                        iteration,
+                        outcome: RuntimeToolOutcomeKind::Denied,
+                    })
+                    .await?;
+                Ok(PreparedToolExecution::Completed(
+                    ConversationMessage::tool_result(
+                        prepared.tool_use_id.clone(),
+                        prepared.tool_name.clone(),
+                        projected.model_output,
+                        true,
+                    ),
                 ))
+            }
+            PermissionOutcome::AwaitingApproval { .. } => {
+                unreachable!("approval requests return before authorized intent processing")
             }
         }
     }
 
-    fn finalize_allowed_tool_use<R: RuntimeEventReporter>(
+    async fn finalize_allowed_tool_use<R: RuntimeEventReporter>(
         &mut self,
+        turn_id: &str,
+        iteration: usize,
         prepared: &PreparedToolUse,
         execution: Result<String, ToolError>,
         reporter: &mut R,
-    ) -> ConversationMessage {
+    ) -> Result<ConversationMessage, RuntimeError> {
         let (mut output, mut is_error) = match execution {
             Ok(output) => (output, false),
             Err(error) => (error.to_string(), true),
@@ -1642,19 +2088,121 @@ where
                 || post_hook_result.is_cancelled(),
         );
 
+        let projected = self
+            .finish_tool_in_kernel(RuntimeToolOutcome {
+                turn_id: turn_id.to_string(),
+                invocation_id: prepared.tool_use_id.clone(),
+                tool_name: prepared.tool_name.clone(),
+                input: prepared.effective_input.clone(),
+                output,
+                iteration,
+                outcome: if is_error {
+                    RuntimeToolOutcomeKind::Failed
+                } else {
+                    RuntimeToolOutcomeKind::Completed
+                },
+            })
+            .await?;
         reporter.on_tool_result(
             &prepared.tool_name,
             &prepared.effective_input,
-            &output,
+            &projected.model_output,
             is_error,
         );
         reporter.on_tool_use_end();
-        ConversationMessage::tool_result(
+        Ok(ConversationMessage::tool_result(
             prepared.tool_use_id.clone(),
             prepared.tool_name.clone(),
-            output,
+            projected.model_output,
             is_error,
-        )
+        ))
+    }
+
+    async fn authorize_tool_in_kernel(
+        &self,
+        turn_id: &str,
+        iteration: usize,
+        prepared: &PreparedToolUse,
+    ) -> Result<(), RuntimeError> {
+        let Some(kernel) = self.execution_kernel.clone() else {
+            return Ok(());
+        };
+        let (authorized, denial_reason) = match &prepared.permission_outcome {
+            PermissionOutcome::Allow => (true, None),
+            PermissionOutcome::Deny { reason } => (false, Some(reason.clone())),
+            PermissionOutcome::AwaitingApproval { .. } => {
+                return Err(RuntimeError::new(
+                    "approval request cannot be recorded as an authorized tool intent",
+                ));
+            }
+        };
+        kernel
+            .authorize_tool(&RuntimeToolIntent::new(
+                turn_id,
+                &prepared.tool_use_id,
+                &prepared.tool_name,
+                &prepared.effective_input,
+                iteration,
+                authorized,
+                denial_reason,
+            ))
+            .await
+            .map_err(|error| {
+                RuntimeError::new(format!(
+                    "tool `{}` was not executed because durable authorization failed: {error}",
+                    prepared.tool_name
+                ))
+            })
+    }
+
+    async fn start_tool_in_kernel(
+        &self,
+        turn_id: &str,
+        iteration: usize,
+        prepared: &PreparedToolUse,
+    ) -> Result<(), RuntimeError> {
+        let Some(kernel) = self.execution_kernel.clone() else {
+            return Ok(());
+        };
+        kernel
+            .start_tool(&RuntimeToolIntent::new(
+                turn_id,
+                &prepared.tool_use_id,
+                &prepared.tool_name,
+                &prepared.effective_input,
+                iteration,
+                true,
+                None,
+            ))
+            .await
+            .map_err(|error| {
+                RuntimeError::new(format!(
+                    "tool `{}` was not dispatched because its durable start transition failed: {error}",
+                    prepared.tool_name
+                ))
+            })
+    }
+
+    async fn finish_tool_in_kernel(
+        &self,
+        outcome: RuntimeToolOutcome,
+    ) -> Result<crate::RuntimeToolProjection, RuntimeError> {
+        match self.execution_kernel.clone() {
+            Some(kernel) => kernel.finish_tool(outcome).await,
+            None => Ok(crate::RuntimeToolProjection::inline(outcome.output)),
+        }
+    }
+
+    async fn finish_turn_in_kernel(
+        &self,
+        turn_id: &str,
+        status: RuntimeTurnTerminalStatus,
+        detail: Option<&str>,
+    ) -> Result<(), RuntimeError> {
+        match self.execution_kernel.clone() {
+            Some(kernel) => kernel.finish_turn(turn_id, status, detail).await,
+            None => Ok(()),
+        }
     }
 
     fn observe_repeated_tool_failure(
@@ -1697,6 +2245,43 @@ where
         let mut attributes = Map::new();
         attributes.insert("message".to_string(), Value::String(message.to_string()));
         session_tracer.record(name, attributes);
+    }
+
+    fn activate_tools_from_search_result(&mut self, message: &ConversationMessage) {
+        let Some((tool_name, output, _)) = message_tool_result(message) else {
+            return;
+        };
+        if !tool_name.eq_ignore_ascii_case("ToolSearch")
+            && !tool_name.eq_ignore_ascii_case("tool_search")
+        {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(output) else {
+            return;
+        };
+        let matches = value
+            .get("matches")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !matches.is_empty() {
+            self.api_client.activate_tool_candidates(&matches);
+            if let Some(tracer) = &self.session_tracer {
+                let mut attributes = Map::new();
+                attributes.insert("source".into(), Value::String("ToolSearch".into()));
+                attributes.insert(
+                    "tools".into(),
+                    Value::Array(matches.into_iter().map(Value::String).collect()),
+                );
+                tracer.record("tool_capability_activated", attributes);
+            }
+        }
     }
 
     fn record_tool_started(&self, iteration: usize, tool_name: &str) {
@@ -2325,12 +2910,17 @@ mod tests {
     use super::{
         build_assistant_message, message_tool_result, parse_auto_compaction_threshold,
         should_auto_compact, ApiClient, ApiRequest, AssistantEvent, CompactionHook,
-        ConversationRuntime, DeferredToolResult, PromptCacheEvent, ResumableTurnOutcome,
-        RuntimeError, StaticToolExecutor, ToolExecutionOutcome, ToolExecutionRequest, ToolExecutor,
-        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        ConversationRuntime, DeferredApprovalDecision, DeferredToolResult, PromptCacheEvent,
+        ResumableTurnOutcome, RuntimeError, StaticToolExecutor, ToolExecutionOutcome,
+        ToolExecutionRequest, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+    use crate::execution_kernel::{
+        AgentExecutionKernel, RuntimeApprovalDecision, RuntimeApprovalRequest,
+        RuntimeApprovalResolution, RuntimeContextManifestInput, RuntimeToolIntent,
+        RuntimeToolOutcome, RuntimeToolProjection, RuntimeTurnStart, RuntimeTurnTerminalStatus,
+    };
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest,
@@ -2347,6 +2937,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
     use telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
+
+    /// Keep compaction fixtures large enough that the framed continuation is
+    /// meaningfully smaller than the archived window. Production compaction
+    /// must still fail closed for a replacement that grows the context.
+    fn compaction_fixture_text(label: &str) -> String {
+        format!("{label}: {}", "important context ".repeat(48))
+    }
 
     struct ScriptedApiClient {
         call_count: usize,
@@ -2419,6 +3016,327 @@ mod tests {
             assert_eq!(request.tool_name, "add");
             PermissionPromptDecision::Allow
         }
+    }
+
+    struct PromptDefer;
+
+    impl PermissionPrompter for PromptDefer {
+        fn decide(&mut self, _request: &PermissionRequest) -> PermissionPromptDecision {
+            PermissionPromptDecision::Defer
+        }
+    }
+
+    struct ApprovalApiClient {
+        call_count: usize,
+    }
+
+    #[::async_trait::async_trait]
+    impl ApiClient for ApprovalApiClient {
+        async fn stream(
+            &mut self,
+            request: ApiRequest,
+        ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.call_count += 1;
+            match self.call_count {
+                1 => Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "approval-tool-1".to_string(),
+                        name: "write_external".to_string(),
+                        input: r#"{"value":"durable"}"#.to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ]),
+                2 => {
+                    assert!(matches!(
+                        request.messages.last().and_then(|message| message.blocks.first()),
+                        Some(ContentBlock::ToolResult { tool_use_id, .. })
+                            if tool_use_id == "approval-tool-1"
+                    ));
+                    Ok(vec![
+                        AssistantEvent::TextDelta("approval handled".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+                _ => unreachable!("approval flow made an extra provider call"),
+            }
+        }
+    }
+
+    struct CountingApprovalExecutor {
+        executions: Arc<AtomicUsize>,
+    }
+
+    impl ToolExecutor for CountingApprovalExecutor {
+        fn execute(&mut self, tool_name: &str, _input: &str) -> Result<String, ToolError> {
+            assert_eq!(tool_name, "write_external");
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok("external write completed".to_string())
+        }
+    }
+
+    #[derive(Default)]
+    struct ApprovalKernelState {
+        approval_requests: Vec<RuntimeApprovalRequest>,
+        resolutions: Vec<RuntimeApprovalResolution>,
+        authorized: Vec<RuntimeToolIntent>,
+        started: BTreeSet<String>,
+        finished: Vec<RuntimeToolOutcome>,
+    }
+
+    struct ApprovalTestKernel {
+        state: Mutex<ApprovalKernelState>,
+    }
+
+    impl ApprovalTestKernel {
+        fn new() -> Self {
+            Self {
+                state: Mutex::new(ApprovalKernelState::default()),
+            }
+        }
+    }
+
+    #[::async_trait::async_trait]
+    impl AgentExecutionKernel for ApprovalTestKernel {
+        async fn recover(&self) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn start_turn(&self, _input: RuntimeTurnStart) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn record_context_manifest(
+            &self,
+            _input: RuntimeContextManifestInput,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn record_assistant_message(
+            &self,
+            _turn_id: &str,
+            _iteration: usize,
+            _message: &ConversationMessage,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn authorize_tool(&self, intent: &RuntimeToolIntent) -> Result<(), RuntimeError> {
+            self.state.lock().unwrap().authorized.push(intent.clone());
+            Ok(())
+        }
+
+        async fn start_tool(&self, intent: &RuntimeToolIntent) -> Result<(), RuntimeError> {
+            let mut state = self.state.lock().unwrap();
+            if !state.started.insert(intent.invocation_id.clone()) {
+                return Err(RuntimeError::new("duplicate durable tool dispatch"));
+            }
+            Ok(())
+        }
+
+        async fn request_approval(
+            &self,
+            request: &RuntimeApprovalRequest,
+        ) -> Result<(), RuntimeError> {
+            let mut state = self.state.lock().unwrap();
+            if !state
+                .approval_requests
+                .iter()
+                .any(|existing| existing.invocation_id == request.invocation_id)
+            {
+                state.approval_requests.push(request.clone());
+            }
+            Ok(())
+        }
+
+        async fn resolve_approval(
+            &self,
+            resolution: &RuntimeApprovalResolution,
+        ) -> Result<RuntimeApprovalDecision, RuntimeError> {
+            let mut state = self.state.lock().unwrap();
+            if state
+                .resolutions
+                .iter()
+                .any(|existing| existing.invocation_id == resolution.invocation_id)
+            {
+                return Err(RuntimeError::new("approval was already resolved"));
+            }
+            state.resolutions.push(resolution.clone());
+            Ok(resolution.decision)
+        }
+
+        async fn finish_tool(
+            &self,
+            outcome: RuntimeToolOutcome,
+        ) -> Result<RuntimeToolProjection, RuntimeError> {
+            let projection = RuntimeToolProjection::inline(outcome.output.clone());
+            self.state.lock().unwrap().finished.push(outcome);
+            Ok(projection)
+        }
+
+        async fn finish_turn(
+            &self,
+            _turn_id: &str,
+            _status: RuntimeTurnTerminalStatus,
+            _detail: Option<&str>,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+    }
+
+    fn approval_runtime(
+        executions: Arc<AtomicUsize>,
+        kernel: Arc<ApprovalTestKernel>,
+    ) -> ConversationRuntime<ApprovalApiClient, CountingApprovalExecutor> {
+        ConversationRuntime::new(
+            Session::new(),
+            ApprovalApiClient { call_count: 0 },
+            CountingApprovalExecutor { executions },
+            PermissionPolicy::new(PermissionMode::Prompt)
+                .with_tool_requirement("write_external", PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_execution_kernel(kernel)
+    }
+
+    #[tokio::test]
+    async fn durable_approval_suspends_then_dispatches_the_tool_exactly_once() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let kernel = Arc::new(ApprovalTestKernel::new());
+        let mut runtime = approval_runtime(executions.clone(), kernel.clone());
+        let mut prompter = PromptDefer;
+        assert!(matches!(
+            runtime.permission_policy.authorize(
+                "write_external",
+                r#"{"value":"durable"}"#,
+                Some(&mut prompter),
+            ),
+            crate::permissions::PermissionOutcome::AwaitingApproval { .. }
+        ));
+
+        let outcome = runtime
+            .run_turn_resumable("perform the external write", Some(&mut prompter), ())
+            .await
+            .expect("approval request should suspend the turn");
+        let ResumableTurnOutcome::Suspended(suspended) = outcome else {
+            panic!("approval request must suspend the same turn");
+        };
+        assert_eq!(suspended.deferred_tools.len(), 1);
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert_eq!(kernel.state.lock().unwrap().approval_requests.len(), 1);
+
+        let outcome = runtime
+            .resume_turn_with_approval_decisions(
+                vec![DeferredApprovalDecision {
+                    tool_use_id: "approval-tool-1".to_string(),
+                    decision: RuntimeApprovalDecision::Approved,
+                    reason: Some("user confirmed".to_string()),
+                }],
+                None,
+                (),
+            )
+            .await
+            .expect("approved turn should resume");
+        assert!(matches!(outcome, ResumableTurnOutcome::Completed(_)));
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        let state = kernel.state.lock().unwrap();
+        assert_eq!(state.started.len(), 1);
+        assert_eq!(state.finished.len(), 1);
+        drop(state);
+
+        assert!(runtime
+            .resume_turn_with_approval_decisions(
+                vec![DeferredApprovalDecision {
+                    tool_use_id: "approval-tool-1".to_string(),
+                    decision: RuntimeApprovalDecision::Approved,
+                    reason: None,
+                }],
+                None,
+                (),
+            )
+            .await
+            .is_err());
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn denied_expired_and_cancelled_approvals_never_dispatch_the_tool() {
+        for decision in [
+            RuntimeApprovalDecision::Denied,
+            RuntimeApprovalDecision::Expired,
+            RuntimeApprovalDecision::Cancelled,
+        ] {
+            let executions = Arc::new(AtomicUsize::new(0));
+            let kernel = Arc::new(ApprovalTestKernel::new());
+            let mut runtime = approval_runtime(executions.clone(), kernel.clone());
+            let mut prompter = PromptDefer;
+            assert!(matches!(
+                runtime
+                    .run_turn_resumable("perform the external write", Some(&mut prompter), ())
+                    .await
+                    .unwrap(),
+                ResumableTurnOutcome::Suspended(_)
+            ));
+
+            let outcome = runtime
+                .resume_turn_with_approval_decisions(
+                    vec![DeferredApprovalDecision {
+                        tool_use_id: "approval-tool-1".to_string(),
+                        decision,
+                        reason: None,
+                    }],
+                    None,
+                    (),
+                )
+                .await
+                .expect("a non-approval decision should resume with a denied tool result");
+            assert!(matches!(outcome, ResumableTurnOutcome::Completed(_)));
+            assert_eq!(executions.load(Ordering::SeqCst), 0);
+            let state = kernel.state.lock().unwrap();
+            assert!(state.started.is_empty());
+            assert_eq!(state.finished.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_does_not_bypass_a_policy_rule_added_while_suspended() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let kernel = Arc::new(ApprovalTestKernel::new());
+        let mut runtime = approval_runtime(executions.clone(), kernel.clone());
+        let mut prompter = PromptDefer;
+        assert!(matches!(
+            runtime
+                .run_turn_resumable("perform the external write", Some(&mut prompter), ())
+                .await
+                .unwrap(),
+            ResumableTurnOutcome::Suspended(_)
+        ));
+
+        runtime.permission_policy = PermissionPolicy::new(PermissionMode::Prompt)
+            .with_tool_requirement("write_external", PermissionMode::DangerFullAccess)
+            .with_permission_rules(&crate::config::RuntimePermissionRuleConfig::new(
+                Vec::new(),
+                vec!["write_external(*)".to_string()],
+                Vec::new(),
+            ));
+        let outcome = runtime
+            .resume_turn_with_approval_decisions(
+                vec![DeferredApprovalDecision {
+                    tool_use_id: "approval-tool-1".to_string(),
+                    decision: RuntimeApprovalDecision::Approved,
+                    reason: None,
+                }],
+                None,
+                (),
+            )
+            .await
+            .expect("policy denial should be returned to the model");
+        assert!(matches!(outcome, ResumableTurnOutcome::Completed(_)));
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        let state = kernel.state.lock().unwrap();
+        assert!(state.started.is_empty());
+        assert_eq!(state.finished.len(), 1);
+        assert!(!state.authorized[0].authorized);
     }
 
     #[tokio::test]
@@ -2596,6 +3514,7 @@ mod tests {
                 }],
                 "Accepted final answer",
             )
+            .await
             .expect("terminal deferred result should commit");
 
         assert_eq!(summary.iterations, 0);
@@ -2642,6 +3561,7 @@ mod tests {
                 }],
                 "Accepted final answer",
             )
+            .await
             .expect("terminal deferred result should commit");
         let message_count = runtime.session().messages.len();
 
@@ -3634,15 +4554,15 @@ mod tests {
         }
 
         let mut session = Session::new();
+        let one = compaction_fixture_text("one");
+        let two = compaction_fixture_text("two");
+        let three = compaction_fixture_text("three");
+        let four = compaction_fixture_text("four");
         session.messages = vec![
-            crate::session::ConversationMessage::user_text("one"),
-            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
-                text: "two".to_string(),
-            }]),
-            crate::session::ConversationMessage::user_text("three"),
-            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
-                text: "four".to_string(),
-            }]),
+            crate::session::ConversationMessage::user_text(one),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text { text: two }]),
+            crate::session::ConversationMessage::user_text(three),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text { text: four }]),
         ];
 
         let mut runtime = ConversationRuntime::new(
@@ -3666,7 +4586,7 @@ mod tests {
         assert_eq!(auto_compaction.archived_messages.len(), 2);
         assert!(matches!(
             &auto_compaction.archived_messages[0].blocks[0],
-            ContentBlock::Text { text } if text == "one"
+            ContentBlock::Text { text } if text.starts_with("one:")
         ));
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
 
@@ -3683,11 +4603,11 @@ mod tests {
         assert_eq!(auto_compaction.retained_tail.len(), 4);
         assert!(matches!(
             &auto_compaction.retained_tail[0].blocks[0],
-            ContentBlock::Text { text } if text == "three"
+            ContentBlock::Text { text } if text.starts_with("three:")
         ));
         assert!(matches!(
             &auto_compaction.retained_tail[1].blocks[0],
-            ContentBlock::Text { text } if text == "four"
+            ContentBlock::Text { text } if text.starts_with("four:")
         ));
         assert!(matches!(
             &auto_compaction.retained_tail[2].blocks[0],
@@ -3729,15 +4649,15 @@ mod tests {
         }
 
         let mut session = Session::new();
+        let one = compaction_fixture_text("one");
+        let two = compaction_fixture_text("two");
+        let three = compaction_fixture_text("three");
+        let four = compaction_fixture_text("four");
         session.messages = vec![
-            crate::session::ConversationMessage::user_text("one"),
-            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
-                text: "two".to_string(),
-            }]),
-            crate::session::ConversationMessage::user_text("three"),
-            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
-                text: "four".to_string(),
-            }]),
+            crate::session::ConversationMessage::user_text(one),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text { text: two }]),
+            crate::session::ConversationMessage::user_text(three),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text { text: four }]),
         ];
 
         let sink = Arc::new(MemoryTelemetrySink::default());
@@ -3833,15 +4753,15 @@ mod tests {
                 .as_nanos()
         ));
         let mut session = Session::new().with_persistence_path(path.clone());
+        let one = compaction_fixture_text("one");
+        let two = compaction_fixture_text("two");
+        let three = compaction_fixture_text("three");
+        let four = compaction_fixture_text("four");
         session.messages = vec![
-            crate::session::ConversationMessage::user_text("one"),
-            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
-                text: "two".to_string(),
-            }]),
-            crate::session::ConversationMessage::user_text("three"),
-            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
-                text: "four".to_string(),
-            }]),
+            crate::session::ConversationMessage::user_text(one),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text { text: two }]),
+            crate::session::ConversationMessage::user_text(three),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text { text: four }]),
         ];
         session
             .save_to_path(&path)
@@ -3872,10 +4792,12 @@ mod tests {
                 .replacement_messages,
             runtime.session().messages
         );
-        assert!(restored.messages.iter().all(|message| !message
-            .blocks
+        assert!(restored
+            .messages
             .iter()
-            .any(|block| matches!(block, ContentBlock::Text { text } if text == "one"))));
+            .all(|message| !message.blocks.iter().any(
+                |block| matches!(block, ContentBlock::Text { text } if text.starts_with("one:"))
+            )));
     }
 
     #[tokio::test]
@@ -3918,6 +4840,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_compaction_rejects_a_framed_replacement_that_grows_context() {
+        struct SimpleApi;
+        #[::async_trait::async_trait]
+        impl ApiClient for SimpleApi {
+            async fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::Usage(TokenUsage {
+                        input_tokens: 120_000,
+                        output_tokens: 4,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        struct OversizedSummaryHook;
+        #[::async_trait::async_trait]
+        impl CompactionHook for OversizedSummaryHook {
+            async fn before_compaction(
+                &self,
+                _archived_messages: &[ConversationMessage],
+                _default_summary: &str,
+            ) -> Result<Option<String>, RuntimeError> {
+                Ok(Some("oversized replacement ".repeat(4_096)))
+            }
+        }
+
+        let mut session = Session::new();
+        for index in 0..6 {
+            session
+                .messages
+                .push(ConversationMessage::user_text(compaction_fixture_text(
+                    &format!("source-{index}"),
+                )));
+        }
+        let original_message_count = session.messages.len();
+        let sink = Arc::new(MemoryTelemetrySink::default());
+        let tracer = SessionTracer::new("compaction-growth-guard", sink.clone());
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SimpleApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(100_000)
+        .with_session_tracer(tracer)
+        .with_compaction_hook(Arc::new(OversizedSummaryHook));
+
+        let summary = runtime
+            .run_turn("trigger", None, ())
+            .await
+            .expect("oversized compaction should degrade without aborting the turn");
+
+        assert!(summary.auto_compaction.is_none());
+        assert_eq!(runtime.session().messages.len(), original_message_count + 2);
+        assert!(sink.events().into_iter().any(|event| matches!(
+            event,
+            TelemetryEvent::SessionTrace(trace)
+                if trace.name == "in_turn_compaction_failed"
+                    && trace
+                        .attributes
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .is_some_and(|error| error.contains("framed compaction replacement"))
+        )));
+    }
+
+    #[tokio::test]
     async fn auto_compaction_uses_tokens_since_previous_compaction() {
         struct SequencedApi {
             calls: usize,
@@ -3947,9 +4944,9 @@ mod tests {
         for index in 0..6 {
             session
                 .messages
-                .push(crate::session::ConversationMessage::user_text(format!(
-                    "old-{index}"
-                )));
+                .push(crate::session::ConversationMessage::user_text(
+                    compaction_fixture_text(&format!("old-{index}")),
+                ));
         }
         let mut runtime = ConversationRuntime::new(
             session,
@@ -4506,12 +5503,11 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(index, text)| {
+                    let text = compaction_fixture_text(text);
                     if index % 2 == 0 {
-                        ConversationMessage::user_text(text.clone())
+                        ConversationMessage::user_text(text)
                     } else {
-                        ConversationMessage::assistant(vec![ContentBlock::Text {
-                            text: text.clone(),
-                        }])
+                        ConversationMessage::assistant(vec![ContentBlock::Text { text }])
                     }
                 })
                 .collect();
@@ -4674,12 +5670,11 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(index, text)| {
+                    let text = compaction_fixture_text(text);
                     if index % 2 == 0 {
-                        ConversationMessage::user_text(text.clone())
+                        ConversationMessage::user_text(text)
                     } else {
-                        ConversationMessage::assistant(vec![ContentBlock::Text {
-                            text: text.clone(),
-                        }])
+                        ConversationMessage::assistant(vec![ContentBlock::Text { text }])
                     }
                 })
                 .collect();
@@ -4855,12 +5850,11 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(index, text)| {
+                    let text = compaction_fixture_text(text);
                     if index % 2 == 0 {
-                        ConversationMessage::user_text(text.clone())
+                        ConversationMessage::user_text(text)
                     } else {
-                        ConversationMessage::assistant(vec![ContentBlock::Text {
-                            text: text.clone(),
-                        }])
+                        ConversationMessage::assistant(vec![ContentBlock::Text { text }])
                     }
                 })
                 .collect();

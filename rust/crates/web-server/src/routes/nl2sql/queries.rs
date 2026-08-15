@@ -1218,6 +1218,23 @@ pub(crate) async fn execute(
 
         match sql_result {
             Ok(resp) => {
+                if let Err(error) = crate::semantic_kernel_store::record_nl2sql_execution_evidence(
+                    &state.db,
+                    &claims.tenant_id,
+                    &req.query_id,
+                    resp.rows_count,
+                    resp.columns.len(),
+                    resp.execution_ms,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        tenant_id = %claims.tenant_id,
+                        query_id = %req.query_id,
+                        error = %error,
+                        "failed to attach execution evidence to NL2SQL semantic audit"
+                    );
+                }
                 // Enrich masking rule hit details based on actual returned columns
                 // (more reliable than SQL parse for aliases/expressions).
                 if !masking_rules.is_empty() && !resp.columns.is_empty() {

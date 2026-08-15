@@ -131,7 +131,7 @@ export interface PmFinalDeliveryArtifact {
   deliveryStatus: string;
   response?: {
     text?: string;
-    pm_quality?: Record<string, unknown>;
+    pm_quality?: PmQualitySnapshot;
     pm_report?: PmReportArtifact;
     [key: string]: unknown;
   } | null;

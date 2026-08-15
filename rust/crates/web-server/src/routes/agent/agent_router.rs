@@ -1,3 +1,4 @@
+use super::agent_session_api::list_session_approvals;
 use super::*;
 
 pub(super) fn get_agent_manager(state: &AppState) -> &Arc<AgentSessionManager> {
@@ -48,6 +49,10 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route(
             "/sessions/{session_id}/cancel-turn",
             routing_post(cancel_session_turn),
+        )
+        .route(
+            "/sessions/{session_id}/approvals",
+            routing_get(list_session_approvals),
         )
         .route(
             "/sessions/{session_id}/context-status",

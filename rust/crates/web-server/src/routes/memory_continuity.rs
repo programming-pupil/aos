@@ -4,6 +4,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -230,6 +231,19 @@ struct MemoryConsolidateRequest {
     summary: Option<String>,
     turn_count: Option<i32>,
     metadata: Option<Value>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    relations: Vec<MemoryConsolidationRelation>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MemoryConsolidationRelation {
+    from_memory_id: String,
+    to_memory_id: String,
+    relation: String,
+    reason: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1727,16 +1741,71 @@ pub(crate) async fn delete_memory_item_internal(
     user_id: &str,
     memory_id: &str,
 ) -> Result<bool, AppError> {
+    // Memory deletion is a graph operation, not just removal of the visible
+    // row. Keep the operation tenant/user scoped and atomic so a deleted item
+    // cannot remain retrievable through relations, citations, summaries, or a
+    // later consolidation pass.
+    let mut tx = db.begin().await?;
+    crate::acquire_sqlite_write_lock(&mut tx).await?;
+    let session_id = sqlx::query_scalar::<sqlx::Sqlite, Option<String>>(
+        "SELECT session_id FROM agent_memory_items
+         WHERE tenant_id = ? AND user_id = ? AND id = ?",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(memory_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .flatten();
     let affected = sqlx::query(
         "DELETE FROM agent_memory_items WHERE tenant_id = ? AND user_id = ? AND id = ?",
     )
     .bind(tenant_id)
     .bind(user_id)
     .bind(memory_id)
-    .execute(db)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
-    Ok(affected > 0)
+    if affected == 0 {
+        tx.commit().await?;
+        return Ok(false);
+    }
+    sqlx::query(
+        "DELETE FROM agent_memory_relations
+         WHERE tenant_id = ? AND user_id = ?
+           AND (from_memory_id = ? OR to_memory_id = ?)",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(memory_id)
+    .bind(memory_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM agent_memory_citations
+         WHERE tenant_id = ? AND user_id = ? AND memory_id = ?",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(memory_id)
+    .execute(&mut *tx)
+    .await?;
+    // A summary can contain the deleted item verbatim. Remove the affected
+    // session summary so the next consolidation pass rebuilds it from the
+    // remaining evidence instead of serving stale text.
+    if let Some(session_id) = session_id.as_deref() {
+        sqlx::query(
+            "DELETE FROM agent_memory_summaries
+             WHERE tenant_id = ? AND user_id = ? AND session_id = ?",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(true)
 }
 
 async fn search_memory(
@@ -1850,6 +1919,17 @@ async fn consolidate_memory(
     Extension(claims): Extension<Claims>,
     Json(req): Json<MemoryConsolidateRequest>,
 ) -> Result<Json<Value>, AppError> {
+    let result =
+        consolidate_memory_internal(&state.db, &claims.tenant_id, &claims.sub, req).await?;
+    Ok(Json(result))
+}
+
+async fn consolidate_memory_internal(
+    db: &sqlx::SqlitePool,
+    tenant_id: &str,
+    user_id: &str,
+    req: MemoryConsolidateRequest,
+) -> Result<Value, AppError> {
     let app = normalize_app(req.app.as_deref());
     let scope = if req.session_id.is_some() {
         "session".to_string()
@@ -1860,19 +1940,109 @@ async fn consolidate_memory(
         .summary
         .map(|value| compact_text(&value, 8_000))
         .unwrap_or_else(|| "Manual consolidation checkpoint.".to_string());
-    let id = uuid::Uuid::new_v4().to_string();
+    let session_key = req.session_id.clone().unwrap_or_default();
+    let cursor = req.cursor.clone().unwrap_or_else(|| {
+        format!(
+            "{}:{}",
+            Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            summary.len()
+        )
+    });
+    let id = format!(
+        "summary:{}",
+        content_hash(&format!(
+            "{}|{}|{}|{}|{}",
+            tenant_id, user_id, scope, app, session_key
+        ))
+    );
     let metadata_json = req
         .metadata
         .as_ref()
         .map(serde_json::to_string)
         .transpose()?;
-    let session_key = req.session_id.clone().unwrap_or_default();
+    let mut tx = db.begin().await?;
+    crate::acquire_sqlite_write_lock(&mut tx).await?;
+    let existing_cursor = sqlx::query_scalar::<_, String>(
+        "SELECT cursor FROM agent_memory_consolidation_cursors
+         WHERE tenant_id = ? AND user_id = ? AND scope = ? AND app = ? AND session_key = ?",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(&scope)
+    .bind(&app)
+    .bind(&session_key)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if existing_cursor.as_deref() == Some(cursor.as_str()) {
+        tx.commit().await?;
+        return Ok(json!({
+            "ok": true,
+            "idempotent": true,
+            "scope": scope,
+            "app": app,
+            "sessionId": req.session_id,
+            "cursor": cursor,
+            "relationCount": req.relations.len()
+        }));
+    }
+    for relation in &req.relations {
+        let relation_kind = relation.relation.trim().to_ascii_lowercase();
+        if !matches!(relation_kind.as_str(), "supersedes" | "conflicts_with") {
+            return Err(AppError::ValidationError(
+                "memory relation must be supersedes or conflicts_with".to_string(),
+            ));
+        }
+        let valid_ids: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_memory_items
+             WHERE tenant_id = ? AND user_id = ? AND id IN (?, ?)",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(&relation.from_memory_id)
+        .bind(&relation.to_memory_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if valid_ids != 2 {
+            return Err(AppError::ValidationError(
+                "memory relation references an inaccessible item".to_string(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO agent_memory_relations
+                (id, tenant_id, user_id, from_memory_id, to_memory_id, relation, reason, source_cursor)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(tenant_id, user_id, from_memory_id, to_memory_id, relation) DO UPDATE SET
+                reason = excluded.reason, source_cursor = excluded.source_cursor",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(&relation.from_memory_id)
+        .bind(&relation.to_memory_id)
+        .bind(&relation_kind)
+        .bind(compact_text(&relation.reason, 1_000))
+        .bind(&cursor)
+        .execute(&mut *tx)
+        .await?;
+        if relation_kind == "supersedes" {
+            sqlx::query(
+                "UPDATE agent_memory_items
+                 SET enabled = 0, stale_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                 WHERE tenant_id = ? AND user_id = ? AND id = ?",
+            )
+            .bind(tenant_id)
+            .bind(user_id)
+            .bind(&relation.from_memory_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
     sqlx::query(
         r#"
         INSERT INTO agent_memory_summaries
           (id, tenant_id, user_id, scope, app, session_id, session_key, summary, source_type, turn_count, metadata_json)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'session_summary', ?, json(?))
-        ON CONFLICT DO UPDATE SET
+        ON CONFLICT(id) DO UPDATE SET
           summary = excluded.summary,
           source_type = excluded.source_type,
           turn_count = excluded.turn_count,
@@ -1881,8 +2051,8 @@ async fn consolidate_memory(
         "#,
     )
     .bind(&id)
-    .bind(&claims.tenant_id)
-    .bind(&claims.sub)
+    .bind(tenant_id)
+    .bind(user_id)
     .bind(&scope)
     .bind(&app)
     .bind(&req.session_id)
@@ -1890,11 +2060,33 @@ async fn consolidate_memory(
     .bind(&summary)
     .bind(req.turn_count.unwrap_or(0))
     .bind(metadata_json)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
-    Ok(Json(
-        json!({ "ok": true, "scope": scope, "app": app, "sessionId": req.session_id }),
-    ))
+    sqlx::query(
+        "INSERT INTO agent_memory_consolidation_cursors
+            (tenant_id, user_id, scope, app, session_key, cursor, revision)
+         VALUES (?, ?, ?, ?, ?, ?, 1)
+         ON CONFLICT(tenant_id, user_id, scope, app, session_key) DO UPDATE SET
+            cursor = excluded.cursor, revision = revision + 1, updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(&scope)
+    .bind(&app)
+    .bind(&session_key)
+    .bind(&cursor)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(json!({
+        "ok": true,
+        "idempotent": false,
+        "scope": scope,
+        "app": app,
+        "sessionId": req.session_id,
+        "cursor": cursor,
+        "relationCount": req.relations.len()
+    }))
 }
 
 pub(crate) async fn create_memory_item_internal(
@@ -3876,6 +4068,225 @@ mod tests {
             virtual_path: "MEMORY.md".to_string(),
             legacy_source: None,
         }
+    }
+
+    async fn insert_consolidation_fixture(
+        pool: &sqlx::SqlitePool,
+        id: &str,
+        tenant_id: &str,
+        user_id: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO agent_memory_items
+                (id, tenant_id, user_id, scope, app, session_id, session_key,
+                 memory_type, content, content_hash, source_type, confidence,
+                 pinned, enabled)
+             VALUES (?, ?, ?, 'global', 'chat', NULL, '', 'note', ?, ?,
+                     'manual', 1.0, 0, 1)",
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(format!("memory {id}"))
+        .bind(content_hash(id))
+        .execute(pool)
+        .await
+        .expect("insert consolidation fixture");
+    }
+
+    fn consolidation_request(
+        cursor: &str,
+        relation: &str,
+        from_memory_id: &str,
+        to_memory_id: &str,
+    ) -> MemoryConsolidateRequest {
+        MemoryConsolidateRequest {
+            app: Some("chat".into()),
+            session_id: None,
+            summary: Some("current consolidated facts".into()),
+            turn_count: Some(2),
+            metadata: None,
+            cursor: Some(cursor.into()),
+            relations: vec![MemoryConsolidationRelation {
+                from_memory_id: from_memory_id.into(),
+                to_memory_id: to_memory_id.into(),
+                relation: relation.into(),
+                reason: "new evidence".into(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn consolidation_is_transactional_idempotent_and_tenant_scoped() {
+        let db = crate::test_sqlite_pool().await;
+        insert_consolidation_fixture(&db, "old", "tenant", "user").await;
+        insert_consolidation_fixture(&db, "new", "tenant", "user").await;
+        insert_consolidation_fixture(&db, "foreign", "other", "user").await;
+
+        let first = consolidate_memory_internal(
+            &db,
+            "tenant",
+            "user",
+            consolidation_request("cursor-1", "supersedes", "old", "new"),
+        )
+        .await
+        .expect("first consolidation");
+        assert_eq!(first["idempotent"], false);
+        let old_state: (i64, Option<String>) =
+            sqlx::query_as("SELECT enabled, stale_at FROM agent_memory_items WHERE id = 'old'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(old_state.0, 0);
+        assert!(old_state.1.is_some());
+
+        let retry = consolidate_memory_internal(
+            &db,
+            "tenant",
+            "user",
+            consolidation_request("cursor-1", "supersedes", "old", "new"),
+        )
+        .await
+        .expect("idempotent retry");
+        assert_eq!(retry["idempotent"], true);
+        let (revision, relation_count): (i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT revision FROM agent_memory_consolidation_cursors
+                 WHERE tenant_id = 'tenant' AND user_id = 'user' AND app = 'chat'),
+                (SELECT COUNT(*) FROM agent_memory_relations
+                 WHERE tenant_id = 'tenant' AND user_id = 'user')",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!((revision, relation_count), (1, 1));
+
+        let rejected = consolidate_memory_internal(
+            &db,
+            "tenant",
+            "user",
+            consolidation_request("cursor-2", "conflicts_with", "new", "foreign"),
+        )
+        .await;
+        assert!(rejected.is_err());
+        let cursor: String = sqlx::query_scalar(
+            "SELECT cursor FROM agent_memory_consolidation_cursors
+             WHERE tenant_id = 'tenant' AND user_id = 'user' AND app = 'chat'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(cursor, "cursor-1");
+    }
+
+    #[tokio::test]
+    async fn deleting_memory_removes_graph_citations_and_session_summary() {
+        let db = crate::test_sqlite_pool().await;
+        insert_consolidation_fixture(&db, "memory-delete", "tenant", "user").await;
+        insert_consolidation_fixture(&db, "memory-keep", "tenant", "user").await;
+        sqlx::query(
+            "UPDATE agent_memory_items SET session_id = 'session-delete', scope = 'session'
+             WHERE tenant_id = 'tenant' AND user_id = 'user' AND id IN ('memory-delete', 'memory-keep')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_memory_relations
+               (id, tenant_id, user_id, from_memory_id, to_memory_id, relation, reason, source_cursor)
+             VALUES ('relation-delete', 'tenant', 'user', 'memory-delete', 'memory-keep',
+                     'conflicts_with', 'test', 'cursor')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_memory_citations
+               (id, tenant_id, user_id, session_id, memory_id, path, line_start, line_end, note)
+             VALUES ('citation-delete', 'tenant', 'user', 'session-delete', 'memory-delete',
+                     'MEMORY.md', 1, 1, 'test')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_memory_summaries
+               (id, tenant_id, user_id, scope, app, session_id, session_key,
+                summary, source_type, turn_count)
+             VALUES ('summary-delete', 'tenant', 'user', 'session', 'chat',
+                     'session-delete', 'session-delete', 'contains memory-delete', 'manual', 1)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        assert!(
+            delete_memory_item_internal(&db, "tenant", "user", "memory-delete")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_memory_relations
+                 WHERE tenant_id = 'tenant' AND user_id = 'user'",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_memory_citations
+                 WHERE tenant_id = 'tenant' AND user_id = 'user'",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_memory_summaries
+                 WHERE tenant_id = 'tenant' AND user_id = 'user' AND session_id = 'session-delete'",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_memory_items
+                 WHERE tenant_id = 'tenant' AND user_id = 'user' AND id = 'memory-keep'",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn conflict_consolidation_preserves_both_current_memories() {
+        let db = crate::test_sqlite_pool().await;
+        insert_consolidation_fixture(&db, "left", "tenant", "user").await;
+        insert_consolidation_fixture(&db, "right", "tenant", "user").await;
+        consolidate_memory_internal(
+            &db,
+            "tenant",
+            "user",
+            consolidation_request("cursor-conflict", "conflicts_with", "left", "right"),
+        )
+        .await
+        .expect("record conflict");
+        let enabled: Vec<i64> = sqlx::query_scalar(
+            "SELECT enabled FROM agent_memory_items
+             WHERE id IN ('left', 'right') ORDER BY id",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(enabled, vec![1, 1]);
     }
 
     #[tokio::test]

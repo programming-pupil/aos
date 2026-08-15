@@ -223,6 +223,19 @@ fn contains_secret(text: &str) -> bool {
         .expect("static secret regex")
         .is_match(text)
 }
+
+/// Shared production admission guard for adapters that still persist through
+/// the legacy Unified Memory repository.  This keeps compaction and the pure
+/// engine on one secret/no-evidence policy during the staged migration.
+pub fn validate_memory_text(text: &str) -> Result<(), MemoryError> {
+    if text.trim().is_empty() {
+        return Err(MemoryError::MissingEvidence);
+    }
+    if contains_secret(text) {
+        return Err(MemoryError::Sensitive(stable_source_hash(text)));
+    }
+    Ok(())
+}
 pub fn stable_source_hash(text: &str) -> String {
     hex::encode(Sha256::digest(text.as_bytes()))
 }

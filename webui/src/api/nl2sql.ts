@@ -1155,16 +1155,20 @@ export const nl2sqlApi = {
     feedbackType: 'thumbs_up' | 'thumbs_down' | 'correction' | 'clarification_needed';
     correctedSql?: string;
     correctionNote?: string;
+    approved?: boolean;
   }) => client.post<{ id: number }>('/nl2sql/feedback', data).then((r) => r.data),
 
   getFeedbackStats: (datasourceId: string) =>
     client.get<{
-      ds_id: string;
-      total_feedback: number;
-      thumbs_up_count: number;
-      thumbs_down_count: number;
-      correction_count: number;
-      satisfaction_rate: number | null;
+      dsId: string;
+      totalFeedback: number;
+      thumbsUpCount: number;
+      thumbsDownCount: number;
+      correctionCount: number;
+      satisfactionRate: number | null;
+      labeledObservations: number;
+      expectedCalibrationError: number;
+      brierScore: number;
     }>(`/nl2sql/feedback/stats/${encodeURIComponent(datasourceId)}`).then((r) => r.data),
 
   // ── Result Cache ─────────────────────────────────────────────────────────────

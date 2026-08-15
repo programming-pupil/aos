@@ -349,6 +349,16 @@ pub struct AttributionDriver {
     pub evidence_step_ids: Vec<String>,
     #[serde(default)]
     pub confidence: Option<String>,
+    #[serde(default = "default_driver_interpretation")]
+    pub interpretation: String,
+}
+
+fn default_driver_interpretation() -> String {
+    "candidate_explanation".to_string()
+}
+
+fn default_attribution_evidence_level() -> String {
+    "L0_descriptive".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -370,6 +380,8 @@ pub struct AttributionReport {
     pub confidence: Option<String>,
     #[serde(default)]
     pub coverage: Option<String>,
+    #[serde(default = "default_attribution_evidence_level")]
+    pub evidence_level: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -4352,6 +4364,7 @@ async fn synthesize_attribution_report(
 - 如果数据不足以回答为什么，明确说还缺什么，并给下一步要补查的方向。
 - 如果 evidenceCards 中 sampled=true，说明模型看到的是结果样本/截断快照，不能声称已检查所有明细行；但聚合 SQL 的结果仍可支持聚合结论。
 - mainCauses 必须引用 evidenceStepIds；没有证据支撑的判断只能放到 nextQuestions，不能写成原因。
+- 当前流程没有实验/准实验 identification contract，只允许输出 L0_descriptive 或 L1_decomposition。mainCauses 必须表述为“贡献方向/候选解释”，禁止使用“导致、证明、因果效应”等因果措辞。
 - 用自然语言解释“指标是多少、比对比期变了多少、主要是谁拖动、下一步怎么做”。
 - 不要输出 SQL，不要 markdown 表格，不要 JSON 外文字。
 
@@ -4366,14 +4379,16 @@ async fn synthesize_attribution_report(
       "explanation": "为什么这么判断",
       "impact": "影响方向和大小；没有精确值就写相对判断",
       "evidenceStepIds": ["main_metric"],
-      "confidence": "高/中/低"
+      "confidence": "高/中/低",
+      "interpretation": "contribution_direction"
     }
   ],
   "recommendations": ["具体下一步动作"],
   "caveats": ["口径、样本、失败查询、缺失维度等注意事项"],
   "nextQuestions": ["建议继续追问的问题"],
   "confidence": "高/中/低",
-  "coverage": "本次覆盖了哪些数据和哪些没覆盖"
+  "coverage": "本次覆盖了哪些数据和哪些没覆盖",
+  "evidenceLevel": "L0_descriptive 或 L1_decomposition"
 }"#;
 
     let prompt = serde_json::to_string(&ReportInput {
@@ -4740,6 +4755,7 @@ fn sanitize_attribution_report(
         .collect::<std::collections::HashSet<_>>();
     if valid_step_ids.is_empty() {
         report.main_causes.clear();
+        report.evidence_level = "L0_descriptive".to_string();
         if !report
             .caveats
             .iter()
@@ -4764,6 +4780,7 @@ fn sanitize_attribution_report(
             if cause.evidence_step_ids.is_empty() {
                 None
             } else {
+                cause.interpretation = "contribution_direction".to_string();
                 Some(cause)
             }
         })
@@ -4772,6 +4789,21 @@ fn sanitize_attribution_report(
         report
             .caveats
             .push("已隐藏缺少成功数据证据引用的原因，避免把猜测当成结论。".to_string());
+    }
+    report.evidence_level = if report.main_causes.is_empty() {
+        "L0_descriptive".to_string()
+    } else {
+        "L1_decomposition".to_string()
+    };
+    if !report
+        .caveats
+        .iter()
+        .any(|caveat| caveat.contains("不能证明因果"))
+    {
+        report.caveats.push(
+            "本报告为描述性分析/贡献分解（L0-L1），可定位同步变化和贡献方向，但不能证明因果；因果结论需要明确的实验或准实验识别策略。"
+                .to_string(),
+        );
     }
     report
 }
@@ -4807,6 +4839,7 @@ fn fallback_report(question: &str, observations: &[AttributionObservation]) -> A
                 impact: None,
                 evidence_step_ids: vec![o.step_id.clone()],
                 confidence: Some("低".to_string()),
+                interpretation: "contribution_direction".to_string(),
             })
             .collect(),
         recommendations: vec![if timed_out {
@@ -4823,6 +4856,12 @@ fn fallback_report(question: &str, observations: &[AttributionObservation]) -> A
         coverage: Some(format!(
             "成功查询 {success_count} 个方向，失败 {failed_count} 个方向。"
         )),
+        evidence_level: if success_count == 0 {
+            "L0_descriptive"
+        } else {
+            "L1_decomposition"
+        }
+        .to_string(),
     }
 }
 
@@ -5312,12 +5351,14 @@ mod tests {
                     impact: None,
                     evidence_step_ids: vec!["cost_by_channel".to_string()],
                     confidence: Some("高".to_string()),
+                    interpretation: "contribution_direction".to_string(),
                 }],
                 recommendations: vec!["优先检查渠道 A 出价和素材消耗。".to_string()],
                 caveats: Vec::new(),
                 next_questions: Vec::new(),
                 confidence: Some("高".to_string()),
                 coverage: None,
+                evidence_level: "L1_decomposition".to_string(),
             }),
             plan: None,
             observations: Vec::new(),
@@ -5707,6 +5748,7 @@ mod tests {
                     next_questions: Vec::new(),
                     confidence: Some("中".to_string()),
                     coverage: None,
+                    evidence_level: "L0_descriptive".to_string(),
                 }),
                 plan: None,
                 observations: Vec::new(),
@@ -6147,6 +6189,7 @@ mod tests {
                     impact: None,
                     evidence_step_ids: vec!["main_metric".to_string()],
                     confidence: Some("高".to_string()),
+                    interpretation: "contribution_direction".to_string(),
                 },
                 AttributionDriver {
                     title: "无证据".to_string(),
@@ -6154,6 +6197,7 @@ mod tests {
                     impact: None,
                     evidence_step_ids: vec!["missing".to_string()],
                     confidence: Some("高".to_string()),
+                    interpretation: "candidate_explanation".to_string(),
                 },
             ],
             recommendations: Vec::new(),
@@ -6161,6 +6205,7 @@ mod tests {
             next_questions: Vec::new(),
             confidence: Some("中".to_string()),
             coverage: None,
+            evidence_level: "L1_decomposition".to_string(),
         };
         let report = sanitize_attribution_report(report, &observations);
         assert_eq!(report.main_causes.len(), 1);
@@ -6203,12 +6248,14 @@ mod tests {
                 impact: None,
                 evidence_step_ids: vec!["main_metric".to_string()],
                 confidence: Some("高".to_string()),
+                interpretation: "candidate_explanation".to_string(),
             }],
             recommendations: Vec::new(),
             caveats: Vec::new(),
             next_questions: Vec::new(),
             confidence: Some("高".to_string()),
             coverage: None,
+            evidence_level: "L0_descriptive".to_string(),
         };
         let report = sanitize_attribution_report(report, &observations);
         assert!(report.main_causes.is_empty());

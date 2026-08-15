@@ -1443,7 +1443,7 @@ impl AgentSessionManager {
         options: AgentTurnOptions,
     ) -> Result<AgentTurnRunOutcome> {
         self.run_or_resume_turn_streaming_with_options(
-            session_id, user_input, sender, options, None,
+            session_id, user_input, sender, options, None, None,
         )
         .await
     }
@@ -1461,6 +1461,25 @@ impl AgentSessionManager {
             sender,
             options,
             Some(deferred_results),
+            None,
+        )
+        .await
+    }
+
+    pub async fn resume_turn_streaming_with_approval_decisions(
+        &self,
+        session_id: &str,
+        approval_decisions: Vec<runtime::DeferredApprovalDecision>,
+        sender: mpsc::Sender<AgentEvent>,
+        options: AgentTurnOptions,
+    ) -> Result<AgentTurnRunOutcome> {
+        self.run_or_resume_turn_streaming_with_options(
+            session_id,
+            String::new(),
+            sender,
+            options,
+            None,
+            Some(approval_decisions),
         )
         .await
     }
@@ -1502,15 +1521,15 @@ impl AgentSessionManager {
         let mut runtime_arc = session.built.take_runtime_arc().ok_or_else(|| {
             GatewayError::RuntimeExecution("session runtime unavailable".to_string())
         })?;
-        let result = Arc::get_mut(&mut runtime_arc)
-            .ok_or_else(|| {
-                GatewayError::RuntimeExecution("runtime Arc is not uniquely owned".to_string())
-            })
-            .and_then(|runtime| {
-                runtime
-                    .finalize_suspended_turn_with_tool_results(results, final_text)
-                    .map_err(GatewayError::Runtime)
-            });
+        let result = match Arc::get_mut(&mut runtime_arc) {
+            Some(runtime) => runtime
+                .finalize_suspended_turn_with_tool_results(results, final_text)
+                .await
+                .map_err(GatewayError::Runtime),
+            None => Err(GatewayError::RuntimeExecution(
+                "runtime Arc is not uniquely owned".to_string(),
+            )),
+        };
         session.built.return_runtime(runtime_arc);
         if result.is_ok() {
             session.state = SessionState::Idle;
@@ -1675,8 +1694,9 @@ impl AgentSessionManager {
         session_id: &str,
         user_input: String,
         sender: mpsc::Sender<AgentEvent>,
-        options: AgentTurnOptions,
+        mut options: AgentTurnOptions,
         deferred_results: Option<Vec<runtime::DeferredToolResult>>,
+        approval_decisions: Option<Vec<runtime::DeferredApprovalDecision>>,
     ) -> Result<AgentTurnRunOutcome> {
         // Acquire the per-session lock — non-blocking. If the session already has
         // a turn in-flight, try_lock returns None and we return 409 CONFLICT.
@@ -1705,7 +1725,8 @@ impl AgentSessionManager {
         // A deferred resume is still the same model turn. Keep its runtime/key
         // snapshot stable and avoid one tenant-version query per tool result;
         // fresh user turns still perform the normal hot-reload check.
-        let needs_hot_reload = if deferred_results.is_some() {
+        let is_resume = deferred_results.is_some() || approval_decisions.is_some();
+        let needs_hot_reload = if is_resume {
             false
         } else {
             let tenant_id = {
@@ -1845,7 +1866,58 @@ impl AgentSessionManager {
         let runtime = Arc::get_mut(&mut runtime_arc).ok_or_else(|| {
             GatewayError::RuntimeExecution("runtime Arc is not uniquely owned".to_string())
         })?;
-        let pre_turn_compaction = if deferred_results.is_none() {
+        if is_resume {
+            if let Some(turn) = runtime
+                .session()
+                .turns
+                .iter()
+                .rev()
+                .find(|turn| matches!(turn.status, runtime::SessionTurnStatus::Suspended))
+            {
+                if let Some(context) = turn.runtime_context.as_ref() {
+                    options.reasoning_budget = match context.reasoning_budget.as_deref() {
+                        Some("fast") => InternalReasoningBudget::Fast,
+                        Some("deep") => InternalReasoningBudget::Deep,
+                        _ => InternalReasoningBudget::Standard,
+                    };
+                    options.blocked_tools = context.blocked_tools.clone();
+                    options.disable_tools = context
+                        .metadata
+                        .get("disable_tools")
+                        .is_some_and(|value| value == "true")
+                        || !context.tools_enabled;
+                    options.disable_provider_thinking = context
+                        .metadata
+                        .get("disable_provider_thinking")
+                        .is_some_and(|value| value == "true");
+                    options.enable_deferred_tools = context
+                        .metadata
+                        .get("deferred_tools_enabled")
+                        .is_some_and(|value| value == "true");
+                    options.prefer_native_web_search = context.prefer_native_web_search;
+                    options.suppress_native_web_search = context.suppress_native_web_search;
+                    options.stream_timeout_secs = context.stream_timeout_secs;
+                    options.disable_stream_timeout = context.disable_stream_timeout;
+                    options.web_tool_result_budget = context
+                        .metadata
+                        .get("web_tool_result_budget")
+                        .and_then(|value| value.parse::<usize>().ok());
+                    if let Some(serialized) = context.metadata.get("turn_system_instructions") {
+                        if let Ok(instructions) = serde_json::from_str::<Vec<String>>(serialized) {
+                            options.system_instructions = instructions;
+                        }
+                    }
+                }
+                if let Some(baseline) = turn.context_baseline.as_ref() {
+                    let current = runtime.system_prompt_sections();
+                    if baseline.system_prompt_sections.starts_with(current) {
+                        options.system_instructions =
+                            baseline.system_prompt_sections[current.len()..].to_vec();
+                    }
+                }
+            }
+        }
+        let pre_turn_compaction = if !is_resume {
             compact_runtime_for_continuity(
                 runtime,
                 &session_id_owned,
@@ -1898,10 +1970,11 @@ impl AgentSessionManager {
             streaming_options.clone(),
             Some(cancel_rx),
             deferred_results.clone(),
+            approval_decisions.clone(),
         )
         .await;
         if let Err(error) = result.as_ref() {
-            if deferred_results.is_none() && error.is_context_window_exceeded() {
+            if !is_resume && error.is_context_window_exceeded() {
                 context_retry_compaction = compact_runtime_for_continuity(
                     runtime,
                     &session_id_owned,
@@ -1943,6 +2016,7 @@ impl AgentSessionManager {
                     retry_options,
                     Some(retry_cancel_rx),
                     None,
+                    None,
                 )
                 .await;
 
@@ -1966,6 +2040,7 @@ impl AgentSessionManager {
                         sender.clone(),
                         context_window_recovery_options(&streaming_options),
                         Some(recovery_cancel_rx),
+                        None,
                         None,
                     )
                     .await;

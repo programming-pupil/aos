@@ -82,74 +82,6 @@ fn emit_pm_answer_snapshot(answer_delta: Option<&PmAnswerDeltaCallback>, stage: 
     }
 }
 
-async fn run_pm_chat_engine_with_timeout(
-    state: &AppState,
-    manager: Arc<AgentSessionManager>,
-    tenant_id: &str,
-    user_id: &str,
-    session_id: &str,
-    model: &str,
-    message: String,
-    turn_options: ChatTurnOptions,
-    memory_instruction: Option<String>,
-    extra_system_instructions: Vec<String>,
-    mark_memory_pollution: bool,
-    reasoning_budget_override: Option<agent_gateway::InternalReasoningBudget>,
-    timeout_secs: u64,
-    timeout_label: &str,
-    answer_delta: Option<PmAnswerDeltaCallback>,
-) -> Result<(TurnResult, serde_json::Value), GatewayError> {
-    let mut memory_instructions = memory_instruction.into_iter().collect::<Vec<_>>();
-    memory_instructions.extend(extra_system_instructions);
-    let plan = plan_chat_turn(ChatTurnEngineInput {
-        state,
-        tenant_id,
-        user_id,
-        session_id,
-        model,
-        message: &message,
-        turn_options,
-        memory_instructions,
-        has_documents: pm_user_message_has_document_context(&message),
-        mark_memory_pollution,
-        reasoning_budget_override,
-    })
-    .await;
-    let mut options = plan.options;
-    options
-        .blocked_tools
-        .extend(pm_blocked_non_search_research_tools());
-    let trace = serde_json::json!({
-        "engine": "shared_chat_turn_engine",
-        "searchMode": plan.search_mode.as_str(),
-        "reasoningBudget": format!("{:?}", plan.reasoning_budget).to_ascii_lowercase(),
-        "trace": plan.trace,
-    });
-    let turn = if let Some(answer_delta) = answer_delta {
-        run_pm_user_visible_answer_streaming_turn(
-            manager,
-            session_id.to_string(),
-            message,
-            timeout_secs,
-            timeout_label,
-            options,
-            move |delta| answer_delta("shared_chat", delta),
-        )
-        .await?
-    } else {
-        run_pm_turn_with_timeout_cleanup_and_options(
-            manager,
-            session_id.to_string(),
-            message,
-            timeout_secs,
-            timeout_label,
-            options,
-        )
-        .await?
-    };
-    Ok((turn, trace))
-}
-
 fn pm_shared_chat_turn_options(search_enabled: bool) -> ChatTurnOptions {
     ChatTurnOptions {
         search_mode: if search_enabled {
@@ -1434,7 +1366,7 @@ pub(super) async fn run_pm_orchestrated_turn(
     .await?;
 
     let mut plan = prepared.plan;
-    if let Err(error) = crate::semantic_kernel_store::persist_pm_requirement_state_delta(
+    match crate::semantic_kernel_store::persist_pm_requirement_state_delta(
         db,
         tenant_id,
         session_id,
@@ -1444,12 +1376,36 @@ pub(super) async fn run_pm_orchestrated_turn(
     )
     .await
     {
-        tracing::warn!(
-            run_id = %run_id,
-            tenant_id = %tenant_id,
-            error = %error,
-            "failed to persist PM requirement-state delta"
-        );
+        Ok(requirement_state) => {
+            let next_question = pm_domain::requirement_state::next_question(&requirement_state);
+            on_stage(
+                "requirement_state",
+                "completed",
+                1,
+                Some(serde_json::json!({
+                    "message": "需求状态已根据本轮输入增量更新。",
+                    "requirementState": requirement_state,
+                    "nextQuestion": next_question,
+                })),
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                run_id = %run_id,
+                tenant_id = %tenant_id,
+                error = %error,
+                "failed to persist PM requirement-state delta"
+            );
+            on_stage(
+                "requirement_state",
+                "degraded",
+                1,
+                Some(serde_json::json!({
+                    "message": "需求状态暂未更新，本轮研究仍继续。",
+                    "errorClass": "requirement_state_persistence",
+                })),
+            );
+        }
     }
     let runtime_budget = prepared.runtime_budget;
     let resume_detail = prepared.resume_detail;

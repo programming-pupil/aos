@@ -11,7 +11,9 @@ mod reducer;
 mod types;
 
 pub use compaction::{CompactionCandidate, CompactionError, CompactionValidator};
-pub use context::{ContextBlock, ContextCompiler, ContextPacket, ContextSelection, PromptLayer};
+pub use context::{
+    ContextBlock, ContextCompiler, ContextError, ContextPacket, ContextSelection, PromptLayer,
+};
 pub use evidence::{
     EvidenceAuthority, EvidenceLedger, EvidenceLedgerError, EvidenceRef, EvidenceSourceType,
     SourceRange,

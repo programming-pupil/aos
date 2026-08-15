@@ -263,11 +263,13 @@ function reportMarkdown(
     nextQuestions: string;
     coverage: string;
     confidence: string;
+    evidenceLevel: string;
     confidenceValue: (value: string) => string;
   },
 ): string {
   const sections = [
     report.title ? `### ${report.title}` : "",
+    report.evidenceLevel ? `**${labels.evidenceLevel}**: ${report.evidenceLevel}` : "",
     report.executiveSummary,
     report.metricAnswer ? `### ${labels.metricAnswer}\n\n${report.metricAnswer}` : "",
     report.mainCauses?.length
@@ -600,6 +602,7 @@ function AttributionAuditPanelImpl({
                     nextQuestions: t("dataAttribution.nextQuestions", "建议继续追问"),
                     coverage: t("chat.attributionAuditCoverage", "证据覆盖"),
                     confidence: t("chat.attributionAuditConfidence", "结论置信度"),
+                    evidenceLevel: t("chat.attributionAuditEvidenceLevel", "证据等级"),
                     confidenceValue: (value) => translatedConfidence(value, t),
                   })}
                 </AttributionMarkdownDetail>

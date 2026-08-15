@@ -42,7 +42,7 @@ use sha2::Digest;
 use sqlx::Row;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::{timeout, Duration};
-use tools::{GlobalToolRegistry, RuntimeToolDefinition};
+use tools::{canonical_allowed_tool_name, GlobalToolRegistry, RuntimeToolDefinition};
 
 use crate::config_registry::UserRuntimeConfig;
 use crate::error::{GatewayError, Result};
@@ -678,6 +678,7 @@ pub(crate) struct GatewayApiClient {
     blocked_tools: BTreeSet<String>,
     scoped_blocked_tools: BTreeSet<String>,
     tool_registry: GlobalToolRegistry,
+    activated_tools: BTreeSet<String>,
     /// Fallback API keys for failover, ordered by priority.
     fallback_keys: Vec<FallbackKey>,
     /// Reasoning effort for models that support extended thinking (e.g. `high` for o4-mini).
@@ -809,6 +810,7 @@ impl GatewayApiClient {
             blocked_tools: config.blocked_tools.iter().cloned().collect(),
             scoped_blocked_tools: BTreeSet::new(),
             tool_registry,
+            activated_tools: BTreeSet::new(),
             fallback_keys,
             reasoning_effort,
             capabilities: primary_capabilities,
@@ -988,6 +990,36 @@ impl GatewayApiClient {
             .as_ref()
             .map(|v| v.iter().cloned().collect());
         let mut defs = self.tool_registry.definitions(allowed.as_ref());
+        if allowed.is_none() {
+            let core = [
+                "ToolSearch",
+                "complete_turn",
+                "read_file",
+                "glob_search",
+                "grep_search",
+                "WebSearch",
+                "WebFetch",
+                "memory_list",
+                "memory_search",
+                "memory_read",
+                "memory_note",
+                "workspace_tree",
+                "workspace_find",
+                "workspace_rg",
+                "data_attribution_start",
+                "data_attribution_step",
+                "nl2sql_analyze",
+            ]
+            .into_iter()
+            .map(canonical_allowed_tool_name)
+            .chain(
+                self.activated_tools
+                    .iter()
+                    .map(|name| canonical_allowed_tool_name(name)),
+            )
+            .collect::<BTreeSet<_>>();
+            defs.retain(|tool| core.contains(&canonical_allowed_tool_name(&tool.name)));
+        }
         let block_mcp_search_tools = self.blocked_tools.contains(CHAT_BLOCK_MCP_SEARCH_TOOLS)
             || self
                 .scoped_blocked_tools
@@ -1916,6 +1948,26 @@ fn record_live_gateway_runtime_context(
         context
             .metadata
             .insert("turn_mode".to_string(), turn_mode.to_string());
+        context.metadata.insert(
+            "deferred_tools_enabled".to_string(),
+            options.enable_deferred_tools.to_string(),
+        );
+        context.metadata.insert(
+            "disable_provider_thinking".to_string(),
+            options.disable_provider_thinking.to_string(),
+        );
+        context.metadata.insert(
+            "disable_tools".to_string(),
+            options.disable_tools.to_string(),
+        );
+        context.metadata.insert(
+            "turn_system_instructions".to_string(),
+            serde_json::to_string(&options.system_instructions).unwrap_or_default(),
+        );
+        context.metadata.insert(
+            "turn_blocked_tools".to_string(),
+            serde_json::to_string(&options.blocked_tools).unwrap_or_default(),
+        );
         context.metadata.insert(
             "native_web_search_effective".to_string(),
             native_web_search_enabled.to_string(),
@@ -2940,6 +2992,17 @@ impl GatewayApiClient {
 
 #[::async_trait::async_trait]
 impl ApiClient for GatewayApiClient {
+    fn model_version(&self) -> Option<String> {
+        Some(self.model.clone())
+    }
+
+    fn active_tool_names(&self) -> Vec<String> {
+        self.filter_tool_specs()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect()
+    }
+
     fn is_tool_call_allowed(&self, tool_name: &str) -> bool {
         let tools_enabled = self.scoped_tools_enabled.unwrap_or(self.enable_tools);
         tools_enabled
@@ -2951,6 +3014,17 @@ impl ApiClient for GatewayApiClient {
 
     fn block_tool_for_turn(&mut self, tool_name: &str) {
         self.scoped_blocked_tools.insert(tool_name.to_string());
+    }
+
+    fn activate_tool_candidates(&mut self, tool_names: &[String]) {
+        let available = self.tool_registry.actual_tool_names();
+        for name in tool_names {
+            if available.iter().any(|candidate| {
+                canonical_allowed_tool_name(candidate) == canonical_allowed_tool_name(name)
+            }) {
+                self.activated_tools.insert(name.clone());
+            }
+        }
     }
 
     fn prepare_model_iteration(
@@ -4219,6 +4293,9 @@ pub struct GatewayToolExecutor {
     /// Skill paths keyed by sanitized skill name.
     /// Lazily populated by `discover_skill_tools`.
     skill_tools: std::collections::HashMap<String, std::path::PathBuf>,
+    /// Session-scoped registry, including MCP and Skill runtime definitions,
+    /// used by ToolSearch so discovery and activation share one source.
+    tool_registry: GlobalToolRegistry,
 }
 
 const PM_WEB_FETCH_DOMAIN_LIMIT: usize = 3;
@@ -5167,6 +5244,7 @@ impl GatewayToolExecutor {
         memory_context: Option<GatewayMemoryContext>,
         file_context: Option<GatewayFileContext>,
         pm_search_providers: Vec<tools::WebSearchProviderConfig>,
+        tool_registry: GlobalToolRegistry,
     ) -> Self {
         let workspace_root = path_validator.workspace_root().to_path_buf();
         let data_root = infer_agent_data_root(&workspace_root);
@@ -5189,6 +5267,7 @@ impl GatewayToolExecutor {
             pm_search_providers,
             rd_read_cache: BTreeMap::new(),
             pm_web_fetch_guard: Arc::new(Mutex::new(PmWebFetchGuardState::default())),
+            tool_registry,
         }
     }
 
@@ -8033,6 +8112,31 @@ async fn gateway_memory_note(
 
 impl ToolExecutor for GatewayToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> std::result::Result<String, ToolError> {
+        if tool_name.eq_ignore_ascii_case("ToolSearch")
+            || tool_name.eq_ignore_ascii_case("tool_search")
+        {
+            let parsed =
+                serde_json::from_str::<Value>(input).unwrap_or_else(|_| serde_json::json!({}));
+            let query = parsed
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let max_results = parsed
+                .get("max_results")
+                .or_else(|| parsed.get("maxResults"))
+                .and_then(Value::as_u64)
+                .unwrap_or(5)
+                .clamp(1, 20) as usize;
+            return serde_json::to_string_pretty(&self.tool_registry.search(
+                query,
+                max_results,
+                None,
+                None,
+            ))
+            .map_err(|error| {
+                ToolError::new(format!("failed to serialize ToolSearch result: {error}"))
+            });
+        }
         let protects_external_boundary = tool_crosses_external_boundary(tool_name);
         if protects_external_boundary {
             let protected_input =
@@ -8591,17 +8695,17 @@ that prerequisite clearly; do not pretend it is a web-search failure.\n\
 }
 
 // ---------------------------------------------------------------------------
-// Permission Prompter (auto for web mode)
+// Permission Prompter (durable suspend for web mode)
 // ---------------------------------------------------------------------------
 
-struct AutoAllowPrompter;
+struct DurableDeferPrompter;
 
-impl PermissionPrompter for AutoAllowPrompter {
+impl PermissionPrompter for DurableDeferPrompter {
     fn decide(
         &mut self,
         _request: &runtime::PermissionRequest,
     ) -> runtime::PermissionPromptDecision {
-        runtime::PermissionPromptDecision::Allow
+        runtime::PermissionPromptDecision::Defer
     }
 }
 
@@ -8629,6 +8733,10 @@ pub struct CompactionHookContext {
     /// Unified_Memory `app` bucket (chat/pm/rd/nl2sql/...) derived from the
     /// runtime scenario.
     pub app: String,
+    /// Effective model selected for this runtime (key override included).
+    /// Compaction's semantic extraction must use the same tenant-scoped model
+    /// policy as the active conversation instead of a hidden global default.
+    pub model: String,
 }
 
 /// Factory injected by higher layers (e.g. the web-server Super_Assistant
@@ -9001,6 +9109,7 @@ impl RuntimeBuilder {
                     .unwrap_or_else(|| "chat".to_string()),
             }),
             self.config.pm_search_providers.clone(),
+            tool_registry.clone(),
         );
 
         let sessions_dir = self.workspace.join(".aos").join("sessions");
@@ -9115,9 +9224,19 @@ impl RuntimeBuilder {
                 user_id: self.config.user_id.clone(),
                 session_id: self.session_id.clone(),
                 app,
+                model: effective_model.clone(),
             }))
         });
         if let Some(hook) = compaction_hook {
+            if let Some(kernel) = hook.execution_kernel() {
+                kernel.recover().await.map_err(|error| {
+                    GatewayError::Internal(format!(
+                        "execution-kernel recovery failed for session {}: {error}",
+                        self.session_id
+                    ))
+                })?;
+                runtime = runtime.with_execution_kernel(kernel);
+            }
             runtime = runtime.with_compaction_hook(hook);
         }
 
@@ -9670,6 +9789,7 @@ impl StreamingReporter {
             crate::events::AgentEvent::ToolUseInput { .. } => "tool_use_input",
             crate::events::AgentEvent::ToolUseEnd { .. } => "tool_use_end",
             crate::events::AgentEvent::ToolResult { .. } => "tool_result",
+            crate::events::AgentEvent::ApprovalRequired { .. } => "approval_required",
             crate::events::AgentEvent::SessionActivated { .. } => "session_activated",
             crate::events::AgentEvent::ConfigHotReload { .. } => "config_hot_reload",
             crate::events::AgentEvent::SessionCompacted { .. } => "session_compacted",
@@ -9920,6 +10040,7 @@ pub(crate) async fn run_streaming_turn_streaming(
     options: StreamingTurnOptions,
     cancel_rx: Option<oneshot::Receiver<()>>,
     deferred_results: Option<Vec<runtime::DeferredToolResult>>,
+    approval_decisions: Option<Vec<runtime::DeferredApprovalDecision>>,
 ) -> Result<StreamingResumableTurnResult> {
     tracing::debug!("run_streaming_turn_streaming: starting");
 
@@ -9932,6 +10053,7 @@ pub(crate) async fn run_streaming_turn_streaming(
     let previous_scoped_blocked_tools = runtime.api_client_mut().scoped_blocked_tools.clone();
     let previous_blocked_tools = runtime.api_client_mut().blocked_tools.clone();
     let previous_allowed_tools = runtime.api_client_mut().allowed_tools.clone();
+    let previous_activated_tools = runtime.api_client_mut().activated_tools.clone();
     let previous_scoped_reasoning_effort = runtime.api_client_mut().scoped_reasoning_effort.clone();
     let previous_scoped_disable_provider_thinking =
         runtime.api_client_mut().scoped_disable_provider_thinking;
@@ -9996,15 +10118,23 @@ pub(crate) async fn run_streaming_turn_streaming(
         sender.clone(),
         hook_events.clone(),
     ))));
-    let reporter = StreamingReporter::new(sender, runtime_status_events.clone());
-    let mut prompter = AutoAllowPrompter;
+    let reporter = StreamingReporter::new(sender.clone(), runtime_status_events.clone());
+    if deferred_results.is_some() && approval_decisions.is_some() {
+        return Err(GatewayError::RuntimeExecution(
+            "a runtime turn cannot resume with tool results and approval decisions simultaneously"
+                .to_string(),
+        ));
+    }
+    let mut prompter = DurableDeferPrompter;
     let rollback_message_len = runtime.message_count();
     let result = if let Some(cancel_rx) = cancel_rx {
         tokio::select! {
             result = async {
-                match deferred_results {
-                    Some(results) => runtime.resume_turn_with_tool_results(results, Some(&mut prompter), reporter).await,
-                    None => runtime.run_turn_resumable(user_input, Some(&mut prompter), reporter).await,
+                match (deferred_results, approval_decisions) {
+                    (Some(results), None) => runtime.resume_turn_with_tool_results(results, Some(&mut prompter), reporter).await,
+                    (None, Some(decisions)) => runtime.resume_turn_with_approval_decisions(decisions, Some(&mut prompter), reporter).await,
+                    (None, None) => runtime.run_turn_resumable(user_input, Some(&mut prompter), reporter).await,
+                    (Some(_), Some(_)) => unreachable!("validated above"),
                 }
             } => result.map_err(GatewayError::Runtime),
             _ = cancel_rx => {
@@ -10018,21 +10148,37 @@ pub(crate) async fn run_streaming_turn_streaming(
             },
         }
     } else {
-        match deferred_results {
-            Some(results) => {
+        match (deferred_results, approval_decisions) {
+            (Some(results), None) => {
                 runtime
                     .resume_turn_with_tool_results(results, Some(&mut prompter), reporter)
                     .await
             }
-            None => {
+            (None, Some(decisions)) => {
+                runtime
+                    .resume_turn_with_approval_decisions(decisions, Some(&mut prompter), reporter)
+                    .await
+            }
+            (None, None) => {
                 runtime
                     .run_turn_resumable(user_input, Some(&mut prompter), reporter)
                     .await
             }
+            (Some(_), Some(_)) => unreachable!("validated above"),
         }
         .map_err(GatewayError::Runtime)
     };
     if let Err(error) = result.as_ref() {
+        let _ = runtime
+            .finish_latest_kernel_turn(
+                if matches!(error, GatewayError::TurnCancelled) {
+                    runtime::RuntimeTurnTerminalStatus::Cancelled
+                } else {
+                    runtime::RuntimeTurnTerminalStatus::Failed
+                },
+                Some("outer coordinator interrupted the runtime turn"),
+            )
+            .await;
         if error.is_context_window_exceeded() {
             if let Err(rollback_error) =
                 rollback_current_runtime_turn(runtime, rollback_message_len)
@@ -10050,6 +10196,7 @@ pub(crate) async fn run_streaming_turn_streaming(
         api_client.scoped_blocked_tools = previous_scoped_blocked_tools;
         api_client.blocked_tools = previous_blocked_tools;
         api_client.allowed_tools = previous_allowed_tools;
+        api_client.activated_tools = previous_activated_tools;
         api_client.scoped_reasoning_effort = previous_scoped_reasoning_effort;
         api_client.scoped_disable_provider_thinking = previous_scoped_disable_provider_thinking;
         api_client.scoped_max_tokens = previous_scoped_max_tokens;
@@ -10066,6 +10213,40 @@ pub(crate) async fn run_streaming_turn_streaming(
             let (summary, suspended) = match outcome {
                 runtime::ResumableTurnOutcome::Completed(summary) => (summary, None),
                 runtime::ResumableTurnOutcome::Suspended(suspended) => {
+                    for deferred in &suspended.deferred_tools {
+                        let metadata =
+                            serde_json::from_str::<serde_json::Value>(&deferred.metadata)
+                                .unwrap_or(serde_json::Value::Null);
+                        if metadata.get("kind").and_then(serde_json::Value::as_str)
+                            != Some("approval")
+                        {
+                            continue;
+                        }
+                        let current_mode = metadata
+                            .get("currentMode")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let required_mode = metadata
+                            .get("requiredMode")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let reason = metadata
+                            .get("reason")
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToOwned::to_owned);
+                        let _ = sender
+                            .send(crate::events::AgentEvent::ApprovalRequired {
+                                turn_id: suspended.turn_id.clone(),
+                                invocation_id: deferred.tool_use_id.clone(),
+                                tool_name: deferred.tool_name.clone(),
+                                current_mode,
+                                required_mode,
+                                reason,
+                            })
+                            .await;
+                    }
                     (suspended.partial_summary.clone(), Some(suspended))
                 }
             };
@@ -10349,7 +10530,7 @@ pub(crate) async fn run_streaming_turn_with_options(
         hook_events.clone(),
     ))));
     let collector = SseEventCollector::new(runtime_status_events.clone());
-    let mut prompter = AutoAllowPrompter;
+    let mut prompter = DurableDeferPrompter;
     let rollback_message_len = runtime.message_count();
     let result = if let Some(cancel_rx) = cancel_rx {
         tokio::select! {
@@ -10553,6 +10734,7 @@ pub(crate) async fn run_streaming_turn_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config_registry::ApiKeyEntry;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::path::PathBuf;
 
@@ -10697,6 +10879,92 @@ mod tests {
     }
 
     #[test]
+    fn tool_search_activates_only_authorized_tools_for_one_turn() {
+        let config = UserRuntimeConfig {
+            db: None,
+            user_id: "user".to_string(),
+            tenant_id: "tenant".to_string(),
+            api_keys: vec![ApiKeyEntry {
+                id: "key".to_string(),
+                key: "sk-test".to_string(),
+                provider: "openai".to_string(),
+                base_url: None,
+                model: Some("gpt-test".to_string()),
+                audio_generate_path: None,
+                audio_query_path: None,
+                priority: 0,
+                is_primary: true,
+                input_price_per_million: None,
+                output_price_per_million: None,
+                capabilities_json: None,
+            }],
+            provider: "openai".to_string(),
+            model: "gpt-test".to_string(),
+            permission_mode: runtime::PermissionMode::ReadOnly,
+            allowed_tools: None,
+            blocked_tools: Vec::new(),
+            mcp_servers: Vec::new(),
+            skills: Vec::new(),
+            hooks: runtime::RuntimeHookConfig::default(),
+            pm_search_providers: Vec::new(),
+            scenario_scoped: true,
+            scenario: Some("chat".to_string()),
+        };
+        let deferred = "mcp__weather__forecast".to_string();
+        let registry = GlobalToolRegistry::builtin()
+            .with_runtime_tools(vec![RuntimeToolDefinition {
+                name: deferred.clone(),
+                description: Some("Get a weather forecast for a city".to_string()),
+                input_schema: json!({"type": "object"}),
+                required_permission: runtime::PermissionMode::ReadOnly,
+            }])
+            .expect("runtime tool registry");
+        let mut client = GatewayApiClient::new(&config, "session", None, registry).unwrap();
+
+        assert!(!client
+            .filter_tool_specs()
+            .iter()
+            .any(|definition| definition.name == deferred));
+        let discovery = client
+            .tool_registry
+            .search("weather forecast", 5, None, None);
+        let discovered_names = serde_json::to_value(discovery)
+            .expect("serialize tool discovery")
+            .get("matches")
+            .and_then(Value::as_array)
+            .expect("tool search matches")
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        assert!(discovered_names.iter().any(|name| name == &deferred));
+        client.activate_tool_candidates(&discovered_names);
+        assert!(client
+            .filter_tool_specs()
+            .iter()
+            .any(|definition| definition.name == deferred));
+
+        client.block_tool_for_turn(&deferred);
+        assert!(!client
+            .filter_tool_specs()
+            .iter()
+            .any(|definition| definition.name == deferred));
+        client.scoped_blocked_tools.clear();
+        client.activated_tools.clear();
+        assert!(!client
+            .filter_tool_specs()
+            .iter()
+            .any(|definition| definition.name == deferred));
+
+        client.allowed_tools = Some(vec!["ToolSearch".to_string()]);
+        client.activate_tool_candidates(&[deferred.clone()]);
+        assert!(!client
+            .filter_tool_specs()
+            .iter()
+            .any(|definition| definition.name == deferred));
+    }
+
+    #[test]
     fn native_search_annotations_are_projected_into_citable_answer_urls() {
         let mut events = vec![
             AssistantEvent::TextDelta("北京明天有雨。".to_string()),
@@ -10786,6 +11054,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            GlobalToolRegistry::builtin(),
         );
         (executor, workspace)
     }

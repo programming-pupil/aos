@@ -1077,7 +1077,28 @@ async fn delete_session(
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
     match delete_session_file(&state.data_dir, &claims.tenant_id, &claims.sub, &session_id) {
-        Ok(()) => Json(serde_json::json!({ "deleted": true })).into_response(),
+        Ok(()) => {
+            if let Err(error) = crate::semantic_kernel_store::delete_session_artifacts(
+                &state.db,
+                &claims.tenant_id,
+                &session_id,
+            )
+            .await
+            {
+                tracing::error!(
+                    tenant_id = %claims.tenant_id,
+                    session_id = %session_id,
+                    error = %error,
+                    "chat session deleted but artifact tombstone cleanup failed"
+                );
+                return AppError::Internal(
+                    "session deleted; artifact cleanup will be retried by retention recovery"
+                        .to_string(),
+                )
+                .into_response();
+            }
+            Json(serde_json::json!({ "deleted": true })).into_response()
+        }
         Err(e) => e.into_response(),
     }
 }

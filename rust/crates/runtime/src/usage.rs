@@ -45,7 +45,7 @@ impl ModelPricing {
 }
 
 /// Token counters accumulated for a conversation turn or session.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,

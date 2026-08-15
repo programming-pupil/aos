@@ -77,6 +77,8 @@ async fn upsert_semantic_evidence_ledger(
     db: &sqlx::SqlitePool,
     rows: &[PmEvidenceGraphEdge],
 ) -> Result<(), sqlx::Error> {
+    let mut tx = db.begin().await?;
+    crate::acquire_sqlite_write_lock(&mut tx).await?;
     for row in rows {
         let excerpt = row.evidence_excerpt.as_deref().unwrap_or_default();
         let evidence_id = format!(
@@ -120,7 +122,7 @@ async fn upsert_semantic_evidence_ledger(
             .to_string(),
         )
         .bind(authority)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
 
         let assertion_id = format!(
@@ -135,38 +137,71 @@ async fn upsert_semantic_evidence_ledger(
             "contradicts" => "contested",
             _ => "proposed",
         };
+        let assertion_scope = serde_json::json!({"sessionId": row.session_id}).to_string();
+        let assertion_subject = serde_json::json!({"claimKey": row.claim_key}).to_string();
+        let assertion_value = serde_json::json!({
+            "text": row.claim_text,
+            "relation": row.relation,
+            "source": row.url,
+        })
+        .to_string();
+        let assertion_version: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM semantic_assertion_versions
+             WHERE tenant_id = ? AND assertion_id = ?",
+        )
+        .bind(&row.tenant_id)
+        .bind(&assertion_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO semantic_assertion_versions
+                (tenant_id, assertion_id, version, assertion_json, source_event_ids_json)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(tenant_id, assertion_id, version) DO NOTHING",
+        )
+        .bind(&row.tenant_id)
+        .bind(&assertion_id)
+        .bind(assertion_version)
+        .bind(serde_json::json!({
+            "id": assertion_id,
+            "tenantId": row.tenant_id,
+            "scope": serde_json::from_str::<serde_json::Value>(&assertion_scope).unwrap_or(serde_json::Value::Null),
+            "subject": serde_json::from_str::<serde_json::Value>(&assertion_subject).unwrap_or(serde_json::Value::Null),
+            "predicate": "research_claim",
+            "value": serde_json::from_str::<serde_json::Value>(&assertion_value).unwrap_or(serde_json::Value::Null),
+            "status": assertion_status,
+            "confidence": row.confidence.clamp(0.0, 1.0),
+            "source": row.url,
+        }).to_string())
+        .bind(serde_json::json!([format!("pm-evidence-{}", sha256_hex(&format!("{}\n{}\n{}\n{}", row.tenant_id, row.session_id, row.claim_key, row.url)))]).to_string())
+        .execute(&mut *tx)
+        .await?;
         sqlx::query::<sqlx::Sqlite>(
             "INSERT INTO semantic_assertions
                 (id, tenant_id, scope_json, subject_json, predicate, value_json,
                  status, confidence, observed_at, valid_time_json, sensitivity,
                  retention_policy, version)
              VALUES (?, ?, ?, ?, 'research_claim', ?, ?, ?, CURRENT_TIMESTAMP,
-                     NULL, 'internal', 'tenant_default', 1)
+                     NULL, 'internal', 'tenant_default', ?)
              ON CONFLICT(id) DO UPDATE SET
                  value_json = excluded.value_json,
                  status = excluded.status,
                  confidence = excluded.confidence,
                  observed_at = CURRENT_TIMESTAMP,
-                 version = semantic_assertions.version + 1",
+                 version = excluded.version",
         )
         .bind(assertion_id)
         .bind(&row.tenant_id)
-        .bind(serde_json::json!({"sessionId": row.session_id}).to_string())
-        .bind(serde_json::json!({"claimKey": row.claim_key}).to_string())
-        .bind(
-            serde_json::json!({
-                "text": row.claim_text,
-                "relation": row.relation,
-                "source": row.url,
-            })
-            .to_string(),
-        )
+        .bind(assertion_scope)
+        .bind(assertion_subject)
+        .bind(assertion_value)
         .bind(assertion_status)
         .bind(row.confidence.clamp(0.0, 1.0))
-        .execute(db)
+        .bind(assertion_version)
+        .execute(&mut *tx)
         .await?;
     }
-    Ok(())
+    tx.commit().await
 }
 
 pub(super) async fn persist_pm_evidence_graph(

@@ -138,20 +138,28 @@ impl SensitiveProjector {
         policy: &SensitiveProjectionPolicy,
     ) -> ProjectedPayload {
         let source_hash = hex::encode(Sha256::digest(text.as_bytes()));
-        if matches!(kind, ProjectionKind::RawEncrypted) && policy.allow_raw_encrypted {
+        if matches!(kind, ProjectionKind::RawEncrypted) {
             return ProjectedPayload {
                 kind,
+                text: if policy.allow_raw_encrypted {
+                    format!("encrypted-artifact://{source_hash}")
+                } else {
+                    "[RAW_PAYLOAD_NOT_RETAINED]".into()
+                },
                 source_hash,
                 policy_version: policy.version.clone(),
-                text: text.to_owned(),
-                redaction_provenance: vec!["raw-retention-authorized".into()],
+                redaction_provenance: vec![if policy.allow_raw_encrypted {
+                    "raw-storage-envelope-required".into()
+                } else {
+                    "raw-retention-denied".into()
+                }],
             };
         }
         let mut value = text.to_owned();
         let mut provenance = vec![];
         if policy.redact_credentials {
             for marker in ["sk-", "password=", "token=", "Authorization: Bearer "] {
-                if let Some(start) = value.find(marker) {
+                while let Some(start) = value.find(marker) {
                     let end = value[start..]
                         .find(|c: char| c.is_whitespace() || c == ',' || c == '}')
                         .map_or(value.len(), |offset| start + offset);
@@ -308,6 +316,29 @@ mod tests {
         assert!(!projected.text.contains("sk-secret"));
         assert!(!projected.text.contains("hunter2"));
         assert_eq!(projected.source_hash.len(), 64);
+    }
+    #[test]
+    fn raw_projection_requires_encrypted_storage_and_repeated_secrets_are_redacted() {
+        let policy = SensitiveProjectionPolicy {
+            version: "p1".into(),
+            allow_raw_encrypted: true,
+            redact_credentials: true,
+            redact_pii: true,
+        };
+        let raw = SensitiveProjector::project(
+            "sk-first sk-second",
+            ProjectionKind::RawEncrypted,
+            &policy,
+        );
+        assert!(raw.text.starts_with("encrypted-artifact://"));
+        assert!(!raw.text.contains("sk-first"));
+        let telemetry = SensitiveProjector::project(
+            "sk-first sk-second",
+            ProjectionKind::TelemetryRedacted,
+            &policy,
+        );
+        assert!(!telemetry.text.contains("sk-first"));
+        assert!(!telemetry.text.contains("sk-second"));
     }
     #[test]
     fn artifacts_are_tenant_and_owner_scoped_and_deletable() {

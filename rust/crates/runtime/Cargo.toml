@@ -7,7 +7,7 @@ publish.workspace = true
 
 [features]
 default = []
-local-embedding = ["dep:anyhow", "dep:fastembed", "dep:hex", "dep:parking_lot"]
+local-embedding = ["dep:anyhow", "dep:fastembed", "dep:parking_lot"]
 
 [dependencies]
 agent-protocol = { path = "../agent-protocol" }
@@ -31,7 +31,7 @@ walkdir = "2"
 tiktoken-rs = "0.12"
 anyhow = { workspace = true, optional = true }
 fastembed = { version = "=5.13.0", default-features = false, features = ["ort-load-dynamic"], optional = true }
-hex = { version = "0.4", optional = true }
+hex = "0.4"
 parking_lot = { workspace = true, optional = true }
 
 [dev-dependencies]

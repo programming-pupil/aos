@@ -182,7 +182,28 @@ pub(super) async fn delete_session(
     }
 
     match get_agent_manager(&state).destroy_session(&session_id).await {
-        Ok(()) => Json(serde_json::json!({ "deleted": true })).into_response(),
+        Ok(()) => {
+            if let Err(error) = crate::semantic_kernel_store::delete_session_artifacts(
+                &state.db,
+                &claims.tenant_id,
+                &session_id,
+            )
+            .await
+            {
+                tracing::error!(
+                    tenant_id = %claims.tenant_id,
+                    session_id = %session_id,
+                    error = %error,
+                    "session deleted but artifact tombstone cleanup failed"
+                );
+                return AppError::Internal(
+                    "session deleted; artifact cleanup will be retried by retention recovery"
+                        .to_string(),
+                )
+                .into_response();
+            }
+            Json(serde_json::json!({ "deleted": true })).into_response()
+        }
         Err(e) => gateway_error_to_response(&e),
     }
 }
@@ -211,6 +232,33 @@ pub(super) async fn cancel_session_turn(
         })
         .into_response(),
         Err(e) => gateway_error_to_response(&e),
+    }
+}
+
+/// GET `/api/v1/agent/sessions/{session_id}/approvals` - list only the
+/// authenticated owner's unresolved durable approvals. Tool inputs and scope
+/// hashes remain server-side.
+pub(super) async fn list_session_approvals(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    let Some(handle) = get_agent_manager(&state).get_session(&session_id).await else {
+        return AppError::NotFound(format!("session {session_id} not found")).into_response();
+    };
+    if handle.user_id != claims.sub || handle.tenant_id != claims.tenant_id {
+        return AppError::Forbidden.into_response();
+    }
+    match crate::semantic_kernel_store::list_runtime_approvals(
+        &state.db,
+        &claims.tenant_id,
+        &claims.sub,
+        &session_id,
+    )
+    .await
+    {
+        Ok(approvals) => Json(serde_json::json!({ "approvals": approvals })).into_response(),
+        Err(error) => AppError::Internal(error.to_string()).into_response(),
     }
 }
 

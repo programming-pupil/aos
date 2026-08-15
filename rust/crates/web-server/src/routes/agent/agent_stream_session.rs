@@ -17,6 +17,16 @@ struct StreamSessionRequest {
     documents: Vec<PmTaskDocumentInput>,
     #[serde(default, alias = "turn_options")]
     turn_options: ChatTurnOptions,
+    #[serde(default)]
+    approval: Option<StreamApprovalDecision>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StreamApprovalDecision {
+    request_id: String,
+    decision: String,
+    reason: Option<String>,
 }
 
 struct StreamTurnCancelOnDrop {
@@ -459,41 +469,92 @@ pub(super) async fn stream_session(
     let session_source = handle.source.clone();
 
     // Support both POST (JSON body) and GET (query param) for backward compatibility.
-    let (raw_message, request_images, request_documents, turn_options) = if request.method()
-        == axum::http::Method::POST
-    {
-        let (_, body) = request.into_parts();
-        let bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
-            Ok(b) => b,
-            Err(e) => {
-                return AppError::Internal(format!("failed to read request body: {e}"))
+    let (raw_message, request_images, request_documents, turn_options, approval_request) =
+        if request.method() == axum::http::Method::POST {
+            let (_, body) = request.into_parts();
+            let bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+                Ok(b) => b,
+                Err(e) => {
+                    return AppError::Internal(format!("failed to read request body: {e}"))
+                        .into_response()
+                }
+            };
+            let parsed: StreamSessionRequest = match serde_json::from_slice(&bytes) {
+                Ok(p) => p,
+                Err(_) => {
+                    return AppError::ValidationError("invalid JSON body".into()).into_response()
+                }
+            };
+            (
+                parsed.message,
+                parsed.images,
+                parsed.documents,
+                parsed.turn_options,
+                parsed.approval,
+            )
+        } else {
+            (
+                String::new(),
+                Vec::new(),
+                Vec::new(),
+                ChatTurnOptions::default(),
+                None,
+            )
+        };
+
+    let approval_resume = if let Some(approval) = approval_request {
+        let stored = match crate::semantic_kernel_store::get_runtime_approval(
+            &state.db,
+            &claims.tenant_id,
+            &claims.sub,
+            &session_id,
+            approval.request_id.trim(),
+        )
+        .await
+        {
+            Ok(Some(stored)) => stored,
+            Ok(None) => {
+                return AppError::ValidationError(
+                    "approval request is not pending in this authenticated session".to_string(),
+                )
+                .into_response()
+            }
+            Err(error) => return AppError::Internal(error.to_string()).into_response(),
+        };
+        let decision = if stored.expired {
+            runtime::RuntimeApprovalDecision::Expired
+        } else {
+            match approval.decision.trim().to_ascii_lowercase().as_str() {
+                "approve" | "approved" => runtime::RuntimeApprovalDecision::Approved,
+                "deny" | "denied" | "reject" | "rejected" => {
+                    runtime::RuntimeApprovalDecision::Denied
+                }
+                "cancel" | "cancelled" | "canceled" => runtime::RuntimeApprovalDecision::Cancelled,
+                _ => {
+                    return AppError::ValidationError(
+                        "approval decision must be approve, deny, or cancel".to_string(),
+                    )
                     .into_response()
+                }
             }
         };
-        let parsed: StreamSessionRequest = match serde_json::from_slice(&bytes) {
-            Ok(p) => p,
-            Err(_) => return AppError::ValidationError("invalid JSON body".into()).into_response(),
-        };
-        (
-            parsed.message,
-            parsed.images,
-            parsed.documents,
-            parsed.turn_options,
-        )
+        Some(runtime::DeferredApprovalDecision {
+            tool_use_id: stored.invocation_id,
+            decision,
+            reason: approval.reason,
+        })
     } else {
-        (
-            String::new(),
-            Vec::new(),
-            Vec::new(),
-            ChatTurnOptions::default(),
-        )
+        None
     };
 
     // Intercept skill slash commands: `/<skill-name> args` -> `$<skill-name> args`.
-    let original_user_message =
+    let original_user_message = if approval_resume.is_some() {
+        String::new()
+    } else {
         maybe_dispatch_skill_command(&raw_message, &claims.tenant_id, &state.db)
             .await
-            .unwrap_or(raw_message);
+            .unwrap_or(raw_message)
+    };
     let mut user_message = original_user_message.clone();
     let mut image_context_warning_payload: Option<serde_json::Value> = None;
     let mut image_context_trace_payload: Option<serde_json::Value> = None;
@@ -590,14 +651,14 @@ pub(super) async fn stream_session(
     }
     let mut user_message = sanitize_pm_user_message(&session_source, user_message);
 
-    if user_message.trim().is_empty() {
+    if approval_resume.is_none() && user_message.trim().is_empty() {
         return AppError::ValidationError("message cannot be empty".into()).into_response();
     }
 
     let mut chat_artifact_evidence = Vec::<serde_json::Value>::new();
     let mut chat_trace = Vec::<serde_json::Value>::new();
 
-    if session_source.eq_ignore_ascii_case("chat") {
+    if approval_resume.is_none() && session_source.eq_ignore_ascii_case("chat") {
         if let Some(trace) = image_context_trace_payload.take() {
             chat_trace.push(trace);
         }
@@ -674,7 +735,7 @@ pub(super) async fn stream_session(
 
     let message = wrap_pm_research_prompt(&session_source, user_message.clone());
 
-    if session_source.eq_ignore_ascii_case("pm") {
+    if approval_resume.is_none() && session_source.eq_ignore_ascii_case("pm") {
         let task_id = format!("pm-research-task-{}", uuid::Uuid::new_v4());
         let task_manager = pm_research_task_manager().clone();
         if let Err(e) = task_manager
@@ -735,13 +796,13 @@ pub(super) async fn stream_session(
 
     // Channel for the turn result (sent when the turn finishes).
     let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<
-        Result<agent_gateway::TurnResult, agent_gateway::GatewayError>,
+        Result<agent_gateway::AgentTurnRunOutcome, agent_gateway::GatewayError>,
     >(1);
 
     // Spawn the turn so we can forward channel events while awaiting the result.
     let mut turn_policy = agent_gateway::AgentTurnOptions::default();
     let mut effective_search_mode = EffectiveChatSearchMode::Off;
-    if session_source.eq_ignore_ascii_case("chat") {
+    if approval_resume.is_none() && session_source.eq_ignore_ascii_case("chat") {
         let memory_instructions = chat_artifact_evidence
             .iter()
             .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("memory"))
@@ -778,18 +839,20 @@ pub(super) async fn stream_session(
     }
 
     tokio::spawn(async move {
-        let r = manager
-            .run_turn_streaming_with_options(&session_id, message, tx, turn_policy)
-            .await
-            .and_then(|outcome| match outcome {
-                agent_gateway::AgentTurnRunOutcome::Completed(turn) => Ok(turn),
-                agent_gateway::AgentTurnRunOutcome::Suspended(turn) => {
-                    Err(agent_gateway::GatewayError::RuntimeExecution(format!(
-                        "unexpected deferred tool in chat runtime turn {}",
-                        turn.runtime_turn_id
-                    )))
-                }
-            });
+        let r = if let Some(decision) = approval_resume {
+            manager
+                .resume_turn_streaming_with_approval_decisions(
+                    &session_id,
+                    vec![decision],
+                    tx,
+                    turn_policy,
+                )
+                .await
+        } else {
+            manager
+                .run_turn_streaming_with_options(&session_id, message, tx, turn_policy)
+                .await
+        };
         let _ = result_tx.send(r).await;
     });
 
@@ -878,7 +941,7 @@ pub(super) async fn stream_session(
             break result;
         };
         match turn_result {
-            Some(Ok(turn)) => {
+            Some(Ok(agent_gateway::AgentTurnRunOutcome::Completed(turn))) => {
                 let stream_mode = if text_delta_count > 0 && tool_event_seen {
                     "tool_interleaved"
                 } else if text_delta_count > 0 {
@@ -1069,6 +1132,25 @@ pub(super) async fn stream_session(
                             "cancelled": false,
                             "searchMode": effective_search_mode.as_str(),
                         }
+                    }).to_string());
+            }
+            Some(Ok(agent_gateway::AgentTurnRunOutcome::Suspended(turn))) => {
+                let pending = crate::semantic_kernel_store::list_runtime_approvals(
+                    &state.db,
+                    &claims.tenant_id,
+                    &claims.sub,
+                    &turn.session_id,
+                )
+                .await
+                .unwrap_or_default();
+                yield axum::response::sse::Event::default()
+                    .event("approval_paused")
+                    .data(serde_json::json!({
+                        "sessionId": turn.session_id,
+                        "runtimeTurnId": turn.runtime_turn_id,
+                        "approvals": pending,
+                        "partialText": turn.partial_text,
+                        "iterations": turn.iterations,
                     }).to_string());
             }
             Some(Err(e)) => {

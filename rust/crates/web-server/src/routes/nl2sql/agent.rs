@@ -505,7 +505,7 @@ fn decode_postgres_cell(row: &sqlx::postgres::PgRow, i: usize) -> serde_json::Va
     }
 }
 
-fn is_safe_sql(sql: &str) -> bool {
+pub(crate) fn is_safe_sql(sql: &str) -> bool {
     use crate::routes::nl2sql::sql_safety::SqlSafetyResult;
     matches!(classify_sql(sql), SqlSafetyResult::Safe)
 }

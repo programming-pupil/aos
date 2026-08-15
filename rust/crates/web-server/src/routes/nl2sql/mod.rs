@@ -4643,6 +4643,108 @@ pub(crate) async fn query(
         || req.question.clone(),
         |context| context.semantic_question(&req.question),
     );
+    // Compile and persist the semantic request before any provider is asked to
+    // write SQL. A failed/timeout generation therefore still leaves an
+    // auditable intent and the next repair attempt can reuse the same IR.
+    let mut question_intent = semantic_audit::compile_question_intent(
+        &claims.tenant_id,
+        &req.data_source_id,
+        &semantic_question,
+        &matched_metrics,
+    );
+    // Resolve metric aliases against tenant-owned, versioned contracts before
+    // SQL generation.  A missing/ambiguous contract remains explicit in the
+    // IR and is handled by the semantic verifier; it is never silently
+    // replaced with a prompt-only definition.
+    let mut loaded_metric_contracts = Vec::new();
+    match crate::semantic_kernel_store::load_metric_contracts(
+        &state.db,
+        &claims.tenant_id,
+        &question_intent
+            .metrics
+            .iter()
+            .map(|metric| metric.id.clone())
+            .collect::<Vec<_>>(),
+    )
+    .await
+    {
+        Ok(stored) => {
+            loaded_metric_contracts = stored
+                .iter()
+                .map(|item| item.contract.clone())
+                .collect::<Vec<_>>();
+            semantic_audit::bind_metric_contracts(&mut question_intent, &loaded_metric_contracts);
+            if question_intent
+                .metrics
+                .iter()
+                .any(|metric| metric.version.is_some())
+            {
+                push_rule_hit(
+                    &mut applied_rules,
+                    "metric_contract_bound",
+                    "Metric Contract",
+                    Some(format!(
+                        "bound {} versioned metric(s)",
+                        question_intent
+                            .metrics
+                            .iter()
+                            .filter(|metric| metric.version.is_some())
+                            .count()
+                    )),
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(tenant_id = %claims.tenant_id, error = %error, "metric contract lookup failed; retaining unresolved metric semantics");
+            question_intent
+                .unresolved
+                .push(nl2sql_core::semantic_ir::SemanticAmbiguity {
+                    field: "metric_contract_store".into(),
+                    candidates: Vec::new(),
+                    impact: "metric contract lookup failed; semantic release is blocked".into(),
+                });
+        }
+    }
+    let loaded_join_contracts = match crate::semantic_kernel_store::load_join_contracts(
+        &state.db,
+        &claims.tenant_id,
+    )
+    .await
+    {
+        Ok(stored) => stored
+            .into_iter()
+            .map(|item| item.contract)
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            tracing::warn!(tenant_id = %claims.tenant_id, error = %error, "join contract lookup failed; join verification will remain conservative");
+            Vec::new()
+        }
+    };
+    if let Err(error) = crate::semantic_kernel_store::persist_nl2sql_intent_ir(
+        &state.db,
+        &claims.tenant_id,
+        &conversation_id,
+        &query_id,
+        &query_id,
+        &serde_json::to_value(&question_intent).unwrap_or_else(|_| serde_json::json!({})),
+    )
+    .await
+    {
+        return Err(AppError::Internal(format!(
+            "failed to persist analytic intent before SQL generation: {error}"
+        )));
+    }
+    push_rule_hit(
+        &mut applied_rules,
+        "semantic_ir_compiled_before_sql",
+        "Analytics Semantic Compiler",
+        Some(format!(
+            "metrics={}, dimensions={}, unresolved={}",
+            question_intent.metrics.len(),
+            question_intent.dimensions.len(),
+            question_intent.unresolved.len()
+        )),
+    );
     if let Some(domain_match) = matched_business_domain.as_ref() {
         push_rule_hit(
             &mut applied_rules,
@@ -5958,12 +6060,14 @@ pub(crate) async fn query(
     // exposed as a releasable candidate.  Missing semantic evidence is kept as
     // NeedsClarification for audit/UX; only an explicit verifier rejection is
     // allowed to stop the request.
-    if let Some(audit) = semantic_audit::compile_and_verify(
+    if let Some(audit) = semantic_audit::compile_and_verify_with_contracts_and_joins(
         &claims.tenant_id,
         &req.data_source_id,
         &semantic_question,
         &sql,
         &matched_metrics,
+        &loaded_metric_contracts,
+        &loaded_join_contracts,
     ) {
         let intent_json = semantic_audit::intent_json(&audit);
         let verification_json = semantic_audit::verification_json(&audit);

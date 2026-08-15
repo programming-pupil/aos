@@ -392,6 +392,7 @@ async fn recover_claimed_parent_turn(
         .get_owned_session(&input.session_id, &claims.tenant_id, &claims.sub)
         .await
         .ok_or_else(|| AppError::NotFound("parent runtime session not found".to_string()))?;
+    recover_pending_child_controls_for_session(state, claims, &input.session_id).await?;
     let manager = state.agent_manager().clone();
     if matches!(
         manager.get_session_state(&input.session_id).await,
@@ -802,6 +803,7 @@ pub(crate) async fn cancel_parent_turn(
             .unwrap_or(true),
         recovered_runtime_turn_id: row.get::<Option<String>, _>("runtime_turn_id"),
     };
+    recover_pending_child_controls_for_session(&state, &claims, &session_id).await?;
     if !is_terminal(&status) {
         sqlx::query::<sqlx::Sqlite>(
             "UPDATE super_assistant_turns
@@ -853,6 +855,22 @@ pub(crate) async fn cancel_parent_turn(
             .bind(turn_id)
             .fetch_all(&state.db)
             .await?;
+            let mut controlled_subtasks = Vec::with_capacity(subtasks.len());
+            for subtask in subtasks {
+                let subtask_id = subtask.get::<String, _>("id");
+                let engine = subtask.get::<String, _>("engine");
+                let external = subtask.get::<Option<String>, _>("external_task_id");
+                let control_id = crate::semantic_kernel_store::record_child_control(
+                    &state.db,
+                    &claims.tenant_id,
+                    &subtask_id,
+                    "cancel",
+                    Some("parent turn cancellation propagated to child"),
+                )
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
+                controlled_subtasks.push((subtask_id, engine, external, control_id));
+            }
             sqlx::query::<sqlx::Sqlite>(
                 "UPDATE super_assistant_subtasks
                  SET cancel_requested = 1, status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
@@ -865,39 +883,72 @@ pub(crate) async fn cancel_parent_turn(
             .bind(turn_id)
             .execute(&state.db)
             .await?;
-            for subtask in subtasks {
-                let subtask_id = subtask.get::<String, _>("id");
-                let engine = subtask.get::<String, _>("engine");
-                let external = subtask.get::<Option<String>, _>("external_task_id");
+            for (subtask_id, engine, external, control_id) in controlled_subtasks {
+                let mut signal_error = None;
                 if engine == "nl2sql" {
                     signal_nl2sql_cancellation(&subtask_id);
                 }
                 if let Some(external) = external {
                     if engine == "deep_research" {
-                        let _ = super::agent::request_pm_research_task_cancel_from_agent_ops(
-                            &state,
-                            &claims.tenant_id,
-                            &claims.sub,
-                            &external,
-                        )
-                        .await;
+                        if let Err(error) =
+                            super::agent::request_pm_research_task_cancel_from_agent_ops(
+                                &state,
+                                &claims.tenant_id,
+                                &claims.sub,
+                                &external,
+                            )
+                            .await
+                        {
+                            signal_error = Some(error.to_string());
+                        }
                     } else if engine == "super_adversarial" {
-                        let _ = super::agent::request_chat_adversarial_cancel_from_agent_ops(
-                            &state,
-                            &claims.tenant_id,
-                            &external,
-                        )
-                        .await;
+                        if let Err(error) =
+                            super::agent::request_chat_adversarial_cancel_from_agent_ops(
+                                &state,
+                                &claims.tenant_id,
+                                &external,
+                            )
+                            .await
+                        {
+                            signal_error = Some(error.to_string());
+                        }
                     } else if engine == "data_attribution" {
                         #[cfg(feature = "nl2sql")]
-                        let _ = super::nl2sql::attribution::cancel_attribution_task(
+                        if let Err(error) = super::nl2sql::attribution::cancel_attribution_task(
                             axum::extract::State(state.clone()),
                             axum::extract::Extension(claims.clone()),
                             axum::extract::Path(external),
                         )
-                        .await;
+                        .await
+                        {
+                            signal_error = Some(error.to_string());
+                        }
                     }
                 }
+                let (control_status, result) = signal_error.map_or_else(
+                    || ("applied", json!({"status": "cancelled"})),
+                    |error| {
+                        (
+                            "failed",
+                            json!({"status": "cancelled", "signalError": error}),
+                        )
+                    },
+                );
+                let _ = crate::semantic_kernel_store::settle_child_control(
+                    &state.db,
+                    &claims.tenant_id,
+                    &control_id,
+                    control_status,
+                    Some(&result),
+                )
+                .await;
+                let _ = crate::semantic_kernel_store::record_child_settlement(
+                    &state.db,
+                    &claims.tenant_id,
+                    &subtask_id,
+                    "cancelled",
+                )
+                .await;
             }
             commit_parent_terminal_error(
                 &state,
@@ -2935,6 +2986,25 @@ async fn persist_runtime_event(
             })
             .to_string(),
         )),
+        AgentEvent::ApprovalRequired {
+            turn_id,
+            invocation_id,
+            tool_name,
+            current_mode,
+            required_mode,
+            reason,
+        } => Some((
+            "approval_required",
+            json!({
+                "turnId": turn_id,
+                "invocationId": invocation_id,
+                "toolName": tool_name,
+                "currentMode": current_mode,
+                "requiredMode": required_mode,
+                "reason": reason,
+            })
+            .to_string(),
+        )),
         AgentEvent::SessionCompacted {
             removed_messages, ..
         } => Some((
@@ -3800,7 +3870,33 @@ async fn execute_or_join_subtask(
     } else {
         load_subtask_by_call(state, claims, parent, &tool.tool_use_id).await?
     };
+    // Specialist tasks are also child threads in the unified execution model.
+    // Record lineage before starting/rejoining the external worker so a crash
+    // between spawn and the first progress event is still recoverable.
+    crate::semantic_kernel_store::record_child_spawn(
+        &state.db,
+        &claims.tenant_id,
+        &claims.sub,
+        &parent.session_id,
+        &subtask.id,
+        &tool.tool_use_id,
+        false,
+    )
+    .await
+    .map_err(|error| AppError::Internal(error.to_string()))?;
     if is_terminal(&subtask.status) {
+        let settlement = match subtask.status.as_str() {
+            "completed" => "completed",
+            "cancelled" => "cancelled",
+            _ => "failed",
+        };
+        let _ = crate::semantic_kernel_store::record_child_settlement(
+            &state.db,
+            &claims.tenant_id,
+            &subtask.id,
+            settlement,
+        )
+        .await;
         return terminal_subtask_output(&subtask);
     }
     if reused_existing {
@@ -4765,6 +4861,18 @@ async fn wait_for_subtask(
             last_meaningful_progress = Instant::now();
         }
         if is_terminal(&subtask.status) {
+            let settlement = match subtask.status.as_str() {
+                "completed" => "completed",
+                "cancelled" => "cancelled",
+                _ => "failed",
+            };
+            let _ = crate::semantic_kernel_store::record_child_settlement(
+                &state.db,
+                &claims.tenant_id,
+                &subtask.id,
+                settlement,
+            )
+            .await;
             persist_and_broadcast_super_assistant_event(
                 &state.db,
                 &claims.tenant_id,
@@ -6050,6 +6158,13 @@ async fn persist_subtask_result_inner(
         .await?
     };
     if updated.rows_affected() == 1 {
+        let _ = crate::semantic_kernel_store::record_child_settlement(
+            &state.db,
+            &claims.tenant_id,
+            subtask_id,
+            "completed",
+        )
+        .await;
         return Ok(());
     }
 
@@ -6089,7 +6204,7 @@ async fn fail_owned_subtask(
     error: &str,
     lease_owner: &str,
 ) -> Result<()> {
-    sqlx::query::<sqlx::Sqlite>(
+    let result = sqlx::query::<sqlx::Sqlite>(
         "UPDATE super_assistant_subtasks
          SET status = 'failed', error_message = ?, completed_at = CURRENT_TIMESTAMP,
              lease_owner = NULL, lease_expires_at = NULL, updated_at = CURRENT_TIMESTAMP
@@ -6104,6 +6219,15 @@ async fn fail_owned_subtask(
     .bind(lease_owner)
     .execute(&state.db)
     .await?;
+    if result.rows_affected() == 1 {
+        let _ = crate::semantic_kernel_store::record_child_settlement(
+            &state.db,
+            &claims.tenant_id,
+            subtask_id,
+            "failed",
+        )
+        .await;
+    }
     Ok(())
 }
 
@@ -6113,7 +6237,7 @@ async fn fail_subtask(
     subtask_id: &str,
     error: &str,
 ) -> Result<()> {
-    sqlx::query::<sqlx::Sqlite>(
+    let result = sqlx::query::<sqlx::Sqlite>(
         "UPDATE super_assistant_subtasks
          SET status = 'failed', error_message = ?, completed_at = CURRENT_TIMESTAMP,
              lease_owner = NULL, lease_expires_at = NULL, updated_at = CURRENT_TIMESTAMP
@@ -6126,6 +6250,15 @@ async fn fail_subtask(
     .bind(subtask_id)
     .execute(&state.db)
     .await?;
+    if result.rows_affected() == 1 {
+        let _ = crate::semantic_kernel_store::record_child_settlement(
+            &state.db,
+            &claims.tenant_id,
+            subtask_id,
+            "failed",
+        )
+        .await;
+    }
     Ok(())
 }
 
@@ -6492,6 +6625,7 @@ async fn subtask_cancel(
     parent: &UnifiedParentTurnInput,
     raw: &str,
 ) -> Result<Value> {
+    recover_pending_child_controls_for_session(state, claims, &parent.session_id).await?;
     let input: Value = serde_json::from_str(raw)
         .map_err(|error| AppError::ValidationError(format!("invalid cancel input: {error}")))?;
     let task_id = input
@@ -6522,49 +6656,27 @@ async fn cancel_subtask_execution(
     if is_terminal(status) {
         return Ok(status.to_string());
     }
-    if let Some(external) = external_task_id {
-        match engine {
-            "nl2sql" => {
-                // The durable cancel flag below also prevents a recovered worker from resuming.
-                signal_nl2sql_cancellation(subtask_id);
-            }
-            "deep_research" => {
-                let accepted = super::agent::request_pm_research_task_cancel_from_agent_ops(
-                    state,
-                    &claims.tenant_id,
-                    &claims.sub,
-                    external,
-                )
-                .await?;
-                if !accepted {
-                    return Err(AppError::Conflict(
-                        "deep research task no longer accepts cancellation".to_string(),
-                    ));
-                }
-            }
-            "super_adversarial" => {
-                super::agent::request_chat_adversarial_cancel_from_agent_ops(
-                    state,
-                    &claims.tenant_id,
-                    external,
-                )
-                .await?;
-            }
-            #[cfg(feature = "nl2sql")]
-            "data_attribution" => {
-                let _ = super::nl2sql::attribution::cancel_attribution_task(
-                    axum::extract::State(state.clone()),
-                    axum::extract::Extension(claims.clone()),
-                    axum::extract::Path(external.to_string()),
-                )
-                .await?;
-            }
-            other => {
-                return Err(AppError::ValidationError(format!(
-                    "subtask engine '{other}' does not support cancellation"
-                )));
-            }
-        }
+    let control_id = crate::semantic_kernel_store::record_child_control(
+        &state.db,
+        &claims.tenant_id,
+        subtask_id,
+        "cancel",
+        Some("user or parent requested cancellation"),
+    )
+    .await
+    .map_err(|error| AppError::Internal(error.to_string()))?;
+    if let Err(error) =
+        dispatch_child_cancel_signal(state, claims, subtask_id, engine, external_task_id).await
+    {
+        let _ = crate::semantic_kernel_store::settle_child_control(
+            &state.db,
+            &claims.tenant_id,
+            &control_id,
+            "failed",
+            Some(&json!({"error": error.to_string()})),
+        )
+        .await;
+        return Err(error);
     }
     let cancelled = sqlx::query::<sqlx::Sqlite>(
         "UPDATE super_assistant_subtasks
@@ -6578,8 +6690,25 @@ async fn cancel_subtask_execution(
     .bind(subtask_id)
     .execute(&state.db)
     .await?;
+    if cancelled.rows_affected() == 1 {
+        let _ = crate::semantic_kernel_store::settle_child_control(
+            &state.db,
+            &claims.tenant_id,
+            &control_id,
+            "applied",
+            Some(&json!({"status": "cancelled"})),
+        )
+        .await;
+        let _ = crate::semantic_kernel_store::record_child_settlement(
+            &state.db,
+            &claims.tenant_id,
+            subtask_id,
+            "cancelled",
+        )
+        .await;
+    }
     if cancelled.rows_affected() == 0 {
-        return sqlx::query_scalar::<sqlx::Sqlite, _>(
+        let persisted_status = sqlx::query_scalar::<sqlx::Sqlite, _>(
             "SELECT status FROM super_assistant_subtasks
              WHERE tenant_id = ? AND user_id = ? AND id = ? LIMIT 1",
         )
@@ -6588,9 +6717,192 @@ async fn cancel_subtask_execution(
         .bind(subtask_id)
         .fetch_optional(&state.db)
         .await?
-        .ok_or_else(|| AppError::NotFound("subtask not found".to_string()));
+        .ok_or_else(|| AppError::NotFound("subtask not found".to_string()))?;
+        let _ = crate::semantic_kernel_store::settle_child_control(
+            &state.db,
+            &claims.tenant_id,
+            &control_id,
+            "rejected",
+            Some(&json!({"status": persisted_status})),
+        )
+        .await;
+        return Ok(persisted_status);
     }
     Ok("cancelled".to_string())
+}
+
+async fn dispatch_child_cancel_signal(
+    state: &AppState,
+    claims: &Claims,
+    subtask_id: &str,
+    engine: &str,
+    external_task_id: Option<&str>,
+) -> Result<()> {
+    if engine == "nl2sql" {
+        // The durable cancel flag also prevents a recovered worker from resuming.
+        signal_nl2sql_cancellation(subtask_id);
+        return Ok(());
+    }
+    let Some(external) = external_task_id else {
+        // A queued child has no external worker yet; the durable cancel flag is
+        // sufficient to prevent dispatch after recovery.
+        return Ok(());
+    };
+    match engine {
+        "deep_research" => {
+            let accepted = super::agent::request_pm_research_task_cancel_from_agent_ops(
+                state,
+                &claims.tenant_id,
+                &claims.sub,
+                external,
+            )
+            .await?;
+            if accepted {
+                Ok(())
+            } else {
+                Err(AppError::Conflict(
+                    "deep research task no longer accepts cancellation".to_string(),
+                ))
+            }
+        }
+        "super_adversarial" => {
+            super::agent::request_chat_adversarial_cancel_from_agent_ops(
+                state,
+                &claims.tenant_id,
+                external,
+            )
+            .await
+        }
+        #[cfg(feature = "nl2sql")]
+        "data_attribution" => {
+            let _ = super::nl2sql::attribution::cancel_attribution_task(
+                axum::extract::State(state.clone()),
+                axum::extract::Extension(claims.clone()),
+                axum::extract::Path(external.to_string()),
+            )
+            .await?;
+            Ok(())
+        }
+        other => Err(AppError::ValidationError(format!(
+            "subtask engine '{other}' does not support cancellation"
+        ))),
+    }
+}
+
+fn native_child_control_is_supported(action: &str) -> bool {
+    action.eq_ignore_ascii_case("cancel")
+}
+
+async fn recover_pending_child_controls_for_session(
+    state: &AppState,
+    claims: &Claims,
+    session_id: &str,
+) -> Result<()> {
+    let subtasks = sqlx::query::<sqlx::Sqlite>(
+        "SELECT s.id, s.engine, s.status, s.external_task_id
+         FROM super_assistant_subtasks s
+         JOIN child_thread_edges e
+           ON e.tenant_id = s.tenant_id AND e.child_thread_id = s.id
+         WHERE s.tenant_id = ? AND s.user_id = ? AND e.parent_thread_id = ?",
+    )
+    .bind(&claims.tenant_id)
+    .bind(&claims.sub)
+    .bind(session_id)
+    .fetch_all(&state.db)
+    .await?;
+    for subtask in subtasks {
+        let subtask_id = subtask.get::<String, _>("id");
+        let engine = subtask.get::<String, _>("engine");
+        let status = subtask.get::<String, _>("status");
+        let external_task_id = subtask.get::<Option<String>, _>("external_task_id");
+        let pending = crate::semantic_kernel_store::pending_child_controls(
+            &state.db,
+            &claims.tenant_id,
+            &subtask_id,
+        )
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+        for (control_id, action, _detail) in pending {
+            if !native_child_control_is_supported(&action) {
+                let _ = crate::semantic_kernel_store::settle_child_control(
+                    &state.db,
+                    &claims.tenant_id,
+                    &control_id,
+                    "rejected",
+                    Some(&json!({
+                        "code": "executor_capability_unsupported",
+                        "action": action,
+                        "executor": "native-aos",
+                    })),
+                )
+                .await;
+                continue;
+            }
+            if is_terminal(&status) && status != "cancelled" {
+                let _ = crate::semantic_kernel_store::settle_child_control(
+                    &state.db,
+                    &claims.tenant_id,
+                    &control_id,
+                    "rejected",
+                    Some(&json!({"status": status, "reason": "child already completed"})),
+                )
+                .await;
+                continue;
+            }
+            let signal = dispatch_child_cancel_signal(
+                state,
+                claims,
+                &subtask_id,
+                &engine,
+                external_task_id.as_deref(),
+            )
+            .await;
+            match signal {
+                Ok(()) => {
+                    sqlx::query::<sqlx::Sqlite>(
+                        "UPDATE super_assistant_subtasks
+                         SET cancel_requested = 1, status = 'cancelled',
+                             completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+                             lease_owner = NULL, lease_expires_at = NULL,
+                             updated_at = CURRENT_TIMESTAMP
+                         WHERE tenant_id = ? AND user_id = ? AND id = ?
+                           AND status NOT IN ('completed','failed')",
+                    )
+                    .bind(&claims.tenant_id)
+                    .bind(&claims.sub)
+                    .bind(&subtask_id)
+                    .execute(&state.db)
+                    .await?;
+                    let _ = crate::semantic_kernel_store::settle_child_control(
+                        &state.db,
+                        &claims.tenant_id,
+                        &control_id,
+                        "applied",
+                        Some(&json!({"status": "cancelled", "recovered": true})),
+                    )
+                    .await;
+                    let _ = crate::semantic_kernel_store::record_child_settlement(
+                        &state.db,
+                        &claims.tenant_id,
+                        &subtask_id,
+                        "cancelled",
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    let _ = crate::semantic_kernel_store::settle_child_control(
+                        &state.db,
+                        &claims.tenant_id,
+                        &control_id,
+                        "failed",
+                        Some(&json!({"error": error.to_string(), "recovered": true})),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn cancel_subtask_from_agent_ops(
@@ -8810,13 +9122,13 @@ mod tests {
         degraded_completion_answer, direct_response_can_finalize, extract_urls,
         extract_workspace_paths, final_delta_checkpoint_payload, has_multiple_completion_calls,
         is_terminal, load_parent_cancellation_state, merge_json, model_completion_issues,
-        nl2sql_execution_is_usable, ordered_deferred_results, ordinary_live_lookup_tool_budget,
-        ordinary_web_failure_fallback_answer, ordinary_web_fallback_allowed,
-        ordinary_web_rejection_reason, ordinary_web_runtime_failure_can_degrade,
-        ordinary_web_soft_citation_should_pass, parent_allows_new_subtask,
-        parent_reasoning_budget_for, parent_subtask_artifact_id, parent_terminal_public_error,
-        parent_tool_artifact_id, parent_turn_options, pm_progress_payload,
-        pm_response_evidence_summary, promotable_deep_research_summary,
+        native_child_control_is_supported, nl2sql_execution_is_usable, ordered_deferred_results,
+        ordinary_live_lookup_tool_budget, ordinary_web_failure_fallback_answer,
+        ordinary_web_fallback_allowed, ordinary_web_rejection_reason,
+        ordinary_web_runtime_failure_can_degrade, ordinary_web_soft_citation_should_pass,
+        parent_allows_new_subtask, parent_reasoning_budget_for, parent_subtask_artifact_id,
+        parent_terminal_public_error, parent_tool_artifact_id, parent_turn_options,
+        pm_progress_payload, pm_response_evidence_summary, promotable_deep_research_summary,
         promotable_super_adversarial_summary, provider_native_search_verified,
         reconcile_document_delivery_requirements, record_attribution_completion_checks,
         recovered_execution_user_message, recovery_runtime_ownership_conflict,
@@ -8859,6 +9171,14 @@ mod tests {
         assert!(!parent_allows_new_subtask("running_model", true));
         for status in ["queued", "completed", "failed", "cancelled"] {
             assert!(!parent_allows_new_subtask(status, false), "{status}");
+        }
+    }
+
+    #[test]
+    fn native_child_controls_fail_closed_for_unsupported_actions() {
+        assert!(native_child_control_is_supported("cancel"));
+        for action in ["follow_up", "steer", "interrupt", "resume"] {
+            assert!(!native_child_control_is_supported(action), "{action}");
         }
     }
 
@@ -9089,6 +9409,7 @@ mod tests {
                 next_questions: Vec::new(),
                 confidence: None,
                 coverage: None,
+                evidence_level: "L0_descriptive".to_string(),
             }),
             plan: None,
             observations: vec![observation],

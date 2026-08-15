@@ -984,9 +984,31 @@ pub(crate) async fn run_chat_completion_with_any_chat_key(
     system_prompt: &str,
     max_tokens: u32,
 ) -> Result<PmChatRunResult, AppError> {
+    run_chat_completion_with_registry(
+        state.config_registry(),
+        tenant_id,
+        model,
+        messages,
+        system_prompt,
+        max_tokens,
+    )
+    .await
+}
+
+/// Run a bounded, non-streaming chat completion without requiring an `AppState`.
+/// Compaction is owned by the gateway session manager, so this registry-backed
+/// helper lets its semantic extraction channel use the same tenant-scoped key
+/// resolution and failover policy as PM routes while avoiding a state cycle.
+pub(crate) async fn run_chat_completion_with_registry(
+    registry: &agent_gateway::TenantConfigRegistry,
+    tenant_id: &str,
+    model: String,
+    messages: Vec<crate::routes::chat::ChatMessage>,
+    system_prompt: &str,
+    max_tokens: u32,
+) -> Result<PmChatRunResult, AppError> {
     let api_messages = to_api_messages(&messages);
-    let candidates = state
-        .config_registry()
+    let candidates = registry
         .resolve_api_keys_by_model_type(tenant_id, None, "chat")
         .await
         .map_err(|e| AppError::Internal(format!("failed to load chat API keys: {e}")))?;
@@ -1066,7 +1088,7 @@ fn effective_model_for_entry(entry: &agent_gateway::ApiKeyEntry, model_fallback:
         .to_string()
 }
 
-async fn run_pm_completion_with_key(
+pub(crate) async fn run_pm_completion_with_key(
     entry: &agent_gateway::ApiKeyEntry,
     model_fallback: &str,
     api_messages: Vec<api::InputMessage>,

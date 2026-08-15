@@ -43,6 +43,7 @@ mod session;
 pub mod session_control;
 pub use session_control::SessionStore;
 pub mod egress;
+pub mod execution_kernel;
 pub mod isolation;
 #[cfg(feature = "local-embedding")]
 pub mod local_embedding;
@@ -90,9 +91,10 @@ pub use config_validate::{
 pub use conversation::{
     auto_compaction_threshold_from_env, trident_compaction_enabled_from_env, ApiClient, ApiRequest,
     AssistantEvent, AutoCompactionEvent, CompactionHook, ContextManagementReport,
-    ConversationRuntime, DeferredToolResult, DeferredToolUse, PromptCacheEvent,
-    ResumableTurnOutcome, RuntimeError, RuntimeEventReporter, StaticToolExecutor, SuspendedTurn,
-    ToolError, ToolExecutionOutcome, ToolExecutionRequest, ToolExecutor, TurnSummary,
+    ConversationRuntime, DeferredApprovalDecision, DeferredToolResult, DeferredToolUse,
+    PromptCacheEvent, ResumableTurnOutcome, RuntimeError, RuntimeEventReporter, StaticToolExecutor,
+    SuspendedTurn, ToolError, ToolExecutionOutcome, ToolExecutionRequest, ToolExecutor,
+    TurnSummary,
 };
 pub use data_protection::{
     configured_data_protection_mode, explicit_env_opt_in_enabled, explicit_opt_in_value,
@@ -101,6 +103,12 @@ pub use data_protection::{
 };
 pub use egress::{
     evaluate_egress, EgressDecision, EgressPolicy, EgressRule, HostMatcher, NetTarget,
+};
+pub use execution_kernel::{
+    reduce_runtime_artifact, AgentExecutionKernel, RuntimeApprovalDecision, RuntimeApprovalRequest,
+    RuntimeApprovalResolution, RuntimeArtifactKind, RuntimeArtifactPreview,
+    RuntimeContextManifestInput, RuntimeToolIntent, RuntimeToolOutcome, RuntimeToolOutcomeKind,
+    RuntimeToolProjection, RuntimeTurnStart, RuntimeTurnTerminalStatus,
 };
 pub use file_ops::{
     edit_file, edit_file_in_workspace, glob_search, glob_search_in_workspace, grep_search,

@@ -40,20 +40,21 @@ impl ApiClient for ThresholdCrossingApi {
     }
 }
 
-/// Builds an in-memory session with `count` alternating user/assistant text
-/// messages. Content is arbitrary; only the message count matters for the
-/// in-turn compaction window (the runtime compacts with `max_estimated_tokens
-/// = 0`, so any session with enough compactable messages triggers removal).
+/// Builds an in-memory session with alternating user/assistant messages whose
+/// archived window is large enough to shrink after continuation framing. The
+/// runtime must fail closed instead of replacing tiny source messages with a
+/// larger synthetic checkpoint.
 fn build_session(contents: &[String]) -> Session {
     let mut session = Session::new();
     session.messages = contents
         .iter()
         .enumerate()
         .map(|(index, text)| {
+            let text = format!("{text}: {}", "important context ".repeat(48));
             if index % 2 == 0 {
-                ConversationMessage::user_text(text.clone())
+                ConversationMessage::user_text(text)
             } else {
-                ConversationMessage::assistant(vec![ContentBlock::Text { text: text.clone() }])
+                ConversationMessage::assistant(vec![ContentBlock::Text { text }])
             }
         })
         .collect();

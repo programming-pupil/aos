@@ -716,15 +716,26 @@ pub fn build_agent_manager(
     config_home: std::path::PathBuf,
     config_registry: Arc<agent_gateway::TenantConfigRegistry>,
 ) -> std::result::Result<Arc<agent_gateway::AgentSessionManager>, agent_gateway::GatewayError> {
+    let hook_config_registry = config_registry.clone();
     let compaction_hook_factory: agent_gateway::CompactionHookFactory =
-        Arc::new(|ctx: agent_gateway::CompactionHookContext| {
-            Arc::new(crate::routes::super_assistant::RuntimeCompactionHook::new(
-                ctx.db,
-                ctx.tenant_id,
-                ctx.user_id,
-                ctx.session_id,
+        Arc::new(move |ctx: agent_gateway::CompactionHookContext| {
+            let tenant_id = ctx.tenant_id.clone();
+            let user_id = ctx.user_id.clone();
+            let session_id = ctx.session_id.clone();
+            let hook = crate::routes::super_assistant::RuntimeCompactionHook::new(
+                ctx.db.clone(),
+                tenant_id.clone(),
+                user_id.clone(),
+                session_id.clone(),
                 ctx.app,
-            )) as Arc<dyn runtime::CompactionHook>
+            )
+            .with_config_registry(hook_config_registry.clone(), ctx.model.clone())
+            .with_execution_kernel(Arc::new(
+                crate::semantic_kernel_store::RuntimeExecutionKernel::new(
+                    ctx.db, tenant_id, user_id, session_id,
+                ),
+            ));
+            Arc::new(hook) as Arc<dyn runtime::CompactionHook>
         });
     agent_gateway::build_session_manager_with_registry(
         db,

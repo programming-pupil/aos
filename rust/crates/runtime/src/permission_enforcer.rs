@@ -6,7 +6,9 @@
 //! Permission enforcement layer that gates tool execution based on the
 //! active `PermissionPolicy`.
 
-use crate::permissions::{PermissionMode, PermissionOutcome, PermissionPolicy};
+use crate::permissions::{
+    permission_mode_satisfies, PermissionMode, PermissionOutcome, PermissionPolicy,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,14 +37,11 @@ impl PermissionEnforcer {
     }
 
     /// Check whether a tool can be executed under the current permission policy.
-    /// Auto-denies when prompting is required but no prompter is provided.
+    /// Auto-denies when prompting is required because this low-level enforcer
+    /// has no prompter. Interactive runtimes must call `PermissionPolicy`
+    /// directly with their durable prompter instead of treating `Allowed` as
+    /// a request to prompt later.
     pub fn check(&self, tool_name: &str, input: &str) -> EnforcementResult {
-        // When the active mode is Prompt, defer to the caller's interactive
-        // prompt flow rather than hard-denying (the enforcer has no prompter).
-        if self.policy.active_mode() == PermissionMode::Prompt {
-            return EnforcementResult::Allowed;
-        }
-
         let outcome = self.policy.authorize(tool_name, input, None);
 
         match outcome {
@@ -57,6 +56,12 @@ impl PermissionEnforcer {
                     reason,
                 }
             }
+            PermissionOutcome::AwaitingApproval { .. } => EnforcementResult::Denied {
+                tool: tool_name.to_owned(),
+                active_mode: self.policy.active_mode().as_str().to_owned(),
+                required_mode: self.policy.required_mode_for(tool_name).as_str().to_owned(),
+                reason: "interactive approval is required".to_owned(),
+            },
         }
     }
 
@@ -73,16 +78,10 @@ impl PermissionEnforcer {
         input: &str,
         required_mode: PermissionMode,
     ) -> EnforcementResult {
-        // When the active mode is Prompt, defer to the caller's interactive
-        // prompt flow rather than hard-denying.
-        if self.policy.active_mode() == PermissionMode::Prompt {
-            return EnforcementResult::Allowed;
-        }
-
         let active_mode = self.policy.active_mode();
 
         // Check if active mode meets the dynamically determined required mode
-        if active_mode >= required_mode {
+        if permission_mode_satisfies(active_mode, required_mode) {
             return EnforcementResult::Allowed;
         }
 
@@ -355,6 +354,26 @@ mod tests {
 
         let result = enforcer.check_file_write("/workspace/file.rs", "/workspace");
         assert!(matches!(result, EnforcementResult::Denied { .. }));
+    }
+
+    #[test]
+    fn prompt_mode_generic_check_does_not_auto_allow_dangerous_tool() {
+        let policy = PermissionPolicy::new(PermissionMode::Prompt)
+            .with_tool_requirement("dangerous_tool", PermissionMode::DangerFullAccess);
+        let enforcer = PermissionEnforcer::new(policy);
+
+        assert!(matches!(
+            enforcer.check("dangerous_tool", "{}"),
+            EnforcementResult::Denied { .. }
+        ));
+        assert!(matches!(
+            enforcer.check_with_required_mode(
+                "dangerous_tool",
+                "{}",
+                PermissionMode::DangerFullAccess
+            ),
+            EnforcementResult::Denied { .. }
+        ));
     }
 
     #[test]

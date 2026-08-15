@@ -25,8 +25,9 @@
 use std::collections::{HashMap, HashSet};
 #[cfg(feature = "bot-agents")]
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 #[cfg(feature = "bot-agents")]
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
+use std::sync::{Mutex as StdMutex, OnceLock, Weak};
 #[cfg(feature = "bot-agents")]
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1136,7 +1137,11 @@ pub async fn route_message_in_session(
     .await;
     let event = RouteDecisionEvent::from_decision(&decision, turn_id, created_at);
     let persisted_events = 0;
-    let newly_established = extract_key_info(new_messages);
+    // Route-time extraction has the full AppState and therefore uses both the
+    // semantic model channel and the deterministic fallback.  The compaction
+    // hook later persists the already-established state rather than trying to
+    // infer facts from a summary.
+    let newly_established = extract_key_info_dual_channel(state, tenant_id, new_messages).await;
     let context = prior_context.switch_capability(&decision.target_capability, &newly_established);
     SessionRouteOutcome {
         decision,
@@ -1867,6 +1872,67 @@ async fn llm_extract_key_info(
     }
 }
 
+/// Registry-backed variant used by the gateway's compaction hook.  The hook is
+/// intentionally constructed without `AppState`, but it must still use the
+/// same tenant-scoped model candidates as the PM HTTP path.  A short timeout
+/// keeps compaction bounded; the deterministic extractor remains the explicit
+/// low-confidence fallback when the model is unavailable.
+#[cfg(feature = "pm")]
+async fn llm_extract_key_info_with_registry(
+    registry: &agent_gateway::TenantConfigRegistry,
+    tenant_id: &str,
+    model: &str,
+    messages: &[ConversationMessage],
+) -> Option<Vec<ExtractedKeyInfo>> {
+    if key_info_llm_disabled() {
+        return None;
+    }
+    let transcript = render_transcript_for_llm(messages);
+    if transcript.trim().is_empty() {
+        return None;
+    }
+    let prompt = format!("对话内容：\n{transcript}");
+    let result = tokio::time::timeout(
+        Duration::from_secs(20),
+        crate::routes::pm::run_chat_completion_with_registry(
+            registry,
+            tenant_id,
+            model.to_string(),
+            vec![crate::routes::chat::ChatMessage {
+                role: "user".to_string(),
+                content: Value::String(prompt),
+            }],
+            KEY_INFO_EXTRACTION_SYSTEM_PROMPT,
+            1024,
+        ),
+    )
+    .await;
+    match result {
+        Ok(Ok(response)) => parse_llm_key_info(&response.answer),
+        Ok(Err(error)) => {
+            tracing::warn!(tenant_id, error = %error, "compaction semantic memory extraction failed; using deterministic fallback");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                tenant_id,
+                "compaction semantic memory extraction timed out; using deterministic fallback"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "pm"))]
+async fn llm_extract_key_info_with_registry(
+    _registry: &agent_gateway::TenantConfigRegistry,
+    _tenant_id: &str,
+    _model: &str,
+    _messages: &[ConversationMessage],
+) -> Option<Vec<ExtractedKeyInfo>> {
+    None
+}
+
 #[cfg(not(feature = "pm"))]
 async fn llm_extract_key_info(
     _state: &AppState,
@@ -1934,6 +2000,22 @@ pub async fn extract_key_info_dual_channel(
     }
 }
 
+async fn extract_key_info_dual_channel_for_compaction(
+    registry: Option<&agent_gateway::TenantConfigRegistry>,
+    tenant_id: &str,
+    model: &str,
+    messages: &[ConversationMessage],
+) -> Vec<ExtractedKeyInfo> {
+    let heuristic = extract_key_info(messages);
+    let Some(registry) = registry else {
+        return heuristic;
+    };
+    match llm_extract_key_info_with_registry(registry, tenant_id, model, messages).await {
+        Some(llm) => merge_key_info(heuristic, llm),
+        None => heuristic,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Key information persistence (Requirements 4.1 / 4.3)
 // ---------------------------------------------------------------------------
@@ -1948,6 +2030,15 @@ fn memory_type_for(kind: KeyInfoKind) -> &'static str {
         KeyInfoKind::Decision => "decision",
         KeyInfoKind::Preference => "preference",
         KeyInfoKind::AttachmentDigest => "note",
+    }
+}
+
+fn memory_channel_for(kind: KeyInfoKind) -> &'static str {
+    match kind {
+        KeyInfoKind::Constraint | KeyInfoKind::Decision | KeyInfoKind::AttachmentDigest => {
+            "continuity_state"
+        }
+        KeyInfoKind::Fact | KeyInfoKind::Preference => "long_term_memory",
     }
 }
 
@@ -1988,6 +2079,15 @@ pub async fn persist_key_info(
 ) -> usize {
     let mut persisted = 0usize;
     for item in items {
+        if let Err(error) = memory_engine::validate_memory_text(&item.content) {
+            tracing::warn!(
+                tenant_id,
+                session_id,
+                error = %error,
+                "semantic memory engine rejected a compaction candidate"
+            );
+            continue;
+        }
         let req = MemoryUpsertRequest {
             scope: Some("session".to_string()),
             app: Some(app.to_string()),
@@ -2003,6 +2103,12 @@ pub async fn persist_key_info(
             metadata: Some(json!({
                 "createdFrom": "super_assistant_key_info",
                 "keyInfoKind": item.kind,
+                "semanticChannel": memory_channel_for(item.kind),
+                "sourceEvidence": {
+                    "sourceType": "conversation_turn",
+                    "turnId": item.source_turn_id,
+                    "contentHash": memory_engine::stable_source_hash(&item.content),
+                },
                 "sourceTurnId": item.source_turn_id,
             })),
         };
@@ -2016,6 +2122,35 @@ pub async fn persist_key_info(
         }
     }
     persisted
+}
+
+/// Advance the production consolidation cursor only after the extracted
+/// candidates have been admitted. The cursor is deliberately independent from
+/// the human-facing summary: a failed summary update can be retried without
+/// re-reading or silently rewriting earlier Memory events.
+pub async fn advance_memory_consolidation_cursor(
+    db: &sqlx::SqlitePool,
+    tenant_id: &str,
+    user_id: &str,
+    app: &str,
+    session_id: &str,
+    source_cursor: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO agent_memory_consolidation_cursors
+            (tenant_id, user_id, scope, app, session_key, cursor, revision)
+         VALUES (?, ?, 'session', ?, ?, ?, 1)
+         ON CONFLICT(tenant_id, user_id, scope, app, session_key) DO UPDATE SET
+            cursor = excluded.cursor, revision = revision + 1, updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(app)
+    .bind(session_id)
+    .bind(source_cursor)
+    .execute(db)
+    .await
+    .map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -2214,6 +2349,9 @@ pub struct RuntimeCompactionHook {
     user_id: String,
     session_id: String,
     app: String,
+    config_registry: Option<Arc<agent_gateway::TenantConfigRegistry>>,
+    model: String,
+    execution_kernel: Option<Arc<dyn runtime::AgentExecutionKernel>>,
 }
 
 impl RuntimeCompactionHook {
@@ -2232,12 +2370,36 @@ impl RuntimeCompactionHook {
             user_id: user_id.into(),
             session_id: session_id.into(),
             app: app.into(),
+            config_registry: None,
+            model: String::new(),
+            execution_kernel: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_config_registry(
+        mut self,
+        registry: Arc<agent_gateway::TenantConfigRegistry>,
+        model: impl Into<String>,
+    ) -> Self {
+        self.config_registry = Some(registry);
+        self.model = model.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_execution_kernel(mut self, kernel: Arc<dyn runtime::AgentExecutionKernel>) -> Self {
+        self.execution_kernel = Some(kernel);
+        self
     }
 }
 
 #[async_trait::async_trait]
 impl runtime::CompactionHook for RuntimeCompactionHook {
+    fn execution_kernel(&self) -> Option<Arc<dyn runtime::AgentExecutionKernel>> {
+        self.execution_kernel.clone()
+    }
+
     async fn before_compaction(
         &self,
         archived_messages: &[ConversationMessage],
@@ -2250,7 +2412,13 @@ impl runtime::CompactionHook for RuntimeCompactionHook {
         //    fatal error be surfaced here, the runtime downgrades it to "continue
         //    with the uncompacted context" and records it to the session trace
         //    (Req 1.7) rather than aborting the turn.
-        let extracted = extract_key_info(archived_messages);
+        let extracted = extract_key_info_dual_channel_for_compaction(
+            self.config_registry.as_deref(),
+            &self.tenant_id,
+            &self.model,
+            archived_messages,
+        )
+        .await;
         let _persisted = persist_key_info(
             &self.db,
             &self.tenant_id,
@@ -2260,27 +2428,17 @@ impl runtime::CompactionHook for RuntimeCompactionHook {
             &extracted,
         )
         .await;
-
-        // Keep the compaction boundary in the semantic-kernel store as well as
-        // the runtime session log. The checkpoint contains only protected
-        // summary metadata and source coverage; the exact archived messages
-        // remain in the session archive and can be re-read by their owner.
-        let source_event_sequences = (0..archived_messages.len())
-            .map(|index| u64::try_from(index.saturating_add(1)).unwrap_or(u64::MAX))
-            .collect::<Vec<_>>();
-        let checkpoint = serde_json::json!({
-            "schemaVersion": "compaction-checkpoint-v1",
-            "threadId": self.session_id.as_str(),
-            "archivedMessageCount": archived_messages.len(),
-            "summary": default_summary,
-            "sourceCoverage": source_event_sequences.clone(),
-        });
-        if let Err(error) = crate::semantic_kernel_store::persist_compaction_checkpoint(
+        if let Err(error) = advance_memory_consolidation_cursor(
             &self.db,
             &self.tenant_id,
+            &self.user_id,
+            &self.app,
             &self.session_id,
-            &source_event_sequences,
-            &checkpoint,
+            extracted
+                .iter()
+                .filter_map(|item| item.source_turn_id.as_deref())
+                .max()
+                .unwrap_or("compaction-boundary"),
         )
         .await
         {
@@ -2288,9 +2446,46 @@ impl runtime::CompactionHook for RuntimeCompactionHook {
                 tenant_id = %self.tenant_id,
                 session_id = %self.session_id,
                 error = %error,
-                "semantic compaction checkpoint persistence degraded; runtime archive remains authoritative"
+                "semantic memory consolidation cursor did not advance"
             );
         }
+
+        // Keep the compaction boundary in the semantic-kernel store as well as
+        // the runtime session log. The checkpoint contains only protected
+        // summary metadata and source coverage; the exact archived messages
+        // remain in the session archive and can be re-read by their owner.
+        let source_event_sequences = crate::semantic_kernel_store::ledger_sequences_for_thread(
+            &self.db,
+            &self.tenant_id,
+            &self.session_id,
+        )
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        if source_event_sequences.is_empty() {
+            return Err(runtime::RuntimeError::new(
+                "cannot commit compaction without durable source event coverage",
+            ));
+        }
+        let checkpoint = serde_json::json!({
+            "schemaVersion": "compaction-checkpoint-v1",
+            "threadId": self.session_id.as_str(),
+            "archivedMessageCount": archived_messages.len(),
+            "summary": default_summary,
+            "sourceCoverage": source_event_sequences.clone(),
+        });
+        crate::semantic_kernel_store::persist_compaction_checkpoint(
+            &self.db,
+            &self.tenant_id,
+            &self.session_id,
+            &source_event_sequences,
+            &checkpoint,
+        )
+        .await
+        .map_err(|error| {
+            runtime::RuntimeError::new(format!(
+                "durable compaction checkpoint failed; compaction was not committed: {error}"
+            ))
+        })?;
 
         // 2. Protect pinned items: append their contents verbatim to the summary
         //    so summarization can never drop them (Req 4.9). The runtime commits
@@ -2872,8 +3067,9 @@ pub fn zero_loss_probe_enabled() -> bool {
 ///
 /// Before compaction the orchestration knows the key facts extracted from the
 /// soon-to-be-discarded window (persisted ahead of summarization). Each such
-/// fact becomes a probe: a follow-up [`question`](ZeroLossProbe::question) that
-/// references the fact is replayed through [`build_injection_bundle`] once
+/// fact becomes a probe: a non-leaking follow-up
+/// [`question`](ZeroLossProbe::question) is replayed through
+/// [`build_injection_bundle`] once
 /// compaction has run, and the probe counts as recalled when the fact's
 /// verbatim content resurfaces in the injected context (Req 4.4 — post-
 /// compaction follow-up answers stay consistent with the pre-compaction state).
@@ -2981,15 +3177,23 @@ impl ZeroLossMeasurement {
     }
 }
 
-/// Build the follow-up question replayed for one established fact.
+/// Build a non-leaking follow-up question for one established fact.
 ///
-/// The question references the fact verbatim so the reused hybrid
-/// (semantic + keyword) retrieval in [`build_injection_bundle`] has the terms it
-/// needs to resurface the fact — exactly how a user would follow up on prior
-/// context ("请回顾我们之前确立的：…"). Building the probe from the fact keeps
-/// the collection pure and deterministic.
-fn probe_question_for(fact_content: &str) -> String {
-    format!("请根据我们之前已确立的信息回答：{fact_content}")
+/// The expected answer remains in `fact_content` for scoring, but the question
+/// never repeats it.  Retrieval therefore has to use session continuity and
+/// source provenance rather than being handed the answer as query text.
+fn probe_question_for(item: &ExtractedKeyInfo) -> String {
+    let category = match item.kind {
+        KeyInfoKind::Fact => "关键事实",
+        KeyInfoKind::Constraint => "关键约束",
+        KeyInfoKind::Decision => "已确认决策",
+        KeyInfoKind::Preference => "用户偏好",
+        KeyInfoKind::AttachmentDigest => "附件结论",
+    };
+    format!(
+        "请回顾本会话较早阶段记录的一项{category}并准确复述；证据来源轮次为 {}。不要根据本问题猜测内容。",
+        item.source_turn_id.as_deref().unwrap_or("unknown")
+    )
 }
 
 /// Build Zero_Loss probes from the key facts established before compaction.
@@ -3015,7 +3219,7 @@ pub fn build_zero_loss_probes(established: &[ExtractedKeyInfo]) -> Vec<ZeroLossP
         probes.push(ZeroLossProbe {
             fact_content: content.to_string(),
             pinned: item.pinned,
-            question: probe_question_for(content),
+            question: probe_question_for(item),
         });
     }
     probes
@@ -3276,7 +3480,8 @@ mod zero_loss_probe_measurement_tests {
         assert_eq!(probes.len(), 2);
         assert_eq!(probes[0].fact_content, "the production region is APAC");
         assert!(probes[0].pinned);
-        assert!(probes[0].question.contains("the production region is APAC"));
+        assert!(!probes[0].question.contains("the production region is APAC"));
+        assert!(probes[0].question.contains("关键事实"));
         assert_eq!(probes[1].fact_content, "must not touch prod db");
     }
 
