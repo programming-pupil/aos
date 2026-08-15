@@ -16,6 +16,19 @@ pub enum BudgetDimension {
     ArtifactBytes,
 }
 
+/// Why a reservation exists. Protected purposes are reserved before ordinary
+/// work starts so exploration cannot consume the budget required to verify or
+/// close the turn.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetPurpose {
+    #[default]
+    General,
+    FinalSynthesis,
+    DomainVerifier,
+    UserVisibleError,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct BudgetState {
     pub available: u64,
@@ -27,7 +40,11 @@ pub struct BudgetState {
 pub struct BudgetReservation {
     pub id: String,
     pub owner: String,
+    #[serde(default)]
+    pub purpose: BudgetPurpose,
     pub amounts: BTreeMap<BudgetDimension, u64>,
+    #[serde(default)]
+    pub committed_child_amounts: BTreeMap<BudgetDimension, u64>,
     pub active: bool,
     pub parent_id: Option<String>,
 }
@@ -44,6 +61,8 @@ pub enum BudgetError {
     UnknownReservation(String),
     #[error("committed amount {committed} exceeds reservation {reserved}")]
     CommitExceedsReservation { committed: u64, reserved: u64 },
+    #[error("reservation {0} still has active child reservations")]
+    ActiveChildren(String),
     #[error("budget arithmetic overflow")]
     Overflow,
 }
@@ -86,6 +105,32 @@ impl BudgetLedger {
     where
         I: IntoIterator<Item = (BudgetDimension, u64)>,
     {
+        self.reserve_for(owner, BudgetPurpose::General, amounts)
+    }
+
+    /// Reserves a protected stage before general work starts. Since the amount
+    /// is debited from `available`, later general reservations cannot borrow it.
+    pub fn reserve_protected<I>(
+        &mut self,
+        owner: impl Into<String>,
+        purpose: BudgetPurpose,
+        amounts: I,
+    ) -> Result<BudgetReservation, BudgetError>
+    where
+        I: IntoIterator<Item = (BudgetDimension, u64)>,
+    {
+        self.reserve_for(owner, purpose, amounts)
+    }
+
+    fn reserve_for<I>(
+        &mut self,
+        owner: impl Into<String>,
+        purpose: BudgetPurpose,
+        amounts: I,
+    ) -> Result<BudgetReservation, BudgetError>
+    where
+        I: IntoIterator<Item = (BudgetDimension, u64)>,
+    {
         let amounts: BTreeMap<_, _> = amounts.into_iter().collect();
         for (&dimension, &amount) in &amounts {
             let state = self.state(dimension);
@@ -111,7 +156,9 @@ impl BudgetLedger {
         let reservation = BudgetReservation {
             id: Uuid::new_v4().to_string(),
             owner: owner.into(),
+            purpose,
             amounts,
+            committed_child_amounts: BTreeMap::new(),
             active: true,
             parent_id: None,
         };
@@ -129,22 +176,34 @@ impl BudgetLedger {
         I: IntoIterator<Item = (BudgetDimension, u64)>,
     {
         let amounts: BTreeMap<_, _> = amounts.into_iter().collect();
-        if !parent.active {
+        let stored_parent = self
+            .reservations
+            .get(&parent.id)
+            .ok_or_else(|| BudgetError::UnknownReservation(parent.id.clone()))?;
+        if !stored_parent.active {
             return Err(BudgetError::UnknownReservation(parent.id.clone()));
         }
         for (&dimension, &amount) in &amounts {
-            let reserved = parent.amounts.get(&dimension).copied().unwrap_or(0);
+            let reserved = stored_parent.amounts.get(&dimension).copied().unwrap_or(0);
             let already_child: u64 = self
                 .reservations
                 .values()
                 .filter(|r| r.parent_id.as_deref() == Some(&parent.id) && r.active)
                 .map(|r| r.amounts.get(&dimension).copied().unwrap_or(0))
                 .sum();
-            if amount > reserved.saturating_sub(already_child) {
+            let committed_child = stored_parent
+                .committed_child_amounts
+                .get(&dimension)
+                .copied()
+                .unwrap_or(0);
+            let available = reserved
+                .saturating_sub(already_child)
+                .saturating_sub(committed_child);
+            if amount > available {
                 return Err(BudgetError::Insufficient {
                     dimension,
                     requested: amount,
-                    available: reserved.saturating_sub(already_child),
+                    available,
                 });
             }
         }
@@ -153,7 +212,9 @@ impl BudgetLedger {
         let reservation = BudgetReservation {
             id: Uuid::new_v4().to_string(),
             owner: owner.into(),
+            purpose: stored_parent.purpose,
             amounts,
+            committed_child_amounts: BTreeMap::new(),
             active: true,
             parent_id: Some(parent.id.clone()),
         };
@@ -171,7 +232,8 @@ impl BudgetLedger {
     {
         let stored = self
             .reservations
-            .get_mut(&reservation.id)
+            .get(&reservation.id)
+            .cloned()
             .ok_or_else(|| BudgetError::UnknownReservation(reservation.id.clone()))?;
         if !stored.active {
             return Err(BudgetError::UnknownReservation(reservation.id.clone()));
@@ -186,12 +248,43 @@ impl BudgetLedger {
                 });
             }
         }
-        if stored.parent_id.is_some() {
-            stored.active = false;
+        if let Some(parent_id) = stored.parent_id.as_deref() {
+            let parent = self
+                .reservations
+                .get_mut(parent_id)
+                .ok_or_else(|| BudgetError::UnknownReservation(parent_id.to_string()))?;
+            if !parent.active {
+                return Err(BudgetError::UnknownReservation(parent_id.to_string()));
+            }
+            for (&dimension, &used) in &actual {
+                let committed = parent.committed_child_amounts.entry(dimension).or_default();
+                *committed = committed.checked_add(used).ok_or(BudgetError::Overflow)?;
+            }
+            self.reservations
+                .get_mut(&reservation.id)
+                .expect("reservation was loaded above")
+                .active = false;
             return Ok(());
         }
+        if self
+            .reservations
+            .values()
+            .any(|child| child.parent_id.as_deref() == Some(&reservation.id) && child.active)
+        {
+            return Err(BudgetError::ActiveChildren(reservation.id.clone()));
+        }
         for (&d, &reserved) in &stored.amounts {
-            let used = actual.get(&d).copied().unwrap_or(0);
+            let own_used = actual.get(&d).copied().unwrap_or(0);
+            let child_used = stored.committed_child_amounts.get(&d).copied().unwrap_or(0);
+            let used = own_used
+                .checked_add(child_used)
+                .ok_or(BudgetError::Overflow)?;
+            if used > reserved {
+                return Err(BudgetError::CommitExceedsReservation {
+                    committed: used,
+                    reserved,
+                });
+            }
             let state = self.accounts.entry(d).or_default();
             state.reserved = state.reserved.saturating_sub(reserved);
             state.committed = state
@@ -203,7 +296,10 @@ impl BudgetLedger {
                 .checked_add(reserved - used)
                 .ok_or(BudgetError::Overflow)?;
         }
-        stored.active = false;
+        self.reservations
+            .get_mut(&reservation.id)
+            .expect("reservation was loaded above")
+            .active = false;
         Ok(())
     }
     pub fn release(&mut self, reservation: &BudgetReservation) -> Result<(), BudgetError> {

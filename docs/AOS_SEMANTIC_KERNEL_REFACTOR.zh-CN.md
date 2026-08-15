@@ -328,7 +328,9 @@ proposed -> awaiting_authorization -> authorized -> started -> streaming
 
 AOS 已有 Task/Worker、subtask control 和 durable parent state，不能按“完全没有子 Agent”处理；缺口是不同业务链路尚未统一为可查看、可控制、可重放的 Child Thread。
 
-Child Thread 必须具备：
+Child Thread 协议必须表达以下能力；具体 executor 通过 capability negotiation
+声明可执行子集。被声明为支持的动作必须真实执行，不支持的动作必须形成 durable
+rejection，禁止用“请求已接收”伪装成功：
 
 - 独立上下文、事件账本和 checkpoint；
 - `parent_thread_id`、spawn item 和 lineage；
@@ -1483,8 +1485,8 @@ Trace 必须分成两层：最小、append-only 的事件 spine 记录顺序和�
 | TOOL-001 | durable tool/approval lifecycle | Tools/Gateway | suspend/resume/cancel/idempotency/outcome_unknown 通过故障测试 |
 | TOOL-002 | Tool Capability Router | Tools/Runtime | 默认最小工具集，search 后策略裁决/临时激活/失效，schema Token 与召回达到 §17.6 |
 | ART-001 | Artifact/Spill Plane | Tools/Storage | typed preview、hash/locator/paging、完整恢复、tenant retention/delete 通过 |
-| BUDGET-001 | Resource Budget Ledger | Runtime/Billing | reserve/commit/release、父子守恒、并发无超卖、verifier reserve |
-| CHILD-001 | 统一 Child Thread | Runtime/Gateway | lineage、预算、steer/interrupt、top-down cancel、settlement |
+| BUDGET-001 | Resource Budget Ledger | Runtime/Billing | reserve/commit/release、父子守恒、并发无超卖、final/verifier/error 保护池不可被 general 挪用 |
+| CHILD-001 | 统一 Child Thread | Runtime/Gateway | lineage、预算、top-down cancel、settlement；支持 steer/interrupt/resume 的 executor 必须真实执行，不支持者 durable reject |
 | SEC-001 | Durable capability/approval token | Security/Runtime | 所有 Tool/Child/Executor 强制接线，权限只降不升，sandbox/approval 分层 |
 | SEC-002 | Sensitive Data Projection Contract | Security/Storage | raw/model/client/telemetry 独立裁决，provenance 与全链路删除 |
 | PROMPT-001 | Prompt Manifest 与 model variant | Runtime/Eval | trust/cache/tool-schema/hash/评测 lineage 可追踪 |
@@ -1564,6 +1566,10 @@ AOS 不应以“我也能调用工具、也能写 SQL、也能研究”与 Codex
 
 本节是本次代码交付前的逐项核对，不以“表已创建”或“类型已定义”作为完成依据：只有存在生产调用路径和回归测试才标记为“已接通”。第 17 节中的准确率、召回率、ECE、Brier、延迟和竞品胜率属于需要固定数据集/模型/预算后才能证明的实证门槛，不能由离线单元测试虚报为已达标。
 
+逐 P0 的触发条件、生产符号、测试符号和状态见
+`docs/AOS_SEMANTIC_KERNEL_CONFORMANCE_MATRIX.zh-CN.md`；CI 由
+`eval/datasets/semantic-kernel-conformance.json` 的 traceability gate 防止文档与源码漂移。
+
 | 规格能力 | 当前实现状态 | 代码/测试证据 |
 | --- | --- | --- |
 | Unified Agent Protocol、事件 hash、sequence、幂等、writer fencing | 已接通 | `agent-protocol` 类型与回放测试；SQLite `agent_event_ledger`、`agent_writer_leases`、中段损坏 fail-closed 测试 |
@@ -1571,7 +1577,7 @@ AOS 不应以“我也能调用工具、也能写 SQL、也能研究”与 Codex
 | Context Manifest 与敏感投影 | 已接通 | 每次模型迭代在 provider 前由 `semantic-core::ContextCompiler` 生成四层 `ContextPacket`，记录 block/snapshot/hash/预算/截断；结构化保护、hash、PM prompt manifest 测试 |
 | Tool Capability Router 渐进披露 | 已接通 | 普通 Chat 默认核心工具 + `ToolSearch`；命中候选按 registry/permission 再激活；runtime 工具路由测试 |
 | Artifact/Spill 与精确恢复 | 已接通 | oversized tool output 先持久化完整受保护 payload，再按 text/log/search/table/JSON/binary 类型 reducer 生成 model/client/telemetry 投影；只有显式 `source` projection 可 owner 分页恢复，测试覆盖 UTF-8、行/字节计数、租户隔离和泄漏 |
-| 多维资源预算 | 已接通 | `agent-protocol::BudgetLedger`；SQLite 工具调用、web query、datasource scan 和 artifact bytes 记账，父子守恒由纯内核测试覆盖 |
+| 多维资源预算 | 已接通 | `agent-protocol::BudgetLedger`；SQLite 工具调用、web query、datasource scan 和 artifact bytes 记账；general/final synthesis/domain verifier/user-visible error 阶段隔离，测试证明 general 耗尽后 final 仍能执行并结算 |
 | Child Thread lineage / settlement / top-down cancel | 已接通（能力协商） | Super Assistant specialist subtask 在执行前写 `child_thread_edges` 和统一 Agent Ledger；完成、失败、取消只结算一次；父任务取消向下传播，tenant lineage 回归测试覆盖。native AOS executor 实际支持 `cancel`，并在重启后恢复 pending cancel；`follow_up`/`steer`/`interrupt`/`resume` 会持久化后按 executor capability 明确拒绝，不伪装成已执行 |
 | Durable capability 与权限只降不升 | 已接通 | Tool intent 在 side effect 前持久化一次性 capability token 并消费，resource scope 仅存 hash；child 使用既有 permission snapshot，`CapabilityScope::intersection` 阻止扩权；权限模式比较使用显式语义，回归测试覆盖 `Prompt` 不能因 enum 顺序而自动满足危险权限 |
 | 通用 Web Approval suspend/resolve/resume | 已接通（Server/Gateway/WebUI） | `DurableDeferPrompter` 在生产 Gateway 路径中写入 durable request 后挂起；SSE 发送脱敏 `approval_paused`，恢复要求租户/用户/session/turn/invocation owner scope、一次性决策、过期检查和当前策略重检；SQLite owner/expiry/单次 dispatch 与重启回归测试通过；WebUI 刷新后从持久化审批列表恢复卡片，并用 reload-safe handlers 继续批准或拒绝，`approvalResume.test.ts` 覆盖实时与刷新两条路径 |
@@ -1585,6 +1591,7 @@ AOS 不应以“我也能调用工具、也能写 SQL、也能研究”与 Codex
 | Attribution evidence level / causal guard | 已接通 | 报告输出 `L0_descriptive`/`L1_decomposition`、主因强制 evidence step、服务端加入不可证明因果 caveat，WebUI 展示证据等级 |
 | Provider replay / fault TCK | 已接通（离线） | `eval-harness::replay` canonical request hash、stable script key、`assert_consumed` 和故障帧测试 |
 | No-leak Memory probe | 已接通（机制） | Zero Loss follow-up 不再包含待召回事全文，expected fact 只用于评分；最终效果数值仍必须由固定数据集实测 |
+| 会话删除与 retention 投影 | 已接通 | 即使会话没有 artifact，删除仍撤销 session Memory、relation/citation/summary、archive、Context/Prompt Manifest、checkpoint、snapshot、PM delivery 和 trace；global Memory 与 compliance 记录保留 |
 | 跨竞品质量、准确率、召回率和效果领先 | 待实证 | 必须按第 17 节固定 case、同模型/工具/预算盲评后才可宣布，代码不伪造该结论；本次代码已提供可复现 fixture/指标记录入口 |
 
 本次交付不再把 legacy JSONL、PM stage 表或 NL2SQL 旧 SQL 行当作第二个事实源：它们保留为兼容 projection；新的运行事件、语义 IR、证据等级和最终交付 artifact 是可恢复路径的事实来源。任何 provider/数据库故障都进入结构化降级或 `outcome_unknown`，不得伪造 completed。

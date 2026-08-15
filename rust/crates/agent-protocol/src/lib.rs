@@ -12,7 +12,9 @@ mod ledger;
 mod lifecycle;
 mod protocol;
 
-pub use budget::{BudgetDimension, BudgetError, BudgetLedger, BudgetReservation, BudgetState};
+pub use budget::{
+    BudgetDimension, BudgetError, BudgetLedger, BudgetPurpose, BudgetReservation, BudgetState,
+};
 pub use capabilities::{
     PromptManifest, PromptRegistry, PromptVariant, ToolCandidate, ToolCapabilityRouter,
     ToolDecision,
@@ -109,6 +111,117 @@ mod tests {
                 available: 80,
                 reserved: 0,
                 committed: 20
+            }
+        );
+    }
+
+    #[test]
+    fn protected_final_and_verifier_budget_cannot_be_spent_by_general_work() {
+        let mut ledger = BudgetLedger::new([
+            (BudgetDimension::TokenInput, 100),
+            (BudgetDimension::TokenOutput, 60),
+        ]);
+        let final_budget = ledger
+            .reserve_protected(
+                "turn-final",
+                BudgetPurpose::FinalSynthesis,
+                [
+                    (BudgetDimension::TokenInput, 30),
+                    (BudgetDimension::TokenOutput, 20),
+                ],
+            )
+            .unwrap();
+        let verifier_budget = ledger
+            .reserve_protected(
+                "turn-verifier",
+                BudgetPurpose::DomainVerifier,
+                [
+                    (BudgetDimension::TokenInput, 20),
+                    (BudgetDimension::TokenOutput, 10),
+                ],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            ledger.reserve(
+                "exploration",
+                [
+                    (BudgetDimension::TokenInput, 51),
+                    (BudgetDimension::TokenOutput, 31),
+                ]
+            ),
+            Err(BudgetError::Insufficient { .. })
+        ));
+        let exploration = ledger
+            .reserve(
+                "exploration",
+                [
+                    (BudgetDimension::TokenInput, 50),
+                    (BudgetDimension::TokenOutput, 30),
+                ],
+            )
+            .unwrap();
+        let final_call = ledger
+            .reserve_child(
+                &final_budget,
+                "final-call",
+                [
+                    (BudgetDimension::TokenInput, 25),
+                    (BudgetDimension::TokenOutput, 15),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            ledger.release(&final_budget),
+            Err(BudgetError::ActiveChildren(_))
+        ));
+
+        ledger
+            .commit(
+                &final_call,
+                [
+                    (BudgetDimension::TokenInput, 18),
+                    (BudgetDimension::TokenOutput, 9),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            ledger.reserve_child(
+                &final_budget,
+                "oversized-second-final-call",
+                [
+                    (BudgetDimension::TokenInput, 13),
+                    (BudgetDimension::TokenOutput, 12),
+                ],
+            ),
+            Err(BudgetError::Insufficient { .. })
+        ));
+        ledger.release(&final_budget).unwrap();
+        ledger.release(&verifier_budget).unwrap();
+        ledger
+            .commit(
+                &exploration,
+                [
+                    (BudgetDimension::TokenInput, 40),
+                    (BudgetDimension::TokenOutput, 20),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            ledger.state(BudgetDimension::TokenInput),
+            BudgetState {
+                available: 42,
+                reserved: 0,
+                committed: 58,
+            }
+        );
+        assert_eq!(
+            ledger.state(BudgetDimension::TokenOutput),
+            BudgetState {
+                available: 31,
+                reserved: 0,
+                committed: 29,
             }
         );
     }

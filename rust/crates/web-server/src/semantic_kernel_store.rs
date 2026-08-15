@@ -1072,6 +1072,7 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             "schemaVersion":"context-manifest-v2",
             "turnId":input.turn_id,
             "iteration":input.iteration,
+            "budgetStage":input.budget_stage.as_str(),
             "systemSections":sections,
             "systemPromptHash":system_prompt_hash,
             "messages":messages,
@@ -1081,11 +1082,15 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             "contextPacket":context_packet,
             "contextPacketHash":context_packet_hash,
         });
-        let output_reserve = std::env::var("AOS_MODEL_OUTPUT_RESERVE_TOKENS")
+        let configured_output_reserve = std::env::var("AOS_MODEL_OUTPUT_RESERVE_TOKENS")
             .ok()
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(16_384)
             .clamp(256, 131_072);
+        let output_reserve =
+            model_output_reserve_for_stage(input.budget_stage, configured_output_reserve);
+        ensure_protected_model_budgets(&mut tx, &self.tenant_id, &self.session_id, &input.turn_id)
+            .await?;
         for (dimension, amount, initial) in [
             (
                 "token_input",
@@ -1116,18 +1121,53 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
-            let updated = sqlx::query::<Sqlite>("UPDATE resource_budget_accounts SET available = available - ?, reserved = reserved + ? WHERE tenant_id = ? AND owner_scope = ? AND dimension = ? AND available >= ?")
-                .bind(amount).bind(amount).bind(&self.tenant_id).bind(&self.session_id).bind(dimension).bind(amount)
+            let parent_reservation_id = if input.budget_stage.is_protected() {
+                let parent_reservation_id =
+                    protected_model_reservation_id(&input.turn_id, input.budget_stage);
+                let updated = sqlx::query::<Sqlite>(
+                    "UPDATE resource_budget_entries
+                     SET amount = amount - ?
+                     WHERE tenant_id = ? AND owner_scope = ? AND reservation_id = ?
+                       AND dimension = ? AND state = 'protected' AND amount >= ?",
+                )
+                .bind(amount)
+                .bind(&self.tenant_id)
+                .bind(&self.session_id)
+                .bind(&parent_reservation_id)
+                .bind(dimension)
+                .bind(amount)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
-            if updated.rows_affected() != 1 {
-                return Err(runtime::RuntimeError::new(format!(
-                    "{dimension} model budget exhausted before provider execution"
-                )));
-            }
-            sqlx::query::<Sqlite>("INSERT INTO resource_budget_entries (id, tenant_id, owner_scope, reservation_id, dimension, amount, state, created_at) VALUES (?, ?, ?, ?, ?, ?, 'reserved', CURRENT_TIMESTAMP)")
-                .bind(Uuid::new_v4().to_string()).bind(&self.tenant_id).bind(&self.session_id).bind(&model_reservation_id).bind(dimension).bind(amount)
+                if updated.rows_affected() != 1 {
+                    return Err(runtime::RuntimeError::new(format!(
+                        "budget_exhausted dimension={dimension} reservation={parent_reservation_id} stage={} suggestion=reduce_context_or_retry",
+                        input.budget_stage.as_str()
+                    )));
+                }
+                Some(parent_reservation_id)
+            } else {
+                let updated = sqlx::query::<Sqlite>("UPDATE resource_budget_accounts SET available = available - ?, reserved = reserved + ? WHERE tenant_id = ? AND owner_scope = ? AND dimension = ? AND available >= ?")
+                    .bind(amount).bind(amount).bind(&self.tenant_id).bind(&self.session_id).bind(dimension).bind(amount)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+                if updated.rows_affected() != 1 {
+                    return Err(runtime::RuntimeError::new(format!(
+                        "budget_exhausted dimension={dimension} reservation={model_reservation_id} stage=general suggestion=use_protected_final_or_reduce_context"
+                    )));
+                }
+                None
+            };
+            sqlx::query::<Sqlite>("INSERT INTO resource_budget_entries (id, tenant_id, owner_scope, reservation_id, dimension, amount, state, purpose, parent_reservation_id, committed_amount, created_at) VALUES (?, ?, ?, ?, ?, ?, 'reserved', ?, ?, 0, CURRENT_TIMESTAMP)")
+                .bind(Uuid::new_v4().to_string())
+                .bind(&self.tenant_id)
+                .bind(&self.session_id)
+                .bind(&model_reservation_id)
+                .bind(dimension)
+                .bind(amount)
+                .bind(input.budget_stage.as_str())
+                .bind(parent_reservation_id)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
@@ -1686,8 +1726,10 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         if !matches!(status, runtime::RuntimeTurnTerminalStatus::Suspended) {
             let reservation_prefix = format!("model:{turn_id}:%");
             let rows = sqlx::query::<Sqlite>(
-                "SELECT dimension, amount FROM resource_budget_entries
-                 WHERE tenant_id = ? AND owner_scope = ? AND reservation_id LIKE ? AND state = 'reserved'",
+                "SELECT dimension, amount, parent_reservation_id
+                 FROM resource_budget_entries
+                 WHERE tenant_id = ? AND owner_scope = ? AND reservation_id LIKE ?
+                   AND state = 'reserved'",
             )
             .bind(&self.tenant_id)
             .bind(&self.session_id)
@@ -1712,12 +1754,77 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                 let amount = row
                     .try_get::<i64, _>(1)
                     .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+                let parent_reservation_id = row
+                    .try_get::<Option<String>, _>(2)
+                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+                if let Some(parent_reservation_id) = parent_reservation_id {
+                    let restored = sqlx::query::<Sqlite>(
+                        "UPDATE resource_budget_entries SET amount = amount + ?
+                         WHERE tenant_id = ? AND owner_scope = ? AND reservation_id = ?
+                           AND dimension = ? AND state = 'protected'",
+                    )
+                    .bind(amount)
+                    .bind(&self.tenant_id)
+                    .bind(&self.session_id)
+                    .bind(parent_reservation_id)
+                    .bind(&dimension)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+                    if restored.rows_affected() != 1 {
+                        return Err(runtime::RuntimeError::new(
+                            "protected model budget parent missing during turn settlement",
+                        ));
+                    }
+                } else {
+                    sqlx::query::<Sqlite>(
+                        "UPDATE resource_budget_accounts
+                         SET reserved = MAX(reserved - ?, 0), available = available + ?
+                         WHERE tenant_id = ? AND owner_scope = ? AND dimension = ?",
+                    )
+                    .bind(amount)
+                    .bind(amount)
+                    .bind(&self.tenant_id)
+                    .bind(&self.session_id)
+                    .bind(&dimension)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+                }
+            }
+            let protected_prefix = format!("model-protected:{turn_id}:%");
+            let protected_rows = sqlx::query::<Sqlite>(
+                "SELECT dimension, amount, committed_amount
+                 FROM resource_budget_entries
+                 WHERE tenant_id = ? AND owner_scope = ? AND reservation_id LIKE ?
+                   AND state = 'protected'",
+            )
+            .bind(&self.tenant_id)
+            .bind(&self.session_id)
+            .bind(&protected_prefix)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            for row in protected_rows {
+                let dimension = row
+                    .try_get::<String, _>(0)
+                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+                let available = row
+                    .try_get::<i64, _>(1)
+                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+                let committed = row
+                    .try_get::<i64, _>(2)
+                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
                 sqlx::query::<Sqlite>(
-                    "UPDATE resource_budget_accounts SET reserved = MAX(reserved - ?, 0), available = available + ?
+                    "UPDATE resource_budget_accounts
+                     SET reserved = MAX(reserved - ?, 0),
+                         available = available + ?,
+                         committed = committed + ?
                      WHERE tenant_id = ? AND owner_scope = ? AND dimension = ?",
                 )
-                .bind(amount)
-                .bind(amount)
+                .bind(available.saturating_add(committed))
+                .bind(available)
+                .bind(committed)
                 .bind(&self.tenant_id)
                 .bind(&self.session_id)
                 .bind(&dimension)
@@ -1725,6 +1832,18 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                 .await
                 .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
             }
+            sqlx::query::<Sqlite>(
+                "UPDATE resource_budget_entries
+                 SET state = CASE WHEN committed_amount > 0 THEN 'committed' ELSE 'released' END
+                 WHERE tenant_id = ? AND owner_scope = ? AND reservation_id LIKE ?
+                   AND state = 'protected'",
+            )
+            .bind(&self.tenant_id)
+            .bind(&self.session_id)
+            .bind(&protected_prefix)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
         }
         sqlx::query::<Sqlite>("UPDATE agent_turns SET status = ?, ended_at = CASE WHEN ? <> 'suspended' THEN CURRENT_TIMESTAMP ELSE ended_at END, terminal_outcome = CASE WHEN ? <> 'suspended' THEN ? ELSE terminal_outcome END WHERE tenant_id = ? AND id = ?")
             .bind(status_text).bind(status_text).bind(status_text).bind(status_text).bind(&self.tenant_id).bind(turn_id).execute(&mut *tx).await.map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
@@ -1746,6 +1865,129 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
 
 fn sha256_bytes(value: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(value))
+}
+
+fn protected_model_reservation_id(
+    turn_id: &str,
+    stage: runtime::RuntimeModelBudgetStage,
+) -> String {
+    format!("model-protected:{turn_id}:{}", stage.as_str())
+}
+
+fn protected_model_budget_amounts(
+    stage: runtime::RuntimeModelBudgetStage,
+) -> [(&'static str, i64, i64); 2] {
+    match stage {
+        runtime::RuntimeModelBudgetStage::General => {
+            [("token_input", 0, 2_000_000), ("token_output", 0, 512_000)]
+        }
+        runtime::RuntimeModelBudgetStage::FinalSynthesis => [
+            ("token_input", 262_144, 2_000_000),
+            ("token_output", 32_768, 512_000),
+        ],
+        runtime::RuntimeModelBudgetStage::DomainVerifier => [
+            ("token_input", 131_072, 2_000_000),
+            ("token_output", 16_384, 512_000),
+        ],
+        runtime::RuntimeModelBudgetStage::UserVisibleError => [
+            ("token_input", 16_384, 2_000_000),
+            ("token_output", 4_096, 512_000),
+        ],
+    }
+}
+
+fn model_output_reserve_for_stage(stage: runtime::RuntimeModelBudgetStage, configured: i64) -> i64 {
+    if !stage.is_protected() {
+        return configured;
+    }
+    let protected_output = protected_model_budget_amounts(stage)
+        .into_iter()
+        .find_map(|(dimension, amount, _)| (dimension == "token_output").then_some(amount))
+        .unwrap_or(configured);
+    configured.min(protected_output)
+}
+
+async fn ensure_protected_model_budgets(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    tenant_id: &str,
+    owner_scope: &str,
+    turn_id: &str,
+) -> Result<(), runtime::RuntimeError> {
+    for stage in [
+        runtime::RuntimeModelBudgetStage::FinalSynthesis,
+        runtime::RuntimeModelBudgetStage::DomainVerifier,
+        runtime::RuntimeModelBudgetStage::UserVisibleError,
+    ] {
+        let reservation_id = protected_model_reservation_id(turn_id, stage);
+        for (dimension, amount, initial) in protected_model_budget_amounts(stage) {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM resource_budget_entries
+                 WHERE tenant_id = ? AND owner_scope = ? AND reservation_id = ?
+                   AND dimension = ?",
+            )
+            .bind(tenant_id)
+            .bind(owner_scope)
+            .bind(&reservation_id)
+            .bind(dimension)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            if exists > 0 {
+                continue;
+            }
+            sqlx::query::<Sqlite>(
+                "INSERT INTO resource_budget_accounts
+                    (tenant_id, owner_scope, dimension, available, reserved, committed)
+                 VALUES (?, ?, ?, ?, 0, 0)
+                 ON CONFLICT(tenant_id, owner_scope, dimension) DO NOTHING",
+            )
+            .bind(tenant_id)
+            .bind(owner_scope)
+            .bind(dimension)
+            .bind(initial)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            let updated = sqlx::query::<Sqlite>(
+                "UPDATE resource_budget_accounts
+                 SET available = available - ?, reserved = reserved + ?
+                 WHERE tenant_id = ? AND owner_scope = ? AND dimension = ?
+                   AND available >= ?",
+            )
+            .bind(amount)
+            .bind(amount)
+            .bind(tenant_id)
+            .bind(owner_scope)
+            .bind(dimension)
+            .bind(amount)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            if updated.rows_affected() != 1 {
+                return Err(runtime::RuntimeError::new(format!(
+                    "budget_exhausted dimension={dimension} reservation={reservation_id} stage={} suggestion=reduce_turn_concurrency_or_budget",
+                    stage.as_str()
+                )));
+            }
+            sqlx::query::<Sqlite>(
+                "INSERT INTO resource_budget_entries
+                    (id, tenant_id, owner_scope, reservation_id, dimension, amount,
+                     state, purpose, parent_reservation_id, committed_amount, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, 'protected', ?, NULL, 0, CURRENT_TIMESTAMP)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(tenant_id)
+            .bind(owner_scope)
+            .bind(&reservation_id)
+            .bind(dimension)
+            .bind(amount)
+            .bind(stage.as_str())
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        }
+    }
+    Ok(())
 }
 
 fn tool_budget_dimensions(tool_name: &str) -> Vec<(&'static str, i64)> {
@@ -1918,7 +2160,7 @@ async fn settle_model_budget(
         .await
         .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
     let rows = sqlx::query::<Sqlite>(
-        "SELECT dimension, amount FROM resource_budget_entries
+        "SELECT dimension, amount, parent_reservation_id FROM resource_budget_entries
          WHERE tenant_id = ? AND owner_scope = ? AND reservation_id = ? AND state = 'reserved'",
     )
     .bind(tenant_id)
@@ -1942,6 +2184,9 @@ async fn settle_model_budget(
         let reserved = row
             .try_get::<i64, _>(1)
             .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let parent_reservation_id = row
+            .try_get::<Option<String>, _>(2)
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
         let actual = match dimension.as_str() {
             "token_input" => usage
                 .map(|value| i64::from(value.input_tokens))
@@ -1955,9 +2200,10 @@ async fn settle_model_budget(
         }
         .clamp(0, reserved);
         sqlx::query::<Sqlite>(
-            "UPDATE resource_budget_entries SET state = 'committed'
+            "UPDATE resource_budget_entries SET state = 'committed', committed_amount = ?
              WHERE tenant_id = ? AND owner_scope = ? AND reservation_id = ? AND dimension = ? AND state = 'reserved'",
         )
+        .bind(actual)
         .bind(tenant_id)
         .bind(owner_scope)
         .bind(&reservation_id)
@@ -1965,20 +2211,43 @@ async fn settle_model_budget(
         .execute(&mut *tx)
         .await
         .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
-        sqlx::query::<Sqlite>(
-            "UPDATE resource_budget_accounts
-             SET reserved = MAX(reserved - ?, 0), committed = committed + ?, available = available + ?
-             WHERE tenant_id = ? AND owner_scope = ? AND dimension = ?",
-        )
-        .bind(reserved)
-        .bind(actual)
-        .bind(reserved - actual)
-        .bind(tenant_id)
-        .bind(owner_scope)
-        .bind(&dimension)
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        if let Some(parent_reservation_id) = parent_reservation_id {
+            let settled = sqlx::query::<Sqlite>(
+                "UPDATE resource_budget_entries
+                 SET amount = amount + ?, committed_amount = committed_amount + ?
+                 WHERE tenant_id = ? AND owner_scope = ? AND reservation_id = ?
+                   AND dimension = ? AND state = 'protected'",
+            )
+            .bind(reserved - actual)
+            .bind(actual)
+            .bind(tenant_id)
+            .bind(owner_scope)
+            .bind(parent_reservation_id)
+            .bind(&dimension)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            if settled.rows_affected() != 1 {
+                return Err(runtime::RuntimeError::new(
+                    "protected model budget parent missing during provider settlement",
+                ));
+            }
+        } else {
+            sqlx::query::<Sqlite>(
+                "UPDATE resource_budget_accounts
+                 SET reserved = MAX(reserved - ?, 0), committed = committed + ?, available = available + ?
+                 WHERE tenant_id = ? AND owner_scope = ? AND dimension = ?",
+            )
+            .bind(reserved)
+            .bind(actual)
+            .bind(reserved - actual)
+            .bind(tenant_id)
+            .bind(owner_scope)
+            .bind(&dimension)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        }
     }
     tx.commit()
         .await
@@ -2213,10 +2482,6 @@ pub(crate) async fn delete_session_artifacts(
     .bind(owner_scope)
     .fetch_all(&mut *tx)
     .await?;
-    if artifact_ids.is_empty() {
-        tx.commit().await?;
-        return Ok(0);
-    }
     for chunk in artifact_ids.chunks(100) {
         let mut query = sqlx::QueryBuilder::<Sqlite>::new(
             "DELETE FROM artifact_projections WHERE artifact_id IN (",
@@ -2255,6 +2520,125 @@ pub(crate) async fn delete_session_artifacts(
                AND a.deleted_at IS NOT NULL
                AND evidence_ledger.source_locator = 'artifact://' || a.id
            )",
+    )
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .execute(&mut *tx)
+    .await?;
+
+    // A session deletion must revoke every user-visible semantic projection,
+    // not only the generated artifact payload.  These rows are all scoped by
+    // the runtime session id and are deliberately removed in the same
+    // transaction so a failed cleanup cannot leave a searchable memory,
+    // compaction archive, trace, or final-delivery copy behind.
+    sqlx::query::<Sqlite>(
+        "DELETE FROM agent_memory_relations
+         WHERE tenant_id = ? AND (from_memory_id IN (
+             SELECT id FROM agent_memory_items
+             WHERE tenant_id = ? AND session_id = ?
+         ) OR to_memory_id IN (
+             SELECT id FROM agent_memory_items
+             WHERE tenant_id = ? AND session_id = ?
+         ))",
+    )
+    .bind(tenant_id)
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query::<Sqlite>(
+        "DELETE FROM agent_memory_citations
+         WHERE tenant_id = ? AND session_id = ?",
+    )
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query::<Sqlite>(
+        "DELETE FROM agent_memory_items
+         WHERE tenant_id = ? AND session_id = ?",
+    )
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query::<Sqlite>(
+        "DELETE FROM agent_memory_summaries
+         WHERE tenant_id = ? AND session_id = ?",
+    )
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query::<Sqlite>(
+        "DELETE FROM agent_thread_memory_state
+         WHERE tenant_id = ? AND session_id = ?",
+    )
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query::<Sqlite>(
+        "DELETE FROM agent_context_archives
+         WHERE tenant_id = ? AND session_id = ?",
+    )
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query::<Sqlite>(
+        "DELETE FROM agent_trace_events
+         WHERE tenant_id = ? AND runtime_session_id = ?",
+    )
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query::<Sqlite>(
+        "DELETE FROM context_packet_manifests
+         WHERE tenant_id = ? AND thread_id = ?",
+    )
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query::<Sqlite>(
+        "DELETE FROM compaction_checkpoints
+         WHERE tenant_id = ? AND thread_id = ?",
+    )
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query::<Sqlite>(
+        "DELETE FROM semantic_snapshots
+         WHERE tenant_id = ? AND scope = ?",
+    )
+    .bind(tenant_id)
+    .bind(format!("session:{owner_scope}"))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query::<Sqlite>(
+        "DELETE FROM prompt_manifests
+         WHERE tenant_id = ? AND thread_id = ?",
+    )
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query::<Sqlite>(
+        "DELETE FROM pm_research_task_stage_state
+         WHERE tenant_id = ? AND session_id = ?",
+    )
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query::<Sqlite>(
+        "DELETE FROM pm_final_delivery_artifacts
+         WHERE tenant_id = ? AND session_id = ?",
     )
     .bind(tenant_id)
     .bind(owner_scope)
@@ -4622,6 +5006,190 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_cleanup_revokes_memory_archives_manifests_traces_and_pm_delivery_without_artifacts(
+    ) {
+        let db = db().await;
+        sqlx::query(
+            "INSERT INTO agent_memory_items
+               (id, tenant_id, user_id, scope, app, session_id, session_key,
+                memory_type, content, content_hash, source_type)
+             VALUES ('memory-session', 'tenant', 'user', 'session', 'chat',
+                     'session-delete', 'session-delete', 'fact', 'secret fact',
+                     'memory-hash', 'automatic'),
+                    ('memory-global', 'tenant', 'user', 'global', 'chat', NULL,
+                     '', 'fact', 'global fact', 'global-hash', 'manual')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_memory_relations
+               (id, tenant_id, user_id, from_memory_id, to_memory_id, relation,
+                reason, source_cursor)
+             VALUES ('relation-session', 'tenant', 'user', 'memory-session',
+                     'memory-global', 'conflicts_with', 'fixture', 'cursor')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_memory_citations
+               (id, tenant_id, user_id, session_id, memory_id, path)
+             VALUES ('citation-session', 'tenant', 'user', 'session-delete',
+                     'memory-session', 'memory://memory-session')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_memory_summaries
+               (id, tenant_id, user_id, scope, app, session_id, session_key,
+                summary, source_type)
+             VALUES ('summary-session', 'tenant', 'user', 'session', 'chat',
+                     'session-delete', 'session-delete', 'summary', 'session_summary')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_thread_memory_state
+               (tenant_id, user_id, session_id)
+             VALUES ('tenant', 'user', 'session-delete')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_context_archives
+               (id, tenant_id, user_id, session_id, window_id, role, content,
+                content_hash, char_count)
+             VALUES ('archive-session', 'tenant', 'user', 'session-delete',
+                     'window', 'user', 'archived secret', 'archive-hash', 15)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO context_packet_manifests
+               (id, tenant_id, thread_id, manifest_hash, manifest_json, created_at)
+             VALUES ('context-session', 'tenant', 'session-delete', 'context-hash',
+                     '{}', CURRENT_TIMESTAMP)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO compaction_checkpoints
+               (id, tenant_id, thread_id, source_event_seqs_json, checkpoint_json,
+                source_hash, extractor_version, prompt_version, durable, created_at)
+             VALUES ('checkpoint-session', 'tenant', 'session-delete', '[]', '{}',
+                     'checkpoint-hash', 'test', 'test', 1, CURRENT_TIMESTAMP)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO semantic_snapshots
+               (id, tenant_id, scope, version, snapshot_hash, snapshot_json, created_at)
+             VALUES ('snapshot-session', 'tenant', 'session:session-delete', 1,
+                     'snapshot-hash', '{}', CURRENT_TIMESTAMP)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO prompt_manifests
+               (id, tenant_id, thread_id, run_id, prompt_id, version, variant,
+                model, stable_prefix_hash, task_packet_hash, tool_schema_hash,
+                context_manifest_id, input_budget, output_budget,
+                trust_policy_version, eval_suite)
+             VALUES ('prompt-session', 'tenant', 'session-delete', 'run', 'chat',
+                     '1', 'default', 'model', 'stable', 'task', 'tools',
+                     'context-session', 100, 100, 'trust-v1', 'suite')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO pm_research_task_stage_state
+               (task_id, tenant_id, user_id, session_id, stage, status)
+             VALUES ('pm-task', 'tenant', 'user', 'session-delete', 'research', 'completed')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO pm_final_delivery_artifacts
+               (task_id, tenant_id, user_id, session_id, task_status, quality_status,
+                response_json, stages_json, content_hash)
+             VALUES ('pm-task', 'tenant', 'user', 'session-delete', 'completed',
+                     'passed', '{}', '[]', 'delivery-hash')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_tasks
+               (id, tenant_id, capability_key, title, owner_user_id, origin_session_id)
+             VALUES ('trace-task', 'tenant', 'ai_chat', 'trace fixture', 'user',
+                     'session-delete')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_trace_events
+               (id, tenant_id, task_id, event_type, message, runtime_session_id)
+             VALUES ('trace-session', 'tenant', 'trace-task', 'provider',
+                     'redacted trace', 'session-delete')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            delete_session_artifacts(&db, "tenant", "session-delete")
+                .await
+                .unwrap(),
+            0,
+            "semantic cleanup must run even when the session has no artifacts"
+        );
+
+        for (table, predicate) in [
+            ("agent_memory_items", "id = 'memory-session'"),
+            ("agent_memory_relations", "id = 'relation-session'"),
+            ("agent_memory_citations", "id = 'citation-session'"),
+            ("agent_memory_summaries", "id = 'summary-session'"),
+            (
+                "agent_thread_memory_state",
+                "tenant_id = 'tenant' AND session_id = 'session-delete'",
+            ),
+            ("agent_context_archives", "id = 'archive-session'"),
+            ("context_packet_manifests", "id = 'context-session'"),
+            ("compaction_checkpoints", "id = 'checkpoint-session'"),
+            ("semantic_snapshots", "id = 'snapshot-session'"),
+            ("prompt_manifests", "id = 'prompt-session'"),
+            ("pm_research_task_stage_state", "task_id = 'pm-task'"),
+            ("pm_final_delivery_artifacts", "task_id = 'pm-task'"),
+            ("agent_trace_events", "id = 'trace-session'"),
+        ] {
+            let count: i64 =
+                sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE {predicate}"))
+                    .fetch_one(&db)
+                    .await
+                    .unwrap();
+            assert_eq!(count, 0, "session projection remained in {table}");
+        }
+        let global_memory_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_memory_items WHERE id = 'memory-global'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(global_memory_count, 1);
+    }
+
+    #[tokio::test]
     async fn runtime_kernel_commits_intent_before_outcome_and_recovers_open_tools() {
         let db = db().await;
         let kernel = RuntimeExecutionKernel::new(db.clone(), "tenant", "user", "session");
@@ -4636,6 +5204,7 @@ mod tests {
             .record_context_manifest(runtime::RuntimeContextManifestInput {
                 turn_id: "turn-1".into(),
                 iteration: 1,
+                budget_stage: runtime::RuntimeModelBudgetStage::General,
                 system_sections: vec!["system token=hidden".into()],
                 messages: vec![
                     runtime::ConversationMessage::assistant(vec![runtime::ContentBlock::Text {
@@ -4840,13 +5409,23 @@ mod tests {
     #[tokio::test]
     async fn concurrent_model_reservations_never_oversell_the_sqlite_budget() {
         let (db, path) = crate::test_sqlite_file_pool().await;
+        let protected_input = [
+            runtime::RuntimeModelBudgetStage::FinalSynthesis,
+            runtime::RuntimeModelBudgetStage::DomainVerifier,
+            runtime::RuntimeModelBudgetStage::UserVisibleError,
+        ]
+        .into_iter()
+        .map(|stage| protected_model_budget_amounts(stage)[0].1)
+        .sum::<i64>();
+        let initial_input = 1_500_000 + protected_input;
         sqlx::query(
             "INSERT INTO resource_budget_accounts
                 (tenant_id, owner_scope, dimension, available, reserved, committed)
-             VALUES ('tenant', 'session', 'token_input', 1500000, 0, 0)
+             VALUES ('tenant', 'session', 'token_input', ?, 0, 0)
              ON CONFLICT(tenant_id, owner_scope, dimension) DO UPDATE SET
                 available = excluded.available, reserved = 0, committed = 0",
         )
+        .bind(initial_input)
         .execute(&db)
         .await
         .unwrap();
@@ -4858,6 +5437,7 @@ mod tests {
                 .record_context_manifest(runtime::RuntimeContextManifestInput {
                     turn_id: turn_id.to_string(),
                     iteration: 1,
+                    budget_stage: runtime::RuntimeModelBudgetStage::General,
                     system_sections: vec!["system".to_string()],
                     messages: vec![runtime::ConversationMessage::user_text("query")],
                     estimated_tokens: 1_500_000,
@@ -4882,9 +5462,150 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(available, 0);
-        assert_eq!(reserved, 1_500_000);
+        assert_eq!(reserved, initial_input);
         db.close().await;
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn protected_final_budget_survives_general_exhaustion_and_settles() {
+        let db = db().await;
+        let kernel = RuntimeExecutionKernel::new(db.clone(), "tenant", "user", "protected-session");
+        kernel
+            .start_turn(runtime::RuntimeTurnStart {
+                turn_id: "protected-turn".into(),
+                user_input: "research then finish".into(),
+            })
+            .await
+            .unwrap();
+        let manifest = |iteration, stage, estimated_tokens| runtime::RuntimeContextManifestInput {
+            turn_id: "protected-turn".into(),
+            iteration,
+            budget_stage: stage,
+            system_sections: vec!["system".into()],
+            messages: vec![runtime::ConversationMessage::user_text("query")],
+            estimated_tokens,
+            model_version: Some("test-model".into()),
+            active_tools: vec!["ToolSearch".into()],
+            semantic_snapshot_version: None,
+        };
+        let assistant =
+            runtime::ConversationMessage::assistant(vec![runtime::ContentBlock::Text {
+                text: "step".into(),
+            }]);
+
+        kernel
+            .record_context_manifest(manifest(1, runtime::RuntimeModelBudgetStage::General, 1))
+            .await
+            .unwrap();
+        kernel
+            .record_assistant_message("protected-turn", 1, &assistant)
+            .await
+            .unwrap();
+        let general_input_available: i64 = sqlx::query_scalar(
+            "SELECT available FROM resource_budget_accounts
+             WHERE tenant_id = 'tenant' AND owner_scope = 'protected-session'
+               AND dimension = 'token_input'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(general_input_available > 0);
+
+        kernel
+            .record_context_manifest(manifest(
+                2,
+                runtime::RuntimeModelBudgetStage::General,
+                usize::try_from(general_input_available).unwrap(),
+            ))
+            .await
+            .unwrap();
+        kernel
+            .record_assistant_message("protected-turn", 2, &assistant)
+            .await
+            .unwrap();
+        let exhausted = kernel
+            .record_context_manifest(manifest(3, runtime::RuntimeModelBudgetStage::General, 1))
+            .await
+            .unwrap_err();
+        assert!(exhausted.to_string().contains("stage=general"));
+
+        kernel
+            .record_context_manifest(manifest(
+                4,
+                runtime::RuntimeModelBudgetStage::FinalSynthesis,
+                1,
+            ))
+            .await
+            .unwrap();
+        let final_manifest: String = sqlx::query_scalar(
+            "SELECT manifest_json FROM context_packet_manifests
+             WHERE tenant_id = 'tenant' AND thread_id = 'protected-session'
+               AND turn_id = 'protected-turn'
+               AND manifest_json LIKE '%\"budgetStage\":\"final_synthesis\"%'
+             LIMIT 1",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let final_manifest: serde_json::Value = serde_json::from_str(&final_manifest).unwrap();
+        assert_eq!(final_manifest["budgetStage"], "final_synthesis");
+        let protected_parent: (i64, i64) = sqlx::query_as(
+            "SELECT amount, committed_amount FROM resource_budget_entries
+             WHERE tenant_id = 'tenant' AND owner_scope = 'protected-session'
+               AND reservation_id = 'model-protected:protected-turn:final_synthesis'
+               AND dimension = 'token_input' AND state = 'protected'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            protected_parent.0,
+            protected_model_budget_amounts(runtime::RuntimeModelBudgetStage::FinalSynthesis)[0].1
+                - 1
+        );
+        assert_eq!(protected_parent.1, 0);
+
+        kernel
+            .record_assistant_message("protected-turn", 4, &assistant)
+            .await
+            .unwrap();
+        for (iteration, stage) in [
+            (5, runtime::RuntimeModelBudgetStage::DomainVerifier),
+            (6, runtime::RuntimeModelBudgetStage::UserVisibleError),
+        ] {
+            kernel
+                .record_context_manifest(manifest(iteration, stage, 1))
+                .await
+                .unwrap();
+            kernel
+                .record_assistant_message("protected-turn", iteration, &assistant)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            model_output_reserve_for_stage(
+                runtime::RuntimeModelBudgetStage::UserVisibleError,
+                16_384,
+            ),
+            4_096
+        );
+        kernel
+            .finish_turn(
+                "protected-turn",
+                runtime::RuntimeTurnTerminalStatus::Completed,
+                None,
+            )
+            .await
+            .unwrap();
+        let reserved: i64 = sqlx::query_scalar(
+            "SELECT SUM(reserved) FROM resource_budget_accounts
+             WHERE tenant_id = 'tenant' AND owner_scope = 'protected-session'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(reserved, 0);
     }
 
     fn approval_request(turn_id: &str, invocation_id: &str) -> runtime::RuntimeApprovalRequest {

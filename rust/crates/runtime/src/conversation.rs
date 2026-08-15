@@ -12,8 +12,9 @@ use crate::compact::{
 use crate::config::RuntimeFeatureConfig;
 use crate::execution_kernel::{
     AgentExecutionKernel, RuntimeApprovalDecision, RuntimeApprovalRequest,
-    RuntimeApprovalResolution, RuntimeContextManifestInput, RuntimeToolIntent, RuntimeToolOutcome,
-    RuntimeToolOutcomeKind, RuntimeTurnStart, RuntimeTurnTerminalStatus,
+    RuntimeApprovalResolution, RuntimeContextManifestInput, RuntimeModelBudgetStage,
+    RuntimeToolIntent, RuntimeToolOutcome, RuntimeToolOutcomeKind, RuntimeTurnStart,
+    RuntimeTurnTerminalStatus,
 };
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::permissions::{
@@ -104,6 +105,23 @@ pub trait ApiClient: Send + Sync {
         _completed_tool_names: &[String],
     ) -> Option<String> {
         None
+    }
+
+    /// Selects the protected budget class for the request after iteration
+    /// policy has been applied. Generic clients only enter final synthesis
+    /// when they explicitly emitted a close-out instruction; domain adapters
+    /// may override this for verifier or user-visible recovery calls.
+    fn model_budget_stage(
+        &self,
+        _iteration: usize,
+        _completed_tool_names: &[String],
+        iteration_instruction: Option<&str>,
+    ) -> RuntimeModelBudgetStage {
+        if iteration_instruction.is_some() {
+            RuntimeModelBudgetStage::FinalSynthesis
+        } else {
+            RuntimeModelBudgetStage::General
+        }
     }
 
     /// Whether a model-emitted tool call is still available for this iteration.
@@ -1237,6 +1255,11 @@ where
             let iteration_instruction = self
                 .api_client
                 .prepare_model_iteration(accumulator.iterations, &completed_tool_names);
+            let budget_stage = self.api_client.model_budget_stage(
+                accumulator.iterations,
+                &completed_tool_names,
+                iteration_instruction.as_deref(),
+            );
             if let Some(instruction) = iteration_instruction.as_deref() {
                 reporter.on_runtime_status("tool_budget_synthesis", instruction);
             }
@@ -1262,6 +1285,7 @@ where
                     .record_context_manifest(RuntimeContextManifestInput {
                         turn_id: turn_id.to_string(),
                         iteration: accumulator.iterations,
+                        budget_stage,
                         estimated_tokens: request
                             .messages
                             .iter()

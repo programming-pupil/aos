@@ -20,6 +20,7 @@ pub struct RuntimeTurnStart {
 pub struct RuntimeContextManifestInput {
     pub turn_id: String,
     pub iteration: usize,
+    pub budget_stage: RuntimeModelBudgetStage,
     pub system_sections: Vec<String>,
     pub messages: Vec<ConversationMessage>,
     pub estimated_tokens: usize,
@@ -29,6 +30,36 @@ pub struct RuntimeContextManifestInput {
     /// snapshot body stays in the semantic-state store; the manifest carries
     /// the immutable reference so replay can load the exact state.
     pub semantic_snapshot_version: Option<u64>,
+}
+
+/// Budget class for one provider request. General exploration is isolated from
+/// protected close-out stages so tool loops cannot starve verification or the
+/// final user-visible answer.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeModelBudgetStage {
+    #[default]
+    General,
+    FinalSynthesis,
+    DomainVerifier,
+    UserVisibleError,
+}
+
+impl RuntimeModelBudgetStage {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::FinalSynthesis => "final_synthesis",
+            Self::DomainVerifier => "domain_verifier",
+            Self::UserVisibleError => "user_visible_error",
+        }
+    }
+
+    #[must_use]
+    pub fn is_protected(self) -> bool {
+        !matches!(self, Self::General)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

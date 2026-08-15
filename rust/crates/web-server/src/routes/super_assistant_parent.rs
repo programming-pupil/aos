@@ -8957,6 +8957,7 @@ fn completion_repair_options(
     model_stop_reason: Option<&str>,
 ) -> AgentTurnOptions {
     let mut options = base.clone();
+    options.model_budget_stage = runtime::RuntimeModelBudgetStage::FinalSynthesis;
     // Some OpenAI-compatible gateways accept Responses hosted search while
     // silently ignoring function tools. A missing complete_turn after one
     // native attempt is therefore repaired through the regular function-tool

@@ -691,6 +691,7 @@ pub(crate) struct GatewayApiClient {
     scoped_disable_stream_timeout: bool,
     scoped_tools_enabled: Option<bool>,
     scoped_web_tool_result_budget: Option<usize>,
+    scoped_model_budget_stage: runtime::RuntimeModelBudgetStage,
     scoped_prefer_native_web_search: bool,
     scoped_suppress_native_web_search: bool,
     scenario: Option<String>,
@@ -821,6 +822,7 @@ impl GatewayApiClient {
             scoped_disable_stream_timeout: false,
             scoped_tools_enabled: None,
             scoped_web_tool_result_budget: None,
+            scoped_model_budget_stage: runtime::RuntimeModelBudgetStage::General,
             scoped_prefer_native_web_search: false,
             scoped_suppress_native_web_search: false,
             scenario: config.scenario.clone(),
@@ -1961,6 +1963,10 @@ fn record_live_gateway_runtime_context(
             options.disable_tools.to_string(),
         );
         context.metadata.insert(
+            "model_budget_stage".to_string(),
+            options.model_budget_stage.as_str().to_string(),
+        );
+        context.metadata.insert(
             "turn_system_instructions".to_string(),
             serde_json::to_string(&options.system_instructions).unwrap_or_default(),
         );
@@ -3001,6 +3007,24 @@ impl ApiClient for GatewayApiClient {
             .into_iter()
             .map(|definition| definition.name)
             .collect()
+    }
+
+    fn model_budget_stage(
+        &self,
+        _iteration: usize,
+        _completed_tool_names: &[String],
+        iteration_instruction: Option<&str>,
+    ) -> runtime::RuntimeModelBudgetStage {
+        if !matches!(
+            self.scoped_model_budget_stage,
+            runtime::RuntimeModelBudgetStage::General
+        ) {
+            self.scoped_model_budget_stage
+        } else if iteration_instruction.is_some() {
+            runtime::RuntimeModelBudgetStage::FinalSynthesis
+        } else {
+            runtime::RuntimeModelBudgetStage::General
+        }
     }
 
     fn is_tool_call_allowed(&self, tool_name: &str) -> bool {
@@ -9999,6 +10023,7 @@ pub(crate) struct StreamingTurnOptions {
     pub stream_timeout_secs: Option<u64>,
     pub disable_stream_timeout: bool,
     pub web_tool_result_budget: Option<usize>,
+    pub model_budget_stage: runtime::RuntimeModelBudgetStage,
 }
 
 fn rollback_current_runtime_turn(
@@ -10043,6 +10068,12 @@ pub(crate) async fn run_streaming_turn_streaming(
     approval_decisions: Option<Vec<runtime::DeferredApprovalDecision>>,
 ) -> Result<StreamingResumableTurnResult> {
     tracing::debug!("run_streaming_turn_streaming: starting");
+    if deferred_results.is_some() && approval_decisions.is_some() {
+        return Err(GatewayError::RuntimeExecution(
+            "a runtime turn cannot resume with tool results and approval decisions simultaneously"
+                .to_string(),
+        ));
+    }
 
     let mut tool_records = Vec::new();
     let mut tool_index: u32 = 0;
@@ -10063,6 +10094,7 @@ pub(crate) async fn run_streaming_turn_streaming(
         runtime.api_client_mut().scoped_disable_stream_timeout;
     let previous_scoped_web_tool_result_budget =
         runtime.api_client_mut().scoped_web_tool_result_budget;
+    let previous_scoped_model_budget_stage = runtime.api_client_mut().scoped_model_budget_stage;
     let previous_scoped_prefer_native_web_search =
         runtime.api_client_mut().scoped_prefer_native_web_search;
     let previous_scoped_suppress_native_web_search =
@@ -10109,6 +10141,7 @@ pub(crate) async fn run_streaming_turn_streaming(
         ));
         api_client.scoped_disable_stream_timeout = options.disable_stream_timeout;
         api_client.scoped_web_tool_result_budget = options.web_tool_result_budget;
+        api_client.scoped_model_budget_stage = options.model_budget_stage;
         api_client.scoped_prefer_native_web_search = options.prefer_native_web_search;
         api_client.scoped_suppress_native_web_search = options.suppress_native_web_search;
     }
@@ -10119,12 +10152,6 @@ pub(crate) async fn run_streaming_turn_streaming(
         hook_events.clone(),
     ))));
     let reporter = StreamingReporter::new(sender.clone(), runtime_status_events.clone());
-    if deferred_results.is_some() && approval_decisions.is_some() {
-        return Err(GatewayError::RuntimeExecution(
-            "a runtime turn cannot resume with tool results and approval decisions simultaneously"
-                .to_string(),
-        ));
-    }
     let mut prompter = DurableDeferPrompter;
     let rollback_message_len = runtime.message_count();
     let result = if let Some(cancel_rx) = cancel_rx {
@@ -10203,6 +10230,7 @@ pub(crate) async fn run_streaming_turn_streaming(
         api_client.scoped_stream_timeout_secs = previous_scoped_stream_timeout_secs;
         api_client.scoped_disable_stream_timeout = previous_scoped_disable_stream_timeout;
         api_client.scoped_web_tool_result_budget = previous_scoped_web_tool_result_budget;
+        api_client.scoped_model_budget_stage = previous_scoped_model_budget_stage;
         api_client.scoped_prefer_native_web_search = previous_scoped_prefer_native_web_search;
         api_client.scoped_suppress_native_web_search = previous_scoped_suppress_native_web_search;
     }
@@ -10475,6 +10503,7 @@ pub(crate) async fn run_streaming_turn_with_options(
         runtime.api_client_mut().scoped_disable_stream_timeout;
     let previous_scoped_web_tool_result_budget =
         runtime.api_client_mut().scoped_web_tool_result_budget;
+    let previous_scoped_model_budget_stage = runtime.api_client_mut().scoped_model_budget_stage;
     let previous_scoped_prefer_native_web_search =
         runtime.api_client_mut().scoped_prefer_native_web_search;
     let previous_scoped_suppress_native_web_search =
@@ -10521,6 +10550,7 @@ pub(crate) async fn run_streaming_turn_with_options(
         ));
         api_client.scoped_disable_stream_timeout = options.disable_stream_timeout;
         api_client.scoped_web_tool_result_budget = options.web_tool_result_budget;
+        api_client.scoped_model_budget_stage = options.model_budget_stage;
         api_client.scoped_prefer_native_web_search = options.prefer_native_web_search;
         api_client.scoped_suppress_native_web_search = options.suppress_native_web_search;
     }
@@ -10575,6 +10605,7 @@ pub(crate) async fn run_streaming_turn_with_options(
         api_client.scoped_stream_timeout_secs = previous_scoped_stream_timeout_secs;
         api_client.scoped_disable_stream_timeout = previous_scoped_disable_stream_timeout;
         api_client.scoped_web_tool_result_budget = previous_scoped_web_tool_result_budget;
+        api_client.scoped_model_budget_stage = previous_scoped_model_budget_stage;
         api_client.scoped_prefer_native_web_search = previous_scoped_prefer_native_web_search;
         api_client.scoped_suppress_native_web_search = previous_scoped_suppress_native_web_search;
     }
@@ -10962,6 +10993,61 @@ mod tests {
             .filter_tool_specs()
             .iter()
             .any(|definition| definition.name == deferred));
+    }
+
+    #[test]
+    fn explicit_model_budget_stage_overrides_generic_synthesis_detection() {
+        let config = UserRuntimeConfig {
+            db: None,
+            user_id: "user".to_string(),
+            tenant_id: "tenant".to_string(),
+            api_keys: vec![ApiKeyEntry {
+                id: "key".to_string(),
+                key: "sk-test".to_string(),
+                provider: "openai".to_string(),
+                base_url: None,
+                model: Some("gpt-test".to_string()),
+                audio_generate_path: None,
+                audio_query_path: None,
+                priority: 0,
+                is_primary: true,
+                input_price_per_million: None,
+                output_price_per_million: None,
+                capabilities_json: None,
+            }],
+            provider: "openai".to_string(),
+            model: "gpt-test".to_string(),
+            permission_mode: runtime::PermissionMode::ReadOnly,
+            allowed_tools: None,
+            blocked_tools: Vec::new(),
+            mcp_servers: Vec::new(),
+            skills: Vec::new(),
+            hooks: runtime::RuntimeHookConfig::default(),
+            pm_search_providers: Vec::new(),
+            scenario_scoped: true,
+            scenario: Some("chat".to_string()),
+        };
+        let registry = GlobalToolRegistry::builtin();
+        let mut client = GatewayApiClient::new(&config, "session", None, registry).unwrap();
+
+        client.scoped_model_budget_stage = runtime::RuntimeModelBudgetStage::DomainVerifier;
+        assert_eq!(
+            client.model_budget_stage(1, &[], Some("finish")),
+            runtime::RuntimeModelBudgetStage::DomainVerifier
+        );
+        client.scoped_model_budget_stage = runtime::RuntimeModelBudgetStage::General;
+        assert_eq!(
+            client.model_budget_stage(2, &[], Some("finish")),
+            runtime::RuntimeModelBudgetStage::FinalSynthesis
+        );
+        assert_eq!(
+            client.model_budget_stage(3, &["WebSearch".to_string()], None),
+            runtime::RuntimeModelBudgetStage::General
+        );
+        assert_eq!(
+            client.model_budget_stage(4, &[], None),
+            runtime::RuntimeModelBudgetStage::General
+        );
     }
 
     #[test]

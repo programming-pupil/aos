@@ -1098,6 +1098,7 @@ async fn enrich_pm_report_strategy_with_semantic_extraction(
         prefer_native_web_search: false,
         suppress_native_web_search: true,
         stream_timeout_secs: Some(pm_report_semantic_extract_timeout_secs()),
+        model_budget_stage: runtime::RuntimeModelBudgetStage::DomainVerifier,
         ..agent_gateway::AgentTurnOptions::default()
     };
     options.system_instructions.push(

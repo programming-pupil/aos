@@ -95,6 +95,9 @@ pub struct AgentTurnOptions {
     /// Stop exposing Web/search/fetch tools after this many completed Web tool
     /// results, while leaving completion and non-Web tools available.
     pub web_tool_result_budget: Option<usize>,
+    /// Isolates exploration from final synthesis, domain verification and
+    /// user-visible recovery reserves in the durable execution kernel.
+    pub model_budget_stage: runtime::RuntimeModelBudgetStage,
 }
 
 fn context_window_recovery_options(options: &StreamingTurnOptions) -> StreamingTurnOptions {
@@ -108,6 +111,7 @@ fn context_window_recovery_options(options: &StreamingTurnOptions) -> StreamingT
     recovery.disable_stream_timeout = false;
     recovery.stream_timeout_secs = Some(recovery.stream_timeout_secs.unwrap_or(90).min(90));
     recovery.web_tool_result_budget = None;
+    recovery.model_budget_stage = runtime::RuntimeModelBudgetStage::UserVisibleError;
     recovery.system_instructions.push(
         "The previous tool-enabled attempt exceeded the model context window. Do not call tools. Give the user a concise, self-contained final response based on their request and any work already completed in the workspace. Never expose internal provider, context-window, retry, or product-branding errors."
             .to_string(),
@@ -1130,6 +1134,7 @@ impl AgentSessionManager {
             stream_timeout_secs: options.stream_timeout_secs,
             disable_stream_timeout: options.disable_stream_timeout,
             web_tool_result_budget: options.web_tool_result_budget,
+            model_budget_stage: options.model_budget_stage,
         };
         let turn_usage_before = runtime.usage().cumulative_usage();
         let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -1962,6 +1967,7 @@ impl AgentSessionManager {
             stream_timeout_secs: options.stream_timeout_secs,
             disable_stream_timeout: options.disable_stream_timeout,
             web_tool_result_budget: options.web_tool_result_budget,
+            model_budget_stage: options.model_budget_stage,
         };
         let mut result = run_streaming_turn_streaming(
             runtime,
@@ -4668,6 +4674,7 @@ mod tests {
             stream_timeout_secs: Some(450),
             disable_stream_timeout: true,
             web_tool_result_budget: Some(8),
+            model_budget_stage: runtime::RuntimeModelBudgetStage::General,
         };
 
         let recovery = context_window_recovery_options(&original);
@@ -4681,6 +4688,10 @@ mod tests {
         assert_eq!(recovery.stream_timeout_secs, Some(90));
         assert!(!recovery.disable_stream_timeout);
         assert_eq!(recovery.web_tool_result_budget, None);
+        assert_eq!(
+            recovery.model_budget_stage,
+            runtime::RuntimeModelBudgetStage::UserVisibleError
+        );
         assert_eq!(recovery.system_instructions.len(), 2);
     }
 

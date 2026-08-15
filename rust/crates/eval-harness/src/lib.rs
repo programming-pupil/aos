@@ -24,6 +24,7 @@
 //!
 //! Design reference: `.kiro/specs/codex-parity-gaps/design.md` 第 2 节。
 
+pub mod conformance;
 pub mod dataset;
 pub mod parity;
 pub mod positioning;

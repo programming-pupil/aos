@@ -169,11 +169,14 @@ fn pm_llm_final_editor_timeout_for_attempt(
     fair_share.clamp(45, configured)
 }
 
-fn pm_llm_model_only_options() -> agent_gateway::AgentTurnOptions {
+fn pm_llm_model_only_options(
+    model_budget_stage: runtime::RuntimeModelBudgetStage,
+) -> agent_gateway::AgentTurnOptions {
     agent_gateway::AgentTurnOptions {
         disable_tools: true,
         disable_provider_thinking: true,
         reasoning_budget: agent_gateway::InternalReasoningBudget::Fast,
+        model_budget_stage,
         prefer_native_web_search: false,
         suppress_native_web_search: true,
         ..Default::default()
@@ -653,7 +656,7 @@ pub(super) async fn run_pm_llm_expert_review(
         wrap_pm_research_prompt("pm", prompt),
         timeout_secs,
         "pm llm expert review turn",
-        pm_llm_model_only_options(),
+        pm_llm_model_only_options(runtime::RuntimeModelBudgetStage::DomainVerifier),
     )
     .await;
     match result {
@@ -883,7 +886,7 @@ pub(super) async fn run_pm_llm_final_editor_if_needed(
             wrap_pm_research_prompt("pm", prompt),
             timeout_secs,
             "pm llm final editor turn",
-            pm_llm_model_only_options(),
+            pm_llm_model_only_options(runtime::RuntimeModelBudgetStage::FinalSynthesis),
         )
         .await;
 
@@ -1114,16 +1117,28 @@ mod tests {
     }
 
     #[test]
-    fn review_and_final_editor_are_fast_model_only_turns() {
-        let options = pm_llm_model_only_options();
-        assert!(options.disable_tools);
-        assert!(options.disable_provider_thinking);
+    fn review_and_final_editor_are_fast_model_only_turns_with_separate_budgets() {
+        let review = pm_llm_model_only_options(runtime::RuntimeModelBudgetStage::DomainVerifier);
+        let final_editor =
+            pm_llm_model_only_options(runtime::RuntimeModelBudgetStage::FinalSynthesis);
+        for options in [&review, &final_editor] {
+            assert!(options.disable_tools);
+            assert!(options.disable_provider_thinking);
+            assert_eq!(
+                options.reasoning_budget,
+                agent_gateway::InternalReasoningBudget::Fast
+            );
+            assert!(options.suppress_native_web_search);
+            assert!(!options.prefer_native_web_search);
+        }
         assert_eq!(
-            options.reasoning_budget,
-            agent_gateway::InternalReasoningBudget::Fast
+            review.model_budget_stage,
+            runtime::RuntimeModelBudgetStage::DomainVerifier
         );
-        assert!(options.suppress_native_web_search);
-        assert!(!options.prefer_native_web_search);
+        assert_eq!(
+            final_editor.model_budget_stage,
+            runtime::RuntimeModelBudgetStage::FinalSynthesis
+        );
     }
 
     #[test]

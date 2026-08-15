@@ -850,6 +850,7 @@ fn pm_force_synthesize_no_tool_options(timeout_secs: u64) -> agent_gateway::Agen
         stream_timeout_secs: Some(timeout_secs),
         disable_tools: true,
         disable_provider_thinking: true,
+        model_budget_stage: runtime::RuntimeModelBudgetStage::FinalSynthesis,
         ..agent_gateway::AgentTurnOptions::default()
     };
     options

@@ -107,8 +107,8 @@ pub use egress::{
 pub use execution_kernel::{
     reduce_runtime_artifact, AgentExecutionKernel, RuntimeApprovalDecision, RuntimeApprovalRequest,
     RuntimeApprovalResolution, RuntimeArtifactKind, RuntimeArtifactPreview,
-    RuntimeContextManifestInput, RuntimeToolIntent, RuntimeToolOutcome, RuntimeToolOutcomeKind,
-    RuntimeToolProjection, RuntimeTurnStart, RuntimeTurnTerminalStatus,
+    RuntimeContextManifestInput, RuntimeModelBudgetStage, RuntimeToolIntent, RuntimeToolOutcome,
+    RuntimeToolOutcomeKind, RuntimeToolProjection, RuntimeTurnStart, RuntimeTurnTerminalStatus,
 };
 pub use file_ops::{
     edit_file, edit_file_in_workspace, glob_search, glob_search_in_workspace, grep_search,

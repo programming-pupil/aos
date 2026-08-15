@@ -487,6 +487,7 @@ pub(super) async fn repair_exec_constraints_with_retries(
             blocked_tools: pm_blocked_non_search_research_tools(),
             prefer_native_web_search: false,
             suppress_native_web_search: true,
+            model_budget_stage: runtime::RuntimeModelBudgetStage::DomainVerifier,
             ..agent_gateway::AgentTurnOptions::default()
         };
         options.system_instructions.push(
@@ -645,6 +646,7 @@ pub(super) async fn repair_task_graph_with_retries(
             blocked_tools: pm_blocked_non_search_research_tools(),
             prefer_native_web_search: false,
             suppress_native_web_search: true,
+            model_budget_stage: runtime::RuntimeModelBudgetStage::DomainVerifier,
             ..agent_gateway::AgentTurnOptions::default()
         };
         options.system_instructions.push(
