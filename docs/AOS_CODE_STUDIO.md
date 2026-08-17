@@ -1,6 +1,6 @@
 # AOS Code Studio
 
-AOS Code Studio is the coding workspace for AOS. It combines a Cursor/Codex-style chat workflow with a Kiro-style structured planning workflow, while keeping every code change behind Diff-first approval.
+AOS Code Studio is the coding workspace for AOS. It combines agent-assisted development with a structured planning workflow, while keeping every code change behind Diff-first approval.
 
 ## Modes
 

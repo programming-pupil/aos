@@ -11,6 +11,7 @@ on:
       - .github/workflows/release.yml
       - scripts/aos-package.sh
       - scripts/aos-package-windows.ps1
+      - scripts/check-onnxruntime-contract.sh
       - scripts/aos-start.sh
       - scripts/aos-start.ps1
       - scripts/aos-stop.sh
@@ -43,6 +44,9 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
+      - name: Verify local embedding runtime contract
+        shell: bash
+        run: ./scripts/check-onnxruntime-contract.sh
       - name: Verify version and release notes
         id: version
         shell: bash

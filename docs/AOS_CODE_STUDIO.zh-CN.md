@@ -1,6 +1,6 @@
 # AOS Code Studio
 
-AOS Code Studio 是 AOS 的代码开发工作台。它同时提供类似 Cursor/Codex 的聊天式开发体验，以及类似 Kiro 的结构化研发流程，并且所有代码修改都必须经过 Diff-first 审批。
+AOS Code Studio 是 AOS 的代码开发工作台。它同时提供 Agent 对话式开发体验和结构化研发流程，并且所有代码修改都必须经过 Diff-first 审批。
 
 ## 两种模式
 

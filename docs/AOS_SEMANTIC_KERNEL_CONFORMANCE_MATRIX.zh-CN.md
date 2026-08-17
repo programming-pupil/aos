@@ -1,6 +1,6 @@
 # AOS 语义内核一致性矩阵
 
-> 规格：`docs/AOS_SEMANTIC_KERNEL_REFACTOR.zh-CN.md`
+> 规格：AOS 语义内核生产契约与行为验收标准
 > 数据集：`eval/datasets/semantic-kernel-conformance.json`
 > 判定原则：生产符号存在、触发路径可达、行为断言通过，三者缺一不可。
 
@@ -9,7 +9,7 @@
 - `automated_behavior_verified`：生产调用路径和自动化行为测试均已接通。
 - `capability_negotiated`：统一协议已接通；executor 支持的动作必须真实执行，不支持的动作必须持久化并明确拒绝。
 - `mechanism_verified_effect_pending`：机制与测量链路已验证，准确率/召回率/延迟等数值仍需固定环境实测。
-- `pending_blind_review`：真实 adapter、trace、盲评配对已具备，但没有完成同模型/工具/预算的人工盲评，不声明竞品领先。
+- `pending_blind_review`：真实 adapter、trace、盲评配对已具备，但没有完成同模型、工具和预算的人工盲评，不声明效果领先。
 
 | ID | 行为触发与关键断言 | 状态 |
 | --- | --- | --- |
@@ -42,7 +42,7 @@
 | SQL-004 | correction 仅能绑定本人真实查询，只有 datasource owner/admin 可批准；批准/撤销有 append-only 审计，confidence 只使用同 scope 标注并输出 ECE/Brier | mechanism_verified_effect_pending |
 | SQL-005 | 逻辑维度绑定唯一 schema 列后，canonical IR 首次持久化即不可变；直接重写和后置 semantic-audit 重写同 ID 均 fail closed | automated_behavior_verified |
 | EVAL-001 | probe 不包含目标事实，压缩后按隐藏答案和真实证据评分 | mechanism_verified_effect_pending |
-| EVAL-002 | 180-case manifest、真实 AOS/Codex adapter、raw trace、盲评隐藏键可复现 | pending_blind_review |
+| EVAL-002 | 180-case manifest、真实执行 adapter、raw trace、盲评隐藏键可复现 | pending_blind_review |
 | EVAL-003 | provider partial/hang/timeout/late/crash fixture 校验 request hash 与 assert_consumed | automated_behavior_verified |
 
 ## 删除与保留
@@ -51,4 +51,4 @@
 
 ## 仍需外部实证的发布门槛
 
-以下数值不能由本地单元测试替代：Memory recall/false-memory、PM omission/support precision、NL2SQL semantic accuracy/ECE/Brier、Attribution causal overclaim、工具 schema token 降幅、p95 延迟、AOS/Codex/DSH 同条件盲评胜率。运行结果必须保留 case 清单、模型、工具、权限、预算、trace 和人工盲评状态；在完成前统一标记为 `pending_blind_review`，禁止写成“已领先”。
+以下数值不能由本地单元测试替代：Memory recall/false-memory、PM omission/support precision、NL2SQL semantic accuracy/ECE/Brier、Attribution causal overclaim、工具 schema token 降幅、p95 延迟和同条件盲评胜率。运行结果必须保留 case 清单、模型、工具、权限、预算、trace 和人工盲评状态；在完成前统一标记为 `pending_blind_review`，禁止写成“已领先”。

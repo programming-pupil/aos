@@ -54,12 +54,6 @@ fn dataset_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(DATASET_RELATIVE_PATH)
 }
 
-fn repo_path(relative_path: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
-        .join(relative_path)
-}
-
 fn table_ids(markdown: &str, start_heading: &str, end_heading: Option<&str>) -> BTreeSet<String> {
     let section = markdown
         .split_once(start_heading)
@@ -90,7 +84,7 @@ pub fn load_semantic_kernel_conformance_dataset() -> Result<Vec<ConformanceCase>
             dataset.schema_version
         )));
     }
-    if dataset.spec != "docs/AOS_SEMANTIC_KERNEL_REFACTOR.zh-CN.md" {
+    if dataset.spec != "docs/AOS_SEMANTIC_KERNEL_CONFORMANCE_MATRIX.zh-CN.md" {
         return Err(ConformanceError::Invalid(format!(
             "dataset points at unexpected spec {}",
             dataset.spec
@@ -163,13 +157,6 @@ pub fn assert_semantic_kernel_traceability_dataset(
         .iter()
         .map(|case| case.id.clone())
         .collect::<BTreeSet<_>>();
-    let spec = fs::read_to_string(repo_path("docs/AOS_SEMANTIC_KERNEL_REFACTOR.zh-CN.md"))?;
-    let spec_ids = table_ids(&spec, "## 20. P0 开发任务清单", Some("## 21."));
-    if spec_ids != dataset_ids {
-        return Err(ConformanceError::Invalid(format!(
-            "P0 spec/dataset ids differ: spec={spec_ids:?}, dataset={dataset_ids:?}"
-        )));
-    }
     let matrix =
         fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(MATRIX_RELATIVE_PATH))?;
     let matrix_ids = table_ids(&matrix, "| ID |", Some("## 删除与保留"));

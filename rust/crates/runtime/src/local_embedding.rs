@@ -176,3 +176,30 @@ fn embed_with_priority(texts: Vec<String>, background: bool) -> anyhow::Result<V
     }
     Ok(vectors)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{configure_cache_dir, embed, shutdown, DIMENSIONS};
+    use std::path::PathBuf;
+
+    #[test]
+    #[ignore = "requires AOS_TEST_LOCAL_EMBEDDING_CACHE_DIR and ONNX Runtime"]
+    fn bundled_model_loads_and_produces_distinct_finite_vectors() {
+        let cache_dir = std::env::var_os("AOS_TEST_LOCAL_EMBEDDING_CACHE_DIR")
+            .map(PathBuf::from)
+            .expect("AOS_TEST_LOCAL_EMBEDDING_CACHE_DIR must point to the bundled model cache");
+        configure_cache_dir(cache_dir).expect("configure local embedding cache");
+
+        let vectors = embed(vec![
+            "AOS local embedding readiness check".to_string(),
+            "完全不同的业务指标查询".to_string(),
+        ])
+        .expect("run local embedding inference");
+        assert_eq!(vectors.len(), 2);
+        assert!(vectors.iter().all(
+            |vector| vector.len() == DIMENSIONS && vector.iter().all(|value| value.is_finite())
+        ));
+        assert_ne!(vectors[0], vectors[1]);
+        shutdown();
+    }
+}

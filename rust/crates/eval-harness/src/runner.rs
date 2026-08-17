@@ -32,15 +32,14 @@ use crate::scenario::EvalScenario;
 
 /// Default disclaimer injected when a config does not supply its own.
 ///
-/// As of task 3.5 this is an alias of the canonical
+/// This is an alias of the canonical
 /// [`crate::positioning::DISCLAIMER`], so [`EvalConfig::new`] injects the
-/// authoritative Requirement 2.9 text (containing `"非本 spec 承诺"`) and every
-/// [`EvalReport`] carries it.
+/// same text and every [`EvalReport`] carries it.
 pub const DEFAULT_DISCLAIMER: &str = crate::positioning::DISCLAIMER;
 
 /// Default positioning statement injected when a config does not supply one.
 ///
-/// As of task 3.5 this is an alias of the canonical
+/// This is an alias of the canonical
 /// [`crate::positioning::POSITIONING`] (containing
 /// `"模型无关 + 企业级 + 深度分析"`).
 pub const DEFAULT_POSITIONING: &str = crate::positioning::POSITIONING;

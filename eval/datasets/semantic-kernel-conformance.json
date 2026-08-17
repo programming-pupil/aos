@@ -1,6 +1,6 @@
 {
   "schemaVersion": "semantic-kernel-conformance-v1",
-  "spec": "docs/AOS_SEMANTIC_KERNEL_REFACTOR.zh-CN.md",
+  "spec": "docs/AOS_SEMANTIC_KERNEL_CONFORMANCE_MATRIX.zh-CN.md",
   "cases": [
     {"id":"PROTO-001","section":"5.2","production":"rust/crates/agent-protocol/src/lib.rs::AgentEventEnvelope","test":"rust/crates/agent-protocol/src/lib.rs::envelope_hash_is_deterministic_and_verifiable","trigger":"提交带 payload hash 的事件并重算 hash","expected":"hash 可重算且不一致被拒绝"},
     {"id":"PROTO-002","section":"5.2","production":"rust/crates/agent-gateway/src/session_manager.rs::load_durable_ledger_session","test":"rust/crates/agent-gateway/src/session_manager.rs::durable_ledger_loader_recovers_exact_encrypted_runtime_without_jsonl","trigger":"只写入脱敏 Ledger envelope 与绑定其 hash 的加密恢复 payload（包含 turn 内消息和后台可见消息），不创建 JSONL，然后执行恢复、密文替换和密文删除攻击","expected":"Runtime 精确恢复 user/assistant/background message 和唯一真实 turn，后台消息不制造 ghost turn；Ledger 明文不含 secret，替换或删除恢复密文均 fail closed，JSONL 不参与"},

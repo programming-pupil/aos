@@ -329,4 +329,4 @@ macOS 上的 fail-closed 隔离行为、SQLite A/B 用户 Workspace 隔离和原
 
 企业 GA 还需要完成：租户级 L2/L3 供应商策略、全产品 100+ 泄漏样本、统一删除控制器、
 SIEM/WORM、Secret Manager/KMS、依赖/SBOM/CVE 门禁、渗透测试和恢复演练。180-case
-AOS/Codex 盲评属于效果验收门，按当前发布决策暂未执行，不能据此宣称效果已超过 Codex。
+同模型、同工具、同预算的盲评属于效果验收门，按当前发布决策暂未执行，不能据此宣称效果领先。

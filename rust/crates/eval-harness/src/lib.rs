@@ -2,7 +2,7 @@
 //!
 //! 自动化准确度评测 harness(需求 2)。可复现、可纳入 CI 的评测框架,覆盖
 //! 六个 [`EvalScenario`]:普通聊天、联网检索、SQL 归因、深度报告、编码任务
-//! 成功率、上下文 0 丢失召回率。产出可与 Codex 基准对比的结构化报表。
+//! 成功率、上下文 0 丢失召回率，并产出可供外部盲评的结构化报表。
 //!
 //! 本 crate 遵循 spec 总原则「复用优先、不推倒重做」:0 丢失召回场景复用
 //! 现有 `ZeroLossMeasurement`,不新建并行的召回度量实现。
@@ -19,10 +19,7 @@
 //!   到 [`ScenarioScore`],不新建并行召回度量。
 //!
 //! - 3.5 免责 / 定位固化([`positioning`])并注入报表;评测数据集目录
-//!   (`eval/datasets/`,固定种子、可复现)与对比文档
-//!   (`docs/AOS_VS_CODEX_EVAL.md`)。
-//!
-//! Design reference: `.kiro/specs/codex-parity-gaps/design.md` 第 2 节。
+//!   (`eval/datasets/`,固定种子、可复现)。
 
 pub mod conformance;
 pub mod dataset;

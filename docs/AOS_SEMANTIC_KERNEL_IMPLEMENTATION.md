@@ -1,6 +1,6 @@
 # AOS Semantic Kernel implementation notes
 
-This file is the implementation record for `AOS_SEMANTIC_KERNEL_REFACTOR.zh-CN.md`.
+This file records the production implementation of the AOS Semantic Kernel.
 Legacy rows remain readable as compatibility projections, but new production
 decisions are controlled by the semantic-kernel contracts. Durable Agent Ledger
 recovery precedes JSONL, the Context Compiler constructs the provider request,
@@ -43,8 +43,8 @@ runtime recovery input. Legacy PM task/chat rows are projection-only. Every comp
 durable final-delivery artifact, and history replay returns artifacts for all
 tasks in a session. NL2SQL keeps the existing provider-backed generator but
 now writes a semantic IR and verifier result before exposing a generated SQL
-candidate. The pure contracts remain reusable by native, Codex-compatible and
-future DSH-compatible executors.
+candidate. The pure contracts remain reusable by native and future external
+executors.
 
 The SQLite migration is additive and idempotent. Existing data is not rewritten
 or reclassified as confirmed facts. Completed pre-migration PM tasks are lazily
@@ -64,15 +64,15 @@ stream handlers that refresh canonical history on completion. Native AOS Child T
 capability-negotiated: cancellation is live and recoverable after restart;
 `follow_up`/`steer`/`interrupt`/`resume` are durably recorded and explicitly
 rejected when the selected executor does not advertise those capabilities.
-External executor adapters remain the Phase 6 strategic option described in the
-main specification, rather than an unverified compatibility claim.
+External executor adapters remain an optional extension point rather than an
+unverified compatibility claim.
 
 ## Explicit non-claims
 
 The new verifier does not claim that parseable SQL is business-correct, and the
 attribution path does not turn L0/L1 contribution evidence into causal claims.
-No external Trino, provider, Codex or DeepSeek Harness endpoint is contacted by
-these tests.  A real-provider test must be opted into with explicit fixtures or
+No external Trino, analytics data source, or model-provider endpoint is contacted
+by these tests. A real-provider test must be opted into with explicit fixtures or
 environment variables and remains subject to the per-user three-request limit.
 
 ## Required checks before enabling a domain
@@ -92,4 +92,4 @@ npm run build
 The durable Agent Ledger and PM final-delivery artifact are authoritative for
 new recovery. A failed semantic-audit persistence write blocks SQL release. A
 future quality claim must still pass the replay, semantic-accuracy and latency
-gates in the main specification and record differences in `eval_case_results`.
+gates in the conformance matrix and record differences in `eval_case_results`.
