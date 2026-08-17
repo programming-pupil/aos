@@ -30,7 +30,7 @@ tracing.workspace = true
 walkdir = "2"
 tiktoken-rs = "0.12"
 anyhow = { workspace = true, optional = true }
-fastembed = { version = "=5.13.0", default-features = false, features = ["ort-load-dynamic"], optional = true }
+fastembed = { version = "=5.17.4", default-features = false, features = ["ort-load-dynamic"], optional = true }
 hex = "0.4"
 parking_lot = { workspace = true, optional = true }
 
