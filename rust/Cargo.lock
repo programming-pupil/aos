@@ -1606,7 +1606,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "prost",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "rustls",
  "serde",
  "serde_json",
@@ -4230,9 +4230,9 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.13.3"
+version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62e0021ea2c22aed41653bc7e1419abb2c97e038ff2c33d0e1309e49a97deec0"
+checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -5208,6 +5208,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
+name = "structmeta"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e1575d8d40908d70f6fd05537266b90ae71b15dbbe7a8b7dffa2b759306d329"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "structmeta-derive",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "structmeta-derive"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "152a0b65a590ff6c3da95cabe2353ee04e6167c896b28e3b14478c2636c922fc"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5757,11 +5780,13 @@ dependencies = [
 
 [[package]]
 name = "trino-rust-client"
-version = "0.9.3"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "098f2b7b8aa17252d1a6f9c5ce8f201c413cb47936a38473d7719b6e35007902"
+checksum = "bfe66faa4ffac64969c1cc2a20c26e2065785ae52392b73b4bad4a75e286b9a2"
 dependencies = [
+ "async-stream",
  "backon",
+ "base64 0.22.1",
  "bigdecimal",
  "chrono",
  "chrono-tz",
@@ -5770,14 +5795,14 @@ dependencies = [
  "http",
  "iterable",
  "lazy_static",
- "log",
  "paste",
  "regex",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
  "trino-rust-client-macros",
  "url",
  "uuid",
@@ -5785,12 +5810,13 @@ dependencies = [
 
 [[package]]
 name = "trino-rust-client-macros"
-version = "0.7.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b04462cffd8fffed369b78e026dc81593a04efe7df6f6372864558474a67ee0d"
+checksum = "aac0945199002143dc15ceb3cd950af9c8c46e40f512f199f924f68d23abb70b"
 dependencies = [
  "proc-macro2",
  "quote",
+ "structmeta",
  "syn 2.0.117",
 ]
 
