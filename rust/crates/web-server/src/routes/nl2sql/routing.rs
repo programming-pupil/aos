@@ -3671,7 +3671,7 @@ async fn list_foreign_keys(
         "SELECT id, source_table, source_column, source_type, target_table, \
              target_column, target_type, created_by, updated_by, created_at \
              FROM nl2sql_foreign_keys \
-             WHERE tenant_id = ? AND datasource_id = ? AND deleted_at IS NULL",
+             WHERE tenant_id = ? AND datasource_id = ? AND status = 'published' AND deleted_at IS NULL",
     )
     .bind(&claims.tenant_id)
     .bind(&datasource_id)
@@ -4516,7 +4516,7 @@ pub(crate) async fn clarify(
             Option<serde_json::Value>,
         )> = sqlx::query_as(
             "SELECT metric_name, metric_aliases, expression, filter_conditions FROM nl2sql_metrics \
-             WHERE tenant_id = ? AND datasource_id = ? AND deleted_at IS NULL",
+             WHERE tenant_id = ? AND datasource_id = ? AND status = 'published' AND deleted_at IS NULL",
         )
         .bind(tenant_id)
         .bind(&data_source_id)
@@ -4698,6 +4698,34 @@ pub(crate) async fn clarify(
     } else {
         semantic_question
     };
+    let query_id = uuid::Uuid::new_v4().to_string();
+    let evidence_columns = synonym_hits
+        .iter()
+        .map(|(_, _, column)| column.clone())
+        .collect::<Vec<_>>();
+    let durable_intent = super::semantic_audit::compile_bind_and_persist_intent(
+        &state.db,
+        tenant_id,
+        &data_source_id,
+        &conv_id,
+        &query_id,
+        &generation_question,
+        &matched_metrics,
+        &schema_tables,
+        &evidence_columns,
+        qu_result.as_ref(),
+    )
+    .await
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "failed to persist bound analytic intent before clarification SQL generation: {error}"
+        ))
+    })?;
+    let semantic_intent_json = durable_intent.intent_json().map_err(|error| {
+        AppError::Internal(format!(
+            "failed to serialize clarification analytic intent: {error}"
+        ))
+    })?;
     let planning_start = std::time::Instant::now();
     super::query_async::emit_stage("cache_lookup", "正在检查缓存");
     super::query_async::emit_stage("generate_sql", "正在生成 SQL");
@@ -4723,13 +4751,12 @@ pub(crate) async fn clarify(
         business_domain_context.as_deref(),
         None,
         true,
+        &semantic_intent_json,
     )
     .await;
     super::query_async::emit_stage("generate_sql", "SQL 生成完成");
 
     let planning_ms = planning_start.elapsed().as_millis() as i64;
-    let query_id = uuid::Uuid::new_v4().to_string();
-
     let (sql, _err): (Option<String>, Option<String>) = match &sql_result {
         Ok(r) => {
             if let (Some(usage), Some(model)) = (r.usage.as_ref(), r.model.as_deref()) {
@@ -4982,6 +5009,52 @@ pub(crate) async fn clarify(
             );
         }
     }
+
+    let final_sql = sql.as_deref().ok_or_else(|| {
+        AppError::ValidationError(
+            "clarification completed without a SQL candidate; retry the request".to_string(),
+        )
+    })?;
+    let audit = super::semantic_audit::compile_canonical_intent_with_contracts_and_joins(
+        &durable_intent.intent,
+        final_sql,
+        &durable_intent.metric_contracts,
+        &durable_intent.join_contracts,
+    )
+    .ok_or_else(|| {
+        AppError::ValidationError(
+            "clarification SQL could not be verified against the canonical analytic intent"
+                .to_string(),
+        )
+    })?;
+    let release_decision = serde_json::to_string(&audit.verification.release_decision)
+        .unwrap_or_else(|_| "\"NeedsClarification\"".to_string())
+        .trim_matches('"')
+        .to_string();
+    crate::semantic_kernel_store::persist_nl2sql_semantic_audit(
+        &state.db,
+        tenant_id,
+        &data_source_id,
+        &conv_id,
+        &query_id,
+        &super::semantic_audit::intent_json(&audit),
+        &super::semantic_audit::verification_json(&audit),
+        &release_decision,
+        f64::from(audit.verification.confidence_basis.calibrated_score),
+    )
+    .await
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "failed to persist clarification semantic verification: {error}"
+        ))
+    })?;
+    super::semantic_audit::require_execution_validation_decision(&release_decision).map_err(
+        |reason| {
+            AppError::ValidationError(format!(
+            "{reason}. Resolve the metric, grain, population, time or join ambiguity and retry."
+        ))
+        },
+    )?;
 
     sqlx::query(
         "INSERT INTO nl2sql_queries \

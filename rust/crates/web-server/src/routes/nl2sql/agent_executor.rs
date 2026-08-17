@@ -1257,6 +1257,46 @@ pub struct Nl2SqlAgent {
     protected_request: bool,
 }
 
+#[derive(Clone)]
+struct AgentSemanticGuard {
+    conversation_id: String,
+    intent_id: String,
+    datasource_id: String,
+    intent: nl2sql_core::semantic_ir::AnalyticIntentIR,
+    metric_contracts: Vec<nl2sql_core::semantic_ir::MetricContract>,
+    join_contracts: Vec<nl2sql_core::semantic_ir::JoinContract>,
+}
+
+impl AgentSemanticGuard {
+    fn intent_json(&self) -> anyhow::Result<String> {
+        serde_json::to_string(&self.intent)
+            .map_err(|error| anyhow::anyhow!("failed to serialize analytic intent: {error}"))
+    }
+}
+
+fn audit_agent_semantic_candidate(
+    guard: &AgentSemanticGuard,
+    sql: &str,
+) -> anyhow::Result<super::semantic_audit::SemanticAudit> {
+    super::semantic_audit::compile_canonical_intent_with_contracts_and_joins(
+        &guard.intent,
+        sql,
+        &guard.metric_contracts,
+        &guard.join_contracts,
+    )
+    .ok_or_else(|| anyhow::anyhow!("SQL candidate could not be parsed for semantic audit"))
+}
+
+fn reference_evidence_columns(snippets: &[ReferencePromptSnippet]) -> Vec<String> {
+    let mut columns = snippets
+        .iter()
+        .flat_map(|snippet| super::extract_columns_from_sql(&snippet.content))
+        .collect::<Vec<_>>();
+    columns.sort_unstable_by_key(|column| column.to_ascii_lowercase());
+    columns.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    columns
+}
+
 impl Nl2SqlAgent {
     pub fn new(state: Arc<AppState>, preferred_model: Option<String>, bounded: bool) -> Self {
         Self {
@@ -1285,6 +1325,169 @@ impl Nl2SqlAgent {
             network_budget,
             protected_request: true,
         }
+    }
+
+    async fn prepare_semantic_guard(
+        &self,
+        claims: &Claims,
+        conversation_id: &str,
+        intent_id: &str,
+        datasource_id: &str,
+        question: &str,
+        schema: &serde_json::Value,
+        matched_metrics: &[String],
+        evidence_columns: &[String],
+    ) -> anyhow::Result<AgentSemanticGuard> {
+        let understanding = if super::should_enable_qu() {
+            match crate::nl2sql::resolve_chat_config(
+                self.state.config_registry(),
+                &claims.tenant_id,
+                &claims.sub,
+                &self.state.default_model,
+                Some("nl2sql"),
+            )
+            .await
+            {
+                Ok(config) => {
+                    let service = crate::nl2sql::query_understanding::QueryUnderstanding::new(
+                        self.state.db.clone(),
+                        config,
+                    );
+                    match service
+                        .understand(question, datasource_id, &claims.tenant_id, schema)
+                        .await
+                    {
+                        Ok(result) => Some(result),
+                        Err(error) => {
+                            tracing::warn!(
+                                datasource_id,
+                                error = %error,
+                                "agent semantic compiler query-understanding proposal failed; using deterministic proposal"
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        datasource_id,
+                        error = %error,
+                        "agent semantic compiler could not resolve query-understanding model; using deterministic proposal"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let durable = super::semantic_audit::compile_bind_and_persist_intent(
+            &self.state.db,
+            &claims.tenant_id,
+            datasource_id,
+            conversation_id,
+            intent_id,
+            question,
+            matched_metrics,
+            schema,
+            evidence_columns,
+            understanding.as_ref(),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to persist analytic intent: {error}"))?;
+        Ok(AgentSemanticGuard {
+            conversation_id: conversation_id.to_string(),
+            intent_id: intent_id.to_string(),
+            datasource_id: datasource_id.to_string(),
+            intent: durable.intent,
+            metric_contracts: durable.metric_contracts,
+            join_contracts: durable.join_contracts,
+        })
+    }
+
+    async fn matched_metrics_for_schemas(
+        &self,
+        tenant_id: &str,
+        question: &str,
+        schemas: &[DatasourceSchemaInfo],
+    ) -> Vec<String> {
+        let mut candidates = Vec::new();
+        for schema in schemas {
+            let rows: Vec<(
+                String,
+                Option<serde_json::Value>,
+                Option<String>,
+                Option<serde_json::Value>,
+            )> = sqlx::query_as(
+                "SELECT metric_name, metric_aliases, expression, filter_conditions
+                 FROM nl2sql_metrics
+                 WHERE tenant_id = ? AND datasource_id = ? AND status = 'published' AND deleted_at IS NULL",
+            )
+            .bind(tenant_id)
+            .bind(&schema.datasource_id)
+            .fetch_all(&self.state.db)
+            .await
+            .unwrap_or_default();
+            candidates.extend(rows.into_iter().map(
+                |(name, aliases, expression, filter_conditions)| MetricMatchCandidate {
+                    name,
+                    aliases: parse_metric_aliases(aliases.as_ref()),
+                    expression,
+                    filter_conditions,
+                },
+            ));
+        }
+        let mut matched = matched_metric_names(question, &candidates);
+        matched.sort_unstable();
+        matched.dedup();
+        matched
+    }
+
+    async fn verify_semantic_candidate(
+        &self,
+        claims: &Claims,
+        guard: &AgentSemanticGuard,
+        sql: &str,
+        repair: bool,
+    ) -> anyhow::Result<()> {
+        let audit = audit_agent_semantic_candidate(guard, sql)?;
+        let verification = super::semantic_audit::verification_json(&audit);
+        let release_decision = serde_json::to_string(&audit.verification.release_decision)
+            .unwrap_or_else(|_| "\"Reject\"".to_string())
+            .trim_matches('"')
+            .to_string();
+        if repair {
+            crate::semantic_kernel_store::persist_nl2sql_repair_verification(
+                &self.state.db,
+                &claims.tenant_id,
+                &guard.intent_id,
+                sql,
+                &verification,
+                &release_decision,
+                f64::from(audit.verification.confidence_basis.calibrated_score),
+            )
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("failed to persist repaired SQL verification: {error}")
+            })?;
+        } else {
+            crate::semantic_kernel_store::persist_nl2sql_semantic_audit(
+                &self.state.db,
+                &claims.tenant_id,
+                &guard.datasource_id,
+                &guard.conversation_id,
+                &guard.intent_id,
+                &serde_json::to_value(&guard.intent).map_err(|error| {
+                    anyhow::anyhow!("failed to encode canonical analytic intent: {error}")
+                })?,
+                &verification,
+                &release_decision,
+                f64::from(audit.verification.confidence_basis.calibrated_score),
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to persist SQL semantic audit: {error}"))?;
+        }
+        super::semantic_audit::require_execution_validation_decision(&release_decision)
+            .map_err(anyhow::Error::msg)
     }
 
     async fn datasource_has_direct_sql_knowledge(
@@ -1518,6 +1721,8 @@ impl Nl2SqlAgent {
         question: &str,
         schemas: &[DatasourceSchemaInfo],
         explicit_datasource_scope: bool,
+        conversation_id: &str,
+        query_id: &str,
     ) -> anyhow::Result<Option<AgentExecuteResponse>> {
         let Some((workspace, question_tokens)) =
             self.build_federated_trino_workspace(question, schemas, explicit_datasource_scope)
@@ -1573,6 +1778,23 @@ impl Nl2SqlAgent {
                 workspace.sources.len()
             )),
         };
+        let matched_metrics = self
+            .matched_metrics_for_schemas(&claims.tenant_id, question, schemas)
+            .await;
+        let evidence_columns = reference_evidence_columns(&reference_snippets);
+        let semantic_guard = self
+            .prepare_semantic_guard(
+                claims,
+                conversation_id,
+                query_id,
+                &execution_source.schema.datasource_id,
+                question,
+                &schema,
+                &matched_metrics,
+                &evidence_columns,
+            )
+            .await?;
+        let semantic_intent_json = semantic_guard.intent_json()?;
         let sql_result = match generate_sql(
             &self.state,
             claims,
@@ -1592,6 +1814,7 @@ impl Nl2SqlAgent {
             None,
             self.preferred_model.as_deref(),
             !self.bounded,
+            &semantic_intent_json,
         )
         .await
         {
@@ -1657,6 +1880,7 @@ impl Nl2SqlAgent {
                     &execution_source.schema.datasource_id,
                     &execution_source.schema.config,
                     &mut current_sql,
+                    &semantic_guard,
                 )
                 .await
             {
@@ -1695,6 +1919,19 @@ impl Nl2SqlAgent {
             }
         }
 
+        if let Err(error) = self
+            .verify_semantic_candidate(claims, &semantic_guard, &current_sql, false)
+            .await
+        {
+            return Ok(Some(self.federated_error_response(
+                start,
+                &workspace,
+                Some(current_sql),
+                format!("federated SQL semantic verification failed: {error}"),
+                used_references,
+            )));
+        }
+
         super::agent_async::emit_agent_stage("execute_sql", "正在执行联邦 Trino SQL");
         match self
             .execute_federated_sql_with_repair(
@@ -1704,6 +1941,7 @@ impl Nl2SqlAgent {
                 &execution_source.schema.datasource_id,
                 &execution_source.schema.config,
                 &mut current_sql,
+                &semantic_guard,
             )
             .await
         {
@@ -1858,6 +2096,7 @@ impl Nl2SqlAgent {
         datasource_id: &str,
         config_json: &serde_json::Value,
         sql: &mut String,
+        semantic_guard: &AgentSemanticGuard,
     ) -> Result<(), String> {
         if !claim_trino_explain_probe(datasource_id).await {
             return Err(format!(
@@ -1915,6 +2154,13 @@ impl Nl2SqlAgent {
                             "federated Trino EXPLAIN failed and repair produced no better SQL: {e}"
                         ));
                     }
+                    self.verify_semantic_candidate(claims, semantic_guard, &repaired, true)
+                        .await
+                        .map_err(|verification_error| {
+                            format!(
+                                "federated Trino EXPLAIN repair changed the canonical analytic intent and was blocked: {verification_error}"
+                            )
+                        })?;
                     *sql = repaired;
                 }
                 Err(e) => {
@@ -1939,6 +2185,7 @@ impl Nl2SqlAgent {
         datasource_id: &str,
         config_json: &serde_json::Value,
         sql: &mut String,
+        semantic_guard: &AgentSemanticGuard,
     ) -> Result<
         (
             Vec<String>,
@@ -2085,6 +2332,22 @@ impl Nl2SqlAgent {
                         return Err((
                             format!(
                                 "federated Trino execution failed and repair produced no better SQL: {error}"
+                            ),
+                            execution_attempts,
+                        ));
+                    }
+                    if let Err(verification_error) = self
+                        .verify_semantic_candidate(claims, semantic_guard, &repaired, true)
+                        .await
+                    {
+                        if let (Some(attempt), Some(decision)) =
+                            (execution_attempts.last_mut(), repair_decision.as_ref())
+                        {
+                            annotate_attempt_with_decision(attempt, decision);
+                        }
+                        return Err((
+                            format!(
+                                "federated Trino repair changed the canonical analytic intent and was blocked: {verification_error}"
                             ),
                             execution_attempts,
                         ));
@@ -2236,6 +2499,8 @@ impl Nl2SqlAgent {
         retrieval_question: &str,
         schema: &DatasourceSchemaInfo,
         route_snippets: &[ReferencePromptSnippet],
+        conversation_id: &str,
+        query_id: &str,
     ) -> anyhow::Result<AgentExecuteResponse> {
         let start = std::time::Instant::now();
         super::agent_async::emit_agent_stage(
@@ -2485,7 +2750,7 @@ impl Nl2SqlAgent {
                 Option<serde_json::Value>,
             )> = sqlx::query_as(
                 "SELECT metric_name, metric_aliases, expression, filter_conditions FROM nl2sql_metrics \
-                 WHERE tenant_id = ? AND datasource_id = ? AND deleted_at IS NULL",
+                 WHERE tenant_id = ? AND datasource_id = ? AND status = 'published' AND deleted_at IS NULL",
             )
             .bind(&claims.tenant_id)
             .bind(&schema.datasource_id)
@@ -2505,7 +2770,7 @@ impl Nl2SqlAgent {
         };
         let metrics: Vec<(String, String, Option<String>)> = sqlx::query_as(
             "SELECT metric_name, expression, filter_conditions FROM nl2sql_metrics \
-             WHERE tenant_id = ? AND datasource_id = ? AND deleted_at IS NULL",
+             WHERE tenant_id = ? AND datasource_id = ? AND status = 'published' AND deleted_at IS NULL",
         )
         .bind(&claims.tenant_id)
         .bind(&schema.datasource_id)
@@ -2585,6 +2850,20 @@ impl Nl2SqlAgent {
                 schema.datasource_name, schema.db_type
             )),
         };
+        let evidence_columns = reference_evidence_columns(&reference_snippets);
+        let semantic_guard = self
+            .prepare_semantic_guard(
+                claims,
+                conversation_id,
+                query_id,
+                &schema.datasource_id,
+                question,
+                &schema_tables,
+                &matched_metrics,
+                &evidence_columns,
+            )
+            .await?;
+        let semantic_intent_json = semantic_guard.intent_json()?;
         let large_schema_mode = schema_tables
             .as_array()
             .map(|arr| arr.len() > 20)
@@ -2608,6 +2887,7 @@ impl Nl2SqlAgent {
             None,
             self.preferred_model.as_deref(),
             !self.bounded,
+            &semantic_intent_json,
         )
         .await
         {
@@ -2672,6 +2952,7 @@ impl Nl2SqlAgent {
                     &schema.datasource_id,
                     &schema.config,
                     &mut current_sql,
+                    &semantic_guard,
                 )
                 .await
             {
@@ -2724,6 +3005,7 @@ impl Nl2SqlAgent {
                 std::slice::from_ref(&enriched_schema),
                 question,
                 &join_paths,
+                &semantic_guard,
             )
             .await?;
         let response_rows_cap = max_agent_response_rows().max(50);
@@ -2776,6 +3058,8 @@ impl Nl2SqlAgent {
         shared_context: Option<&str>,
         max_steps_override: Option<usize>,
         allowed_datasource_ids: &[String],
+        conversation_id: &str,
+        query_id: &str,
     ) -> anyhow::Result<AgentExecuteResponse> {
         let start = std::time::Instant::now();
         super::agent_async::emit_agent_stage("request_validation", "开始校验请求");
@@ -2855,6 +3139,8 @@ impl Nl2SqlAgent {
                 routing_question,
                 &schemas,
                 !allowed_datasource_ids.is_empty() || sql_knowledge_route.is_some(),
+                conversation_id,
+                query_id,
             )
             .await?
         {
@@ -2874,6 +3160,8 @@ impl Nl2SqlAgent {
                     retrieval_question,
                     &schemas[0],
                     route_snippets,
+                    conversation_id,
+                    query_id,
                 )
                 .await;
         }
@@ -2887,8 +3175,42 @@ impl Nl2SqlAgent {
             "query_understanding",
             "开始理解问题并规划多数据源步骤",
         );
+        let combined_schema = serde_json::Value::Array(
+            schemas
+                .iter()
+                .flat_map(|schema| schema.tables.as_array().into_iter().flatten().cloned())
+                .collect(),
+        );
+        let datasource_scope = schemas
+            .iter()
+            .map(|schema| schema.datasource_id.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let planning_metrics = self
+            .matched_metrics_for_schemas(&claims.tenant_id, &model_question, &schemas)
+            .await;
+        let planning_evidence_columns = reference_evidence_columns(&planning_references);
+        let planning_guard = self
+            .prepare_semantic_guard(
+                claims,
+                conversation_id,
+                query_id,
+                &datasource_scope,
+                &model_question,
+                &combined_schema,
+                &planning_metrics,
+                &planning_evidence_columns,
+            )
+            .await?;
+        let planning_intent_json = planning_guard.intent_json()?;
         let plan = self
-            .generate_multi_step_plan(claims, &model_question, &schemas, &planning_references)
+            .generate_multi_step_plan(
+                claims,
+                &model_question,
+                &schemas,
+                &planning_references,
+                &planning_intent_json,
+            )
             .await?;
 
         // 3. Execute the plan.
@@ -2903,6 +3225,8 @@ impl Nl2SqlAgent {
                 &plan,
                 &schemas,
                 effective_max_steps,
+                conversation_id,
+                query_id,
             )
             .await?;
 
@@ -3068,6 +3392,7 @@ impl Nl2SqlAgent {
         question: &str,
         schemas: &[DatasourceSchemaInfo],
         reference_snippets: &[ReferencePromptSnippet],
+        semantic_intent_json: &str,
     ) -> anyhow::Result<crate::nl2sql::MultiStepPlan> {
         let mut chat_candidates = crate::nl2sql::resolve_chat_config_candidates(
             self.state.config_registry(),
@@ -3095,8 +3420,9 @@ impl Nl2SqlAgent {
         let clusters_summary =
             load_cross_domain_clusters_summary(&self.state.db, &claims.tenant_id).await;
         let knowledge_context = format_agent_sql_knowledge_context(reference_snippets);
-        let prompt =
+        let mut prompt =
             build_agent_planning_prompt(question, schemas, &clusters_summary, &knowledge_context);
+        super::append_canonical_semantic_intent(&mut prompt, semantic_intent_json);
 
         let request = api::MessageRequest {
             model: model.clone(),
@@ -3145,6 +3471,8 @@ impl Nl2SqlAgent {
         plan: &crate::nl2sql::MultiStepPlan,
         schemas: &[DatasourceSchemaInfo],
         max_steps: usize,
+        conversation_id: &str,
+        query_id: &str,
     ) -> anyhow::Result<Vec<crate::nl2sql::StepResult>> {
         let mut results: Vec<crate::nl2sql::StepResult> = Vec::new();
         let mut intermediate: std::collections::HashMap<String, crate::nl2sql::StepResult> =
@@ -3168,10 +3496,29 @@ impl Nl2SqlAgent {
                     step_id,
                     datasource_id,
                     sql,
-                    description: _,
+                    description,
                     output_name,
                     max_rows,
                 } => {
+                    let schema = schemas
+                        .iter()
+                        .find(|schema| schema.datasource_id == datasource_id.as_str())
+                        .map(|schema| schema.tables.clone())
+                        .unwrap_or_else(super::empty_schema_info);
+                    let step_intent_id = format!("{query_id}:step:{step_id}");
+                    let step_question = format!("{question}\nStep requirement: {description}");
+                    let semantic_guard = self
+                        .prepare_semantic_guard(
+                            claims,
+                            conversation_id,
+                            &step_intent_id,
+                            datasource_id,
+                            &step_question,
+                            &schema,
+                            &[],
+                            &[],
+                        )
+                        .await?;
                     self.execute_query_step(
                         claims,
                         *step_id,
@@ -3182,6 +3529,7 @@ impl Nl2SqlAgent {
                         schemas,
                         question,
                         &[],
+                        &semantic_guard,
                     )
                     .await?
                 }
@@ -3223,6 +3571,7 @@ impl Nl2SqlAgent {
         schemas: &[DatasourceSchemaInfo],
         question_context: &str,
         join_paths: &[(String, String)],
+        semantic_guard: &AgentSemanticGuard,
     ) -> anyhow::Result<crate::nl2sql::StepResult> {
         let start = std::time::Instant::now();
 
@@ -3328,6 +3677,26 @@ impl Nl2SqlAgent {
         let mut execution_attempts = Vec::new();
         let mut next_retry_reason: Option<String> = None;
         let mut current_repair_decision: Option<SqlRepairDecision> = None;
+
+        if let Err(error) = self
+            .verify_semantic_candidate(claims, semantic_guard, &current_sql, false)
+            .await
+        {
+            return Ok(crate::nl2sql::StepResult {
+                step_id,
+                output_name: output_name.to_owned(),
+                sql: Some(current_sql),
+                columns: vec![],
+                rows: vec![],
+                row_count: 0,
+                execution_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                error: Some(format!("SQL semantic verification failed: {error}")),
+                datasource_id: Some(datasource_id.to_owned()),
+                execution_attempts,
+                diagnostic_only: false,
+                recovery_note: None,
+            });
+        }
 
         loop {
             let attempt_started = std::time::Instant::now();
@@ -3566,6 +3935,39 @@ impl Nl2SqlAgent {
                         let new_sql = strip_trailing_semicolon(&new_sql);
                         if !new_sql.is_empty() && new_sql != strip_trailing_semicolon(&current_sql)
                         {
+                            if let Err(verification_error) = self
+                                .verify_semantic_candidate(claims, semantic_guard, &new_sql, true)
+                                .await
+                            {
+                                if let (Some(attempt), Some(decision)) =
+                                    (execution_attempts.last_mut(), repair_decision.as_ref())
+                                {
+                                    annotate_attempt_with_decision(attempt, decision);
+                                }
+                                tracing::warn!(
+                                    step_id,
+                                    datasource_id = %datasource_id,
+                                    error = %verification_error,
+                                    "execute_query_step: repaired SQL failed canonical semantic verification"
+                                );
+                                return Ok(crate::nl2sql::StepResult {
+                                    step_id,
+                                    output_name: output_name.to_owned(),
+                                    sql: Some(current_sql),
+                                    columns: vec![],
+                                    rows: vec![],
+                                    row_count: 0,
+                                    execution_ms: u64::try_from(start.elapsed().as_millis())
+                                        .unwrap_or(u64::MAX),
+                                    error: Some(format!(
+                                        "repaired SQL changed the canonical analytic intent and was blocked: {verification_error}"
+                                    )),
+                                    datasource_id: Some(datasource_id.to_owned()),
+                                    execution_attempts,
+                                    diagnostic_only: false,
+                                    recovery_note: None,
+                                });
+                            }
                             tracing::info!(
                                 step_id,
                                 datasource_id = %datasource_id,
@@ -4172,9 +4574,10 @@ impl Nl2SqlAgent {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_trino_user_permit, contextual_agent_question, datasource_visible_to_user,
-        deterministic_dialect_repair, dialect_preflight_error, execute_trino_query_bounded,
-        merge_input_error, DatasourceRequestBudget, AGENT_SHARED_CONTEXT_MAX_CHARS,
+        acquire_trino_user_permit, audit_agent_semantic_candidate, contextual_agent_question,
+        datasource_visible_to_user, deterministic_dialect_repair, dialect_preflight_error,
+        execute_trino_query_bounded, merge_input_error, AgentSemanticGuard,
+        DatasourceRequestBudget, AGENT_SHARED_CONTEXT_MAX_CHARS,
     };
     use axum::extract::State;
     use axum::http::StatusCode;
@@ -4182,6 +4585,50 @@ mod tests {
     use axum::{Json, Router};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn agent_semantic_guard_releases_matching_sql_and_blocks_grain_drift() {
+        let mut intent = super::super::semantic_audit::compile_question_intent(
+            "tenant",
+            "datasource",
+            "按设备统计订单数",
+            &[],
+        );
+        super::super::semantic_audit::bind_schema_dimensions(
+            &mut intent,
+            &serde_json::json!([{
+                "table_name": "task_offer",
+                "columns": [{"name": "executor_device_id"}, {"name": "order_id"}]
+            }]),
+            &[],
+        );
+        let guard = AgentSemanticGuard {
+            conversation_id: "conversation".into(),
+            intent_id: "intent".into(),
+            datasource_id: "datasource".into(),
+            intent,
+            metric_contracts: vec![],
+            join_contracts: vec![],
+        };
+        let matching = audit_agent_semantic_candidate(
+            &guard,
+            "SELECT executor_device_id, COUNT(*) AS order_count FROM task_offer GROUP BY executor_device_id",
+        )
+        .expect("matching SQL audit");
+        assert_eq!(
+            matching.verification.release_decision,
+            nl2sql_core::semantic_ir::QueryReleaseDecision::Release
+        );
+        let drifting = audit_agent_semantic_candidate(
+            &guard,
+            "SELECT COUNT(*) AS order_count FROM task_offer",
+        )
+        .expect("drifting SQL audit");
+        assert_ne!(
+            drifting.verification.release_decision,
+            nl2sql_core::semantic_ir::QueryReleaseDecision::Release
+        );
+    }
 
     #[test]
     fn datasource_visibility_includes_tenant_shared_sources_for_members() {

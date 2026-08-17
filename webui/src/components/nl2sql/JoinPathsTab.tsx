@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Table, Button, Modal, Form, Input, Select, Space, Tag, message,
-  Popconfirm, Typography, Card, Spin, Empty, Tooltip, Alert,
+  Popconfirm, Typography, Card, Spin, Empty, Tooltip, Alert, Switch,
 } from 'antd';
 import {
   PlusOutlined, DeleteOutlined, EditOutlined,
@@ -29,6 +29,11 @@ interface JoinPathFormValues {
   targetColumn: string;
   joinType: string;
   notes?: string;
+  cardinality: '1:1' | '1:N' | 'N:1' | 'N:N';
+  temporalCondition?: string;
+  nullable: boolean;
+  dedupStrategy?: string;
+  allowedGrains: string[];
 }
 
 interface EditModalState {
@@ -147,6 +152,11 @@ export function JoinPathsTab() {
       sourceColumn: '',
       targetColumn: '',
       joinType: 'INNER',
+      cardinality: 'N:1',
+      temporalCondition: '',
+      nullable: false,
+      dedupStrategy: '',
+      allowedGrains: [],
       notes: '',
     });
     setEditModal({ open: true, path: null });
@@ -159,6 +169,11 @@ export function JoinPathsTab() {
       sourceColumn: record.sourceColumn ?? '',
       targetColumn: record.targetColumn ?? '',
       joinType: record.joinType ?? 'INNER',
+      cardinality: record.cardinality ?? 'N:1',
+      temporalCondition: record.temporalCondition ?? '',
+      nullable: record.nullable ?? false,
+      dedupStrategy: record.dedupStrategy ?? '',
+      allowedGrains: record.allowedGrains ?? [],
       notes: record.notes ?? '',
     });
     setEditModal({ open: true, path: record });
@@ -172,6 +187,11 @@ export function JoinPathsTab() {
         sourceColumn: values.sourceColumn,
         targetColumn: values.targetColumn,
         joinType: values.joinType,
+        cardinality: values.cardinality,
+        temporalCondition: values.temporalCondition?.trim() || undefined,
+        nullable: values.nullable,
+        dedupStrategy: values.dedupStrategy?.trim() || undefined,
+        allowedGrains: values.allowedGrains,
         notes: values.notes || undefined,
       };
 
@@ -238,6 +258,13 @@ export function JoinPathsTab() {
       width: 130,
       render: (v: string) =>
         v ? <Tag style={{ fontSize: 11 }}>{v}</Tag> : <Text type="secondary" style={{ fontSize: 12 }}>{t('common.dash')}</Text>,
+    },
+    {
+      title: t('management.joinPaths.cardinality'),
+      dataIndex: 'cardinality',
+      key: 'cardinality',
+      width: 90,
+      render: (value?: string) => <Tag>{value || t('common.dash')}</Tag>,
     },
     {
       title: t('management.joinPaths.verifiedToggle'),
@@ -459,6 +486,42 @@ export function JoinPathsTab() {
             initialValue="INNER"
           >
             <Select options={getJoinTypeOptions()} />
+          </Form.Item>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 12px' }}>
+            <Form.Item
+              name="cardinality"
+              label={t('management.joinPaths.cardinality')}
+              rules={[{ required: true, message: t('common.required') }]}
+            >
+              <Select options={[
+                { value: '1:1', label: '1:1' },
+                { value: '1:N', label: '1:N' },
+                { value: 'N:1', label: 'N:1' },
+                { value: 'N:N', label: 'N:N' },
+              ]} />
+            </Form.Item>
+            <Form.Item name="nullable" label={t('management.joinPaths.nullable')} valuePropName="checked">
+              <Switch />
+            </Form.Item>
+          </div>
+
+          <Form.Item name="dedupStrategy" label={t('management.joinPaths.dedupStrategy')}>
+            <Input placeholder={t('management.joinPaths.dedupStrategyPlaceholder')} />
+          </Form.Item>
+
+          <Form.Item name="temporalCondition" label={t('management.joinPaths.temporalCondition')}>
+            <Input placeholder={t('management.joinPaths.temporalConditionPlaceholder')} />
+          </Form.Item>
+
+          <Form.Item name="allowedGrains" label={t('management.joinPaths.allowedGrains')}>
+            <Select mode="multiple" options={[
+              { value: 'entity', label: 'Entity' },
+              { value: 'hour', label: 'Hour' },
+              { value: 'day', label: 'Day' },
+              { value: 'week', label: 'Week' },
+              { value: 'month', label: 'Month' },
+            ]} />
           </Form.Item>
 
           <Form.Item

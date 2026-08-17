@@ -138,6 +138,44 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --all-features
 
+  semantic-kernel-behavior:
+    name: semantic kernel behavior conformance
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+      - name: Execute every production conformance case
+        run: scripts/check-semantic-kernel-behavior.sh
+
+  semantic-kernel-strict:
+    name: semantic kernel strict clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+      - name: Deny warnings in semantic kernel crates
+        run: >
+          cargo clippy -p runtime -p agent-gateway -p web-server
+          --no-deps --all-features --all-targets --
+          -A clippy::all
+          -A clippy::pedantic
+          -A clippy::nursery
+          -A clippy::restriction
+          -D warnings
+          -D clippy::correctness
+          -D clippy::suspicious
+
   clippy-workspace:
     name: cargo clippy --workspace --all-features
     runs-on: ubuntu-latest

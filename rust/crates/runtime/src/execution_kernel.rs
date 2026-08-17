@@ -5,7 +5,7 @@
 //! a trait avoids coupling the generic runtime to SQLx or the web server.
 
 use crate::permissions::PermissionRequest;
-use crate::session::ConversationMessage;
+use crate::session::{ConversationMessage, Session};
 use crate::RuntimeError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -24,11 +24,39 @@ pub struct RuntimeContextManifestInput {
     pub system_sections: Vec<String>,
     pub messages: Vec<ConversationMessage>,
     pub estimated_tokens: usize,
+    /// Exact hard input limit used by the Context Compiler for the provider
+    /// request represented by this manifest.
+    pub max_input_tokens: u64,
     pub model_version: Option<String>,
     pub active_tools: Vec<String>,
+    /// Exact packet whose selected blocks produced `system_sections` and
+    /// `messages`. This is captured before provider dispatch so replay never
+    /// has to reconstruct selection from a shadow manifest.
+    pub context_packet: semantic_core::ContextPacket,
+    /// Evaluated prompt variant which actually contributed the stable/domain
+    /// sections in this provider request.
+    pub prompt_manifest: Option<agent_protocol::PromptManifest>,
     /// Version of the semantic snapshot used to compile this request. The
     /// snapshot body stays in the semantic-state store; the manifest carries
     /// the immutable reference so replay can load the exact state.
+    pub semantic_snapshot_version: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeContextSupplementRequest {
+    pub turn_id: String,
+    pub iteration: usize,
+    pub objective: String,
+    pub domain: String,
+    pub max_input_tokens: u64,
+    pub model_version: Option<String>,
+    pub active_tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimeContextSupplement {
+    pub envelope: semantic_core::ContextEnvelope,
+    pub blocks: Vec<semantic_core::ContextBlock>,
     pub semantic_snapshot_version: Option<u64>,
 }
 
@@ -72,6 +100,137 @@ pub struct RuntimeToolIntent {
     pub authorized: bool,
     pub denial_reason: Option<String>,
     pub idempotency_key: String,
+    pub contract: RuntimeToolContract,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeToolSideEffectClass {
+    None,
+    LocalRead,
+    ExternalRead,
+    LocalWrite,
+    ExternalWrite,
+    Irreversible,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeToolRiskLevel {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeToolRetryPolicy {
+    Never,
+    SafeTransportOnly,
+    Idempotent,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeToolCancellationContract {
+    Cooperative,
+    Immediate,
+    Unsupported,
+}
+
+/// Runtime-enforced tool lifecycle contract. Tool descriptions remain model
+/// metadata; this contract is server authority and is hashed into durable
+/// intent before any executor can observe the request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeToolContract {
+    pub tool_name: String,
+    pub contract_version: String,
+    pub input_schema_version: String,
+    pub output_schema_version: String,
+    pub side_effect_class: RuntimeToolSideEffectClass,
+    pub risk_level: RuntimeToolRiskLevel,
+    pub required_capability: String,
+    pub tenant_policy: String,
+    pub secret_scope: String,
+    pub idempotency_strategy: String,
+    pub retry_policy: RuntimeToolRetryPolicy,
+    pub timeout_ms: u64,
+    pub deadline_ms: u64,
+    pub cancellation: RuntimeToolCancellationContract,
+    pub network_policy: String,
+    pub filesystem_policy: String,
+    pub datasource_policy: String,
+    pub artifact_policy: String,
+    pub evidence_policy: String,
+    pub compensation: String,
+    pub can_parallel: bool,
+    pub supports_deferred: bool,
+    pub continue_after_parent_cancel: bool,
+}
+
+impl RuntimeToolContract {
+    #[must_use]
+    pub fn test_read_only(tool_name: impl Into<String>) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+            contract_version: "tool-contract-v1".into(),
+            input_schema_version: "v1".into(),
+            output_schema_version: "v1".into(),
+            side_effect_class: RuntimeToolSideEffectClass::LocalRead,
+            risk_level: RuntimeToolRiskLevel::Low,
+            required_capability: "execute".into(),
+            tenant_policy: "current_tenant".into(),
+            secret_scope: "none".into(),
+            idempotency_strategy: "read_only".into(),
+            retry_policy: RuntimeToolRetryPolicy::SafeTransportOnly,
+            timeout_ms: 30_000,
+            deadline_ms: 60_000,
+            cancellation: RuntimeToolCancellationContract::Cooperative,
+            network_policy: "deny".into(),
+            filesystem_policy: "read_only".into(),
+            datasource_policy: "deny".into(),
+            artifact_policy: "spill_if_oversized".into(),
+            evidence_policy: "eligible_with_provenance".into(),
+            compensation: "none_required".into(),
+            can_parallel: false,
+            supports_deferred: false,
+            continue_after_parent_cancel: false,
+        }
+    }
+
+    pub fn validate(&self, tool_name: &str) -> Result<(), RuntimeError> {
+        if self.tool_name != tool_name
+            || self.contract_version.trim().is_empty()
+            || self.input_schema_version.trim().is_empty()
+            || self.output_schema_version.trim().is_empty()
+            || self.required_capability.trim().is_empty()
+            || self.idempotency_strategy.trim().is_empty()
+            || self.timeout_ms == 0
+            || self.deadline_ms < self.timeout_ms
+        {
+            return Err(RuntimeError::new(format!(
+                "tool `{tool_name}` has an incomplete or mismatched runtime contract"
+            )));
+        }
+        if matches!(
+            self.side_effect_class,
+            RuntimeToolSideEffectClass::ExternalWrite | RuntimeToolSideEffectClass::Irreversible
+        ) && self.idempotency_strategy == "none"
+        {
+            return Err(RuntimeError::new(format!(
+                "tool `{tool_name}` cannot perform high-risk side effects without idempotency"
+            )));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn content_hash(&self) -> String {
+        let bytes = serde_json::to_vec(self).expect("tool contract is serializable");
+        hex::encode(Sha256::digest(bytes))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +241,7 @@ pub struct RuntimeApprovalRequest {
     pub input: String,
     pub iteration: usize,
     pub request: PermissionRequest,
+    pub contract: RuntimeToolContract,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,7 +271,32 @@ impl RuntimeToolIntent {
         authorized: bool,
         denial_reason: Option<String>,
     ) -> Self {
+        Self::new_with_contract(
+            turn_id,
+            invocation_id,
+            tool_name,
+            input,
+            iteration,
+            authorized,
+            denial_reason,
+            RuntimeToolContract::test_read_only(tool_name),
+        )
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_contract(
+        turn_id: &str,
+        invocation_id: &str,
+        tool_name: &str,
+        input: &str,
+        iteration: usize,
+        authorized: bool,
+        denial_reason: Option<String>,
+        contract: RuntimeToolContract,
+    ) -> Self {
         let input_hash = hex::encode(Sha256::digest(input.as_bytes()));
+        let contract_hash = contract.content_hash();
         Self {
             turn_id: turn_id.to_string(),
             invocation_id: invocation_id.to_string(),
@@ -120,7 +305,8 @@ impl RuntimeToolIntent {
             iteration,
             authorized,
             denial_reason,
-            idempotency_key: format!("tool:{turn_id}:{invocation_id}:{input_hash}"),
+            idempotency_key: format!("tool:{turn_id}:{invocation_id}:{input_hash}:{contract_hash}"),
+            contract,
         }
     }
 }
@@ -353,6 +539,16 @@ pub trait AgentExecutionKernel: Send + Sync {
 
     async fn start_turn(&self, input: RuntimeTurnStart) -> Result<(), RuntimeError>;
 
+    /// Load the governed semantic state that must be considered by the real
+    /// provider request. Durable adapters may retrieve/rank data here, but the
+    /// generic runtime remains responsible for final token-budget selection.
+    async fn load_context_supplement(
+        &self,
+        _input: RuntimeContextSupplementRequest,
+    ) -> Result<RuntimeContextSupplement, RuntimeError> {
+        Ok(RuntimeContextSupplement::default())
+    }
+
     /// Persist the exact model-visible context manifest before the provider is
     /// called.  Payload projections may redact secrets, but hashes always refer
     /// to the original runtime view.
@@ -367,6 +563,26 @@ pub trait AgentExecutionKernel: Send + Sync {
         iteration: usize,
         message: &ConversationMessage,
     ) -> Result<(), RuntimeError>;
+
+    /// Persist a user-visible message produced outside the native model turn
+    /// loop (for example a background PM, attribution, or adversarial task).
+    /// The message must reach the ledger before the in-memory Session changes.
+    async fn record_visible_message(
+        &self,
+        message_id: &str,
+        message: &ConversationMessage,
+    ) -> Result<(), RuntimeError>;
+
+    /// Atomically append a canonical, field-complete runtime checkpoint and
+    /// its query projection. Durable adapters encrypt the exact payload;
+    /// redacted event projections are never used as the recovery source.
+    async fn checkpoint_session(
+        &self,
+        _reason: &str,
+        _session: &Session,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
 
     /// Commit durable intent, capability consumption and budget reservation
     /// before a tool executor is allowed to observe the request.

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
+use sqlx::Row;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -40,6 +41,271 @@ use sha2::Digest;
 const DEFAULT_MAX_CONCURRENT: usize = 3;
 const INTERNAL_TRANSIENT_SESSION_SWEEP_AFTER_SECS: i64 = 30 * 60;
 const CONTEXT_ARCHIVE_MAX_CHARS: usize = 2_000_000;
+
+/// Rebuild the user-visible runtime session from the durable execution ledger.
+/// JSONL is intentionally not consulted here: it is an export/compatibility
+/// archive, while the ledger is the ordered recovery authority for new turns.
+fn rebuild_session_from_ledger_rows(
+    session_id: &str,
+    tenant_id: &str,
+    user_id: &str,
+    rows: &[(i64, String, String, String, Option<String>)],
+) -> std::result::Result<Option<runtime::Session>, String> {
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let mut session = runtime::Session::new();
+    session.session_id = session_id.to_string();
+    session.tenant_id = Some(tenant_id.to_string());
+    session.user_id = Some(user_id.to_string());
+    let mut expected_sequence = 1_u64;
+    for (stored_sequence, _event_type, raw, stored_hash, recovery_ciphertext) in rows {
+        let sequence = u64::try_from(*stored_sequence)
+            .map_err(|_| "execution ledger contains a negative sequence".to_string())?;
+        if sequence != expected_sequence {
+            return Err(format!(
+                "execution ledger sequence gap: expected {expected_sequence}, found {sequence}"
+            ));
+        }
+        let typed_envelope = serde_json::from_str::<agent_protocol::AgentEventEnvelope>(raw)
+            .map_err(|error| format!("invalid execution-ledger envelope: {error}"))?;
+        if typed_envelope.sequence != sequence {
+            return Err(format!(
+                "execution ledger sequence mismatch: row={sequence}, envelope={}",
+                typed_envelope.sequence
+            ));
+        }
+        if typed_envelope.schema_version != 1 {
+            return Err(format!(
+                "execution ledger contains unsupported required schema version {}",
+                typed_envelope.schema_version
+            ));
+        }
+        if typed_envelope.payload_hash != *stored_hash {
+            return Err(format!(
+                "execution ledger payload hash mismatch at sequence {sequence}"
+            ));
+        }
+        typed_envelope.verify_hash().map_err(|error| {
+            format!("execution ledger envelope failed hash verification: {error}")
+        })?;
+        if typed_envelope.thread_id != session_id {
+            return Err(format!(
+                "execution ledger envelope belongs to thread {}, expected {session_id}",
+                typed_envelope.thread_id
+            ));
+        }
+        let expected_event_type = match &typed_envelope.event {
+            agent_protocol::AgentEventV1::Domain(domain) => {
+                format!("{}.{}", domain.domain, domain.kind)
+            }
+            _ => "agent.event".to_string(),
+        };
+        if expected_event_type != *_event_type {
+            return Err(format!(
+                "execution ledger event type mismatch at sequence {sequence}: row={_event_type}, envelope={expected_event_type}"
+            ));
+        }
+        expected_sequence = expected_sequence.saturating_add(1);
+        let agent_protocol::AgentEventV1::Domain(domain) = &typed_envelope.event else {
+            continue;
+        };
+        let protected_payload = &domain.payload;
+        if domain.payload.get("_recoveryPayloadHash").is_some() && recovery_ciphertext.is_none() {
+            return Err(
+                "execution ledger is missing the encrypted payload required for exact recovery"
+                    .to_string(),
+            );
+        }
+        let recovery_payload = recovery_ciphertext
+            .as_deref()
+            .map(|ciphertext| {
+                crate::crypto::decrypt(ciphertext)
+                    .map_err(|error| format!("cannot decrypt runtime recovery payload: {error}"))
+            })
+            .transpose()?
+            .map(|value| {
+                let expected_hash = protected_payload
+                    .get("_recoveryPayloadHash")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        "encrypted recovery payload is not bound to the ledger envelope".to_string()
+                    })?;
+                let actual_hash = format!("{:x}", sha2::Sha256::digest(value.as_bytes()));
+                if actual_hash != expected_hash {
+                    return Err(
+                        "decrypted recovery payload hash does not match ledger envelope"
+                            .to_string(),
+                    );
+                }
+                serde_json::from_str::<Value>(&value)
+                    .map_err(|error| format!("invalid decrypted recovery payload: {error}"))
+            })
+            .transpose()?;
+        let payload = recovery_payload.as_ref().unwrap_or(protected_payload);
+        let kind = domain.kind.as_str();
+        let turn_id = typed_envelope
+            .turn_id
+            .as_deref()
+            .unwrap_or("recovered-turn");
+        let known_runtime_kind = matches!(
+            kind,
+            "turn_started"
+                | "assistant_message"
+                | "visible_message"
+                | "tool_outcome"
+                | "tool_outcome_unknown"
+                | "turn_terminal"
+                | "context_manifest_committed"
+                | "tool_intent_authorized"
+                | "tool_started"
+                | "session_checkpoint"
+        );
+        if domain.domain == "runtime"
+            && !known_runtime_kind
+            && domain
+                .payload
+                .get("_requiredForRecovery")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            return Err(format!(
+                "execution ledger contains unknown required runtime event {kind}"
+            ));
+        }
+        if kind == "turn_started" && !session.turns.iter().any(|turn| turn.turn_id == turn_id) {
+            let input = payload
+                .get("userInput")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            session.restore_turn(
+                turn_id,
+                input,
+                session.messages.len(),
+                None,
+                runtime::SessionTurnStatus::Running,
+            );
+        }
+        if kind == "session_checkpoint" {
+            let checkpoint = payload
+                .get("session")
+                .ok_or_else(|| "session_checkpoint is missing session state".to_string())?;
+            let state_hash = payload
+                .get("stateHash")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "session_checkpoint is missing stateHash".to_string())?;
+            let actual_hash = format!(
+                "{:x}",
+                sha2::Sha256::digest(serde_json::to_vec(checkpoint).unwrap_or_default())
+            );
+            if actual_hash != state_hash {
+                return Err("session_checkpoint state hash mismatch".to_string());
+            }
+            let checkpoint = runtime::Session::from_recovery_json(checkpoint)
+                .map_err(|error| format!("invalid runtime session checkpoint: {error}"))?;
+            if checkpoint.session_id != session_id
+                || checkpoint.tenant_id.as_deref() != Some(tenant_id)
+                || checkpoint.user_id.as_deref() != Some(user_id)
+            {
+                return Err("runtime session checkpoint scope mismatch".to_string());
+            }
+            session = checkpoint;
+            continue;
+        }
+        let result = match kind {
+            "turn_started" => payload
+                .get("userInput")
+                .and_then(Value::as_str)
+                .map(runtime::ConversationMessage::user_text),
+            "assistant_message" => payload
+                .get("message")
+                .and_then(|value| value.get("message"))
+                .and_then(|value| {
+                    serde_json::from_value::<runtime::ConversationMessage>(value.clone()).ok()
+                }),
+            "visible_message" => payload.get("message").and_then(|value| {
+                serde_json::from_value::<runtime::ConversationMessage>(value.clone()).ok()
+            }),
+            "tool_outcome" => {
+                let invocation_id = payload
+                    .get("invocationId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "tool_outcome is missing invocationId".to_string())?;
+                let tool_name = payload
+                    .get("toolName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool");
+                let output = payload
+                    .get("modelOutput")
+                    .and_then(Value::as_str)
+                    .unwrap_or("[tool result recovered from execution ledger]");
+                Some(runtime::ConversationMessage::tool_result(
+                    invocation_id.to_string(),
+                    tool_name.to_string(),
+                    output.to_string(),
+                    payload
+                        .get("outcome")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| value != "completed"),
+                ))
+            }
+            _ => None,
+        };
+        if let Some(message) = result {
+            if session.push_message(message).is_err() {
+                return Err("execution ledger produced an invalid message sequence".to_string());
+            }
+        }
+        if kind == "turn_terminal" {
+            let status = match payload.get("status").and_then(Value::as_str) {
+                Some("completed") => runtime::SessionTurnStatus::Completed,
+                Some("suspended") => runtime::SessionTurnStatus::Suspended,
+                Some("rolled_back") => runtime::SessionTurnStatus::RolledBack,
+                _ => runtime::SessionTurnStatus::Failed,
+            };
+            if let Some(turn) = session
+                .turns
+                .iter_mut()
+                .find(|turn| turn.turn_id == turn_id)
+            {
+                turn.status = status;
+                turn.end_message_count = Some(session.messages.len());
+            }
+        }
+    }
+    Ok(Some(session))
+}
+
+async fn load_durable_ledger_session(
+    db: &sqlx::SqlitePool,
+    session_id: &str,
+    tenant_id: &str,
+    user_id: &str,
+) -> Result<Option<runtime::Session>> {
+    let rows = sqlx::query(
+        "SELECT sequence, event_type, payload_json, payload_hash, raw_payload_ciphertext
+         FROM agent_event_ledger
+         WHERE tenant_id = ? AND thread_id = ? AND durable = 1
+         ORDER BY sequence ASC",
+    )
+    .bind(tenant_id)
+    .bind(session_id)
+    .fetch_all(db)
+    .await?
+    .into_iter()
+    .map(|row| {
+        Ok((
+            row.try_get::<i64, _>(0)?,
+            row.try_get::<String, _>(1)?,
+            row.try_get::<String, _>(2)?,
+            row.try_get::<String, _>(3)?,
+            row.try_get::<Option<String>, _>(4)?,
+        ))
+    })
+    .collect::<std::result::Result<Vec<_>, sqlx::Error>>()?;
+    rebuild_session_from_ledger_rows(session_id, tenant_id, user_id, &rows)
+        .map_err(GatewayError::RuntimeBuild)
+}
 
 fn token_usage_delta(after: RuntimeTokenUsage, before: RuntimeTokenUsage) -> RuntimeTokenUsage {
     RuntimeTokenUsage {
@@ -1543,8 +1809,8 @@ impl AgentSessionManager {
         result
     }
 
-    /// Load a suspended runtime turn from its JSONL checkpoint for a durable
-    /// parent coordinator after process restart.
+    /// Load a suspended runtime turn reconstructed from the durable Agent
+    /// Ledger for a parent coordinator after process restart.
     pub async fn suspended_turn_snapshot(
         &self,
         session_id: &str,
@@ -2325,9 +2591,9 @@ impl AgentSessionManager {
         })?;
         let append_result = if let Some(runtime) = Arc::get_mut(&mut runtime_arc) {
             runtime
-                .session_mut()
-                .push_message(message)
-                .map_err(|error| GatewayError::RuntimeExecution(error.to_string()))
+                .append_visible_message(message)
+                .await
+                .map_err(GatewayError::Runtime)
         } else {
             Err(GatewayError::RuntimeExecution(
                 "runtime Arc is not uniquely owned".to_string(),
@@ -2410,9 +2676,9 @@ impl AgentSessionManager {
         })?;
         let append_result = if let Some(runtime) = Arc::get_mut(&mut runtime_arc) {
             runtime
-                .session_mut()
-                .push_message(message)
-                .map_err(|error| GatewayError::RuntimeExecution(error.to_string()))
+                .append_visible_message(message)
+                .await
+                .map_err(GatewayError::Runtime)
         } else {
             Err(GatewayError::RuntimeExecution(
                 "runtime Arc is not uniquely owned".to_string(),
@@ -2544,12 +2810,29 @@ impl AgentSessionManager {
         let custom_input_price = first_key.and_then(|k| k.input_price_per_million);
         let custom_output_price = first_key.and_then(|k| k.output_price_per_million);
 
-        let builder = self.attach_compaction_hook_factory(RuntimeBuilder::restore(
-            config,
-            workspace.clone(),
-            session_id.to_string(),
-            new_tenant_mcp,
-        ));
+        let durable_session = load_durable_ledger_session(
+            &self.config_registry.database(),
+            session_id,
+            &tenant_id,
+            &user_id,
+        )
+        .await?
+        .unwrap_or_else(|| {
+            let mut session = runtime::Session::new();
+            session.session_id = session_id.to_string();
+            session.tenant_id = Some(tenant_id.clone());
+            session.user_id = Some(user_id.clone());
+            session
+        });
+        let builder = self.attach_compaction_hook_factory(
+            RuntimeBuilder::restore(
+                config,
+                workspace.clone(),
+                session_id.to_string(),
+                new_tenant_mcp,
+            )
+            .with_restored_session(durable_session),
+        );
         let new_built = builder.build().await?;
         let new_model = new_built.model.clone();
         let new_provider = new_built.provider.clone();
@@ -2607,6 +2890,13 @@ impl AgentSessionManager {
     /// to the DB from a previous server run), we still try to mark it as
     /// `completed` in the DB so that `list_user_sessions` excludes it.
     pub async fn destroy_session(&self, session_id: &str) -> Result<()> {
+        let persisted_workspace = self
+            .config_registry
+            .get_agent_session_record(session_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|record| PathBuf::from(record.workspace_path));
         // Capture the workspace path before removing from the map so we can delete the file.
         let session_workspace = {
             let mut sessions = self.sessions.write().await;
@@ -2644,14 +2934,11 @@ impl AgentSessionManager {
             }
         }
 
-        // Physically delete the session .jsonl file asynchronously.
-        // Fall back to glob search if the session was not loaded into memory.
+        // Physically delete the diagnostic JSONL export asynchronously. The
+        // registry workspace is sufficient; recovery never scans this file.
         let file_to_delete: Option<PathBuf> = session_workspace
-            .map(|ws| ws.join(".aos/sessions").join(format!("{session_id}.jsonl")))
-            .or_else(|| {
-                self.try_load_session_from_disk(session_id)
-                    .map(|(p, _, _)| p)
-            });
+            .or(persisted_workspace)
+            .map(|ws| ws.join(".aos/sessions").join(format!("{session_id}.jsonl")));
         if let Some(path) = file_to_delete {
             let sid = session_id.to_string();
             tokio::spawn(async move {
@@ -3108,10 +3395,9 @@ impl AgentSessionManager {
     /// 1. In-memory sessions map (active sessions)
     /// 2. Database lookup + lazy restoration (inactive sessions from a previous server run)
     ///
-    /// When a session is found in the DB but not in memory, it is lazily restored:
-    /// the conversation history is loaded from the persisted JSONL file, and a fresh
-    /// runtime is built with the user's current config. This ensures historical sessions
-    /// remain accessible even after server restarts.
+    /// When a session is found in the DB but not in memory, it is lazily restored
+    /// from the durable Agent Ledger into a fresh runtime using the user's
+    /// current config.
     pub async fn get_session(&self, session_id: &str) -> Option<SessionHandle> {
         self.get_session_scoped(session_id, None, None).await
     }
@@ -3207,8 +3493,8 @@ impl AgentSessionManager {
 
     /// Restore an inactive session from the database.
     ///
-    /// Loads the conversation history from the persisted JSONL file and builds a fresh
-    /// runtime with the user's current config. Returns the fully restored `AgentSession`.
+    /// Loads conversation state from the durable Agent Ledger and builds a
+    /// fresh runtime with the user's current config.
     async fn restore_session(
         &self,
         rec: &crate::config_registry::AgentSessionRecord,
@@ -3241,13 +3527,31 @@ impl AgentSessionManager {
         self.init_mcp_manager_from_config(&rec.tenant_id, &config)
             .await?;
 
-        // Build the runtime using the RESTORED session (carries conversation history).
-        let builder = self.attach_compaction_hook_factory(RuntimeBuilder::restore(
+        // The execution ledger is the sole recovery authority. JSONL may be
+        // emitted as a diagnostic export, but it is never read to reconstruct
+        // a production runtime.
+        let durable_session = load_durable_ledger_session(
+            &self.config_registry.database(),
+            &rec.session_id,
+            &rec.tenant_id,
+            &rec.user_id,
+        )
+        .await?
+        .unwrap_or_else(|| {
+            let mut session = runtime::Session::new();
+            session.session_id.clone_from(&rec.session_id);
+            session.tenant_id = Some(rec.tenant_id.clone());
+            session.user_id = Some(rec.user_id.clone());
+            session
+        });
+        let builder = RuntimeBuilder::restore(
             config,
             workspace.clone(),
             rec.session_id.clone(),
             tenant_mcp,
-        ));
+        )
+        .with_restored_session(durable_session);
+        let builder = self.attach_compaction_hook_factory(builder);
         let built = builder.build().await?;
 
         self.config_registry
@@ -3293,137 +3597,59 @@ impl AgentSessionManager {
         })
     }
 
-    /// Get session messages from the persisted session file.
-    ///
-    /// **Fallback chain**:
-    /// 1. In-memory session → its persisted JSONL path
-    /// 2. DB record (`tenant_id` + `user_id` + `session_id`) → workspace path → `.aos/sessions/{session_id}.jsonl`
-    ///
-    /// Fallback (2) ensures that sessions created in a previous server process
-    /// (e.g. after a restart) are still loadable from disk even though they are
-    /// no longer in the in-memory sessions map.
-    ///
-    /// **Authorization**: `tenant_id` and `user_id`, if provided, are validated against
-    /// the session's stored tenant/user IDs on the disk fallback path. This prevents
-    /// cross-tenant data leakage when a session exists on disk but not in memory.
+    /// Get the authoritative session projection from the durable Agent Ledger.
+    /// Ownership is validated against the session registry before any ledger
+    /// row is read. JSONL is deliberately excluded from this path.
     pub async fn get_session_messages(
         &self,
         session_id: &str,
         tenant_id: Option<&str>,
         user_id: Option<&str>,
     ) -> Option<runtime::Session> {
-        // Check if session is in memory (valid session, may or may not have a persistence file yet).
-        let in_memory = {
-            let sessions = self.sessions.read().await;
-            sessions.contains_key(session_id)
-        };
-
-        let session_path = {
-            let sessions = self.sessions.read().await;
-            sessions.get(session_id).map(|s| s.built.persistence_path())
-        };
-
-        // Try in-memory persistence path first.
-        if let Some(path) = session_path {
-            if let Ok(session) = runtime::Session::load_from_path(&path) {
-                return Some(session);
-            }
-
-            // Concurrent reads can catch a JSONL file between append operations.
-            // Retry once shortly before falling back.
-            sleep(Duration::from_millis(30)).await;
-            if let Ok(session) = runtime::Session::load_from_path(&path) {
-                return Some(session);
-            }
-
-            // If session runtime is currently available in memory (idle state),
-            // return its snapshot to avoid showing empty history in UI.
-            if in_memory {
-                let snapshot = {
-                    let sessions = self.sessions.read().await;
-                    sessions
-                        .get(session_id)
-                        .and_then(|session| session.built.try_session_snapshot())
-                };
-                if snapshot.is_some() {
-                    return snapshot;
-                }
-            }
-
-            return if in_memory {
-                // Session is valid but no messages have been persisted yet (fresh session),
-                // or runtime snapshot is temporarily unavailable while turn is running.
-                Some(runtime::Session::default())
-            } else {
-                None
-            };
-        }
-
-        // Fallback: scan disk for sessions not in memory (e.g. after server restart).
-        // Validate tenant/user ownership before returning to prevent cross-tenant leakage.
-        if let Some((path, disk_tenant, disk_user)) = self.try_load_session_from_disk(session_id) {
-            // If caller provided credentials, validate they match the session's owner.
-            // This prevents serving another user's session data from the disk fallback path.
-            if let (Some(want_tenant), Some(want_user)) = (tenant_id, user_id) {
-                if disk_tenant != want_tenant || disk_user != want_user {
-                    tracing::warn!(
-                        session_id,
-                        wanted_tenant = want_tenant,
-                        wanted_user = want_user,
-                        got_tenant = disk_tenant,
-                        got_user = disk_user,
-                        "session ownership mismatch on disk fallback — denying access"
-                    );
-                    return None;
-                }
-            }
-            return runtime::Session::load_from_path(&path).ok();
-        }
-
-        // Session is in memory but has no persistence path yet (runtime not built).
-        // Return an empty session so the UI can load without error.
-        if in_memory {
-            return Some(runtime::Session::default());
-        }
-
-        None
-    }
-
-    /// Try to locate a session's JSONL file by scanning the data directory.
-    /// Used when the session is not in the in-memory map (e.g. after server restart).
-    /// Returns the path and the tenant/user IDs extracted from the directory structure.
-    fn try_load_session_from_disk(&self, session_id: &str) -> Option<(PathBuf, String, String)> {
-        let data_dir = &self.data_dir;
-        let session_filename = format!("{session_id}.jsonl");
-        let search_path = data_dir
-            .join("*")
-            .join("*")
-            .join("workspace")
-            .join(".aos")
-            .join("sessions")
-            .join(&session_filename);
-
-        let glob_pattern = search_path.to_str()?;
-        let Ok(entries) = glob::glob(glob_pattern) else {
+        let record = self
+            .config_registry
+            .get_agent_session_record(session_id)
+            .await
+            .ok()
+            .flatten()?;
+        if !session_owner_matches(&record.tenant_id, &record.user_id, tenant_id, user_id) {
             return None;
-        };
-
-        entries.flatten().next().map(|path| {
-            // Path structure: {data_dir}/{tenant_id}/{user_id}/workspace/.aos/sessions/{session_id}.jsonl
-            let components: Vec<_> = path.components().collect();
-            // Find workspace component and go two levels up: tenant_id, user_id
-            let tenant_id = components
-                .windows(2)
-                .find(|w| w[1].as_os_str() == "workspace")
-                .map(|w| w[0].as_os_str().to_string_lossy().to_string())
-                .unwrap_or_default();
-            let user_id = components
-                .windows(3)
-                .find(|w| w[2].as_os_str() == "workspace")
-                .map(|w| w[1].as_os_str().to_string_lossy().to_string())
-                .unwrap_or_default();
-            (path, tenant_id, user_id)
-        })
+        }
+        match load_durable_ledger_session(
+            &self.config_registry.database(),
+            session_id,
+            &record.tenant_id,
+            &record.user_id,
+        )
+        .await
+        {
+            Ok(Some(session)) => Some(session),
+            Ok(None) => {
+                if let Some(snapshot) = self
+                    .sessions
+                    .read()
+                    .await
+                    .get(session_id)
+                    .and_then(|session| session.built.try_session_snapshot())
+                {
+                    return Some(snapshot);
+                }
+                let mut session = runtime::Session::new();
+                session.session_id = session_id.to_string();
+                session.tenant_id = Some(record.tenant_id);
+                session.user_id = Some(record.user_id);
+                Some(session)
+            }
+            Err(error) => {
+                tracing::error!(
+                    session_id,
+                    tenant_id = record.tenant_id,
+                    error = %error,
+                    "durable execution ledger is corrupt; refusing recovery"
+                );
+                None
+            }
+        }
     }
 
     /// Returns a reference to the per-tenant MCP managers map.
@@ -3877,20 +4103,17 @@ async fn compact_runtime_for_continuity(
         // case for CJK or provider-specific tokenization.
         max_estimated_tokens: 0,
     };
-    let mut compact_result = runtime.compact(compaction_config);
-    if compact_result.removed_message_count == 0 {
+    let baseline = runtime.compact(compaction_config);
+    if baseline.removed_message_count == 0 {
         return Ok(None);
     }
+    let mut selected_summary = baseline.summary.clone();
     let mut strategy = continuity_compaction_strategy();
     let mut provider_native_used = false;
     if let Some(bridge) = native_compaction_bridge {
-        match compact_session_with_provider_native(runtime, bridge, &compact_result.summary).await {
+        match compact_session_with_provider_native(runtime, bridge, &selected_summary).await {
             Ok(Some(summary)) if !summary.trim().is_empty() => {
-                compact_result = runtime::compact_session_with_summary(
-                    runtime.session(),
-                    compaction_config,
-                    summary,
-                );
+                selected_summary = summary;
                 strategy = bridge
                     .mode
                     .as_deref()
@@ -3922,13 +4145,9 @@ async fn compact_runtime_for_continuity(
         );
     }
     if !provider_native_used && model_summary_compaction_enabled() {
-        match summarize_session_for_compaction(runtime, &compact_result.summary).await {
+        match summarize_session_for_compaction(runtime, &selected_summary).await {
             Ok(summary) if !summary.trim().is_empty() => {
-                compact_result = runtime::compact_session_with_summary(
-                    runtime.session(),
-                    compaction_config,
-                    summary,
-                );
+                selected_summary = summary;
                 strategy = "model_summary_compaction".to_string();
             }
             Ok(_) => {
@@ -3948,13 +4167,15 @@ async fn compact_runtime_for_continuity(
             }
         }
     }
-    runtime.restore_session(compact_result.compacted_session.clone());
-    if let Some(path) = runtime.session().persistence_path().map(PathBuf::from) {
-        runtime
-            .session()
-            .save_to_path(path)
-            .map_err(|error| GatewayError::RuntimeExecution(error.to_string()))?;
-    }
+    let compact_result = runtime
+        .compact_transactionally(compaction_config, trigger, Some(selected_summary))
+        .await
+        .map_err(|error| GatewayError::RuntimeExecution(error.to_string()))?
+        .ok_or_else(|| {
+            GatewayError::RuntimeExecution(
+                "compaction source window disappeared before transactional commit".to_string(),
+            )
+        })?;
     let after_tokens =
         runtime::estimate_session_tokens_with_options(runtime.session(), token_options);
     let archive_entries = build_compaction_archive_entries(&compact_result.archived_messages);
@@ -4348,6 +4569,372 @@ mod tests {
     use super::*;
     use crate::config_registry::{ApiKeyEntry, UserRuntimeConfig};
     use proptest::prelude::*;
+
+    fn runtime_ledger_envelope(
+        thread_id: &str,
+        kind: &str,
+        payload: Value,
+        sequence: u64,
+    ) -> agent_protocol::AgentEventEnvelope {
+        agent_protocol::AgentEventEnvelope::new(
+            thread_id,
+            Some("turn-1"),
+            None,
+            format!("runtime-{kind}-{sequence}"),
+            agent_protocol::AgentEventV1::Domain(agent_protocol::DomainEvent {
+                domain: "runtime".into(),
+                kind: kind.into(),
+                payload,
+            }),
+            sequence,
+        )
+    }
+
+    fn ledger_event_type(event: &agent_protocol::AgentEventEnvelope) -> String {
+        match &event.event {
+            agent_protocol::AgentEventV1::Domain(domain) => {
+                format!("{}.{}", domain.domain, domain.kind)
+            }
+            _ => "agent.event".into(),
+        }
+    }
+
+    #[test]
+    fn ledger_recovery_rebuilds_messages_without_jsonl() {
+        let assistant =
+            runtime::ConversationMessage::assistant(vec![runtime::ContentBlock::Text {
+                text: "done".into(),
+            }]);
+        let background =
+            runtime::ConversationMessage::assistant(vec![runtime::ContentBlock::Text {
+                text: "background delivery".into(),
+            }]);
+        let mut visible = runtime_ledger_envelope(
+            "s",
+            "visible_message",
+            serde_json::json!({"message":serde_json::to_value(&background).unwrap()}),
+            4,
+        );
+        visible.turn_id = None;
+        visible.payload_hash = visible.compute_payload_hash().unwrap();
+        let envelopes = vec![
+            runtime_ledger_envelope(
+                "s",
+                "turn_started",
+                serde_json::json!({"userInput":"hello"}),
+                1,
+            ),
+            runtime_ledger_envelope(
+                "s",
+                "assistant_message",
+                serde_json::json!({"iteration":1,"message":{"message":serde_json::to_value(&assistant).unwrap()}}),
+                2,
+            ),
+            runtime_ledger_envelope(
+                "s",
+                "turn_terminal",
+                serde_json::json!({"status":"completed"}),
+                3,
+            ),
+            visible,
+        ];
+        let mut rows = envelopes
+            .iter()
+            .map(|envelope| {
+                (
+                    i64::try_from(envelope.sequence).unwrap(),
+                    ledger_event_type(envelope),
+                    serde_json::to_string(envelope).unwrap(),
+                    envelope.payload_hash.clone(),
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut checkpoint = rebuild_session_from_ledger_rows("s", "t", "u", &rows)
+            .unwrap()
+            .unwrap();
+        checkpoint.stage_runtime_context(runtime::SessionRuntimeContext {
+            model: Some("checkpoint-model".into()),
+            provider: Some("checkpoint-provider".into()),
+            tools_enabled: true,
+            allowed_tools: vec!["read_file".into()],
+            ..runtime::SessionRuntimeContext::default()
+        });
+        checkpoint.stage_context_baseline(runtime::SessionContextBaseline {
+            label: Some("canonical-baseline".into()),
+            system_prompt_sections: vec!["system section".into()],
+            tool_names: vec!["read_file".into()],
+            ..runtime::SessionContextBaseline::default()
+        });
+        checkpoint.fork = Some(runtime::SessionFork {
+            parent_session_id: "parent-session".into(),
+            branch_name: Some("audit-branch".into()),
+        });
+        checkpoint.record_compaction_with_replacement(
+            "exact compaction summary",
+            1,
+            checkpoint.messages.clone(),
+        );
+        let checkpoint_json = checkpoint.to_recovery_json().unwrap();
+        let checkpoint_hash = format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&checkpoint_json).unwrap())
+        );
+        let checkpoint_event = runtime_ledger_envelope(
+            "s",
+            "session_checkpoint",
+            serde_json::json!({
+                "schemaVersion": "runtime-session-checkpoint-v1",
+                "reason": "test",
+                "stateHash": checkpoint_hash,
+                "session": checkpoint_json,
+            }),
+            5,
+        );
+        rows.push((
+            5,
+            ledger_event_type(&checkpoint_event),
+            serde_json::to_string(&checkpoint_event).unwrap(),
+            checkpoint_event.payload_hash.clone(),
+            None,
+        ));
+        let session = rebuild_session_from_ledger_rows("s", "t", "u", &rows)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.messages.len(), 3);
+        assert_eq!(
+            session.messages[0],
+            runtime::ConversationMessage::user_text("hello")
+        );
+        assert_eq!(session.messages[1], assistant);
+        assert_eq!(session.messages[2], background);
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(
+            session.turns[0].status,
+            runtime::SessionTurnStatus::Completed
+        );
+        assert_eq!(
+            session.to_recovery_json().unwrap(),
+            checkpoint.to_recovery_json().unwrap()
+        );
+        assert_eq!(
+            session
+                .runtime_context
+                .as_ref()
+                .and_then(|context| context.model.as_deref()),
+            Some("checkpoint-model")
+        );
+        assert!(session.compaction.is_some());
+        assert!(session.fork.is_some());
+
+        let mut gap = rows.clone();
+        gap[1].0 = 4;
+        assert!(rebuild_session_from_ledger_rows("s", "t", "u", &gap).is_err());
+
+        let mut tampered = rows.clone();
+        tampered[1].2 = tampered[1].2.replace("done", "tampered");
+        assert!(rebuild_session_from_ledger_rows("s", "t", "u", &tampered).is_err());
+
+        let mut unknown = runtime_ledger_envelope(
+            "s",
+            "future_required_state",
+            serde_json::json!({"_requiredForRecovery": true}),
+            1,
+        );
+        unknown.payload_hash = unknown.compute_payload_hash().unwrap();
+        let unknown_rows = vec![(
+            1,
+            ledger_event_type(&unknown),
+            serde_json::to_string(&unknown).unwrap(),
+            unknown.payload_hash.clone(),
+            None,
+        )];
+        let error = rebuild_session_from_ledger_rows("s", "t", "u", &unknown_rows)
+            .expect_err("unknown required event must fail closed");
+        assert!(error.contains("unknown required runtime event"));
+    }
+
+    #[tokio::test]
+    async fn durable_ledger_loader_recovers_exact_encrypted_runtime_without_jsonl() {
+        let db = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE agent_event_ledger (
+                tenant_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                raw_payload_ciphertext TEXT,
+                durable INTEGER NOT NULL
+            )",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let assistant =
+            runtime::ConversationMessage::assistant(vec![runtime::ContentBlock::Text {
+                text: "ledger answer with sk-fake-recovery-secret-1234".into(),
+            }]);
+        let protected_assistant =
+            runtime::ConversationMessage::assistant(vec![runtime::ContentBlock::Text {
+                text: "ledger answer with [REDACTED_API_KEY]".into(),
+            }]);
+        let background =
+            runtime::ConversationMessage::assistant(vec![runtime::ContentBlock::Text {
+                text: "background delivery with sk-fake-background-secret-5678".into(),
+            }]);
+        let protected_background =
+            runtime::ConversationMessage::assistant(vec![runtime::ContentBlock::Text {
+                text: "background delivery with [REDACTED_API_KEY]".into(),
+            }]);
+        let mut visible = runtime_ledger_envelope(
+            "session",
+            "visible_message",
+            serde_json::json!({"message":protected_background}),
+            4,
+        );
+        visible.turn_id = None;
+        visible.payload_hash = visible.compute_payload_hash().unwrap();
+        let events = [
+            (
+                runtime_ledger_envelope(
+                    "session",
+                    "turn_started",
+                    serde_json::json!({"userInput":"ledger question [REDACTED_API_KEY]"}),
+                    1,
+                ),
+                serde_json::json!({"userInput":"ledger question sk-fake-recovery-secret-1234"}),
+            ),
+            (
+                runtime_ledger_envelope(
+                    "session",
+                    "assistant_message",
+                    serde_json::json!({"message":{"message":protected_assistant}}),
+                    2,
+                ),
+                serde_json::json!({"message":{"message":assistant}}),
+            ),
+            (
+                runtime_ledger_envelope(
+                    "session",
+                    "turn_terminal",
+                    serde_json::json!({"status":"completed"}),
+                    3,
+                ),
+                serde_json::json!({"status":"completed"}),
+            ),
+            (visible, serde_json::json!({"message":background})),
+        ];
+        for (mut event, recovery_payload) in events {
+            let recovery_payload_raw = recovery_payload.to_string();
+            let recovery_payload_hash = format!(
+                "{:x}",
+                sha2::Sha256::digest(recovery_payload_raw.as_bytes())
+            );
+            let agent_protocol::AgentEventV1::Domain(domain) = &mut event.event else {
+                panic!("runtime fixture must be a domain event");
+            };
+            domain.payload.as_object_mut().unwrap().insert(
+                "_recoveryPayloadHash".to_string(),
+                serde_json::Value::String(recovery_payload_hash),
+            );
+            event.payload_hash = event.compute_payload_hash().unwrap();
+            let recovery_payload_ciphertext =
+                crate::crypto::encrypt(&recovery_payload_raw).unwrap();
+            sqlx::query(
+                "INSERT INTO agent_event_ledger
+                 (tenant_id, thread_id, sequence, event_type, payload_json, payload_hash,
+                  raw_payload_ciphertext, durable)
+                 VALUES ('tenant', 'session', ?, ?, ?, ?, ?, 1)",
+            )
+            .bind(i64::try_from(event.sequence).unwrap())
+            .bind(ledger_event_type(&event))
+            .bind(serde_json::to_string(&event).unwrap())
+            .bind(&event.payload_hash)
+            .bind(recovery_payload_ciphertext)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+
+        let recovered = load_durable_ledger_session(&db, "session", "tenant", "user")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.messages.len(), 3);
+        assert_eq!(
+            recovered.messages[0],
+            runtime::ConversationMessage::user_text("ledger question sk-fake-recovery-secret-1234")
+        );
+        assert_eq!(recovered.messages[1], assistant);
+        assert_eq!(recovered.messages[2], background);
+        assert_eq!(recovered.turns.len(), 1);
+        assert_eq!(
+            recovered.turns[0].status,
+            runtime::SessionTurnStatus::Completed
+        );
+
+        let workspace =
+            std::env::temp_dir().join(format!("aos-ledger-runtime-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let built = RuntimeBuilder::restore(
+            test_runtime_config(&["test-model"]),
+            workspace.clone(),
+            "session".into(),
+            Arc::new(RwLock::new(McpServerSessionManager::new())),
+        )
+        .with_restored_session(recovered)
+        .build()
+        .await
+        .unwrap();
+        let runtime_session = built.try_session_snapshot().unwrap();
+        assert_eq!(
+            runtime_session.messages[0],
+            runtime::ConversationMessage::user_text("ledger question sk-fake-recovery-secret-1234")
+        );
+        assert_eq!(runtime_session.messages[1], assistant);
+        assert_eq!(runtime_session.messages[2], background);
+        let persisted_projection: String =
+            sqlx::query_scalar("SELECT payload_json FROM agent_event_ledger WHERE sequence = 1")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(!persisted_projection.contains("sk-fake-recovery-secret-1234"));
+        let persisted_background: String =
+            sqlx::query_scalar("SELECT payload_json FROM agent_event_ledger WHERE sequence = 4")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(!persisted_background.contains("sk-fake-background-secret-5678"));
+
+        let replacement = crate::crypto::encrypt(
+            &serde_json::json!({"userInput":"tampered but valid ciphertext"}).to_string(),
+        )
+        .unwrap();
+        sqlx::query("UPDATE agent_event_ledger SET raw_payload_ciphertext = ? WHERE sequence = 1")
+            .bind(replacement)
+            .execute(&db)
+            .await
+            .unwrap();
+        let error = load_durable_ledger_session(&db, "session", "tenant", "user")
+            .await
+            .expect_err("recovery payload replacement must fail closed");
+        assert!(error
+            .to_string()
+            .contains("recovery payload hash does not match"));
+        sqlx::query(
+            "UPDATE agent_event_ledger SET raw_payload_ciphertext = NULL WHERE sequence = 1",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let error = load_durable_ledger_session(&db, "session", "tenant", "user")
+            .await
+            .expect_err("removing a required recovery payload must fail closed");
+        assert!(error.to_string().contains("missing the encrypted payload"));
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
 
     fn test_runtime_config(models: &[&str]) -> UserRuntimeConfig {
         UserRuntimeConfig {

@@ -26,8 +26,9 @@ use runtime::{
     BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
     GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
     LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session, TaskPacket,
-    ToolError, ToolExecutor,
+    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError,
+    RuntimeToolCancellationContract, RuntimeToolContract, RuntimeToolRetryPolicy,
+    RuntimeToolRiskLevel, RuntimeToolSideEffectClass, Session, TaskPacket, ToolError, ToolExecutor,
 };
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
@@ -325,6 +326,31 @@ impl GlobalToolRegistry {
         Ok(builtin.chain(runtime).chain(plugin).collect())
     }
 
+    /// Resolve the server-authoritative lifecycle contract for a registered
+    /// tool. Model-facing descriptions never substitute for this policy.
+    #[must_use]
+    pub fn runtime_contract(&self, tool_name: &str) -> Option<RuntimeToolContract> {
+        let canonical = canonical_allowed_tool_name(tool_name);
+        let permission = mvp_tool_specs()
+            .into_iter()
+            .find(|spec| canonical_allowed_tool_name(spec.name) == canonical)
+            .map(|spec| spec.required_permission)
+            .or_else(|| {
+                self.runtime_tools
+                    .iter()
+                    .find(|tool| canonical_allowed_tool_name(&tool.name) == canonical)
+                    .map(|tool| tool.required_permission)
+            })
+            .or_else(|| {
+                self.plugin_tools.iter().find_map(|tool| {
+                    (canonical_allowed_tool_name(&tool.definition().name) == canonical)
+                        .then(|| permission_mode_from_plugin(tool.required_permission()).ok())
+                        .flatten()
+                })
+            })?;
+        Some(runtime_contract_for_registered_tool(tool_name, permission))
+    }
+
     #[must_use]
     pub fn actual_tool_names(&self) -> Vec<String> {
         mvp_tool_specs()
@@ -385,15 +411,38 @@ impl GlobalToolRegistry {
         pending_mcp_servers: Option<Vec<String>>,
         mcp_degraded: Option<McpDegradedReport>,
     ) -> ToolSearchOutput {
+        self.search_excluding(
+            query,
+            max_results,
+            pending_mcp_servers,
+            mcp_degraded,
+            &BTreeSet::new(),
+        )
+    }
+
+    #[must_use]
+    pub fn search_excluding(
+        &self,
+        query: &str,
+        max_results: usize,
+        pending_mcp_servers: Option<Vec<String>>,
+        mcp_degraded: Option<McpDegradedReport>,
+        excluded_tools: &BTreeSet<String>,
+    ) -> ToolSearchOutput {
         let query = query.trim().to_string();
         let normalized_query = normalize_tool_search_query(&query);
-        let matches = search_tool_specs(&query, max_results.max(1), &self.searchable_tool_specs());
+        let searchable = self
+            .searchable_tool_specs()
+            .into_iter()
+            .filter(|tool| !excluded_tools.contains(&canonical_allowed_tool_name(&tool.name)))
+            .collect::<Vec<_>>();
+        let matches = search_tool_specs(&query, max_results.max(1), &searchable);
 
         ToolSearchOutput {
             matches,
             query,
             normalized_query,
-            total_deferred_tools: self.searchable_tool_specs().len(),
+            total_deferred_tools: searchable.len(),
             pending_mcp_servers,
             mcp_degraded,
         }
@@ -436,6 +485,126 @@ impl GlobalToolRegistry {
             description: tool.definition().description.clone().unwrap_or_default(),
         });
         builtin.chain(runtime).chain(plugin).collect()
+    }
+}
+
+fn runtime_contract_for_registered_tool(
+    tool_name: &str,
+    permission: PermissionMode,
+) -> RuntimeToolContract {
+    let lower = tool_name.to_ascii_lowercase();
+    let is_deferred = [
+        "deep_research_start",
+        "super_adversarial_start",
+        "nl2sql_analyze",
+        "data_attribution_start",
+    ]
+    .iter()
+    .any(|name| lower == *name);
+    let is_external_read = lower.contains("websearch")
+        || lower.contains("web_search")
+        || lower.contains("webfetch")
+        || lower.contains("web_fetch")
+        || lower.contains("remote_read");
+    let is_unknown_external = lower.starts_with("mcp__")
+        || lower.starts_with("skill__")
+        || lower.contains("remote_trigger");
+    let is_destructive = lower.contains("delete")
+        || lower.contains("cancel")
+        || lower.contains("execute")
+        || lower.contains("bash")
+        || lower.contains("shell");
+    let side_effect_class = if is_deferred || is_unknown_external {
+        RuntimeToolSideEffectClass::ExternalWrite
+    } else if is_external_read {
+        RuntimeToolSideEffectClass::ExternalRead
+    } else {
+        match permission {
+            PermissionMode::ReadOnly => RuntimeToolSideEffectClass::LocalRead,
+            PermissionMode::WorkspaceWrite => RuntimeToolSideEffectClass::LocalWrite,
+            PermissionMode::DangerFullAccess | PermissionMode::Prompt => {
+                RuntimeToolSideEffectClass::LocalWrite
+            }
+            PermissionMode::Allow => RuntimeToolSideEffectClass::None,
+        }
+    };
+    let risk_level = if is_destructive || is_unknown_external {
+        RuntimeToolRiskLevel::High
+    } else if is_deferred || matches!(side_effect_class, RuntimeToolSideEffectClass::LocalWrite) {
+        RuntimeToolRiskLevel::Medium
+    } else {
+        RuntimeToolRiskLevel::Low
+    };
+    let read_only = matches!(
+        side_effect_class,
+        RuntimeToolSideEffectClass::None
+            | RuntimeToolSideEffectClass::LocalRead
+            | RuntimeToolSideEffectClass::ExternalRead
+    );
+    RuntimeToolContract {
+        tool_name: tool_name.to_string(),
+        contract_version: "tool-contract-v1".into(),
+        input_schema_version: "json-schema-v1".into(),
+        output_schema_version: "tool-result-v1".into(),
+        side_effect_class,
+        risk_level,
+        required_capability: canonical_allowed_tool_name(tool_name),
+        tenant_policy: "tenant_user_session_intersection".into(),
+        secret_scope: if is_unknown_external || is_external_read {
+            "approved_credential_integration_only".into()
+        } else {
+            "no_secret_export".into()
+        },
+        idempotency_strategy: if read_only {
+            "read_only".into()
+        } else {
+            "durable_invocation_key".into()
+        },
+        retry_policy: if read_only {
+            RuntimeToolRetryPolicy::SafeTransportOnly
+        } else {
+            RuntimeToolRetryPolicy::Never
+        },
+        timeout_ms: if is_deferred { 300_000 } else { 60_000 },
+        deadline_ms: if is_deferred { 3_600_000 } else { 120_000 },
+        cancellation: if is_deferred {
+            RuntimeToolCancellationContract::Cooperative
+        } else if is_destructive {
+            RuntimeToolCancellationContract::Immediate
+        } else {
+            RuntimeToolCancellationContract::Cooperative
+        },
+        network_policy: if is_external_read || is_unknown_external || is_deferred {
+            "tenant_egress_policy".into()
+        } else {
+            "deny".into()
+        },
+        filesystem_policy: match permission {
+            PermissionMode::ReadOnly => "workspace_read_only",
+            PermissionMode::WorkspaceWrite => "workspace_write",
+            PermissionMode::DangerFullAccess | PermissionMode::Prompt => "sandbox_and_approval",
+            PermissionMode::Allow => "none",
+        }
+        .into(),
+        datasource_policy: if lower.contains("sql") || lower.contains("attribution") {
+            "authorized_datasource_only".into()
+        } else {
+            "deny".into()
+        },
+        artifact_policy: "durable_spill_before_truncation".into(),
+        evidence_policy: if read_only {
+            "eligible_after_source_and_semantic_admission".into()
+        } else {
+            "execution_fact_only".into()
+        },
+        compensation: if read_only {
+            "none_required".into()
+        } else {
+            "manual_recovery_or_domain_compensation".into()
+        },
+        can_parallel: read_only && !is_deferred,
+        supports_deferred: is_deferred,
+        continue_after_parent_cancel: false,
     }
 }
 
@@ -8996,6 +9165,21 @@ impl SubagentToolExecutor {
 }
 
 impl ToolExecutor for SubagentToolExecutor {
+    fn tool_contract(&self, tool_name: &str) -> Option<RuntimeToolContract> {
+        let canonical = canonical_allowed_tool_name(tool_name);
+        let spec = mvp_tool_specs()
+            .into_iter()
+            .find(|spec| canonical_allowed_tool_name(spec.name) == canonical)?;
+        Some(runtime_contract_for_registered_tool(
+            tool_name,
+            spec.required_permission,
+        ))
+    }
+
+    fn requires_tool_contracts(&self) -> bool {
+        true
+    }
+
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
         if !self
             .allowed_tools

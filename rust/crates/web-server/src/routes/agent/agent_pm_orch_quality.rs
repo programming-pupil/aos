@@ -1760,6 +1760,165 @@ pub(super) fn degrade_pm_quality_with_reason(
     quality
 }
 
+fn requirement_state_gap_labels(
+    state: &pm_domain::requirement_state::RequirementState,
+) -> Vec<&'static str> {
+    let mut gaps = Vec::new();
+    if !state
+        .problem_frame
+        .as_ref()
+        .is_some_and(|frame| frame.confirmed)
+    {
+        gaps.push("confirmed problem frame");
+    }
+    if !state.stakeholders.iter().any(|item| item.confirmed) {
+        gaps.push("confirmed primary stakeholder");
+    }
+    if !state.jobs.iter().any(|item| item.confirmed) {
+        gaps.push("confirmed job to be done");
+    }
+    if !state
+        .desired_outcomes
+        .iter()
+        .any(|outcome| outcome.measure.is_some())
+    {
+        gaps.push("measurable outcome");
+    }
+    if state.scope.included.is_empty() {
+        gaps.push("included scope");
+    }
+    if !state
+        .acceptance_criteria
+        .iter()
+        .any(|criterion| criterion.testable)
+    {
+        gaps.push("testable acceptance criterion");
+    }
+    if state.assumptions.iter().any(|assumption| {
+        assumption.importance >= 0.7
+            && assumption.uncertainty >= 0.5
+            && matches!(
+                assumption.status,
+                pm_domain::requirement_state::AssumptionStatus::Open
+            )
+            && assumption.falsification_test.is_none()
+    }) {
+        gaps.push("validation plan for a critical assumption");
+    }
+    gaps
+}
+
+fn enforce_requirement_state_delivery_gate(
+    turn: &mut TurnResult,
+    quality: &mut PmAnswerQualityDto,
+    state: &pm_domain::requirement_state::RequirementState,
+) {
+    use pm_domain::requirement_state::{planning_gate, RequirementPlanningGate};
+
+    let gate = planning_gate(state);
+    if matches!(gate, RequirementPlanningGate::ReadyForDelivery) {
+        return;
+    }
+
+    quality.passed = false;
+    quality.deliverable = false;
+    quality.quality_level = "needs_clarification".to_string();
+    if !quality
+        .missing
+        .iter()
+        .any(|item| item == "requirement_state_not_ready")
+    {
+        quality
+            .missing
+            .push("requirement_state_not_ready".to_string());
+    }
+
+    let next_question = match &gate {
+        RequirementPlanningGate::Ask(question) => Some(question.question.clone()),
+        RequirementPlanningGate::ContinueResearch => {
+            pm_domain::requirement_state::next_question(state).map(|question| question.question)
+        }
+        RequirementPlanningGate::ReadyForDelivery => None,
+    };
+    if let Some(question) = next_question.as_ref() {
+        let suggestion = format!("Resolve the highest-value open question: {question}");
+        if !quality.suggestions.iter().any(|item| item == &suggestion) {
+            quality.suggestions.push(suggestion);
+        }
+    }
+
+    if matches!(gate, RequirementPlanningGate::Ask(_))
+        && next_question
+            .as_ref()
+            .is_some_and(|question| turn.text.contains(question))
+    {
+        return;
+    }
+    let gaps = requirement_state_gap_labels(state);
+    let cjk = contains_cjk(&turn.text);
+    let status = if cjk {
+        let gaps = if gaps.is_empty() {
+            "仍有高价值问题需要确认".to_string()
+        } else {
+            gaps.join("、")
+        };
+        let question = next_question
+            .map(|question| format!("\n\n下一问：{question}"))
+            .unwrap_or_default();
+        format!(
+            "\n\n## 需求状态\n\n当前内容保留为需求简报，尚不能标记为可评审方案。待补齐：{gaps}。{question}"
+        )
+    } else {
+        let gaps = if gaps.is_empty() {
+            "a remaining high-value question".to_string()
+        } else {
+            gaps.join(", ")
+        };
+        let question = next_question
+            .map(|question| format!("\n\nNext question: {question}"))
+            .unwrap_or_default();
+        format!(
+            "\n\n## Requirement status\n\nThis remains a Requirement Brief and is not review-ready. Missing: {gaps}.{question}"
+        )
+    };
+    if !turn.text.contains("## Requirement status") && !turn.text.contains("## 需求状态") {
+        turn.text.push_str(&status);
+    }
+}
+
+fn pm_requirement_evidence_delta(quality: &PmAnswerQualityDto) -> serde_json::Value {
+    let links = quality
+        .evidence_tree
+        .iter()
+        .filter_map(|node| {
+            let evidence_ids = node
+                .evidences
+                .iter()
+                .filter(|evidence| !evidence.url.trim().is_empty())
+                .map(|evidence| sha256_hex(evidence.url.trim().to_ascii_lowercase().as_str()))
+                .collect::<Vec<_>>();
+            if node.claim.trim().is_empty() || evidence_ids.is_empty() {
+                return None;
+            }
+            let support = match node.status.as_str() {
+                "confirmed" => "supported",
+                "contradicted" => "contradicted",
+                _ => "inconclusive",
+            };
+            Some(serde_json::json!({
+                "claim": node.claim,
+                "evidenceIds": evidence_ids,
+                "support": support,
+            }))
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "requirementDelta": {
+            "evidenceLinks": links,
+        }
+    })
+}
+
 pub(super) async fn finalize_pm_orchestration_result(
     db: &sqlx::SqlitePool,
     tenant_id: &str,
@@ -1797,15 +1956,48 @@ pub(super) async fn finalize_pm_orchestration_result(
             quality.suggestions.push(suggestion);
         }
     }
-    if let Err(error) = persist_pm_evidence_graph(db, tenant_id, session_id, &turn, &quality).await
+    persist_pm_evidence_graph(db, tenant_id, session_id, &turn, &quality)
+        .await
+        .map_err(|error| {
+            GatewayError::Internal(format!(
+                "PM evidence ledger persistence failed before delivery: {error}"
+            ))
+        })?;
+    let evidence_delta = pm_requirement_evidence_delta(&quality);
+    if evidence_delta["requirementDelta"]["evidenceLinks"]
+        .as_array()
+        .is_some_and(|links| !links.is_empty())
     {
-        tracing::warn!(
-            tenant_id = %tenant_id,
-            session_id = %session_id,
-            "persist_pm_evidence_graph failed: {}",
-            error
-        );
+        crate::semantic_kernel_store::persist_pm_requirement_state_delta(
+            db,
+            tenant_id,
+            session_id,
+            &format!("{run_id}:evidence"),
+            "",
+            &evidence_delta,
+        )
+        .await
+        .map_err(|error| {
+            GatewayError::Internal(format!(
+                "PM evidence delta persistence failed before delivery: {error}"
+            ))
+        })?;
     }
+    let requirement_state =
+        crate::semantic_kernel_store::load_pm_requirement_state(db, tenant_id, session_id)
+            .await
+            .map_err(|error| {
+                GatewayError::Internal(format!(
+                    "PM requirement-state load failed before delivery: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                GatewayError::Internal(
+            "PM requirement state is missing before final delivery; refusing an ungoverned result"
+                .to_string(),
+        )
+            })?;
+    enforce_requirement_state_delivery_gate(&mut turn, &mut quality, &requirement_state);
     persist_pm_claim_and_conflict_records(db, tenant_id, run_id, &quality).await;
     let quality_score = pm_quality_delivery_score(&quality);
     let task_id = sqlx::query_scalar::<_, Option<String>>(
@@ -4101,5 +4293,192 @@ mod tests {
         assert!(!turn.text.contains("请稍后重试"));
         assert!(!turn.text.contains("+2 more"));
         assert!(!turn.text.contains("Detected first-party evidence"));
+    }
+
+    fn review_ready_requirement_state() -> pm_domain::requirement_state::RequirementState {
+        use pm_domain::requirement_state::{
+            AcceptanceCriterion, JobToBeDone, Outcome, ProblemFrame, RequirementReadiness,
+            Stakeholder,
+        };
+        let mut state = pm_domain::requirement_state::RequirementState {
+            problem_frame: Some(ProblemFrame {
+                statement: "improve onboarding".into(),
+                confirmed: true,
+            }),
+            readiness: RequirementReadiness::ReadyForReview,
+            ..pm_domain::requirement_state::RequirementState::default()
+        };
+        state.stakeholders.push(Stakeholder {
+            name: "product owner".into(),
+            role: Some("decision maker".into()),
+            confirmed: true,
+        });
+        state.jobs.push(JobToBeDone {
+            statement: "activate new users".into(),
+            evidence_ids: vec![],
+            confirmed: true,
+        });
+        state.desired_outcomes.push(Outcome {
+            statement: "increase activation".into(),
+            measure: Some("activation rate".into()),
+        });
+        state.scope.included.push("onboarding".into());
+        state.acceptance_criteria.push(AcceptanceCriterion {
+            id: "ac-1".into(),
+            statement: "activation rate improves in holdout test".into(),
+            testable: true,
+        });
+        state
+    }
+
+    #[test]
+    fn requirement_state_delivery_gate_rejects_unverified_critical_assumptions() {
+        use pm_domain::requirement_state::{Assumption, AssumptionStatus, AssumptionType};
+
+        let ready = review_ready_requirement_state();
+        let mut ready_turn = mock_turn("Review-ready plan");
+        let mut ready_quality = build_pm_direct_answer_quality();
+        enforce_requirement_state_delivery_gate(&mut ready_turn, &mut ready_quality, &ready);
+        assert!(ready_quality.deliverable);
+        assert_eq!(ready_turn.text, "Review-ready plan");
+
+        let mut blocked = ready;
+        blocked.readiness = pm_domain::requirement_state::RequirementReadiness::NeedsClarification;
+        blocked.assumptions.push(Assumption {
+            statement: "capacity is sufficient".into(),
+            type_: AssumptionType::Technical,
+            importance: 0.9,
+            uncertainty: 0.8,
+            status: AssumptionStatus::Open,
+            supporting_evidence: vec![],
+            counter_evidence: vec![],
+            falsification_test: None,
+        });
+        let mut blocked_turn = mock_turn("Draft plan");
+        let mut blocked_quality = build_pm_direct_answer_quality();
+        enforce_requirement_state_delivery_gate(&mut blocked_turn, &mut blocked_quality, &blocked);
+        assert!(!blocked_quality.deliverable);
+        assert!(!blocked_quality.passed);
+        assert_eq!(blocked_quality.quality_level, "needs_clarification");
+        assert!(blocked_turn.text.contains("Requirement Brief"));
+        assert!(blocked_turn
+            .text
+            .contains("validation plan for a critical assumption"));
+    }
+
+    #[tokio::test]
+    async fn durable_requirement_state_controls_final_delivery_status() {
+        let db = crate::test_sqlite_pool().await;
+        let ready_plan = serde_json::json!({
+            "taskGraph": {"subtasks": [{
+                "goal": "improve onboarding",
+                "deliverable": "measurable rollout plan"
+            }]},
+            "requirementDelta": {
+                "problemFrame": {"statement": "improve onboarding", "confirmed": true},
+                "stakeholders": [{"name": "product owner", "role": "decision maker", "confirmed": true}],
+                "jobs": [{"statement": "activate new users", "evidenceIds": [], "confirmed": true}],
+                "desiredOutcomes": [{"statement": "increase activation", "measure": "activation rate"}],
+                "scope": {"included": ["onboarding"], "excluded": []},
+                "acceptanceCriteria": [{
+                    "id": "ac-1",
+                    "statement": "activation improves in a holdout test",
+                    "testable": true
+                }],
+                "readiness": "ready_for_review"
+            }
+        });
+        crate::semantic_kernel_store::persist_pm_requirement_state_delta(
+            &db,
+            "tenant",
+            "ready-session",
+            "ready-event",
+            "improve onboarding for product owner to activate new users",
+            &ready_plan,
+        )
+        .await
+        .unwrap();
+        let (ready_turn, ready_quality) = finalize_pm_orchestration_result(
+            &db,
+            "tenant",
+            "ready-run",
+            "ready-session",
+            mock_turn("Review-ready plan"),
+            build_pm_direct_answer_quality(),
+        )
+        .await
+        .unwrap();
+        assert!(ready_quality.deliverable);
+        assert!(!ready_turn.text.contains("Requirement Brief"));
+
+        let mut blocked_plan = ready_plan;
+        blocked_plan["requirementDelta"]["readiness"] = serde_json::json!("needs_clarification");
+        blocked_plan["requirementDelta"]["assumptions"] = serde_json::json!([{
+            "statement": "capacity is sufficient",
+            "type": "technical",
+            "importance": 0.9,
+            "uncertainty": 0.8,
+            "status": "open",
+            "supportingEvidence": [],
+            "counterEvidence": [],
+            "falsificationTest": null
+        }]);
+        crate::semantic_kernel_store::persist_pm_requirement_state_delta(
+            &db,
+            "tenant",
+            "blocked-session",
+            "blocked-event",
+            "improve onboarding for product owner to activate new users",
+            &blocked_plan,
+        )
+        .await
+        .unwrap();
+        let (blocked_turn, blocked_quality) = finalize_pm_orchestration_result(
+            &db,
+            "tenant",
+            "blocked-run",
+            "blocked-session",
+            mock_turn("Draft plan"),
+            build_pm_direct_answer_quality(),
+        )
+        .await
+        .unwrap();
+        assert!(!blocked_quality.deliverable);
+        assert!(!blocked_quality.passed);
+        assert_eq!(blocked_quality.quality_level, "needs_clarification");
+        assert!(blocked_turn.text.contains("Requirement Brief"));
+        assert!(blocked_turn
+            .text
+            .contains("validation plan for a critical assumption"));
+    }
+
+    #[test]
+    fn admitted_research_evidence_becomes_a_requirement_delta() {
+        let mut quality = build_pm_direct_answer_quality();
+        quality
+            .evidence_tree
+            .push(pm_report::PmEvidenceTreeNodeDto {
+                claim: "Activation improved".into(),
+                status: "confirmed".into(),
+                evidence_count: 1,
+                evidences: vec![pm_report::PmEvidenceLeafDto {
+                    url: "https://example.com/evidence".into(),
+                    domain: "example.com".into(),
+                    excerpt: "A controlled experiment improved activation".into(),
+                }],
+            });
+        let delta = pm_requirement_evidence_delta(&quality);
+        assert_eq!(
+            delta["requirementDelta"]["evidenceLinks"][0]["claim"],
+            "Activation improved"
+        );
+        assert_eq!(
+            delta["requirementDelta"]["evidenceLinks"][0]["support"],
+            "supported"
+        );
+        assert_eq!(
+            delta["requirementDelta"]["evidenceLinks"][0]["evidenceIds"][0],
+            sha256_hex("https://example.com/evidence")
+        );
     }
 }

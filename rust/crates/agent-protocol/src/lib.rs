@@ -58,6 +58,7 @@ mod tests {
             content_hash: None,
         });
         assert_ne!(hash, event.compute_payload_hash().unwrap());
+        assert!(event.verify_hash().is_err());
     }
 
     #[test]

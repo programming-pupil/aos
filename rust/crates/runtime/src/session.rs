@@ -839,6 +839,28 @@ impl Session {
         Ok(turn_id)
     }
 
+    /// Insert a turn recovered from an external durable ledger without
+    /// appending a second JSONL record.  The SQLite execution ledger uses this
+    /// during restart recovery; normal live turns must use `begin_turn`.
+    pub fn restore_turn(
+        &mut self,
+        turn_id: impl Into<String>,
+        user_input: impl Into<String>,
+        start_message_count: usize,
+        end_message_count: Option<usize>,
+        status: SessionTurnStatus,
+    ) {
+        self.turns.push(SessionTurn {
+            turn_id: turn_id.into(),
+            user_input: user_input.into(),
+            start_message_count,
+            end_message_count,
+            status,
+            runtime_context: self.runtime_context.clone(),
+            context_baseline: self.context_baseline.clone(),
+        });
+    }
+
     pub fn complete_turn(
         &mut self,
         turn_id: &str,
@@ -977,6 +999,26 @@ impl Session {
             );
         }
         Ok(JsonValue::Object(object))
+    }
+
+    /// Versioned, field-complete representation used by the durable execution
+    /// ledger. This is separate from JSONL so recovery does not depend on a
+    /// filesystem export or on reconstructing state from redacted messages.
+    pub fn to_recovery_json(&self) -> Result<serde_json::Value, SessionError> {
+        serde_json::from_str(&self.to_json()?.render()).map_err(|error| {
+            SessionError::Format(format!(
+                "cannot encode session recovery checkpoint: {error}"
+            ))
+        })
+    }
+
+    pub fn from_recovery_json(value: &serde_json::Value) -> Result<Self, SessionError> {
+        let parsed = JsonValue::parse(&value.to_string()).map_err(|error| {
+            SessionError::Format(format!(
+                "cannot decode session recovery checkpoint: {error}"
+            ))
+        })?;
+        Self::from_json(&parsed)
     }
 
     pub fn from_json(value: &JsonValue) -> Result<Self, SessionError> {

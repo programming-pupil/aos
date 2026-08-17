@@ -14,6 +14,16 @@ struct PmPreparedOrchestrationPlan {
     resume_attempt: usize,
 }
 
+fn requirement_state_blocking_question(
+    state: &pm_domain::requirement_state::RequirementState,
+) -> Option<pm_domain::requirement_state::OpenQuestion> {
+    match pm_domain::requirement_state::planning_gate(state) {
+        pm_domain::requirement_state::RequirementPlanningGate::Ask(question) => Some(question),
+        pm_domain::requirement_state::RequirementPlanningGate::ContinueResearch
+        | pm_domain::requirement_state::RequirementPlanningGate::ReadyForDelivery => None,
+    }
+}
+
 fn guard_pm_report_strategy_route(
     mut route: PmTurnRoute,
     plan: &mut serde_json::Value,
@@ -1251,6 +1261,31 @@ pub(super) async fn run_pm_orchestrated_turn(
     let run_id = run_id_hint
         .map(std::string::ToString::to_string)
         .unwrap_or_else(|| format!("pm-run-{}", uuid::Uuid::new_v4()));
+    let requirement_input_event = format!("{run_id}:input");
+    if let Err(error) = crate::semantic_kernel_store::persist_pm_requirement_state_delta(
+        db,
+        tenant_id,
+        session_id,
+        &requirement_input_event,
+        user_message,
+        &serde_json::json!({}),
+    )
+    .await
+    {
+        tracing::error!(run_id = %run_id, error = %error, "failed to persist requirement state before planning");
+        on_stage(
+            "requirement_state",
+            "failed",
+            1,
+            Some(serde_json::json!({
+                "message": "需求状态无法持久化，已阻止规划以避免丢失关键约束。",
+                "errorClass": "requirement_state_persistence",
+            })),
+        );
+        return Err(GatewayError::Internal(format!(
+            "requirement-state update failed before planning: {error}"
+        )));
+    }
     let memory_instruction = match crate::semantic_kernel_store::load_pm_requirement_state_context(
         db, tenant_id, session_id,
     )
@@ -1264,13 +1299,24 @@ pub(super) async fn run_pm_orchestrated_turn(
         }),
         Ok(None) => memory_instruction,
         Err(error) => {
-            tracing::warn!(
+            tracing::error!(
                 tenant_id = %tenant_id,
                 session_id = %session_id,
                 error = %error,
-                "failed to load PM requirement-state context"
+                "failed to load authoritative PM requirement-state context"
             );
-            memory_instruction
+            on_stage(
+                "requirement_state",
+                "failed",
+                1,
+                Some(serde_json::json!({
+                    "message": "需求状态无法读取，已阻止规划以避免绕过已确认约束。",
+                    "errorClass": "requirement_state_load",
+                })),
+            );
+            return Err(GatewayError::Internal(format!(
+                "requirement-state load failed before planning: {error}"
+            )));
         }
     };
     let (runtime_budget, budget_snapshot) = resolve_pm_budget_snapshot(db, tenant_id).await;
@@ -1328,7 +1374,7 @@ pub(super) async fn run_pm_orchestrated_turn(
             )
         })
         .unwrap_or_default();
-    if let Err(error) = crate::semantic_kernel_store::persist_pm_prompt_context_manifest(
+    if let Err(error) = crate::semantic_kernel_store::persist_pm_preflight_context_projection(
         db,
         tenant_id,
         session_id,
@@ -1342,12 +1388,24 @@ pub(super) async fn run_pm_orchestrated_turn(
     )
     .await
     {
-        tracing::warn!(
+        tracing::error!(
             run_id = %run_id,
             tenant_id = %tenant_id,
             error = %error,
-            "failed to persist PM prompt/context manifest"
+            "failed to persist PM preflight context projection"
         );
+        on_stage(
+            "understand",
+            "failed",
+            1,
+            Some(serde_json::json!({
+                "message": "规划前上下文投影无法持久化，已阻止不可审计的规划调用。",
+                "errorClass": "preflight_context_projection_persistence",
+            })),
+        );
+        return Err(GatewayError::Internal(format!(
+            "preflight context projection persistence failed before planning: {error}"
+        )));
     }
     let prepared = prepare_pm_orchestration_plan(
         manager.clone(),
@@ -1362,51 +1420,135 @@ pub(super) async fn run_pm_orchestrated_turn(
         resume_checkpoint,
         &session_mcp_servers,
         &session_skills,
+        memory_instruction.as_deref(),
         &mut on_stage,
     )
     .await?;
 
     let mut plan = prepared.plan;
-    match crate::semantic_kernel_store::persist_pm_requirement_state_delta(
-        db,
-        tenant_id,
-        session_id,
-        &run_id,
-        user_message,
-        &plan,
-    )
-    .await
-    {
-        Ok(requirement_state) => {
-            let next_question = pm_domain::requirement_state::next_question(&requirement_state);
-            on_stage(
-                "requirement_state",
-                "completed",
-                1,
-                Some(serde_json::json!({
-                    "message": "需求状态已根据本轮输入增量更新。",
-                    "requirementState": requirement_state,
-                    "nextQuestion": next_question,
-                })),
-            );
-        }
-        Err(error) => {
-            tracing::warn!(
-                run_id = %run_id,
-                tenant_id = %tenant_id,
-                error = %error,
-                "failed to persist PM requirement-state delta"
-            );
-            on_stage(
-                "requirement_state",
-                "degraded",
-                1,
-                Some(serde_json::json!({
-                    "message": "需求状态暂未更新，本轮研究仍继续。",
-                    "errorClass": "requirement_state_persistence",
-                })),
-            );
-        }
+    let blocking_requirement_question =
+        match crate::semantic_kernel_store::persist_pm_requirement_state_delta(
+            db,
+            tenant_id,
+            session_id,
+            &run_id,
+            user_message,
+            &plan,
+        )
+        .await
+        {
+            Ok(requirement_state) => {
+                let next_question = pm_domain::requirement_state::next_question(&requirement_state);
+                let planning_gate = pm_domain::requirement_state::planning_gate(&requirement_state);
+                let blocking_question = requirement_state_blocking_question(&requirement_state);
+                if let Some(question) = next_question
+                    .as_ref()
+                    .filter(|question| question.impact == "core")
+                {
+                    if let Some(object) = plan.as_object_mut() {
+                        object.insert(
+                            "requirementGate".into(),
+                            serde_json::json!({
+                                "action": "ask",
+                                "question": question.question,
+                                "questionId": question.id,
+                                "stateVersion": requirement_state.version,
+                            }),
+                        );
+                    }
+                }
+                on_stage(
+                    "requirement_state",
+                    "completed",
+                    1,
+                    Some(serde_json::json!({
+                        "message": "需求状态已根据本轮输入增量更新。",
+                        "requirementState": requirement_state,
+                        "nextQuestion": next_question,
+                        "planningGate": format!("{planning_gate:?}"),
+                    })),
+                );
+                blocking_question
+            }
+            Err(error) => {
+                tracing::error!(
+                    run_id = %run_id,
+                    tenant_id = %tenant_id,
+                    error = %error,
+                    "failed to persist PM requirement-state delta"
+                );
+                on_stage(
+                    "requirement_state",
+                    "failed",
+                    1,
+                    Some(serde_json::json!({
+                        "message": "需求状态未能可靠更新，已阻止继续研究以避免错误交付。",
+                        "errorClass": "requirement_state_persistence",
+                    })),
+                );
+                return Err(GatewayError::Internal(format!(
+                    "requirement-state update failed before research: {error}"
+                )));
+            }
+        };
+    if let Some(question) = blocking_requirement_question {
+        on_stage(
+            "retrieve",
+            "completed",
+            1,
+            Some(serde_json::json!({
+                "skipped": true,
+                "reason": "requirement_core_question",
+                "questionId": question.id,
+            })),
+        );
+        on_stage(
+            "synthesize",
+            "completed",
+            1,
+            Some(serde_json::json!({
+                "deliveryStatus": "awaiting_clarification",
+                "qualityGatePassed": false,
+                "reason": "requirement_state_blocked_delivery",
+            })),
+        );
+        let turn = TurnResult {
+            session_id: session_id.to_string(),
+            text: question.question,
+            thinking: None,
+            tool_calls: Vec::new(),
+            usage: TokenUsageRecord {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                total_tokens: 0,
+                estimated_cost_usd: 0.0,
+                model: model.to_string(),
+            },
+            compacted: None,
+            iterations: 1,
+            metadata: None,
+            hot_reloaded: false,
+        };
+        let mut quality = build_pm_direct_answer_quality();
+        quality.deliverable = false;
+        quality.quality_level = "needs_clarification".to_string();
+        quality.conflict_reason =
+            "Requirement State contains a core open question; research and delivery are blocked"
+                .to_string();
+        quality
+            .missing
+            .push("core requirement clarification".to_string());
+        return finalize_pm_orchestration_result(
+            state.telemetry_db(),
+            tenant_id,
+            &run_id,
+            session_id,
+            turn,
+            quality,
+        )
+        .await;
     }
     let runtime_budget = prepared.runtime_budget;
     let resume_detail = prepared.resume_detail;
@@ -6670,6 +6812,7 @@ async fn prepare_pm_orchestration_plan(
     resume_checkpoint: Option<&PmResumeCheckpoint>,
     session_mcp_servers: &[String],
     session_skills: &[String],
+    requirement_context: Option<&str>,
     on_stage: &mut PmStageCallback<'_>,
 ) -> Result<PmPreparedOrchestrationPlan, GatewayError> {
     let resume_stage = resume_checkpoint.and_then(|cp| cp.stage.clone());
@@ -6847,6 +6990,13 @@ async fn prepare_pm_orchestration_plan(
             "Internal PM routing/planning turn. Do not call tools, search, browse, fetch URLs, or inspect resources. Classify and plan only from the user request and provided hints."
                 .to_string(),
         );
+        if let Some(requirement_context) =
+            requirement_context.filter(|value| !value.trim().is_empty())
+        {
+            preface_options.system_instructions.push(format!(
+                "The following versioned Requirement State is authoritative planning input. Preserve its confirmed facts, open core questions and readiness; do not invent a ready requirement:\n{requirement_context}"
+            ));
+        }
         let preface_timeout_secs = pm_effective_preface_turn_timeout_secs(&plan);
         match run_pm_internal_turn_with_timeout_cleanup_and_options(
             manager.clone(),
@@ -6893,6 +7043,13 @@ async fn prepare_pm_orchestration_plan(
         }
         if let Some(graph) = task_graph.as_ref() {
             apply_pm_task_graph_to_plan(&mut plan, graph);
+        }
+        if let Some(requirement_delta) =
+            extract_named_json_object(&preface_text, "REQUIREMENT_DELTA_V1")
+        {
+            if let Some(object) = plan.as_object_mut() {
+                object.insert("requirementDelta".to_string(), requirement_delta);
+            }
         }
         let turn_route = extract_pm_turn_route(&preface_text)
             .unwrap_or_else(|| build_pm_fallback_turn_route(user_message, &plan));
@@ -7773,6 +7930,42 @@ async fn build_pm_search_doctor_detail(
 mod tests {
     use super::*;
     use pm_domain::turn_router::{PmAnswerContract, PmDomainScope, PmFilePolicy, PmReasoningDepth};
+
+    #[test]
+    fn requirement_state_gate_blocks_research_before_route_execution() {
+        let mut state = pm_domain::requirement_state::RequirementState::default();
+        state
+            .open_questions
+            .push(pm_domain::requirement_state::OpenQuestion {
+                id: "scope".into(),
+                question: "Which market is in scope?".into(),
+                impact: "core".into(),
+                answerability: "high".into(),
+                user_effort: 1,
+                decision_target: pm_domain::requirement_state::QuestionDecisionTarget::Scope,
+                prior_uncertainty_basis_points: 8_000,
+                answer_branches: vec![
+                    pm_domain::requirement_state::QuestionAnswerBranch {
+                        id: "market-a".into(),
+                        answer: "Market A".into(),
+                        probability_basis_points: 5_000,
+                        posterior_uncertainty_basis_points: 1_000,
+                        decision_effect: "scope market A".into(),
+                    },
+                    pm_domain::requirement_state::QuestionAnswerBranch {
+                        id: "market-b".into(),
+                        answer: "Market B".into(),
+                        probability_basis_points: 5_000,
+                        posterior_uncertainty_basis_points: 1_000,
+                        decision_effect: "scope market B".into(),
+                    },
+                ],
+                expected_posterior_uncertainty_basis_points: 1_000,
+                expected_information_gain_basis_points: 7_000,
+            });
+        let question = requirement_state_blocking_question(&state).unwrap();
+        assert_eq!(question.id, "scope");
+    }
 
     fn route(
         turn_class: PmTurnClass,

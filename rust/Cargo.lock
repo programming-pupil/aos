@@ -48,6 +48,7 @@ name = "agent-gateway"
 version = "0.1.2"
 dependencies = [
  "aes-gcm",
+ "agent-protocol",
  "api",
  "async-stream",
  "async-trait",
@@ -56,6 +57,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "glob",
+ "hex",
  "plugins",
  "proptest",
  "regex",

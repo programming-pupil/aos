@@ -1,8 +1,9 @@
-//! Traceability gate for the semantic-kernel specification.
+//! Traceability half of the semantic-kernel conformance gate.
 //!
-//! The dataset is deliberately a source/test map, not a synthetic quality
-//! score. Every P0 case must point at a production symbol and a behavior test;
-//! a renamed or deleted path fails CI instead of leaving stale documentation.
+//! Source references are not behavior verification. This module validates the
+//! case inventory and emits executable Cargo test commands; the repository
+//! script runs those commands and is the only gate allowed to claim behavior
+//! verification.
 
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -22,6 +23,13 @@ pub struct ConformanceCase {
     pub test: String,
     pub trigger: String,
     pub expected: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BehaviorCommand {
+    pub case_id: String,
+    pub package: String,
+    pub test_filter: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -138,12 +146,12 @@ fn assert_reference_exists(reference: &str) -> Result<(), ConformanceError> {
     Ok(())
 }
 
-pub fn assert_semantic_kernel_conformance_dataset() -> Result<Vec<ConformanceCase>, ConformanceError>
-{
+pub fn assert_semantic_kernel_traceability_dataset(
+) -> Result<Vec<ConformanceCase>, ConformanceError> {
     let cases = load_semantic_kernel_conformance_dataset()?;
-    if cases.len() != 28 {
+    if cases.len() != 31 {
         return Err(ConformanceError::Invalid(format!(
-            "expected 28 P0 cases, found {}",
+            "expected 31 P0 cases, found {}",
             cases.len()
         )));
     }
@@ -173,14 +181,47 @@ pub fn assert_semantic_kernel_conformance_dataset() -> Result<Vec<ConformanceCas
     Ok(cases)
 }
 
+pub fn semantic_kernel_behavior_commands() -> Result<Vec<BehaviorCommand>, ConformanceError> {
+    let cases = assert_semantic_kernel_traceability_dataset()?;
+    cases
+        .into_iter()
+        .map(|case| {
+            let (path, symbol) = source_and_symbol(&case.test)?;
+            let package = path
+                .strip_prefix("rust/crates/")
+                .and_then(|value| value.split('/').next())
+                .ok_or_else(|| {
+                    ConformanceError::Invalid(format!(
+                        "behavior test {} is not inside a Rust crate",
+                        case.test
+                    ))
+                })?;
+            Ok(BehaviorCommand {
+                case_id: case.id,
+                package: package.to_string(),
+                test_filter: symbol.to_string(),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::assert_semantic_kernel_conformance_dataset;
+    use super::{assert_semantic_kernel_traceability_dataset, semantic_kernel_behavior_commands};
 
     #[test]
-    fn every_p0_case_has_live_production_and_behavior_test_references() {
-        let cases = assert_semantic_kernel_conformance_dataset().expect("conformance dataset");
-        assert_eq!(cases.len(), 28);
+    fn every_p0_case_has_live_traceability_references() {
+        let cases = assert_semantic_kernel_traceability_dataset().expect("conformance dataset");
+        assert_eq!(cases.len(), 31);
         assert!(cases.iter().all(|case| case.expected.len() > 12));
+    }
+
+    #[test]
+    fn every_p0_case_produces_an_executable_behavior_command() {
+        let commands = semantic_kernel_behavior_commands().expect("behavior commands");
+        assert_eq!(commands.len(), 31);
+        assert!(commands
+            .iter()
+            .all(|command| !command.package.is_empty() && !command.test_filter.is_empty()));
     }
 }

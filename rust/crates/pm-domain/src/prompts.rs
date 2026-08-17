@@ -524,51 +524,59 @@ pub fn build_pm_understand_plan_prompt(
         .unwrap_or_else(|| "none".to_string());
     format!(
         "{PM_ORCH_INTERNAL_BEGIN}\n\
-You are the universal AOS Product/Ops turn router and planner.\n\
-Strict rules:\n\
-- Do NOT call any tool in this turn.\n\
-- Output in the user's language.\n\
-- First output a concise task-understanding paragraph (2-4 sentences).\n\
-- Then output a numbered execution plan with 4-6 actionable steps.\n\
-- Then output one JSON block named TURN_ROUTE with fields:\n\
-  {{\"engine\":\"chat_direct\"|\"chat_tool_loop\"|\"aos_deep_research\",\"searchPolicy\":\"disabled\"|\"allowed\"|\"required\",\"filePolicy\":\"auto\"|\"required\"|\"off\",\"reasoningDepth\":\"fast\"|\"standard\"|\"deep\",\"turnClass\":\"simple_chat\"|\"simple_answer\"|\"live_lookup\"|\"general_research\"|\"pm_strategy\"|\"pm_report_strategy\",\"domainScope\":\"general\"|\"product_ops\"|\"unknown\",\"searchNeed\":\"none\"|\"fresh_fact\"|\"evidence_augmented\"|\"deep_research\",\"answerContract\":\"short_answer\"|\"source_grounded_answer\"|\"general_research_answer\"|\"pm_decision_package\",\"complexityScore\":number,\"reason\":string}}\n\
-  - The engine is the primary decision. Classify by user intent and required answer shape, not by hard-coded industries, keywords, or message length.\n\
-  - Use engine=\"chat_direct\" only for stable, self-contained turns that should not use tools, search, or attached files.\n\
-  - Use engine=\"chat_tool_loop\" for ordinary conversation with history, file/data analysis from user-provided material, general reasoning, translation/summarization, simple or complex non-PM questions, and current/public factual lookups. This engine is Codex-like: the model may use available tools/files/search as needed.\n\
-  - Use engine=\"aos_deep_research\" only when the user is asking for a professional product/business/operations/market/competitive/growth/research/report strategy deliverable that benefits from AOS's multi-stage deep research, quality gates, and research loop. When engine=\"aos_deep_research\", set searchPolicy=\"required\", reasoningDepth=\"deep\", searchNeed=\"deep_research\", and answerContract=\"pm_decision_package\".\n\
-  - Do not send first-party data analysis, uploaded CSV/table comparison, log/file summarization, or ordinary metric calculation into aos_deep_research unless the user explicitly asks for a strategic decision package, external validation, market/competitor research, or a deep professional operating plan.\n\
-  - A very short prompt can still be aos_deep_research when it asks for market sizing, user/competitive research, product/ops strategy, GTM, monetization, pricing, risk, or similar professional research. A very long prompt can still be chat_tool_loop when it asks to summarize, calculate, clean, compare, or answer from provided context.\n\
-  - searchPolicy=\"required\" when correctness depends on current/public facts or the user explicitly asks to search. Examples are illustrative, not exhaustive: weather, prices, exchange rates, stocks, sports, holidays, transport, releases, policies, availability, current market facts, and similar live/public facts.\n\
-  - searchPolicy=\"allowed\" when search may improve answer quality but is not strictly required. searchPolicy=\"disabled\" when the answer should come from user-provided context, attached files, memory, or stable reasoning.\n\
-  - filePolicy=\"required\" when attached/user-provided files or pasted data are necessary; otherwise use auto unless files must be ignored.\n\
-  - Use turnClass/searchNeed/answerContract as compatibility metadata consistent with the engine; only aos_deep_research may use answerContract=\"pm_decision_package\".\n\
-  - The reportStrategyHint below is advisory only; it must never force aos_deep_research by itself.\n\
-- Then output one JSON block named TASK_GRAPH_V2 with fields:\n\
-  {{\"intent\":\"chat\"|\"research\"|\"analysis\"|\"decision_support\",\"complexityScore\":number,\"decompositionMode\":\"none\"|\"light\"|\"full\",\"subtasks\":[{{\"id\":string,\"title\":string,\"goal\":string,\"queries\":string[],\"deliverable\":string,\"requiredEvidenceType\":\"first_party\"|\"external\"|\"mixed\",\"priority\":\"high\"|\"medium\"|\"low\"}}]}}\n\
-  - For chat_direct/chat_tool_loop, usually choose decompositionMode=\"none\" and subtasks=[] unless a light tool plan is genuinely useful. Do not create PM research subtasks for ordinary data/file analysis or simple live lookup.\n\
-  - For aos_deep_research, choose decompositionMode and subtasks dynamically from decision risk, evidence gaps, and required coverage. Most research questions should use 3-4 substantial subtasks; exceed 4 only when an additional dimension can materially change the decision and cannot be merged into another subtask.\n\
-  - Answer-first policy: if the question can be answered responsibly from general reasoning, known principles, user-provided context, attached files, or a simple model-selected tool loop, choose intent=\"analysis\" (or \"chat\" when appropriate), set decompositionMode=\"none\", and subtasks=[].\n\
-  - Retrieval-first policy: if correctness depends on current external facts or professional external evidence, choose light/full only when that evidence should be explicitly planned.\n\
-  - For each subtask, set requiredEvidenceType precisely: \"first_party\" for user-provided data/metrics/cohort reasoning, \"external\" for public web/current/market/competitor/case/benchmark evidence, and \"mixed\" only when the subtask genuinely needs both. Put empty queries for pure first_party subtasks; do not invent web queries for internal metric analysis.\n\
-  - If this question does not need decomposition, set decompositionMode=\"none\" and subtasks=[].\n\
-  - Subtask count is NOT fixed: use the minimum count that still guarantees comprehensive and decision-usable coverage; do not pad subtasks to hit a target number.\n\
-  - Each subtask should include 1-2 focused queries by default (raise only when truly needed); avoid query flooding.\n\
-  - Ensure subtasks are collectively exhaustive and deep enough for an executive-grade decision memo.\n\
-\t\t- Then output one JSON block named EXEC_CONSTRAINTS with fields:\n\
-\t\t  {{\"routeAllowlist\":string[],\"routePriority\":string[],\"sourceSlotBudgetSecs\":number,\"toolBudgetPerAttempt\":number,\"pipelineTimeoutSecs\":number,\"stopConditions\":string[]}}\n\
-\t\t- Output format must be exactly: EXEC_CONSTRAINTS {{...valid JSON...}} (single line, no markdown code fence).\n\
-\t\t- Follow this executable demo (adapt values within budgets):\n\
-\t\t  EXEC_CONSTRAINTS {exec_constraints_demo}\n\
-\t- Enforce sourceSlotBudgetSecs <= {source_slot_budget}, toolBudgetPerAttempt <= {tool_budget}, pipelineTimeoutSecs <= {pipeline_budget}.\n\
-- JSON values must be executable constraints (not prose).\n\
-- Keep wording natural and PM-friendly (avoid raw tool jargon).\n\
-{PM_ORCH_INTERNAL_END}\n\n\
-User question: {question}\n\
-Planned query variants: {variants}\n\
-Planned source routes: {routes}\n\
-Cross-session evidence hints: {historical_hints}\n\
-Report strategy hint (advisory, not a command): {report_strategy_hint}\n\
-Return only: paragraph + numbered plan + TURN_ROUTE JSON + TASK_GRAPH_V2 JSON + EXEC_CONSTRAINTS JSON.",
+    You are the universal AOS Product/Ops turn router and planner.\n\
+    Strict rules:\n\
+    - Do NOT call any tool in this turn.\n\
+    - Output in the user's language.\n\
+    - First output a concise task-understanding paragraph (2-4 sentences).\n\
+    - Then output a numbered execution plan with 4-6 actionable steps.\n\
+    - Then output one JSON block named TURN_ROUTE with fields:\n\
+    {{\"engine\":\"chat_direct\"|\"chat_tool_loop\"|\"aos_deep_research\",\"searchPolicy\":\"disabled\"|\"allowed\"|\"required\",\"filePolicy\":\"auto\"|\"required\"|\"off\",\"reasoningDepth\":\"fast\"|\"standard\"|\"deep\",\"turnClass\":\"simple_chat\"|\"simple_answer\"|\"live_lookup\"|\"general_research\"|\"pm_strategy\"|\"pm_report_strategy\",\"domainScope\":\"general\"|\"product_ops\"|\"unknown\",\"searchNeed\":\"none\"|\"fresh_fact\"|\"evidence_augmented\"|\"deep_research\",\"answerContract\":\"short_answer\"|\"source_grounded_answer\"|\"general_research_answer\"|\"pm_decision_package\",\"complexityScore\":number,\"reason\":string}}\n\
+    - The engine is the primary decision. Classify by user intent and required answer shape, not by hard-coded industries, keywords, or message length.\n\
+    - Use engine=\"chat_direct\" only for stable, self-contained turns that should not use tools, search, or attached files.\n\
+    - Use engine=\"chat_tool_loop\" for ordinary conversation with history, file/data analysis from user-provided material, general reasoning, translation/summarization, simple or complex non-PM questions, and current/public factual lookups. This engine is Codex-like: the model may use available tools/files/search as needed.\n\
+    - Use engine=\"aos_deep_research\" only when the user is asking for a professional product/business/operations/market/competitive/growth/research/report strategy deliverable that benefits from AOS's multi-stage deep research, quality gates, and research loop. When engine=\"aos_deep_research\", set searchPolicy=\"required\", reasoningDepth=\"deep\", searchNeed=\"deep_research\", and answerContract=\"pm_decision_package\".\n\
+    - Do not send first-party data analysis, uploaded CSV/table comparison, log/file summarization, or ordinary metric calculation into aos_deep_research unless the user explicitly asks for a strategic decision package, external validation, market/competitor research, or a deep professional operating plan.\n\
+    - A very short prompt can still be aos_deep_research when it asks for market sizing, user/competitive research, product/ops strategy, GTM, monetization, pricing, risk, or similar professional research. A very long prompt can still be chat_tool_loop when it asks to summarize, calculate, clean, compare, or answer from provided context.\n\
+    - searchPolicy=\"required\" when correctness depends on current/public facts or the user explicitly asks to search. Examples are illustrative, not exhaustive: weather, prices, exchange rates, stocks, sports, holidays, transport, releases, policies, availability, current market facts, and similar live/public facts.\n\
+    - searchPolicy=\"allowed\" when search may improve answer quality but is not strictly required. searchPolicy=\"disabled\" when the answer should come from user-provided context, attached files, memory, or stable reasoning.\n\
+    - filePolicy=\"required\" when attached/user-provided files or pasted data are necessary; otherwise use auto unless files must be ignored.\n\
+    - Use turnClass/searchNeed/answerContract as compatibility metadata consistent with the engine; only aos_deep_research may use answerContract=\"pm_decision_package\".\n\
+    - The reportStrategyHint below is advisory only; it must never force aos_deep_research by itself.\n\
+    - Then output one JSON block named TASK_GRAPH_V2 with fields:\n\
+    {{\"intent\":\"chat\"|\"research\"|\"analysis\"|\"decision_support\",\"complexityScore\":number,\"decompositionMode\":\"none\"|\"light\"|\"full\",\"subtasks\":[{{\"id\":string,\"title\":string,\"goal\":string,\"queries\":string[],\"deliverable\":string,\"requiredEvidenceType\":\"first_party\"|\"external\"|\"mixed\",\"priority\":\"high\"|\"medium\"|\"low\"}}]}}\n\
+    - For chat_direct/chat_tool_loop, usually choose decompositionMode=\"none\" and subtasks=[] unless a light tool plan is genuinely useful. Do not create PM research subtasks for ordinary data/file analysis or simple live lookup.\n\
+    - For aos_deep_research, choose decompositionMode and subtasks dynamically from decision risk, evidence gaps, and required coverage. Most research questions should use 3-4 substantial subtasks; exceed 4 only when an additional dimension can materially change the decision and cannot be merged into another subtask.\n\
+    - Answer-first policy: if the question can be answered responsibly from general reasoning, known principles, user-provided context, attached files, or a simple model-selected tool loop, choose intent=\"analysis\" (or \"chat\" when appropriate), set decompositionMode=\"none\", and subtasks=[].\n\
+    - Retrieval-first policy: if correctness depends on current external facts or professional external evidence, choose light/full only when that evidence should be explicitly planned.\n\
+    - For each subtask, set requiredEvidenceType precisely: \"first_party\" for user-provided data/metrics/cohort reasoning, \"external\" for public web/current/market/competitor/case/benchmark evidence, and \"mixed\" only when the subtask genuinely needs both. Put empty queries for pure first_party subtasks; do not invent web queries for internal metric analysis.\n\
+    - If this question does not need decomposition, set decompositionMode=\"none\" and subtasks=[].\n\
+    - Subtask count is NOT fixed: use the minimum count that still guarantees comprehensive and decision-usable coverage; do not pad subtasks to hit a target number.\n\
+    - Each subtask should include 1-2 focused queries by default (raise only when truly needed); avoid query flooding.\n\
+    - Ensure subtasks are collectively exhaustive and deep enough for an executive-grade decision memo.\n\
+    \t\t- Then output one JSON block named REQUIREMENT_DELTA_V1 with fields:\n\
+    \t\t  {{\"problemFrame\":{{\"statement\":string,\"confirmed\":boolean}},\"stakeholders\":[{{\"name\":string,\"role\":string|null,\"confirmed\":boolean}}],\"jobs\":[{{\"statement\":string,\"evidenceIds\":string[],\"confirmed\":boolean}}],\"pains\":[{{\"statement\":string,\"severity\":number}}],\"desiredOutcomes\":[{{\"statement\":string,\"measure\":string|null}}],\"constraints\":[{{\"statement\":string,\"priority\":\"must\"|\"should\"|\"could\"}}],\"assumptions\":[{{\"statement\":string,\"type\":\"user\"|\"product\"|\"technical\"|\"market\"|\"data\",\"importance\":number,\"uncertainty\":number,\"status\":\"open\"|\"supported\"|\"falsified\"|\"accepted_risk\",\"supportingEvidence\":string[],\"counterEvidence\":string[],\"falsificationTest\":string|null}}],\"scope\":{{\"included\":string[],\"excluded\":string[]}},\"decisions\":[{{\"id\":string,\"statement\":string,\"version\":number}}],\"openQuestions\":[{{\"id\":string,\"question\":string,\"impact\":\"core\"|\"high\"|\"low\",\"answerability\":\"high\"|\"medium\"|\"low\",\"userEffort\":number,\"decisionTarget\":\"problem_frame\"|\"stakeholder\"|\"outcome_metric\"|\"population\"|\"scope\"|\"constraint\"|\"solution\"|\"deliverable\",\"priorUncertainty\":number,\"answerBranches\":[{{\"id\":string,\"answer\":string,\"probability\":number,\"posteriorUncertainty\":number,\"decisionEffect\":string}}]}}],\"resolvedQuestionIds\":string[],\"questionResolutions\":[{{\"questionId\":string,\"selectedBranchId\":string|null,\"observedPosteriorUncertainty\":number,\"observedConvergence\":number,\"decisionChanged\":boolean,\"sourceEventIds\":string[]}}],\"acceptanceCriteria\":[{{\"id\":string,\"statement\":string,\"testable\":boolean}}],\"evidenceLinks\":[{{\"claim\":string,\"evidenceIds\":string[],\"support\":\"supported\"|\"contradicted\"|\"inconclusive\"|\"not_checked\"}}],\"experiments\":[{{\"id\":string,\"hypothesis\":string,\"successSignal\":string,\"status\":string}}],\"readiness\":\"needs_clarification\"|\"ready_for_review\"}}\n\
+    \t\t- This block is the authoritative incremental requirement-state proposal, not a prose summary. Preserve confirmed facts from the provided Requirement State.\n\
+    \t\t- Ask only a question whose answer can materially change scope, metric, population, decision, or deliverable. Every open question must include at least two realistic answerBranches with probabilities, posterior uncertainty, and distinct decisionEffect values. The runtime recomputes expected information gain and ignores any model-authored score. Put a genuine blocker in openQuestions with impact=\"core\" and readiness=\"needs_clarification\". Do not invent a confirmation question for a clear request.\n\
+    \t\t- When the latest user message resolves an existing question, include both its id in resolvedQuestionIds and an observed questionResolutions record so actual uncertainty reduction and decision convergence can be evaluated later.\n\
+    \t\t- confirmed=true is allowed only when the statement/name is quoted directly from the latest user message or was already confirmed in Requirement State. Never invent a synthetic requesting_user stakeholder. Inferred frames, stakeholders and jobs must remain confirmed=false.\n\
+    \t\t- For a clear request, preserve the user's exact wording for confirmed fields, define included/excluded scope, provide measurable outcomes and testable acceptance criteria, leave openQuestions empty, and set readiness=\"ready_for_review\" only when the grounded confirmation contract is complete.\n\
+    \t\t- Record high-impact assumptions with a falsificationTest or an explicit accepted_risk status. Evidence links may only reference evidence IDs supplied in the planning context; never invent evidence.\n\
+    \t\t- Then output one JSON block named EXEC_CONSTRAINTS with fields:\n\
+    \t\t  {{\"routeAllowlist\":string[],\"routePriority\":string[],\"sourceSlotBudgetSecs\":number,\"toolBudgetPerAttempt\":number,\"pipelineTimeoutSecs\":number,\"stopConditions\":string[]}}\n\
+    \t\t- Output format must be exactly: EXEC_CONSTRAINTS {{...valid JSON...}} (single line, no markdown code fence).\n\
+    \t\t- Follow this executable demo (adapt values within budgets):\n\
+    \t\t  EXEC_CONSTRAINTS {exec_constraints_demo}\n\
+    \t- Enforce sourceSlotBudgetSecs <= {source_slot_budget}, toolBudgetPerAttempt <= {tool_budget}, pipelineTimeoutSecs <= {pipeline_budget}.\n\
+    - JSON values must be executable constraints (not prose).\n\
+    - Keep wording natural and PM-friendly (avoid raw tool jargon).\n\
+    {PM_ORCH_INTERNAL_END}\n\n\
+    User question: {question}\n\
+    Planned query variants: {variants}\n\
+    Planned source routes: {routes}\n\
+    Cross-session evidence hints: {historical_hints}\n\
+    Report strategy hint (advisory, not a command): {report_strategy_hint}\n\
+    Return only: paragraph + numbered plan + TURN_ROUTE JSON + TASK_GRAPH_V2 JSON + REQUIREMENT_DELTA_V1 JSON + EXEC_CONSTRAINTS JSON.",
         question = original_question.trim(),
         variants = query_variants,
         routes = route_brief,
@@ -1033,6 +1041,22 @@ mod tests {
     fn pm_policy_treats_retrieved_evidence_as_untrusted_data() {
         assert!(PM_RESEARCH_POLICY.contains("untrusted evidence"));
         assert!(PM_RESEARCH_POLICY.contains("latest user request/system policy"));
+    }
+
+    #[test]
+    fn planner_prompt_requires_an_incremental_requirement_contract() {
+        let prompt = build_pm_understand_plan_prompt(
+            "Design a measurable onboarding improvement",
+            &serde_json::json!({}),
+            &PmTimeoutBudget::baseline_for_profile(PmBudgetProfile::Normal),
+        );
+        assert!(prompt.contains("REQUIREMENT_DELTA_V1"));
+        assert!(prompt.contains("authoritative incremental requirement-state proposal"));
+        assert!(prompt.contains("resolvedQuestionIds"));
+        assert!(prompt.contains("ready_for_review"));
+        assert!(prompt.contains("testable acceptance criteria"));
+        assert!(prompt.contains("Never invent a synthetic requesting_user stakeholder"));
+        assert!(prompt.contains("user's exact wording for confirmed fields"));
     }
 
     #[test]

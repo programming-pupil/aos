@@ -7,6 +7,16 @@ use axum::extract::{Extension, Json, Path, State};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
+fn map_contract_error(error: crate::semantic_kernel_store::SemanticStoreError) -> AppError {
+    match error {
+        crate::semantic_kernel_store::SemanticStoreError::Database(error) => error.into(),
+        crate::semantic_kernel_store::SemanticStoreError::InvalidEvent(message) => {
+            AppError::ValidationError(message)
+        }
+        other => AppError::Internal(other.to_string()),
+    }
+}
+
 // GET /nl2sql/join-paths/:datasource_id
 pub(crate) async fn list_join_paths(
     State(state): State<AppState>,
@@ -28,7 +38,8 @@ pub(crate) async fn list_join_paths(
         "SELECT id, path_text, hops, verified, \
          CAST(confidence AS TEXT) AS confidence_text, \
          source, CAST(created_at AS TEXT) AS created_at_text, \
-         source_table, target_table, source_column, target_column, join_type, notes \
+         source_table, target_table, source_column, target_column, join_type, notes,
+         cardinality, temporal_condition, nullable, dedup_strategy, allowed_grains_json \
          FROM nl2sql_join_paths \
          WHERE tenant_id = ? AND datasource_id = ? AND deleted_at IS NULL \
          ORDER BY hops ASC",
@@ -107,6 +118,19 @@ pub(crate) async fn list_join_paths(
                 .flatten(),
             r.try_get::<Option<String>, _>("join_type").ok().flatten(),
             r.try_get::<Option<String>, _>("notes").ok().flatten(),
+            r.try_get::<Option<String>, _>("cardinality").ok().flatten(),
+            r.try_get::<Option<String>, _>("temporal_condition")
+                .ok()
+                .flatten(),
+            r.try_get::<bool, _>("nullable").unwrap_or(false),
+            r.try_get::<Option<String>, _>("dedup_strategy")
+                .ok()
+                .flatten(),
+            serde_json::from_str(
+                &r.try_get::<String, _>("allowed_grains_json")
+                    .unwrap_or_else(|_| "[]".into()),
+            )
+            .unwrap_or_default(),
         ));
     }
 
@@ -130,6 +154,11 @@ pub(crate) async fn list_join_paths(
             Some(r.right_column),
             Some(r.match_type),
             None,
+            None,
+            None,
+            false,
+            None,
+            Vec::new(),
         ));
     }
 
@@ -212,12 +241,13 @@ pub(crate) async fn verify_join_path(
     let id = path_id
         .parse::<i64>()
         .map_err(|_| AppError::ValidationError("invalid path id".into()))?;
-    let result = sqlx::query("UPDATE nl2sql_join_paths SET verified = ? WHERE id = ? AND tenant_id = ? AND datasource_id = ?")
+    let mut tx = state.db.begin().await?;
+    let result = sqlx::query("UPDATE nl2sql_join_paths SET verified = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND tenant_id = ? AND datasource_id = ? AND deleted_at IS NULL")
         .bind(verified)
         .bind(id)
         .bind(&claims.tenant_id)
         .bind(&datasource_id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
 
     if result.rows_affected() == 0 {
@@ -225,6 +255,15 @@ pub(crate) async fn verify_join_path(
             "join path not found or access denied".into(),
         ));
     }
+    crate::semantic_kernel_store::sync_join_contract_in_tx(
+        &mut tx,
+        &claims.tenant_id,
+        &datasource_id,
+        id,
+    )
+    .await
+    .map_err(map_contract_error)?;
+    tx.commit().await?;
 
     Ok(Json(serde_json::json!({ "verified": verified })))
 }
@@ -243,6 +282,16 @@ pub(crate) struct CreateJoinPathRequest {
     confidence: Option<f32>,
     #[serde(default)]
     notes: Option<String>,
+    #[serde(default)]
+    cardinality: Option<String>,
+    #[serde(default)]
+    temporal_condition: Option<String>,
+    #[serde(default)]
+    nullable: bool,
+    #[serde(default)]
+    dedup_strategy: Option<String>,
+    #[serde(default)]
+    allowed_grains: Vec<String>,
 }
 
 pub(crate) async fn create_join_path(
@@ -264,11 +313,13 @@ pub(crate) async fn create_join_path(
     let join_type = req.join_type.as_deref().unwrap_or("INNER");
     let confidence = req.confidence.unwrap_or(1.0);
 
+    let mut tx = state.db.begin().await?;
     let insert_result = sqlx::query(
         r#"INSERT INTO nl2sql_join_paths
            (tenant_id, datasource_id, source_table, target_table, source_column, target_column,
-            path_text, sql_joins, hops, join_type, confidence, source, verified, notes)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'manual', 1, ?)"#,
+            path_text, sql_joins, hops, join_type, confidence, source, verified, notes,
+            cardinality, temporal_condition, nullable, dedup_strategy, allowed_grains_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'manual', 0, ?, ?, ?, ?, ?, ?)"#,
     )
     .bind(&claims.tenant_id)
     .bind(&datasource_id)
@@ -287,12 +338,43 @@ pub(crate) async fn create_join_path(
     .bind(join_type)
     .bind(confidence)
     .bind(&req.notes)
-    .execute(&state.db)
+    .bind(
+        req.cardinality
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+    )
+    .bind(
+        req.temporal_condition
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+    )
+    .bind(req.nullable)
+    .bind(
+        req.dedup_strategy
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+    )
+    .bind(serde_json::to_string(&req.allowed_grains).map_err(|error| {
+        AppError::ValidationError(format!("invalid join allowed grains: {error}"))
+    })?)
+    .execute(&mut *tx)
     .await
     .map_err(|e| AppError::Internal(format!("create join path failed: {}", e)))?;
 
     let inserted_id = i64::try_from(insert_result.last_insert_rowid())
         .map_err(|_| AppError::Internal("join path id overflow".into()))?;
+    crate::semantic_kernel_store::sync_join_contract_in_tx(
+        &mut tx,
+        &claims.tenant_id,
+        &datasource_id,
+        inserted_id,
+    )
+    .await
+    .map_err(map_contract_error)?;
+    tx.commit().await?;
 
     let path_text = format!(
         "{}.{} → {}.{}",
@@ -304,7 +386,7 @@ pub(crate) async fn create_join_path(
         join_columns: vec![req.source_column.clone(), req.target_column.clone()],
         ds_ids: Vec::new(),
         total_columns: 1,
-        verified: true,
+        verified: false,
         confidence,
         source: "manual".to_string(),
         created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
@@ -316,6 +398,11 @@ pub(crate) async fn create_join_path(
         path_text: Some(path_text),
         sql_joins: None,
         notes: req.notes,
+        cardinality: req.cardinality,
+        temporal_condition: req.temporal_condition,
+        nullable: req.nullable,
+        dedup_strategy: req.dedup_strategy,
+        allowed_grains: req.allowed_grains,
     }))
 }
 
@@ -339,6 +426,16 @@ pub(crate) struct UpdateJoinPathRequest {
     verified: Option<bool>,
     #[serde(default)]
     notes: Option<String>,
+    #[serde(default)]
+    cardinality: Option<String>,
+    #[serde(default)]
+    temporal_condition: Option<String>,
+    #[serde(default)]
+    nullable: Option<bool>,
+    #[serde(default)]
+    dedup_strategy: Option<String>,
+    #[serde(default)]
+    allowed_grains: Option<Vec<String>>,
 }
 
 pub(crate) async fn update_join_path(
@@ -361,6 +458,7 @@ pub(crate) async fn update_join_path(
         .parse::<i64>()
         .map_err(|_| AppError::ValidationError("invalid path id".into()))?;
 
+    let mut tx = state.db.begin().await?;
     let result = sqlx::query(
         r#"UPDATE nl2sql_join_paths SET
            source_table = COALESCE(?, source_table),
@@ -369,9 +467,14 @@ pub(crate) async fn update_join_path(
            target_column = COALESCE(?, target_column),
            join_type = COALESCE(?, join_type),
            confidence = COALESCE(?, confidence),
-           verified = COALESCE(?, verified),
-           notes = ?
-           WHERE id = ? AND tenant_id = ? AND datasource_id = ?"#,
+           cardinality = COALESCE(?, cardinality),
+           temporal_condition = COALESCE(?, temporal_condition),
+           nullable = COALESCE(?, nullable),
+           dedup_strategy = COALESCE(?, dedup_strategy),
+           allowed_grains_json = COALESCE(?, allowed_grains_json),
+           verified = COALESCE(?, 0),
+           notes = ?, version = version + 1, updated_at = CURRENT_TIMESTAMP
+           WHERE id = ? AND tenant_id = ? AND datasource_id = ? AND deleted_at IS NULL"#,
     )
     .bind(&req.source_table)
     .bind(&req.target_table)
@@ -379,12 +482,40 @@ pub(crate) async fn update_join_path(
     .bind(&req.target_column)
     .bind(&req.join_type)
     .bind(req.confidence)
+    .bind(
+        req.cardinality
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+    )
+    .bind(
+        req.temporal_condition
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+    )
+    .bind(req.nullable)
+    .bind(
+        req.dedup_strategy
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+    )
+    .bind(
+        req.allowed_grains
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| {
+                AppError::ValidationError(format!("invalid join allowed grains: {error}"))
+            })?,
+    )
     .bind(req.verified)
     .bind(&req.notes)
     .bind(id)
     .bind(&claims.tenant_id)
     .bind(&datasource_id)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
 
     if result.rows_affected() == 0 {
@@ -392,6 +523,15 @@ pub(crate) async fn update_join_path(
             "join path not found or access denied".into(),
         ));
     }
+    crate::semantic_kernel_store::sync_join_contract_in_tx(
+        &mut tx,
+        &claims.tenant_id,
+        &datasource_id,
+        id,
+    )
+    .await
+    .map_err(map_contract_error)?;
+    tx.commit().await?;
 
     Ok(Json(serde_json::json!({ "success": true })))
 }
@@ -417,13 +557,14 @@ pub(crate) async fn delete_join_path(
         .map_err(|_| AppError::ValidationError("invalid path id".into()))?;
 
     // Soft-delete: set deleted_at instead of hard delete.
+    let mut tx = state.db.begin().await?;
     let result = sqlx::query(
         "UPDATE nl2sql_join_paths SET deleted_at = CURRENT_TIMESTAMP WHERE id = ? AND tenant_id = ? AND datasource_id = ?",
     )
     .bind(id)
     .bind(&claims.tenant_id)
     .bind(&datasource_id)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
 
     if result.rows_affected() == 0 {
@@ -431,6 +572,15 @@ pub(crate) async fn delete_join_path(
             "join path not found or access denied".into(),
         ));
     }
+    crate::semantic_kernel_store::deactivate_join_contracts_in_tx(
+        &mut tx,
+        &claims.tenant_id,
+        &datasource_id,
+        id,
+    )
+    .await
+    .map_err(map_contract_error)?;
+    tx.commit().await?;
 
     Ok(Json(serde_json::json!({ "success": true })))
 }

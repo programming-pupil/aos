@@ -84,11 +84,16 @@ fn redact_feishu_log_message(message: &str) -> String {
                 break;
             };
             let value_start = search_from + relative_start + needle.len();
+            const PLACEHOLDER: &str = "[REDACTED]";
+            if redacted[value_start..].starts_with(PLACEHOLDER) {
+                search_from = value_start + PLACEHOLDER.len();
+                continue;
+            }
             let value_end = redacted[value_start..]
                 .find(|ch: char| ch == '&' || ch.is_whitespace() || matches!(ch, '\'' | '"' | ']'))
                 .map_or(redacted.len(), |offset| value_start + offset);
-            redacted.replace_range(value_start..value_end, "***");
-            search_from = value_start + 3;
+            redacted.replace_range(value_start..value_end, PLACEHOLDER);
+            search_from = value_start + PLACEHOLDER.len();
         }
     }
     runtime::protect_sensitive_text(&redacted, runtime::configured_data_protection_mode()).value
@@ -1733,8 +1738,9 @@ mod tests {
 
         assert_eq!(
             redacted,
-            "connected wss://example.test/ws?access_key=***&ticket=*** token=***"
+            "connected wss://example.test/ws?access_key=[REDACTED]&ticket=[REDACTED] token=[REDACTED]"
         );
+        assert_eq!(redact_feishu_log_message(&redacted), redacted);
         assert!(!redacted.contains("abc123"));
         assert!(!redacted.contains("t-456"));
         assert!(!redacted.contains("xyz"));

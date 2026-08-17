@@ -226,6 +226,7 @@ impl AppState {
             .connect_with(connect_options)
             .await?;
         sqlx::migrate!("./sqlite-migrations").run(&db).await?;
+        crate::semantic_kernel_store::start_encryption_key_rotation_worker(db.clone());
         let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
             .fetch_one(&db)
             .await?;

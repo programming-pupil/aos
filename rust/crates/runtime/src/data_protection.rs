@@ -190,7 +190,7 @@ fn patterns() -> &'static [SensitivePattern] {
             SensitivePattern {
                 category: SensitiveDataCategory::CredentialAssignment,
                 regex: Regex::new(
-                    r#"(?i)\b(api[_-]?key|apikey|password|passwd|client[_-]?secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|secret[_-]?key)\b(=)([^\s,;}]+)"#,
+                    r#"(?i)\b(api[_-]?key|apikey|password|passwd|token|client[_-]?secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|secret[_-]?key)\b(=)([^\s,;}]+)"#,
                 )
                 .expect("valid compact credential assignment regex"),
                 replacement: "$1$2[REDACTED]",
@@ -199,7 +199,7 @@ fn patterns() -> &'static [SensitivePattern] {
             SensitivePattern {
                 category: SensitiveDataCategory::CredentialAssignment,
                 regex: Regex::new(
-                    r#"(?i)\b(api[_-]?key|apikey|password|passwd|client[_-]?secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|secret[_-]?key)\b(\s*:\s*)([^\s,;}]+)"#,
+                    r#"(?i)\b(api[_-]?key|apikey|password|passwd|token|client[_-]?secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|secret[_-]?key)\b(\s*:\s*)([^\s,;}]+)"#,
                 )
                 .expect("valid unquoted credential field regex"),
                 replacement: "$1$2[REDACTED]",
@@ -208,7 +208,7 @@ fn patterns() -> &'static [SensitivePattern] {
             SensitivePattern {
                 category: SensitiveDataCategory::CredentialAssignment,
                 regex: Regex::new(
-                    r#"(?i)\b(api[_-]?key|apikey|password|passwd|client[_-]?secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|secret[_-]?key)\b(\s*[:=]\s*)(\"[^\"]*\"|'[^']*')"#,
+                    r#"(?i)\b(api[_-]?key|apikey|password|passwd|token|client[_-]?secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|secret[_-]?key)\b(\s*[:=]\s*)(\"[^\"]*\"|'[^']*')"#,
                 )
                 .expect("valid quoted credential assignment regex"),
                 replacement: "$1$2[REDACTED]",
@@ -341,18 +341,20 @@ mod tests {
 
     #[test]
     fn redacts_credentials_without_recording_plaintext_in_report() {
-        let input = "Authorization: Bearer opaque-token-123456 mysql://reader:db-secret@example.test/aos api_key=sk-1234567890abcdef https://example.test/?token=query-secret-value";
+        let input = "Authorization: Bearer opaque-token-123456 mysql://reader:db-secret@example.test/aos api_key=sk-1234567890abcdef token=manifest-secret https://example.test/?token=query-secret-value";
         let protected = protect_sensitive_text(input, DataProtectionMode::SecretsOnly);
         assert!(!protected.value.contains("opaque-token-123456"));
         assert!(!protected.value.contains("db-secret"));
         assert!(!protected.value.contains("sk-1234567890abcdef"));
+        assert!(!protected.value.contains("manifest-secret"));
         assert!(!protected.value.contains("query-secret-value"));
         let report = serde_json::to_string(&protected.report).unwrap();
         assert!(!report.contains("opaque-token-123456"));
         assert!(!report.contains("db-secret"));
         assert!(!report.contains("sk-1234567890abcdef"));
+        assert!(!report.contains("manifest-secret"));
         assert!(!report.contains("query-secret-value"));
-        assert!(protected.report.finding_count >= 4);
+        assert!(protected.report.finding_count >= 5);
     }
 
     #[test]

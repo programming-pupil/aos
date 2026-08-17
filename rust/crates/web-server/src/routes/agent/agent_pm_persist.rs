@@ -23,8 +23,20 @@ struct PmEvidenceGraphEdge {
     confidence: f64,
 }
 
+fn verified_pm_evidence_relation(
+    claim: &str,
+    requested_relation: &str,
+    hit: &PmToolEvidenceHit,
+) -> &'static str {
+    match requested_relation {
+        "supports" if claim_evidence_semantically_supported(claim, &hit.excerpt) => "supports",
+        "contradicts" => "contradicts",
+        _ => "unresolved",
+    }
+}
+
 async fn upsert_pm_evidence_graph_edges(
-    db: &sqlx::SqlitePool,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     rows: &[PmEvidenceGraphEdge],
 ) -> Result<(), sqlx::Error> {
     for chunk in rows.chunks(100) {
@@ -68,49 +80,58 @@ async fn upsert_pm_evidence_graph_edges(
                 avg_confidence = avg_confidence * 0.8 + excluded.avg_confidence * 0.2,
                 last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP",
         );
-        query.build().execute(db).await?;
+        query.build().execute(&mut **transaction).await?;
     }
     Ok(())
 }
 
 async fn upsert_semantic_evidence_ledger(
-    db: &sqlx::SqlitePool,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     rows: &[PmEvidenceGraphEdge],
 ) -> Result<(), sqlx::Error> {
-    let mut tx = db.begin().await?;
-    crate::acquire_sqlite_write_lock(&mut tx).await?;
+    use semantic_core::{
+        AssertionScope, AssertionStatus, CalibratedScore, EntityRef, EvidenceAuthority,
+        EvidenceLedger, EvidenceRef, EvidenceSourceType, ProposedStateDelta, RetentionPolicy,
+        SemanticAssertion, SemanticReducer, SemanticSnapshot, Sensitivity, TypedValue,
+    };
+
+    let scope_key = rows
+        .first()
+        .map(|row| format!("pm-evidence:{}:{}", row.tenant_id, row.session_id));
+    let mut snapshot = if let (Some(scope_key), Some(first)) = (scope_key.as_deref(), rows.first())
+    {
+        sqlx::query_scalar::<sqlx::Sqlite, String>(
+            "SELECT snapshot_json FROM semantic_snapshots
+             WHERE tenant_id = ? AND scope = ? ORDER BY version DESC LIMIT 1",
+        )
+        .bind(&first.tenant_id)
+        .bind(scope_key)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .as_deref()
+        .map(serde_json::from_str::<SemanticSnapshot>)
+        .transpose()
+        .map_err(|error| sqlx::Error::Decode(Box::new(error)))?
+        .unwrap_or_default()
+    } else {
+        SemanticSnapshot::default()
+    };
+
     for row in rows {
         let excerpt = row.evidence_excerpt.as_deref().unwrap_or_default();
+        let content_hash = sha256_hex(&format!("{}\n{}", row.claim_text, excerpt));
         let evidence_id = format!(
             "pm-evidence-{}",
             sha256_hex(&format!(
-                "{}\n{}\n{}\n{}",
-                row.tenant_id, row.session_id, row.claim_key, row.url
+                "{}\n{}\n{}\n{}\n{}",
+                row.tenant_id, row.session_id, row.claim_key, row.url, content_hash
             ))
         );
-        let content_hash = sha256_hex(&format!("{}\n{}", row.claim_text, excerpt));
-        let authority = row
-            .domain
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("unknown");
-        sqlx::query::<sqlx::Sqlite>(
-            "INSERT INTO evidence_ledger
-                (evidence_id, tenant_id, source_type, source_locator, content_hash,
-                 event_seq, range_json, authority, collected_at)
-             VALUES (?, ?, 'web', ?, ?, NULL, ?, ?, CURRENT_TIMESTAMP)
-             ON CONFLICT(evidence_id) DO UPDATE SET
-                 content_hash = excluded.content_hash,
-                 range_json = excluded.range_json,
-                 authority = excluded.authority,
-                 collected_at = CURRENT_TIMESTAMP",
-        )
-        .bind(evidence_id)
-        .bind(&row.tenant_id)
-        .bind(&row.url)
-        .bind(content_hash)
-        .bind(
-            serde_json::json!({
+        let protected_locator =
+            runtime::protect_sensitive_text(&row.url, runtime::configured_data_protection_mode())
+                .value;
+        let protected_range = runtime::protect_sensitive_json(
+            &serde_json::json!({
                 "sessionId": row.session_id,
                 "claimKey": row.claim_key,
                 "relation": row.relation,
@@ -118,12 +139,48 @@ async fn upsert_semantic_evidence_ledger(
                 "sourceTool": row.source_tool,
                 "sourceRoute": row.source_route,
                 "confidence": row.confidence,
-            })
-            .to_string(),
+            }),
+            runtime::configured_data_protection_mode(),
         )
-        .bind(authority)
-        .execute(&mut *tx)
+        .0;
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO evidence_ledger
+                (evidence_id, tenant_id, source_type, source_locator, content_hash,
+                 event_seq, range_json, authority, collected_at)
+             VALUES (?, ?, 'tool_result', ?, ?, NULL, ?, 'tool', CURRENT_TIMESTAMP)
+             ON CONFLICT(evidence_id) DO NOTHING",
+        )
+        .bind(&evidence_id)
+        .bind(&row.tenant_id)
+        .bind(&protected_locator)
+        .bind(&content_hash)
+        .bind(protected_range.to_string())
+        .execute(&mut **transaction)
         .await?;
+
+        let evidence = EvidenceRef {
+            evidence_id: evidence_id.clone(),
+            source_type: EvidenceSourceType::ToolResult,
+            source_locator: protected_locator,
+            content_hash,
+            event_seq: None,
+            byte_or_line_range: None,
+            collected_at: chrono::Utc::now(),
+            authority: EvidenceAuthority::Tool,
+        };
+        let mut evidence_view = EvidenceLedger::default();
+        for source in snapshot
+            .assertions
+            .values()
+            .flat_map(|assertion| assertion.source_refs.iter())
+        {
+            evidence_view
+                .append(source.clone())
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        }
+        evidence_view
+            .append(evidence.clone())
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
 
         let assertion_id = format!(
             "pm-assertion-{}",
@@ -132,27 +189,91 @@ async fn upsert_semantic_evidence_ledger(
                 row.tenant_id, row.session_id, row.claim_key
             ))
         );
-        let assertion_status = match row.relation.as_str() {
-            "supports" => "confirmed",
-            "contradicts" => "contested",
-            _ => "proposed",
+        let mut candidate =
+            snapshot
+                .assertions
+                .get(&assertion_id)
+                .cloned()
+                .unwrap_or(SemanticAssertion {
+                    id: assertion_id.clone(),
+                    tenant_id: row.tenant_id.clone(),
+                    scope: AssertionScope::Session(row.session_id.clone()),
+                    subject: EntityRef::new("research_claim", row.claim_key.clone()),
+                    predicate: "research_claim".into(),
+                    value: TypedValue::String(row.claim_text.clone()),
+                    qualifiers: std::collections::BTreeMap::new(),
+                    valid_time: None,
+                    observed_at: chrono::Utc::now(),
+                    status: AssertionStatus::Proposed,
+                    confidence: CalibratedScore::new(0.0).expect("zero is a valid score"),
+                    source_refs: Vec::new(),
+                    supersedes: Vec::new(),
+                    conflicts_with: Vec::new(),
+                    sensitivity: Sensitivity::Internal,
+                    retention: RetentionPolicy::UntilDeleted,
+                });
+        candidate.value = TypedValue::String(row.claim_text.clone());
+        candidate.observed_at = chrono::Utc::now();
+        if !candidate
+            .source_refs
+            .iter()
+            .any(|source| source.evidence_id == evidence.evidence_id)
+        {
+            candidate.source_refs.push(evidence);
+        }
+        let qualifier = match row.relation.as_str() {
+            "supports" => "supportCount",
+            "contradicts" => "contradictCount",
+            _ => "unresolvedCount",
         };
-        let assertion_scope = serde_json::json!({"sessionId": row.session_id}).to_string();
-        let assertion_subject = serde_json::json!({"claimKey": row.claim_key}).to_string();
-        let assertion_value = serde_json::json!({
-            "text": row.claim_text,
-            "relation": row.relation,
-            "source": row.url,
-        })
-        .to_string();
-        let assertion_version: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(version), 0) + 1 FROM semantic_assertion_versions
-             WHERE tenant_id = ? AND assertion_id = ?",
+        let count = candidate
+            .qualifiers
+            .get(qualifier)
+            .and_then(|value| match value {
+                TypedValue::Number(number) => Some(*number),
+                _ => None,
+            })
+            .unwrap_or(0.0)
+            + 1.0;
+        candidate
+            .qualifiers
+            .insert(qualifier.into(), TypedValue::Number(count));
+        let support_count = qualifier_number(&candidate.qualifiers, "supportCount");
+        let contradict_count = qualifier_number(&candidate.qualifiers, "contradictCount");
+        candidate.status = if contradict_count > 0.0 {
+            AssertionStatus::Disputed
+        } else if support_count > 0.0 {
+            AssertionStatus::Confirmed
+        } else {
+            AssertionStatus::Proposed
+        };
+        candidate.confidence = CalibratedScore::new(row.confidence.clamp(0.0, 1.0) as f32)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+
+        let outcome = SemanticReducer::default()
+            .apply(
+                &snapshot,
+                ProposedStateDelta::UpsertAssertion(candidate.clone()),
+                &evidence_view,
+            )
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        if !outcome.accepted.iter().any(|id| id == &assertion_id) {
+            return Err(sqlx::Error::Protocol(format!(
+                "SemanticReducer did not accept PM evidence assertion {assertion_id}"
+            )));
+        }
+        snapshot = outcome.snapshot;
+        let accepted = snapshot.assertions.get(&assertion_id).ok_or_else(|| {
+            sqlx::Error::Protocol(format!(
+                "SemanticReducer accepted PM assertion {assertion_id} without projection"
+            ))
+        })?;
+        let assertion_json = runtime::protect_sensitive_json(
+            &serde_json::to_value(accepted)
+                .map_err(|error| sqlx::Error::Encode(Box::new(error)))?,
+            runtime::configured_data_protection_mode(),
         )
-        .bind(&row.tenant_id)
-        .bind(&assertion_id)
-        .fetch_one(&mut *tx)
-        .await?;
+        .0;
         sqlx::query::<sqlx::Sqlite>(
             "INSERT INTO semantic_assertion_versions
                 (tenant_id, assertion_id, version, assertion_json, source_event_ids_json)
@@ -161,47 +282,104 @@ async fn upsert_semantic_evidence_ledger(
         )
         .bind(&row.tenant_id)
         .bind(&assertion_id)
-        .bind(assertion_version)
-        .bind(serde_json::json!({
-            "id": assertion_id,
-            "tenantId": row.tenant_id,
-            "scope": serde_json::from_str::<serde_json::Value>(&assertion_scope).unwrap_or(serde_json::Value::Null),
-            "subject": serde_json::from_str::<serde_json::Value>(&assertion_subject).unwrap_or(serde_json::Value::Null),
-            "predicate": "research_claim",
-            "value": serde_json::from_str::<serde_json::Value>(&assertion_value).unwrap_or(serde_json::Value::Null),
-            "status": assertion_status,
-            "confidence": row.confidence.clamp(0.0, 1.0),
-            "source": row.url,
-        }).to_string())
-        .bind(serde_json::json!([format!("pm-evidence-{}", sha256_hex(&format!("{}\n{}\n{}\n{}", row.tenant_id, row.session_id, row.claim_key, row.url)))]).to_string())
-        .execute(&mut *tx)
+        .bind(i64::try_from(snapshot.version).unwrap_or(i64::MAX))
+        .bind(assertion_json.to_string())
+        .bind(
+            serde_json::to_string(
+                &accepted
+                    .source_refs
+                    .iter()
+                    .map(|source| source.evidence_id.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|error| sqlx::Error::Encode(Box::new(error)))?,
+        )
+        .execute(&mut **transaction)
         .await?;
+    }
+
+    let Some(first) = rows.first() else {
+        return Ok(());
+    };
+    for assertion in snapshot.assertions.values() {
+        let protected_value = runtime::protect_sensitive_json(
+            &serde_json::to_value(&assertion.value)
+                .map_err(|error| sqlx::Error::Encode(Box::new(error)))?,
+            runtime::configured_data_protection_mode(),
+        )
+        .0;
         sqlx::query::<sqlx::Sqlite>(
             "INSERT INTO semantic_assertions
                 (id, tenant_id, scope_json, subject_json, predicate, value_json,
                  status, confidence, observed_at, valid_time_json, sensitivity,
                  retention_policy, version)
-             VALUES (?, ?, ?, ?, 'research_claim', ?, ?, ?, CURRENT_TIMESTAMP,
-                     NULL, 'internal', 'tenant_default', ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'internal', 'until_deleted', ?)
              ON CONFLICT(id) DO UPDATE SET
                  value_json = excluded.value_json,
                  status = excluded.status,
                  confidence = excluded.confidence,
-                 observed_at = CURRENT_TIMESTAMP,
+                 observed_at = excluded.observed_at,
                  version = excluded.version",
         )
-        .bind(assertion_id)
-        .bind(&row.tenant_id)
-        .bind(assertion_scope)
-        .bind(assertion_subject)
-        .bind(assertion_value)
-        .bind(assertion_status)
-        .bind(row.confidence.clamp(0.0, 1.0))
-        .bind(assertion_version)
-        .execute(&mut *tx)
+        .bind(&assertion.id)
+        .bind(&assertion.tenant_id)
+        .bind(
+            serde_json::to_string(&assertion.scope)
+                .map_err(|error| sqlx::Error::Encode(Box::new(error)))?,
+        )
+        .bind(
+            serde_json::to_string(&assertion.subject)
+                .map_err(|error| sqlx::Error::Encode(Box::new(error)))?,
+        )
+        .bind(&assertion.predicate)
+        .bind(protected_value.to_string())
+        .bind(format!("{:?}", assertion.status).to_ascii_lowercase())
+        .bind(f64::from(assertion.confidence.value()))
+        .bind(assertion.observed_at.to_rfc3339())
+        .bind(i64::try_from(snapshot.version).unwrap_or(i64::MAX))
+        .execute(&mut **transaction)
         .await?;
     }
-    tx.commit().await
+    let snapshot_json = runtime::protect_sensitive_json(
+        &serde_json::to_value(&snapshot).map_err(|error| sqlx::Error::Encode(Box::new(error)))?,
+        runtime::configured_data_protection_mode(),
+    )
+    .0;
+    let snapshot_hash = sha256_hex(&snapshot_json.to_string());
+    let scope_key = format!("pm-evidence:{}:{}", first.tenant_id, first.session_id);
+    sqlx::query::<sqlx::Sqlite>(
+        "INSERT INTO semantic_snapshots
+            (id, tenant_id, scope, version, snapshot_hash, snapshot_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+    )
+    .bind(format!(
+        "pm-evidence-snapshot-{}",
+        sha256_hex(&format!(
+            "{}:{}:{}",
+            first.tenant_id, first.session_id, snapshot.version
+        ))
+    ))
+    .bind(&first.tenant_id)
+    .bind(scope_key)
+    .bind(i64::try_from(snapshot.version).unwrap_or(i64::MAX))
+    .bind(snapshot_hash)
+    .bind(snapshot_json.to_string())
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+fn qualifier_number(
+    qualifiers: &std::collections::BTreeMap<String, semantic_core::TypedValue>,
+    key: &str,
+) -> f64 {
+    qualifiers
+        .get(key)
+        .and_then(|value| match value {
+            semantic_core::TypedValue::Number(number) => Some(*number),
+            _ => None,
+        })
+        .unwrap_or(0.0)
 }
 
 pub(super) async fn persist_pm_evidence_graph(
@@ -224,24 +402,20 @@ pub(super) async fn persist_pm_evidence_graph(
             continue;
         }
         let claim_key = sha256_hex(&normalized);
-        let relation = if node.status == "confirmed" {
+        let requested_relation = if node.status == "confirmed" {
             "supports"
         } else {
             "unresolved"
         };
-        let base_conf = if relation == "supports" { 0.78 } else { 0.42 };
         for leaf in &node.evidences {
             if leaf.url.trim().is_empty() {
                 continue;
             }
-            let hit = url_hit_map.get(&leaf.url);
-            let source_tool = hit.map(|h| h.source_tool.clone());
-            let source_route = hit.map(|h| h.source_route.clone());
-            let evidence_excerpt = if leaf.excerpt.trim().is_empty() {
-                hit.map(|h| h.excerpt.clone())
-            } else {
-                Some(leaf.excerpt.clone())
+            let Some(hit) = url_hit_map.get(&leaf.url) else {
+                continue;
             };
+            let relation = verified_pm_evidence_relation(&node.claim, requested_relation, hit);
+            let base_conf = if relation == "supports" { 0.78 } else { 0.42 };
             rows.push(PmEvidenceGraphEdge {
                 tenant_id: tenant_id.to_string(),
                 session_id: session_id.to_string(),
@@ -255,9 +429,9 @@ pub(super) async fn persist_pm_evidence_graph(
                     Some(leaf.domain.clone())
                 },
                 relation: relation.to_string(),
-                source_tool,
-                source_route,
-                evidence_excerpt,
+                source_tool: Some(hit.source_tool.clone()),
+                source_route: Some(hit.source_route.clone()),
+                evidence_excerpt: Some(hit.excerpt.clone()),
                 confidence: base_conf,
             });
         }
@@ -284,12 +458,10 @@ pub(super) async fn persist_pm_evidence_graph(
             if url.trim().is_empty() {
                 continue;
             }
-            let hit = url_hit_map.get(url);
-            let source_tool = hit.map(|h| h.source_tool.clone());
-            let source_route = hit.map(|h| h.source_route.clone());
-            let excerpt = hit
-                .map(|h| h.excerpt.clone())
-                .or(Some(edge.verdict.clone()));
+            let Some(hit) = url_hit_map.get(url) else {
+                continue;
+            };
+            let relation = verified_pm_evidence_relation(&claim_text, relation, hit);
             rows.push(PmEvidenceGraphEdge {
                 tenant_id: tenant_id.to_string(),
                 session_id: session_id.to_string(),
@@ -299,15 +471,18 @@ pub(super) async fn persist_pm_evidence_graph(
                 url: url.clone(),
                 domain: extract_url_domain(url),
                 relation: relation.to_string(),
-                source_tool,
-                source_route,
-                evidence_excerpt: excerpt,
+                source_tool: Some(hit.source_tool.clone()),
+                source_route: Some(hit.source_route.clone()),
+                evidence_excerpt: Some(hit.excerpt.clone()),
                 confidence: edge.confidence,
             });
         }
     }
-    upsert_pm_evidence_graph_edges(db, &rows).await?;
-    upsert_semantic_evidence_ledger(db, &rows).await
+    let mut transaction = db.begin().await?;
+    crate::acquire_sqlite_write_lock(&mut transaction).await?;
+    upsert_pm_evidence_graph_edges(&mut transaction, &rows).await?;
+    upsert_semantic_evidence_ledger(&mut transaction, &rows).await?;
+    transaction.commit().await
 }
 
 pub(super) fn score_pm_probe_quality(quality: &PmAnswerQualityDto) -> i64 {
@@ -1432,6 +1607,96 @@ pub(super) async fn persist_pm_claim_and_conflict_records(
 mod tests {
     use super::*;
 
+    fn turn_with_tool_calls(tool_calls: Vec<agent_gateway::ToolCallRecord>) -> TurnResult {
+        TurnResult {
+            session_id: "pm-evidence-test".to_string(),
+            text: "test".to_string(),
+            thinking: None,
+            tool_calls,
+            usage: agent_gateway::TokenUsageRecord {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                total_tokens: 2,
+                estimated_cost_usd: 0.0,
+                model: "fixture".to_string(),
+            },
+            compacted: None,
+            iterations: 1,
+            metadata: None,
+            hot_reloaded: false,
+        }
+    }
+
+    fn quality_with_claim(claim: &str, url: &str) -> PmAnswerQualityDto {
+        PmAnswerQualityDto {
+            passed: true,
+            deliverable: true,
+            quality_level: "high".to_string(),
+            has_tool_calls: true,
+            tool_call_count: 1,
+            citation_count: 1,
+            domain_count: 1,
+            claim_count: 1,
+            claim_alignment_ok: true,
+            triad_total_claims: 1,
+            triad_aligned_claims: 1,
+            triad_coverage: 1.0,
+            conflict_adjudicated: true,
+            conflict_confidence: 1.0,
+            conflict_reason: "fixture".to_string(),
+            citations: vec![url.to_string()],
+            domains: vec!["example.com".to_string()],
+            claim_alignment: Vec::new(),
+            evidence_tree: vec![PmEvidenceTreeNodeDto {
+                claim: claim.to_string(),
+                status: "confirmed".to_string(),
+                evidence_count: 1,
+                evidences: vec![PmEvidenceLeafDto {
+                    url: url.to_string(),
+                    domain: "example.com".to_string(),
+                    excerpt: "model-proposed excerpt must not be trusted".to_string(),
+                }],
+            }],
+            conflict_matrix: Vec::new(),
+            conflict_graph: PmConflictGraphDto {
+                topic_count: 0,
+                edge_count: 0,
+                adjudicated_count: 0,
+                unresolved_count: 0,
+                avg_confidence: 0.0,
+                edges: Vec::new(),
+            },
+            missing: Vec::new(),
+            suggestions: Vec::new(),
+        }
+    }
+
+    fn web_search_tool(url: &str, excerpt: &str) -> agent_gateway::ToolCallRecord {
+        tool_call(
+            "WebSearch",
+            r#"{"query":"ROI trend"}"#,
+            &serde_json::json!({
+                "query": "ROI trend",
+                "results": [{
+                    "tool_use_id": "fixture",
+                    "content": [{
+                        "title": "Evidence",
+                        "url": url,
+                        "domain": "example.com",
+                        "snippet": excerpt,
+                        "content": excerpt,
+                        "contentChars": excerpt.chars().count(),
+                        "relevanceScore": 0.9,
+                        "confidence": 0.9
+                    }]
+                }]
+            })
+            .to_string(),
+        )
+    }
+
     fn tool_call(tool_name: &str, input: &str, output: &str) -> agent_gateway::ToolCallRecord {
         agent_gateway::ToolCallRecord {
             index: 0,
@@ -1456,6 +1721,164 @@ mod tests {
         assert!(first_last_detail <= i32::MAX as usize);
         assert!(first_last_detail < second);
         assert_eq!(second - first, 100);
+    }
+
+    #[tokio::test]
+    async fn production_pm_evidence_admission_requires_real_and_semantically_matching_tool_hits() {
+        let db = crate::test_sqlite_pool().await;
+        let claim = "ROI 12.5% 在 7 天内下降";
+        let url = "https://example.com/roi";
+        let quality = quality_with_claim(claim, url);
+
+        persist_pm_evidence_graph(
+            &db,
+            "tenant",
+            "no-tool-hit",
+            &turn_with_tool_calls(Vec::new()),
+            &quality,
+        )
+        .await
+        .expect("missing tool evidence is ignored");
+        let missing_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM semantic_assertions
+             WHERE tenant_id = ? AND scope_json LIKE ?",
+        )
+        .bind("tenant")
+        .bind("%no-tool-hit%")
+        .fetch_one(&db)
+        .await
+        .expect("count assertions without tool evidence");
+        assert_eq!(missing_count, 0, "a model-proposed URL is not evidence");
+
+        persist_pm_evidence_graph(
+            &db,
+            "tenant",
+            "irrelevant-tool-hit",
+            &turn_with_tool_calls(vec![web_search_tool(
+                url,
+                "这篇文章介绍数据库索引优化和查询缓存。",
+            )]),
+            &quality,
+        )
+        .await
+        .expect("irrelevant real evidence is persisted as unresolved");
+        let irrelevant_status: String = sqlx::query_scalar(
+            "SELECT status FROM semantic_assertions
+             WHERE tenant_id = ? AND scope_json LIKE ?",
+        )
+        .bind("tenant")
+        .bind("%irrelevant-tool-hit%")
+        .fetch_one(&db)
+        .await
+        .expect("load unresolved assertion");
+        assert_eq!(irrelevant_status, "proposed");
+
+        persist_pm_evidence_graph(
+            &db,
+            "tenant",
+            "matching-tool-hit",
+            &turn_with_tool_calls(vec![web_search_tool(
+                url,
+                "ROI 12.5% 在 7 天内下降，主要受留存变化影响。",
+            )]),
+            &quality,
+        )
+        .await
+        .expect("matching real evidence is admitted");
+        let matching_status: String = sqlx::query_scalar(
+            "SELECT status FROM semantic_assertions
+             WHERE tenant_id = ? AND scope_json LIKE ?",
+        )
+        .bind("tenant")
+        .bind("%matching-tool-hit%")
+        .fetch_one(&db)
+        .await
+        .expect("load confirmed assertion");
+        assert_eq!(matching_status, "confirmed");
+        let snapshot_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM semantic_snapshots
+             WHERE tenant_id = ? AND scope = ?",
+        )
+        .bind("tenant")
+        .bind("pm-evidence:tenant:matching-tool-hit")
+        .fetch_one(&db)
+        .await
+        .expect("count reducer snapshots");
+        assert_eq!(snapshot_count, 1);
+        let reducer_version: String = sqlx::query_scalar(
+            "SELECT assertion_json FROM semantic_assertion_versions
+             WHERE tenant_id = ? ORDER BY rowid DESC LIMIT 1",
+        )
+        .bind("tenant")
+        .fetch_one(&db)
+        .await
+        .expect("load reducer-produced assertion version");
+        assert!(reducer_version.contains("Confirmed"));
+        assert!(reducer_version.contains("source_refs"));
+    }
+
+    #[tokio::test]
+    async fn pm_evidence_graph_and_semantic_projection_roll_back_together() {
+        let db = crate::test_sqlite_pool().await;
+        sqlx::query(
+            "CREATE TRIGGER reject_pm_evidence_snapshot
+             BEFORE INSERT ON semantic_snapshots
+             WHEN NEW.scope = 'pm-evidence:tenant:rollback-session'
+             BEGIN
+               SELECT RAISE(FAIL, 'injected snapshot failure');
+             END",
+        )
+        .execute(&db)
+        .await
+        .expect("install failure trigger");
+        let claim = "ROI 12.5% 在 7 天内下降";
+        let url = "https://example.com/roi";
+        let error = persist_pm_evidence_graph(
+            &db,
+            "tenant",
+            "rollback-session",
+            &turn_with_tool_calls(vec![web_search_tool(
+                url,
+                "ROI 12.5% 在 7 天内下降，主要受留存变化影响。",
+            )]),
+            &quality_with_claim(claim, url),
+        )
+        .await
+        .expect_err("injected final-step failure must abort the whole transaction");
+        assert!(error.to_string().contains("injected snapshot failure"));
+
+        let graph_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pm_research_evidence_graph
+             WHERE tenant_id = 'tenant' AND session_id = 'rollback-session'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("count rolled-back evidence graph rows");
+        let evidence_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM evidence_ledger
+             WHERE tenant_id = 'tenant' AND range_json LIKE '%rollback-session%'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("count rolled-back evidence rows");
+        let assertion_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM semantic_assertions
+             WHERE tenant_id = 'tenant' AND scope_json LIKE '%rollback-session%'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("count rolled-back assertion rows");
+        let version_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM semantic_assertion_versions
+             WHERE tenant_id = 'tenant' AND assertion_json LIKE '%rollback-session%'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("count rolled-back assertion versions");
+        assert_eq!(
+            (graph_rows, evidence_rows, assertion_rows, version_rows),
+            (0, 0, 0, 0)
+        );
     }
 
     #[test]

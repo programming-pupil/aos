@@ -92,9 +92,9 @@ pub use conversation::{
     auto_compaction_threshold_from_env, trident_compaction_enabled_from_env, ApiClient, ApiRequest,
     AssistantEvent, AutoCompactionEvent, CompactionHook, ContextManagementReport,
     ConversationRuntime, DeferredApprovalDecision, DeferredToolResult, DeferredToolUse,
-    PromptCacheEvent, ResumableTurnOutcome, RuntimeError, RuntimeEventReporter, StaticToolExecutor,
-    SuspendedTurn, ToolError, ToolExecutionOutcome, ToolExecutionRequest, ToolExecutor,
-    TurnSummary,
+    PreparedCompaction, PromptCacheEvent, ProviderRequestTrace, ResumableTurnOutcome, RuntimeError,
+    RuntimeEventReporter, StaticToolExecutor, SuspendedTurn, ToolError, ToolExecutionOutcome,
+    ToolExecutionRequest, ToolExecutor, TurnSummary,
 };
 pub use data_protection::{
     configured_data_protection_mode, explicit_env_opt_in_enabled, explicit_opt_in_value,
@@ -107,8 +107,11 @@ pub use egress::{
 pub use execution_kernel::{
     reduce_runtime_artifact, AgentExecutionKernel, RuntimeApprovalDecision, RuntimeApprovalRequest,
     RuntimeApprovalResolution, RuntimeArtifactKind, RuntimeArtifactPreview,
-    RuntimeContextManifestInput, RuntimeModelBudgetStage, RuntimeToolIntent, RuntimeToolOutcome,
-    RuntimeToolOutcomeKind, RuntimeToolProjection, RuntimeTurnStart, RuntimeTurnTerminalStatus,
+    RuntimeContextManifestInput, RuntimeContextSupplement, RuntimeContextSupplementRequest,
+    RuntimeModelBudgetStage, RuntimeToolCancellationContract, RuntimeToolContract,
+    RuntimeToolIntent, RuntimeToolOutcome, RuntimeToolOutcomeKind, RuntimeToolProjection,
+    RuntimeToolRetryPolicy, RuntimeToolRiskLevel, RuntimeToolSideEffectClass, RuntimeTurnStart,
+    RuntimeTurnTerminalStatus,
 };
 pub use file_ops::{
     edit_file, edit_file_in_workspace, glob_search, glob_search_in_workspace, grep_search,

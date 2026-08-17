@@ -8,6 +8,17 @@ use crate::error::{AppError, Result};
 use crate::state::AppState;
 use axum::extract::{Extension, Json, Path, Query, State};
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
+
+fn map_contract_error(error: crate::semantic_kernel_store::SemanticStoreError) -> AppError {
+    match error {
+        crate::semantic_kernel_store::SemanticStoreError::Database(error) => error.into(),
+        crate::semantic_kernel_store::SemanticStoreError::InvalidEvent(message) => {
+            AppError::ValidationError(message)
+        }
+        other => AppError::Internal(other.to_string()),
+    }
+}
 
 // GET /nl2sql/metrics/:datasource_id
 pub(crate) async fn list_metrics(
@@ -24,68 +35,62 @@ pub(crate) async fn list_metrics(
     )
     .await?;
 
-    // Try with status column (migration 008+); fall back for older schemas.
-    let rows_with_status: sqlx::Result<Vec<(i64, String, serde_json::Value, String, Option<serde_json::Value>, Option<String>, String, Option<String>, String, Option<String>)>> = sqlx::query_as::<sqlx::Sqlite, _>(
-        "SELECT CAST(m.id AS INTEGER), m.metric_name, m.metric_aliases, m.expression, m.filter_conditions, m.description, m.granularity, \
-         COALESCE(NULLIF(u.name, ''), NULLIF(u.email, ''), m.created_by) AS created_by, \
-         strftime('%Y-%m-%d %H:%M:%S', m.created_at), m.status \
-         FROM nl2sql_metrics m \
-         LEFT JOIN users u ON m.created_by = u.id AND u.tenant_id = m.tenant_id \
-         WHERE m.tenant_id = ? AND m.datasource_id = ? AND m.deleted_at IS NULL ORDER BY m.metric_name",
+    let rows = sqlx::query::<sqlx::Sqlite>(
+        "SELECT CAST(m.id AS INTEGER) AS id, m.metric_name, m.metric_aliases,
+                m.expression, m.filter_conditions, m.description, m.granularity,
+                COALESCE(NULLIF(u.name, ''), NULLIF(u.email, ''), m.created_by) AS created_by,
+                strftime('%Y-%m-%d %H:%M:%S', m.created_at) AS created_at, m.status,
+                m.time_column, m.timezone, m.population_json, m.allowed_grains_json,
+                m.invariants_json, m.join_contract_ids_json
+         FROM nl2sql_metrics m
+         LEFT JOIN users u ON m.created_by = u.id AND u.tenant_id = m.tenant_id
+         WHERE m.tenant_id = ? AND m.datasource_id = ? AND m.deleted_at IS NULL
+         ORDER BY m.metric_name",
     )
     .bind(&claims.tenant_id)
     .bind(&datasource_id)
     .fetch_all(&state.db)
-    .await;
-
-    let rows: Vec<(i64, String, serde_json::Value, String, Option<serde_json::Value>, Option<String>, String, Option<String>, String, Option<String>)> = match rows_with_status {
-        Ok(r) => r,
-        Err(_) => {
-            sqlx::query_as::<sqlx::Sqlite, _>(
-                "SELECT CAST(m.id AS INTEGER), m.metric_name, m.metric_aliases, m.expression, m.filter_conditions, m.description, m.granularity, \
-                 COALESCE(NULLIF(u.name, ''), NULLIF(u.email, ''), m.created_by) AS created_by, \
-                 strftime('%Y-%m-%d %H:%M:%S', m.created_at), NULL \
-                 FROM nl2sql_metrics m \
-                 LEFT JOIN users u ON m.created_by = u.id AND u.tenant_id = m.tenant_id \
-                 WHERE m.tenant_id = ? AND m.datasource_id = ? AND m.deleted_at IS NULL ORDER BY m.metric_name",
-            )
-            .bind(&claims.tenant_id)
-            .bind(&datasource_id)
-            .fetch_all(&state.db)
-            .await?
-        }
-    };
+    .await?;
 
     let metrics = rows
         .into_iter()
-        .map(
-            |(
-                id,
-                metric_name,
-                metric_aliases,
-                expression,
-                filter_conditions,
-                description,
-                granularity,
-                created_by,
-                created_at,
-                status,
-            )| {
-                MetricItem {
-                    id,
-                    metric_name,
-                    metric_aliases,
-                    expression,
-                    filter_conditions,
-                    description,
-                    granularity,
-                    created_by,
-                    created_at,
-                    status,
+        .map(|row| -> Result<MetricItem> {
+            let decode_json = |field: &str| -> Result<serde_json::Value> {
+                let raw = row.try_get::<Option<String>, _>(field)?.unwrap_or_default();
+                if raw.trim().is_empty() {
+                    Ok(serde_json::Value::Null)
+                } else {
+                    serde_json::from_str(&raw).map_err(|error| {
+                        AppError::Internal(format!("invalid stored metric {field}: {error}"))
+                    })
                 }
-            },
-        )
-        .collect();
+            };
+            let decode_string_list = |field: &str| -> Result<Vec<String>> {
+                let raw = row.try_get::<String, _>(field)?;
+                serde_json::from_str(&raw).map_err(|error| {
+                    AppError::Internal(format!("invalid stored metric {field}: {error}"))
+                })
+            };
+            Ok(MetricItem {
+                id: row.try_get("id")?,
+                metric_name: row.try_get("metric_name")?,
+                metric_aliases: decode_json("metric_aliases")?,
+                expression: row.try_get("expression")?,
+                filter_conditions: decode_json("filter_conditions")?.into(),
+                description: row.try_get("description")?,
+                granularity: row.try_get("granularity")?,
+                time_column: row.try_get("time_column")?,
+                timezone: row.try_get("timezone")?,
+                population: decode_json("population_json")?,
+                allowed_grains: decode_string_list("allowed_grains_json")?,
+                invariants: decode_json("invariants_json")?,
+                join_contract_ids: decode_string_list("join_contract_ids_json")?,
+                created_by: row.try_get("created_by")?,
+                created_at: row.try_get("created_at")?,
+                status: row.try_get("status")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(Json(ListMetricsResponse { metrics }))
 }
@@ -107,9 +112,17 @@ pub(crate) async fn create_metric(
     )
     .await?;
 
+    let mut tx = state.db.begin().await?;
+    let allowed_grains = if req.allowed_grains.is_empty() {
+        vec![req.granularity.clone()]
+    } else {
+        req.allowed_grains.clone()
+    };
     let result = sqlx::query::<sqlx::Sqlite>(
         "INSERT INTO nl2sql_metrics (tenant_id, datasource_id, metric_name, metric_aliases, expression, \
-         filter_conditions, description, granularity, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         filter_conditions, description, granularity, created_by, owner_id, time_column, timezone,
+         population_json, allowed_grains_json, invariants_json, join_contract_ids_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&claims.tenant_id)
     .bind(&datasource_id)
@@ -120,12 +133,36 @@ pub(crate) async fn create_metric(
     .bind(&req.description)
     .bind(&req.granularity)
     .bind(&claims.sub)
-    .execute(&state.db)
+    .bind(&claims.sub)
+    .bind(req.time_column.as_deref().map(str::trim).filter(|v| !v.is_empty()))
+    .bind(req.timezone.trim())
+    .bind(serde_json::to_string(&req.population).map_err(|error| {
+        AppError::ValidationError(format!("invalid metric population: {error}"))
+    })?)
+    .bind(serde_json::to_string(&allowed_grains).map_err(|error| {
+        AppError::ValidationError(format!("invalid allowed grains: {error}"))
+    })?)
+    .bind(serde_json::to_string(&req.invariants).map_err(|error| {
+        AppError::ValidationError(format!("invalid metric invariants: {error}"))
+    })?)
+    .bind(serde_json::to_string(&req.join_contract_ids).map_err(|error| {
+        AppError::ValidationError(format!("invalid metric join contracts: {error}"))
+    })?)
+    .execute(&mut *tx)
     .await?;
 
-    Ok(Json(
-        serde_json::json!({ "id": result.last_insert_rowid() }),
-    ))
+    let metric_id = result.last_insert_rowid();
+    crate::semantic_kernel_store::sync_metric_contract_in_tx(
+        &mut tx,
+        &claims.tenant_id,
+        &datasource_id,
+        metric_id,
+    )
+    .await
+    .map_err(map_contract_error)?;
+    tx.commit().await?;
+
+    Ok(Json(serde_json::json!({ "id": metric_id })))
 }
 
 // PATCH /nl2sql/metrics/:datasource_id/:id
@@ -151,6 +188,12 @@ pub(crate) async fn update_metric(
         && req.filter_conditions.is_none()
         && req.description.is_none()
         && req.granularity.is_none()
+        && req.time_column.is_none()
+        && req.timezone.is_none()
+        && req.population.is_none()
+        && req.allowed_grains.is_none()
+        && req.invariants.is_none()
+        && req.join_contract_ids.is_none()
     {
         return Err(AppError::ValidationError("No fields to update".into()));
     }
@@ -207,11 +250,69 @@ pub(crate) async fn update_metric(
         qb.push_bind(v);
         has_assignment = true;
     }
+    if let Some(ref v) = req.time_column {
+        if has_assignment {
+            qb.push(", ");
+        }
+        qb.push("time_column = ");
+        qb.push_bind(v.trim());
+        has_assignment = true;
+    }
+    if let Some(ref v) = req.timezone {
+        if has_assignment {
+            qb.push(", ");
+        }
+        qb.push("timezone = ");
+        qb.push_bind(v.trim());
+        has_assignment = true;
+    }
+    if let Some(ref v) = req.population {
+        if has_assignment {
+            qb.push(", ");
+        }
+        qb.push("population_json = ");
+        qb.push_bind(serde_json::to_string(v).map_err(|error| {
+            AppError::ValidationError(format!("invalid metric population: {error}"))
+        })?);
+        has_assignment = true;
+    }
+    if let Some(ref v) = req.allowed_grains {
+        if has_assignment {
+            qb.push(", ");
+        }
+        qb.push("allowed_grains_json = ");
+        qb.push_bind(serde_json::to_string(v).map_err(|error| {
+            AppError::ValidationError(format!("invalid allowed grains: {error}"))
+        })?);
+        has_assignment = true;
+    }
+    if let Some(ref v) = req.invariants {
+        if has_assignment {
+            qb.push(", ");
+        }
+        qb.push("invariants_json = ");
+        qb.push_bind(serde_json::to_string(v).map_err(|error| {
+            AppError::ValidationError(format!("invalid metric invariants: {error}"))
+        })?);
+        has_assignment = true;
+    }
+    if let Some(ref v) = req.join_contract_ids {
+        if has_assignment {
+            qb.push(", ");
+        }
+        qb.push("join_contract_ids_json = ");
+        qb.push_bind(serde_json::to_string(v).map_err(|error| {
+            AppError::ValidationError(format!("invalid metric join contracts: {error}"))
+        })?);
+        has_assignment = true;
+    }
 
     if has_assignment {
         qb.push(", ");
     }
-    qb.push("updated_at = CURRENT_TIMESTAMP");
+    qb.push(
+        "updated_at = CURRENT_TIMESTAMP, version = version + 1, status = 'draft', approved_by = NULL, approved_at = NULL",
+    );
 
     qb.push(" WHERE id = ");
     qb.push_bind(
@@ -224,7 +325,23 @@ pub(crate) async fn update_metric(
     qb.push(" AND datasource_id = ");
     qb.push_bind(&datasource_id);
 
-    qb.build().execute(&state.db).await?;
+    let metric_id = metric_id
+        .parse::<i64>()
+        .map_err(|_| AppError::ValidationError("invalid metric id".into()))?;
+    let mut tx = state.db.begin().await?;
+    let result = qb.build().execute(&mut *tx).await?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound("metric not found".into()));
+    }
+    crate::semantic_kernel_store::sync_metric_contract_in_tx(
+        &mut tx,
+        &claims.tenant_id,
+        &datasource_id,
+        metric_id,
+    )
+    .await
+    .map_err(map_contract_error)?;
+    tx.commit().await?;
 
     Ok(Json(serde_json::json!({ "updated": true })))
 }
@@ -245,16 +362,31 @@ pub(crate) async fn delete_metric(
     )
     .await?;
 
-    sqlx::query::<sqlx::Sqlite>("DELETE FROM nl2sql_metrics WHERE id = ? AND tenant_id = ? AND datasource_id = ? AND deleted_at IS NULL")
-        .bind(
-            metric_id
-                .parse::<i64>()
-                .map_err(|_| AppError::ValidationError("invalid metric id".into()))?,
-        )
-        .bind(&claims.tenant_id)
-        .bind(&datasource_id)
-        .execute(&state.db)
-        .await?;
+    let metric_id = metric_id
+        .parse::<i64>()
+        .map_err(|_| AppError::ValidationError("invalid metric id".into()))?;
+    let mut tx = state.db.begin().await?;
+    let result = sqlx::query::<sqlx::Sqlite>(
+        "UPDATE nl2sql_metrics SET deleted_at = CURRENT_TIMESTAMP, status = 'deprecated'
+         WHERE id = ? AND tenant_id = ? AND datasource_id = ? AND deleted_at IS NULL",
+    )
+    .bind(metric_id)
+    .bind(&claims.tenant_id)
+    .bind(&datasource_id)
+    .execute(&mut *tx)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound("metric not found".into()));
+    }
+    crate::semantic_kernel_store::deactivate_metric_contracts_in_tx(
+        &mut tx,
+        &claims.tenant_id,
+        &datasource_id,
+        metric_id,
+    )
+    .await
+    .map_err(map_contract_error)?;
+    tx.commit().await?;
 
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
@@ -304,6 +436,7 @@ pub(crate) async fn update_metric_status(
         _ => unreachable!(),
     };
 
+    let mut tx = state.db.begin().await?;
     let affected = sqlx::query::<sqlx::Sqlite>(
         "UPDATE nl2sql_metrics SET status = ?, approved_by = IIF(? = 'approve', ?, approved_by), \
          approved_at = IIF(? = 'approve', CURRENT_TIMESTAMP, approved_at) \
@@ -317,7 +450,7 @@ pub(crate) async fn update_metric_status(
     .bind(&claims.tenant_id)
     .bind(&datasource_id)
     .bind(from_status)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
 
@@ -326,6 +459,29 @@ pub(crate) async fn update_metric_status(
             "metric not found or status transition '{from_status}' → '{to_status}' not allowed"
         )));
     }
+
+    sqlx::query::<sqlx::Sqlite>(
+        "INSERT INTO nl2sql_metric_approvals
+            (metric_id, action, reviewer_id, comment, from_status, to_status)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(crate::sqlite_i64(metric_id))
+    .bind(&req.action)
+    .bind(&claims.sub)
+    .bind(&req.comment)
+    .bind(from_status)
+    .bind(to_status)
+    .execute(&mut *tx)
+    .await?;
+    crate::semantic_kernel_store::sync_metric_contract_in_tx(
+        &mut tx,
+        &claims.tenant_id,
+        &datasource_id,
+        crate::sqlite_i64(metric_id),
+    )
+    .await
+    .map_err(map_contract_error)?;
+    tx.commit().await?;
 
     Ok(Json(serde_json::json!({ "status": to_status })))
 }
@@ -361,7 +517,8 @@ pub(crate) async fn metric_lookup(
 
     let rows: Vec<(i64, String, serde_json::Value, String, Option<serde_json::Value>, Option<String>, String)> = sqlx::query_as::<sqlx::Sqlite, _>(
         "SELECT CAST(id AS INTEGER), metric_name, metric_aliases, expression, filter_conditions, description, granularity \
-         FROM nl2sql_metrics WHERE tenant_id = ? AND datasource_id = ? AND deleted_at IS NULL",
+         FROM nl2sql_metrics WHERE tenant_id = ? AND datasource_id = ?
+           AND status = 'published' AND deleted_at IS NULL",
     )
     .bind(&claims.tenant_id)
     .bind(&datasource_id)

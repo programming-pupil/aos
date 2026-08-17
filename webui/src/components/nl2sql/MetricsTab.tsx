@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
-  Table, Button, Modal, Form, Input, Select, Space, Tag,
+  Table, Button, Modal, Form, Input, Select, Space, Tag, Checkbox,
   message, Popconfirm, Typography, Card, Spin, Empty, Tooltip, Alert,
 } from 'antd';
 import {
@@ -42,6 +42,14 @@ interface MetricFormValues {
   filterConditions: string;
   description: string;
   granularity: string;
+  timeColumn: string;
+  timezone: string;
+  populationSubject: string;
+  dedupKey: string;
+  excludeTestUsers: boolean;
+  excludeInternalUsers: boolean;
+  validRecordRule: string;
+  allowedGrains: string[];
 }
 
 function parseFilterConditionsInput(raw: string): Record<string, unknown> | string | undefined {
@@ -152,14 +160,34 @@ export function MetricsTab() {
   });
 
   const handleOpenCreate = () => {
-    form.setFieldsValue({ metricName: '', metricAliases: '', expression: '', filterConditions: '', description: '', granularity: 'day' });
+    form.setFieldsValue({
+      metricName: '', metricAliases: '', expression: '', filterConditions: '',
+      description: '', granularity: 'day', timeColumn: '', timezone: 'UTC',
+      populationSubject: 'query_rows', dedupKey: '', excludeTestUsers: false,
+      excludeInternalUsers: false, validRecordRule: '', allowedGrains: ['day'],
+    });
     setEditModal({ open: true, metric: null });
   };
 
   const handleOpenEdit = (record: MetricItem) => {
     const aliasesStr = record.metricAliases?.join?.(',') ?? '';
     const filterStr = formatFilterConditionsForEditor(record.filterConditions);
-    form.setFieldsValue({ metricName: record.metricName, metricAliases: aliasesStr, expression: record.expression, filterConditions: filterStr, description: record.description ?? '', granularity: record.granularity });
+    form.setFieldsValue({
+      metricName: record.metricName,
+      metricAliases: aliasesStr,
+      expression: record.expression,
+      filterConditions: filterStr,
+      description: record.description ?? '',
+      granularity: record.granularity,
+      timeColumn: record.timeColumn ?? '',
+      timezone: record.timezone || 'UTC',
+      populationSubject: record.population?.subject || 'query_rows',
+      dedupKey: record.population?.dedup_key ?? '',
+      excludeTestUsers: record.population?.exclude_test_users ?? false,
+      excludeInternalUsers: record.population?.exclude_internal_users ?? false,
+      validRecordRule: record.population?.valid_record_rule ?? '',
+      allowedGrains: record.allowedGrains?.length ? record.allowedGrains : [record.granularity],
+    });
     setEditModal({ open: true, metric: record });
   };
 
@@ -167,7 +195,24 @@ export function MetricsTab() {
     form.validateFields().then((values) => {
       const aliases = values.metricAliases ? values.metricAliases.split(',').map((s) => s.trim()).filter(Boolean) : [];
       const filterConditions = parseFilterConditionsInput(values.filterConditions || '');
-      const payload = { metricName: values.metricName, metricAliases: aliases, expression: values.expression, filterConditions, description: values.description || undefined, granularity: values.granularity };
+      const payload = {
+        metricName: values.metricName,
+        metricAliases: aliases,
+        expression: values.expression,
+        filterConditions,
+        description: values.description || undefined,
+        granularity: values.granularity,
+        timeColumn: values.timeColumn.trim(),
+        timezone: values.timezone.trim(),
+        population: {
+          subject: values.populationSubject.trim(),
+          dedup_key: values.dedupKey.trim() || null,
+          exclude_test_users: values.excludeTestUsers,
+          exclude_internal_users: values.excludeInternalUsers,
+          valid_record_rule: values.validRecordRule.trim() || null,
+        },
+        allowedGrains: values.allowedGrains?.length ? values.allowedGrains : [values.granularity],
+      };
       if (editModal.metric) {
         updateMutation.mutate({ metricId: editModal.metric.id, data: payload });
       } else {
@@ -359,6 +404,48 @@ export function MetricsTab() {
           <Form.Item name="granularity" label={t('management.metrics.defaultGranularity')} initialValue="day">
             <Select options={GRANULARITY_OPTIONS(t)} />
           </Form.Item>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 12px' }}>
+            <Form.Item
+              name="timeColumn"
+              label={t('management.metrics.timeColumn')}
+              rules={[{ required: true, message: t('common.required') }]}
+            >
+              <Input placeholder={t('management.metrics.timeColumnPlaceholder')} />
+            </Form.Item>
+            <Form.Item
+              name="timezone"
+              label={t('management.metrics.timezone')}
+              rules={[{ required: true, message: t('common.required') }]}
+            >
+              <Input placeholder="UTC" />
+            </Form.Item>
+          </div>
+          <Form.Item name="allowedGrains" label={t('management.metrics.allowedGrains')}>
+            <Select mode="multiple" options={GRANULARITY_OPTIONS(t)} />
+          </Form.Item>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 12px' }}>
+            <Form.Item
+              name="populationSubject"
+              label={t('management.metrics.populationSubject')}
+              rules={[{ required: true, message: t('common.required') }]}
+            >
+              <Input placeholder={t('management.metrics.populationSubjectPlaceholder')} />
+            </Form.Item>
+            <Form.Item name="dedupKey" label={t('management.metrics.dedupKey')}>
+              <Input placeholder={t('management.metrics.dedupKeyPlaceholder')} />
+            </Form.Item>
+          </div>
+          <Form.Item name="validRecordRule" label={t('management.metrics.validRecordRule')}>
+            <Input placeholder={t('management.metrics.validRecordRulePlaceholder')} />
+          </Form.Item>
+          <Space size={24} style={{ marginBottom: 16 }}>
+            <Form.Item name="excludeTestUsers" valuePropName="checked" noStyle>
+              <Checkbox>{t('management.metrics.excludeTestUsers')}</Checkbox>
+            </Form.Item>
+            <Form.Item name="excludeInternalUsers" valuePropName="checked" noStyle>
+              <Checkbox>{t('management.metrics.excludeInternalUsers')}</Checkbox>
+            </Form.Item>
+          </Space>
           <Form.Item name="description" label={t('management.metrics.description')}>
             <Input.TextArea placeholder={t('management.metrics.descriptionPlaceholder')} rows={2} />
           </Form.Item>

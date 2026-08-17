@@ -19,6 +19,7 @@ use crate::state::AppState;
 use axum::extract::{Extension, Json, Query, State};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use sqlx::FromRow;
 use sqlx::{Column, Row};
 use std::collections::{BTreeSet, HashSet};
@@ -76,6 +77,460 @@ fn derive_validation_tables(sql: &str, primary_table_hint: &str) -> Vec<String> 
         tables.push("unknown".to_string());
     }
     tables
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct CandidateSemanticVerification {
+    pub intent: nl2sql_core::semantic_ir::AnalyticIntentIR,
+    pub verification: serde_json::Value,
+    pub release_decision: String,
+    pub calibrated_score: f64,
+}
+
+/// Compile a candidate against the immutable IR without mutating durable
+/// state. Callers that create another durable object can therefore persist the
+/// verification and that object in one transaction.
+pub(super) async fn compile_candidate_against_canonical_intent(
+    db: &sqlx::SqlitePool,
+    tenant_id: &str,
+    query_id: &str,
+    datasource_id: Option<&str>,
+    sql: &str,
+) -> Result<CandidateSemanticVerification> {
+    let intent = crate::semantic_kernel_store::load_nl2sql_intent_ir(db, tenant_id, query_id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .ok_or_else(|| {
+            AppError::ValidationError(
+                "SQL repair is blocked because the canonical analytic intent is missing".into(),
+            )
+        })?;
+    if intent.security_scope.tenant_id != tenant_id {
+        return Err(AppError::ValidationError(
+            "SQL execution is blocked because the canonical intent belongs to another tenant"
+                .into(),
+        ));
+    }
+    if let Some(datasource_id) = datasource_id {
+        if intent.security_scope.datasource_id != datasource_id {
+            return Err(AppError::ValidationError(
+                "SQL execution is blocked because the canonical intent is bound to another datasource"
+                    .into(),
+            ));
+        }
+    }
+    let original_release = sqlx::query_scalar::<_, String>(
+        "SELECT release_decision FROM semantic_verifications
+         WHERE tenant_id = ? AND analytic_intent_id = ?",
+    )
+    .bind(tenant_id)
+    .bind(query_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or_else(|| {
+        AppError::ValidationError(
+            "SQL execution is blocked because the original semantic release decision is missing"
+                .into(),
+        )
+    })?;
+    super::semantic_audit::require_execution_validation_decision(&original_release)
+        .map_err(AppError::ValidationError)?;
+    let metric_ids = intent
+        .metrics
+        .iter()
+        .map(|metric| metric.id.clone())
+        .collect::<Vec<_>>();
+    let metric_contracts = crate::semantic_kernel_store::load_metric_contracts(
+        db,
+        tenant_id,
+        &intent.security_scope.datasource_id,
+        &metric_ids,
+    )
+    .await
+    .map_err(|error| AppError::Internal(error.to_string()))?
+    .into_iter()
+    .map(|stored| stored.contract)
+    .collect::<Vec<_>>();
+    let join_contracts = crate::semantic_kernel_store::load_join_contracts(
+        db,
+        tenant_id,
+        &intent.security_scope.datasource_id,
+    )
+    .await
+    .map_err(|error| AppError::Internal(error.to_string()))?
+    .into_iter()
+    .map(|stored| stored.contract)
+    .collect::<Vec<_>>();
+    let audit = super::semantic_audit::compile_canonical_intent_with_contracts_and_joins(
+        &intent,
+        sql,
+        &metric_contracts,
+        &join_contracts,
+    )
+    .ok_or_else(|| {
+        AppError::ValidationError(
+            "SQL repair is blocked because it cannot be verified against the canonical analytic intent"
+                .into(),
+        )
+    })?;
+    let verification = super::semantic_audit::verification_json(&audit);
+    let release_decision = serde_json::to_string(&audit.verification.release_decision)
+        .unwrap_or_else(|_| "\"Reject\"".to_string())
+        .trim_matches('"')
+        .to_string();
+    super::semantic_audit::require_execution_validation_decision(&release_decision)
+        .map_err(AppError::ValidationError)?;
+    Ok(CandidateSemanticVerification {
+        intent,
+        verification,
+        release_decision,
+        calibrated_score: f64::from(audit.verification.confidence_basis.calibrated_score),
+    })
+}
+
+async fn verify_candidate_against_canonical_intent(
+    db: &sqlx::SqlitePool,
+    tenant_id: &str,
+    query_id: &str,
+    datasource_id: Option<&str>,
+    sql: &str,
+) -> Result<CandidateSemanticVerification> {
+    let candidate = match compile_candidate_against_canonical_intent(
+        db,
+        tenant_id,
+        query_id,
+        datasource_id,
+        sql,
+    )
+    .await
+    {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            // A rejected repair is still a durable attempt. Keeping the
+            // failure in the same append-only audit stream makes retries and
+            // post-incident review distinguish "never tried" from "failed
+            // semantic verification" without weakening the fail-closed path.
+            // Scope/identity failures are deliberately excluded: the same SQL
+            // may be retried after the caller supplies the correct datasource
+            // binding and must not be poisoned by a prior scope mismatch.
+            let error_text = error.to_string();
+            let is_scope_or_identity_failure = error_text
+                .contains("canonical analytic intent is missing")
+                || error_text.contains("another tenant")
+                || error_text.contains("another datasource")
+                || error_text.contains("original semantic release decision is missing");
+            if !is_scope_or_identity_failure {
+                let verification = serde_json::json!({
+                    "schemaVersion": "nl2sql-repair-verification-v1",
+                    "release_decision": "Reject",
+                    "status": "semantic_verification_failed",
+                    "error": error_text,
+                });
+                if let Err(persist_error) =
+                    crate::semantic_kernel_store::persist_nl2sql_repair_verification(
+                        db,
+                        tenant_id,
+                        query_id,
+                        sql,
+                        &verification,
+                        "Reject",
+                        0.0,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        tenant_id,
+                        query_id,
+                        error = %persist_error,
+                        "failed to persist rejected NL2SQL repair attempt"
+                    );
+                }
+            }
+            return Err(error);
+        }
+    };
+    crate::semantic_kernel_store::persist_nl2sql_repair_verification(
+        db,
+        tenant_id,
+        query_id,
+        sql,
+        &candidate.verification,
+        &candidate.release_decision,
+        candidate.calibrated_score,
+    )
+    .await
+    .map_err(|error| AppError::Internal(error.to_string()))?;
+    Ok(candidate)
+}
+
+async fn verify_repair_against_canonical_intent(
+    db: &sqlx::SqlitePool,
+    tenant_id: &str,
+    query_id: &str,
+    sql: &str,
+) -> Result<CandidateSemanticVerification> {
+    verify_candidate_against_canonical_intent(db, tenant_id, query_id, None, sql).await
+}
+
+#[derive(Debug)]
+struct ResultValidationOutcome {
+    release_decision: String,
+    observation_count: usize,
+}
+
+async fn finalize_result_invariants(
+    db: &sqlx::SqlitePool,
+    tenant_id: &str,
+    datasource_id: &str,
+    query_id: &str,
+    sql: &str,
+    rows: &[serde_json::Value],
+    columns: usize,
+    execution_ms: u64,
+    candidate: &CandidateSemanticVerification,
+) -> Result<ResultValidationOutcome> {
+    let metric_ids = candidate
+        .intent
+        .metrics
+        .iter()
+        .map(|metric| metric.id.clone())
+        .collect::<Vec<_>>();
+    let contracts = crate::semantic_kernel_store::load_metric_contracts(
+        db,
+        tenant_id,
+        datasource_id,
+        &metric_ids,
+    )
+    .await
+    .map_err(|error| AppError::Internal(error.to_string()))?;
+    let mut invariant_keys = BTreeSet::new();
+    let invariants = contracts
+        .into_iter()
+        .flat_map(|stored| stored.contract.invariants)
+        .filter(|invariant| {
+            invariant_keys.insert(serde_json::to_string(invariant).unwrap_or_default())
+        })
+        .collect::<Vec<_>>();
+    let observations = nl2sql_core::semantic_ir::evaluate_result_invariants(&invariants, rows);
+    let has_failed = observations
+        .iter()
+        .any(|observation| observation.status == nl2sql_core::semantic_ir::CheckStatus::Fail);
+    let has_unobserved = observations
+        .iter()
+        .any(|observation| observation.status == nl2sql_core::semantic_ir::CheckStatus::NotChecked);
+    let release_decision = if has_failed {
+        "Reject"
+    } else if has_unobserved {
+        "NeedsClarification"
+    } else {
+        "Release"
+    }
+    .to_string();
+    let execution_id = uuid::Uuid::new_v4().to_string();
+    let sql_hash = hex::encode(sha2::Sha256::digest(sql.as_bytes()));
+    let mut verification = candidate.verification.clone();
+    let verification_object = verification
+        .as_object_mut()
+        .ok_or_else(|| AppError::Internal("semantic verification is not a JSON object".into()))?;
+    verification_object.insert(
+        "result_invariants".into(),
+        serde_json::Value::Array(
+            observations
+                .iter()
+                .map(|observation| {
+                    serde_json::json!({
+                        "status": observation.status,
+                        "code": observation.code,
+                        "message": observation.message,
+                    })
+                })
+                .collect(),
+        ),
+    );
+    verification_object.insert(
+        "executable".into(),
+        serde_json::json!({
+            "status": "Pass",
+            "code": "executed",
+            "message": format!(
+                "datasource returned {} row(s) across {columns} column(s) in {execution_ms}ms",
+                rows.len()
+            )
+        }),
+    );
+    verification_object.insert(
+        "release_decision".into(),
+        serde_json::Value::String(release_decision.clone()),
+    );
+    if let Some(basis) = verification_object
+        .get_mut("confidence_basis")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        basis.insert("execution_passed".into(), serde_json::Value::Bool(true));
+        if let Some(score) = basis
+            .get("calibrated_score")
+            .and_then(serde_json::Value::as_f64)
+        {
+            basis.insert(
+                "calibrated_score".into(),
+                serde_json::Value::from(if release_decision == "Release" {
+                    (score + 0.03).min(0.99)
+                } else {
+                    score.min(0.5)
+                }),
+            );
+        }
+    }
+    let execution_evidence = serde_json::json!({
+        "schemaVersion": "nl2sql-result-validation-v1",
+        "executionId": execution_id,
+        "queryId": query_id,
+        "sqlHash": sql_hash,
+        "rows": rows.len(),
+        "columns": columns,
+        "executionMs": execution_ms,
+        "releaseDecision": release_decision,
+        "observations": observations,
+    });
+    let protected_verification =
+        runtime::protect_sensitive_json(&verification, runtime::configured_data_protection_mode())
+            .0
+            .to_string();
+    let mut transaction = db.begin().await?;
+    for observation in execution_evidence["observations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let invariant = observation
+            .get("invariant")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let invariant_id = hex::encode(sha2::Sha256::digest(
+            serde_json::to_vec(&invariant).unwrap_or_default(),
+        ));
+        let status = match observation.get("status").and_then(|value| value.as_str()) {
+            Some("Pass") => "pass",
+            Some("Fail") => "fail",
+            _ => "not_observed",
+        };
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO result_invariant_observations
+                (id, tenant_id, datasource_id, analytic_intent_id, query_id,
+                 execution_id, sql_hash, invariant_id, status, observation_json,
+                 created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+        )
+        .bind(format!("result-invariant:{execution_id}:{invariant_id}"))
+        .bind(tenant_id)
+        .bind(datasource_id)
+        .bind(query_id)
+        .bind(query_id)
+        .bind(&execution_id)
+        .bind(&sql_hash)
+        .bind(&invariant_id)
+        .bind(status)
+        .bind(observation.to_string())
+        .execute(&mut *transaction)
+        .await?;
+    }
+    let updated = sqlx::query::<sqlx::Sqlite>(
+        "UPDATE semantic_verifications
+         SET verification_json = ?, release_decision = ?,
+             calibrated_score = CASE
+               WHEN ? = 'Release' THEN MIN(calibrated_score + 0.03, 0.99)
+               ELSE MIN(calibrated_score, 0.5)
+             END
+         WHERE tenant_id = ? AND analytic_intent_id = ?",
+    )
+    .bind(protected_verification)
+    .bind(&release_decision)
+    .bind(&release_decision)
+    .bind(tenant_id)
+    .bind(query_id)
+    .execute(&mut *transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(AppError::ValidationError(
+            "result validation cannot finalize because the semantic audit is missing".into(),
+        ));
+    }
+    sqlx::query::<sqlx::Sqlite>(
+        "UPDATE feedback_regression_cases
+         SET execution_evidence_json = ?,
+             status = CASE
+               WHEN EXISTS (
+                 SELECT 1 FROM feedback_learning_events e
+                 WHERE e.tenant_id = feedback_regression_cases.tenant_id
+                   AND e.id = feedback_regression_cases.feedback_event_id
+                   AND e.approved = 1
+               ) AND ? = 'Release' THEN 'verified'
+               ELSE status
+             END,
+             last_verified_at = IIF(? = 'Release', CURRENT_TIMESTAMP, last_verified_at),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE tenant_id = ? AND datasource_id = ? AND analytic_intent_id = ?
+           AND corrected_sql_hash = ? AND status != 'revoked'",
+    )
+    .bind(execution_evidence.to_string())
+    .bind(&release_decision)
+    .bind(&release_decision)
+    .bind(tenant_id)
+    .bind(datasource_id)
+    .bind(query_id)
+    .bind(&sql_hash)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(ResultValidationOutcome {
+        release_decision,
+        observation_count: invariants.len(),
+    })
+}
+
+async fn load_released_query_binding(
+    db: &sqlx::SqlitePool,
+    tenant_id: &str,
+    user_id: &str,
+    query_id: &str,
+    requested_datasource_id: &str,
+    requested_sql: &str,
+) -> Result<(String, String)> {
+    let (datasource_id, released_sql): (String, String) = sqlx::query_as(
+        "SELECT data_source_id, generated_sql FROM nl2sql_queries
+         WHERE id = ? AND tenant_id = ? AND user_id = ?",
+    )
+    .bind(query_id)
+    .bind(tenant_id)
+    .bind(user_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or_else(|| {
+        AppError::ValidationError(
+            "SQL execution is blocked because this query has no durable released candidate for the current user"
+                .into(),
+        )
+    })?;
+    if datasource_id.trim().is_empty() {
+        return Err(AppError::ValidationError(
+            "SQL execution is blocked because the released query is not bound to a datasource"
+                .into(),
+        ));
+    }
+    if !requested_datasource_id.trim().is_empty() && requested_datasource_id.trim() != datasource_id
+    {
+        return Err(AppError::ValidationError(
+            "SQL execution is blocked because the requested datasource does not match the released query"
+                .into(),
+        ));
+    }
+    if requested_sql != released_sql {
+        return Err(AppError::ValidationError(
+            "SQL execution is blocked because the SQL hash does not match the durable released candidate; generate or explicitly verify a repair instead of editing the statement in place"
+                .into(),
+        ));
+    }
+    Ok((datasource_id, released_sql))
 }
 
 /// Upserts a row in `nl2sql_conversations` after a successful query.
@@ -356,7 +811,7 @@ async fn correct_sql_bounded(
     // P1-2: Re-load metrics for this datasource so corrections can use metric definitions.
     let metrics: Vec<(String, String, Option<String>)> = sqlx::query_as(
         "SELECT metric_name, expression, filter_conditions FROM nl2sql_metrics \
-         WHERE tenant_id = ? AND datasource_id = ? AND deleted_at IS NULL",
+         WHERE tenant_id = ? AND datasource_id = ? AND status = 'published' AND deleted_at IS NULL",
     )
     .bind(&claims.tenant_id)
     .bind(datasource_id)
@@ -909,46 +1364,15 @@ pub(crate) async fn execute(
     }
 
     let requested_data_source_id = req.data_source_id.trim().to_string();
-    let stored_data_source_id: Option<String> = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT data_source_id FROM nl2sql_queries \
-         WHERE id = ? AND tenant_id = ? AND user_id = ?",
+    let (effective_data_source_id, _released_sql) = load_released_query_binding(
+        &state.db,
+        &claims.tenant_id,
+        &claims.sub,
+        &req.query_id,
+        &requested_data_source_id,
+        &req.sql,
     )
-    .bind(&req.query_id)
-    .bind(&claims.tenant_id)
-    .bind(&claims.sub)
-    .fetch_optional(&state.db)
-    .await?
-    .flatten()
-    .and_then(|id| {
-        let trimmed = id.trim().to_string();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    });
-    let effective_data_source_id = stored_data_source_id
-        .clone()
-        .unwrap_or_else(|| requested_data_source_id.clone());
-    if effective_data_source_id.trim().is_empty() {
-        return Err(AppError::ValidationError(
-            "data_source_id is required for SQL execution".to_string(),
-        ));
-    }
-    if stored_data_source_id
-        .as_deref()
-        .is_some_and(|stored| stored != requested_data_source_id)
-        && !requested_data_source_id.is_empty()
-    {
-        tracing::warn!(
-            tenant_id = %claims.tenant_id,
-            user_id = %claims.sub,
-            query_id = %req.query_id,
-            requested_datasource_id = %requested_data_source_id,
-            query_bound_datasource_id = %effective_data_source_id,
-            "execute datasource mismatch; using query-bound datasource"
-        );
-    }
+    .await?;
     let _exec_span = tracing::info_span!(
         "nl2sql_execute",
         tenant_id = %claims.tenant_id,
@@ -1165,6 +1589,21 @@ pub(crate) async fn execute(
         }
         None => req.sql.clone(),
     };
+    let mut current_candidate = verify_candidate_against_canonical_intent(
+        &state.db,
+        &claims.tenant_id,
+        &req.query_id,
+        Some(&effective_data_source_id),
+        &current_sql,
+    )
+    .await?;
+    push_unique_rule_hit(
+        &mut applied_rules,
+        &mut applied_rule_seen,
+        "semantic_release_guard_execute",
+        "Semantic Release Guard",
+        Some("canonical intent, tenant, datasource and SQL candidate re-verified before datasource connection".into()),
+    );
     let mut corrected_sql: Option<String> = None;
     let mut self_correct_failed = false;
     let mut current_repair_decision: Option<SqlRepairDecision> = None;
@@ -1218,22 +1657,24 @@ pub(crate) async fn execute(
 
         match sql_result {
             Ok(resp) => {
-                if let Err(error) = crate::semantic_kernel_store::record_nl2sql_execution_evidence(
+                let result_validation = finalize_result_invariants(
                     &state.db,
                     &claims.tenant_id,
+                    &effective_data_source_id,
                     &req.query_id,
-                    resp.rows_count,
+                    &current_sql,
+                    &resp.rows,
                     resp.columns.len(),
                     resp.execution_ms,
+                    &current_candidate,
                 )
-                .await
-                {
-                    tracing::warn!(
-                        tenant_id = %claims.tenant_id,
-                        query_id = %req.query_id,
-                        error = %error,
-                        "failed to attach execution evidence to NL2SQL semantic audit"
-                    );
+                .await?;
+                if result_validation.release_decision != "Release" {
+                    return Err(AppError::ValidationError(format!(
+                        "query result did not pass semantic release (decision={}; result_invariants={})",
+                        result_validation.release_decision,
+                        result_validation.observation_count,
+                    )));
                 }
                 // Enrich masking rule hit details based on actual returned columns
                 // (more reliable than SQL parse for aliases/expressions).
@@ -1574,7 +2015,7 @@ pub(crate) async fn execute(
                     current_repair_decision = repair_decision;
 
                     if !new_sql.trim().is_empty() && new_sql != current_sql {
-                        current_sql = match policy_row_filter.as_deref() {
+                        let candidate_sql = match policy_row_filter.as_deref() {
                             Some(row_filter) => {
                                 super::inject_query_policy_row_filter(&new_sql, row_filter)
                                     .map_err(|error| {
@@ -1585,8 +2026,37 @@ pub(crate) async fn execute(
                             }
                             None => new_sql,
                         };
-                        corrected_sql = Some(current_sql.clone());
-                        continue;
+                        match verify_repair_against_canonical_intent(
+                            &state.db,
+                            &claims.tenant_id,
+                            &req.query_id,
+                            &candidate_sql,
+                        )
+                        .await
+                        {
+                            Err(error) => {
+                                tracing::warn!(
+                                    tenant_id = %claims.tenant_id,
+                                    query_id = %req.query_id,
+                                    error = %error,
+                                    "execute: repaired SQL failed canonical semantic verification"
+                                );
+                                push_unique_rule_hit(
+                                    &mut applied_rules,
+                                    &mut applied_rule_seen,
+                                    "semantic_repair_blocked",
+                                    "Semantic Repair Verification",
+                                    Some(error.to_string()),
+                                );
+                                self_correct_failed = true;
+                            }
+                            Ok(candidate) => {
+                                current_candidate = candidate;
+                                current_sql = candidate_sql;
+                                corrected_sql = Some(current_sql.clone());
+                                continue;
+                            }
+                        }
                     } else {
                         self_correct_failed = true;
                     }
@@ -2562,6 +3032,46 @@ impl PolicyEnforcementDecision {
     }
 }
 
+pub(crate) async fn query_policy_lineage_hash(
+    db: &sqlx::SqlitePool,
+    tenant_id: &str,
+    datasource_id: &str,
+    user_id: &str,
+    user_email: &str,
+) -> Result<String> {
+    let row: Option<PolicyRow> = sqlx::query_as(
+        "SELECT allowed_tables, denied_tables, allowed_columns, denied_columns, row_filter_expr
+         FROM nl2sql_query_policies
+         WHERE tenant_id = ? AND datasource_id = ?
+           AND (user_id = ? OR LOWER(user_id) = LOWER(?))
+           AND enabled = 1 AND deleted_at IS NULL
+         ORDER BY CASE
+             WHEN user_id = ? THEN 0
+             WHEN LOWER(user_id) = LOWER(?) THEN 1
+             ELSE 2
+           END
+         LIMIT 1",
+    )
+    .bind(tenant_id)
+    .bind(datasource_id)
+    .bind(user_id)
+    .bind(user_email)
+    .bind(user_id)
+    .bind(user_email)
+    .fetch_optional(db)
+    .await?;
+    let value = row.map_or(serde_json::Value::Null, |policy| {
+        serde_json::json!({
+            "allowedTables": policy.allowed_tables,
+            "deniedTables": policy.denied_tables,
+            "allowedColumns": policy.allowed_columns,
+            "deniedColumns": policy.denied_columns,
+            "rowFilter": policy.row_filter_expr,
+        })
+    });
+    Ok(crate::semantic_kernel_store::sha256_json(&value))
+}
+
 pub(crate) fn query_policy_denial_message(decision: &PolicyEnforcementDecision) -> String {
     let mut details = Vec::new();
     if !decision.denied_tables.is_empty() {
@@ -3178,5 +3688,398 @@ JOIN `hive`.`ods`.`order_item` oi ON oi.order_id = bo.order_id
         assert!(message.starts_with("[query_policy_denied]"));
         assert!(message.contains("tables: secrets"));
         assert!(message.contains("columns: password_hash"));
+    }
+
+    #[tokio::test]
+    async fn execution_repair_is_reverified_against_the_durable_canonical_intent() {
+        let pool = crate::test_sqlite_pool().await;
+        let mut intent = super::super::semantic_audit::compile_question_intent(
+            "tenant-a",
+            "datasource-a",
+            "按设备统计订单数",
+            &[],
+        );
+        super::super::semantic_audit::bind_schema_dimensions(
+            &mut intent,
+            &serde_json::json!([{
+                "table_name": "task_offer",
+                "columns": [
+                    {"name": "executor_device_id"},
+                    {"name": "order_id"}
+                ]
+            }]),
+            &[],
+        );
+        crate::semantic_kernel_store::persist_nl2sql_intent_ir(
+            &pool,
+            "tenant-a",
+            "thread-a",
+            "turn-a",
+            "query-a",
+            &serde_json::to_value(&intent).expect("serialize intent"),
+        )
+        .await
+        .expect("persist canonical intent");
+
+        let preserving = "SELECT executor_device_id, COUNT(*) AS order_count \
+                          FROM task_offer GROUP BY executor_device_id";
+        let initial_audit =
+            super::super::semantic_audit::compile_canonical_intent_with_contracts_and_joins(
+                &intent,
+                preserving,
+                &[],
+                &[],
+            )
+            .expect("compile initial semantic release");
+        let initial_decision = serde_json::to_string(&initial_audit.verification.release_decision)
+            .unwrap()
+            .trim_matches('"')
+            .to_string();
+        assert_eq!(initial_decision, "Release");
+        crate::semantic_kernel_store::persist_nl2sql_semantic_audit(
+            &pool,
+            "tenant-a",
+            "datasource-a",
+            "thread-a",
+            "query-a",
+            &super::super::semantic_audit::intent_json(&initial_audit),
+            &super::super::semantic_audit::verification_json(&initial_audit),
+            &initial_decision,
+            f64::from(initial_audit.verification.confidence_basis.calibrated_score),
+        )
+        .await
+        .expect("persist initial semantic release");
+        let missing_ir = verify_candidate_against_canonical_intent(
+            &pool,
+            "tenant-a",
+            "query-missing",
+            Some("datasource-a"),
+            preserving,
+        )
+        .await
+        .expect_err("execution without canonical IR must fail closed");
+        assert!(missing_ir
+            .to_string()
+            .contains("canonical analytic intent is missing"));
+        let datasource_drift = verify_candidate_against_canonical_intent(
+            &pool,
+            "tenant-a",
+            "query-a",
+            Some("datasource-b"),
+            preserving,
+        )
+        .await
+        .expect_err("execution cannot move an intent across datasources");
+        assert!(datasource_drift.to_string().contains("another datasource"));
+        verify_repair_against_canonical_intent(&pool, "tenant-a", "query-a", preserving)
+            .await
+            .expect("scope-preserving repair must pass");
+        let overwrite = crate::semantic_kernel_store::persist_nl2sql_repair_verification(
+            &pool,
+            "tenant-a",
+            "query-a",
+            preserving,
+            &serde_json::json!({"releaseDecision": "Reject"}),
+            "Reject",
+            0.1,
+        )
+        .await
+        .expect_err("the same repaired SQL cannot acquire a different audit outcome");
+        assert!(overwrite.to_string().contains("immutable"));
+
+        let drifting = "SELECT COUNT(*) AS order_count FROM task_offer";
+        let error = verify_repair_against_canonical_intent(&pool, "tenant-a", "query-a", drifting)
+            .await
+            .expect_err("repair that drops the requested grain must be blocked");
+        assert!(error.to_string().contains("did not release"));
+
+        let decisions = sqlx::query_scalar::<_, String>(
+            "SELECT release_decision FROM nl2sql_repair_verifications
+             WHERE tenant_id = 'tenant-a' AND analytic_intent_id = 'query-a'
+             ORDER BY created_at, id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("load repair audit rows");
+        assert_eq!(decisions.len(), 2);
+        assert!(decisions.iter().any(|decision| decision == "Release"));
+        assert!(decisions.iter().any(|decision| decision != "Release"));
+    }
+
+    #[tokio::test]
+    async fn result_invariants_promote_only_observed_passing_results_to_release() {
+        let pool = crate::test_sqlite_pool().await;
+        let contract = nl2sql_core::semantic_ir::MetricContract {
+            id: "orders".into(),
+            version: 1,
+            names: vec!["orders".into()],
+            expression: nl2sql_core::semantic_ir::MetricExpressionIR::Aggregate {
+                function: "COUNT".into(),
+                expression: Box::new(nl2sql_core::semantic_ir::MetricExpressionIR::Literal(
+                    "*".into(),
+                )),
+                distinct: false,
+            },
+            denominator: None,
+            population: nl2sql_core::semantic_ir::PopulationDefinition {
+                subject: "order".into(),
+                dedup_key: None,
+                exclude_test_users: false,
+                exclude_internal_users: false,
+                valid_record_rule: None,
+            },
+            default_grain: nl2sql_core::semantic_ir::Grain::Row,
+            allowed_grains: vec![nl2sql_core::semantic_ir::Grain::Row],
+            time_column: "created_at".into(),
+            timezone: "UTC".into(),
+            mandatory_filters: vec![],
+            join_contracts: vec![],
+            invariants: vec![nl2sql_core::semantic_ir::ResultInvariant::NonNegative {
+                field: "orders".into(),
+            }],
+            valid_from: "2026-01-01".into(),
+            valid_until: None,
+            owner: None,
+            evidence_refs: vec![],
+        };
+        sqlx::query(
+            "INSERT INTO metric_contracts
+                (id, tenant_id, datasource_id, source_metric_id, version, status,
+                 contract_json, lineage_json, valid_from, valid_until)
+             VALUES ('orders', 'tenant', 'ds', NULL, 1, 'active', ?, '{}',
+                     '2026-01-01', NULL)",
+        )
+        .bind(serde_json::to_string(&contract).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut intent = super::super::semantic_audit::compile_question_intent(
+            "tenant",
+            "ds",
+            "订单数",
+            &["orders".into()],
+        );
+        intent.metrics[0].version = Some(1);
+        let candidate = CandidateSemanticVerification {
+            intent,
+            verification: serde_json::json!({
+                "result_invariants": [{
+                    "status": "NotChecked",
+                    "code": "result_invariant_pending",
+                    "message": "pending"
+                }],
+                "executable": null,
+                "confidence_basis": {
+                    "calibrated_score": 0.8,
+                    "execution_passed": false
+                },
+                "release_decision": "ValidateResult"
+            }),
+            release_decision: "ValidateResult".into(),
+            calibrated_score: 0.8,
+        };
+        for query_id in ["query-pass", "query-fail", "query-missing"] {
+            sqlx::query(
+                "INSERT INTO semantic_verifications
+                    (id, tenant_id, analytic_intent_id, verification_json,
+                     release_decision, calibrated_score, created_at)
+                 VALUES (?, 'tenant', ?, ?, 'ValidateResult', 0.8, CURRENT_TIMESTAMP)",
+            )
+            .bind(format!("verification-{query_id}"))
+            .bind(query_id)
+            .bind(candidate.verification.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO feedback_learning_events
+                (id, tenant_id, scope, correction_json, approved, regression_case_id,
+                 approved_by, approved_at, created_at)
+             VALUES ('feedback-pass', 'tenant', 'datasource:ds', '{}', 1,
+                     'case-pass', 'owner', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let sql = "SELECT COUNT(*) AS orders FROM orders";
+        let sql_hash = hex::encode(sha2::Sha256::digest(sql.as_bytes()));
+        sqlx::query(
+            "INSERT INTO feedback_regression_cases
+                (id, tenant_id, datasource_id, feedback_event_id, analytic_intent_id,
+                 original_ir_hash, original_sql_hash, corrected_sql_hash,
+                 semantic_diff_json, verification_json, fixture_json, status)
+             VALUES ('case-pass', 'tenant', 'ds', 'feedback-pass', 'query-pass',
+                     'ir', 'old', ?, '{}', '{}', '{}', 'approved')",
+        )
+        .bind(&sql_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let passed = finalize_result_invariants(
+            &pool,
+            "tenant",
+            "ds",
+            "query-pass",
+            sql,
+            &[serde_json::json!({"orders": 4})],
+            1,
+            12,
+            &candidate,
+        )
+        .await
+        .unwrap();
+        assert_eq!(passed.release_decision, "Release");
+        let released: String = sqlx::query_scalar(
+            "SELECT release_decision FROM semantic_verifications
+             WHERE tenant_id = 'tenant' AND analytic_intent_id = 'query-pass'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(released, "Release");
+        let case_status: String = sqlx::query_scalar(
+            "SELECT status FROM feedback_regression_cases WHERE id = 'case-pass'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(case_status, "verified");
+
+        let failed = finalize_result_invariants(
+            &pool,
+            "tenant",
+            "ds",
+            "query-fail",
+            sql,
+            &[serde_json::json!({"orders": -1})],
+            1,
+            8,
+            &candidate,
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed.release_decision, "Reject");
+        let missing = finalize_result_invariants(
+            &pool,
+            "tenant",
+            "ds",
+            "query-missing",
+            sql,
+            &[serde_json::json!({"other": 1})],
+            1,
+            7,
+            &candidate,
+        )
+        .await
+        .unwrap();
+        assert_eq!(missing.release_decision, "NeedsClarification");
+        let statuses = sqlx::query_scalar::<_, String>(
+            "SELECT status FROM result_invariant_observations
+             WHERE tenant_id = 'tenant' ORDER BY status",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(statuses, vec!["fail", "not_observed", "pass"]);
+    }
+
+    #[tokio::test]
+    async fn execution_binding_rejects_missing_cross_scope_or_edited_queries() {
+        let pool = crate::test_sqlite_pool().await;
+        sqlx::query(
+            "INSERT INTO tenants (id, name, slug) VALUES ('tenant-a', 'Tenant A', 'tenant-a')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert tenant fixture");
+        sqlx::query(
+            "INSERT INTO users (id, email, password_hash, name, tenant_id)
+             VALUES ('user-a', 'user-a@example.com', 'not-used', 'User A', 'tenant-a')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert user fixture");
+        sqlx::query(
+            "INSERT INTO data_sources (id, tenant_id, name, db_type, config)
+             VALUES ('datasource-a', 'tenant-a', 'Datasource A', 'sqlite', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert datasource fixture");
+        sqlx::query(
+            "INSERT INTO nl2sql_queries
+                (id, tenant_id, user_id, data_source_id, question, generated_sql, executed)
+             VALUES ('query-a', 'tenant-a', 'user-a', 'datasource-a', 'orders',
+                     'SELECT COUNT(*) FROM orders', 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert released query fixture");
+
+        let missing = load_released_query_binding(
+            &pool,
+            "tenant-a",
+            "user-a",
+            "missing",
+            "datasource-a",
+            "SELECT COUNT(*) FROM orders",
+        )
+        .await
+        .expect_err("unknown query id must fail closed");
+        assert!(missing
+            .to_string()
+            .contains("no durable released candidate"));
+
+        let other_user = load_released_query_binding(
+            &pool,
+            "tenant-a",
+            "user-b",
+            "query-a",
+            "datasource-a",
+            "SELECT COUNT(*) FROM orders",
+        )
+        .await
+        .expect_err("another user cannot execute the candidate");
+        assert!(other_user
+            .to_string()
+            .contains("no durable released candidate"));
+
+        let other_datasource = load_released_query_binding(
+            &pool,
+            "tenant-a",
+            "user-a",
+            "query-a",
+            "datasource-b",
+            "SELECT COUNT(*) FROM orders",
+        )
+        .await
+        .expect_err("datasource drift must fail closed");
+        assert!(other_datasource.to_string().contains("does not match"));
+
+        let edited = load_released_query_binding(
+            &pool,
+            "tenant-a",
+            "user-a",
+            "query-a",
+            "datasource-a",
+            "SELECT COUNT(DISTINCT id) FROM orders",
+        )
+        .await
+        .expect_err("in-place SQL edits must not inherit the old release");
+        assert!(edited.to_string().contains("SQL hash"));
+
+        let valid = load_released_query_binding(
+            &pool,
+            "tenant-a",
+            "user-a",
+            "query-a",
+            "datasource-a",
+            "SELECT COUNT(*) FROM orders",
+        )
+        .await
+        .expect("exact released candidate remains executable");
+        assert_eq!(valid.0, "datasource-a");
     }
 }

@@ -313,6 +313,18 @@ pub fn extract_pm_visible_answer_text(answer_text: &str) -> String {
 }
 
 pub fn tokenize_for_match(input: &str) -> Vec<String> {
+    fn push_cjk_tokens(buffer: &str, tokens: &mut Vec<String>) {
+        let chars = buffer.chars().collect::<Vec<_>>();
+        if chars.len() < 2 {
+            return;
+        }
+        tokens.push(buffer.to_string());
+        for width in 2..=4.min(chars.len()) {
+            for window in chars.windows(width) {
+                tokens.push(window.iter().collect());
+            }
+        }
+    }
     let mut tokens = Vec::new();
     let lowered = input.to_ascii_lowercase();
     for token in lowered
@@ -331,14 +343,12 @@ pub fn tokenize_for_match(input: &str) -> Vec<String> {
         if is_cjk {
             cjk_buf.push(ch);
         } else if !cjk_buf.is_empty() {
-            if cjk_buf.chars().count() >= 2 {
-                tokens.push(cjk_buf.clone());
-            }
+            push_cjk_tokens(&cjk_buf, &mut tokens);
             cjk_buf.clear();
         }
     }
-    if !cjk_buf.is_empty() && cjk_buf.chars().count() >= 2 {
-        tokens.push(cjk_buf);
+    if !cjk_buf.is_empty() {
+        push_cjk_tokens(&cjk_buf, &mut tokens);
     }
 
     tokens.sort();

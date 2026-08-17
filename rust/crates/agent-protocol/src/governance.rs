@@ -17,10 +17,37 @@ pub struct CapabilityScope {
     pub child_thread: Option<String>,
 }
 impl CapabilityScope {
+    /// Bind a server-selected executor before delegation. A child-supplied
+    /// executor is never adopted by generic scope intersection.
+    pub fn bind_executor(&self, executor: &str) -> Option<Self> {
+        if executor.trim().is_empty() || self.executor.is_some() {
+            return None;
+        }
+        let mut bound = self.clone();
+        bound.executor = Some(executor.to_string());
+        Some(bound)
+    }
+
+    /// Bind a server-generated child id at capability issuance time. Generic
+    /// intersection is not allowed to adopt an id supplied by the child.
+    pub fn bind_child_thread(&self, child_thread: &str) -> Option<Self> {
+        if child_thread.trim().is_empty() || self.child_thread.is_some() {
+            return None;
+        }
+        let mut bound = self.clone();
+        bound.child_thread = Some(child_thread.to_string());
+        Some(bound)
+    }
+
     pub fn intersection(&self, child: &CapabilityScope) -> Option<Self> {
         if self.tenant_id != child.tenant_id
             || self.user_id != child.user_id
             || self.tool_name != child.tool_name
+            // A child may narrow a session, but it can never move a
+            // capability into another session.  A session-less parent is
+            // deliberately not allowed to mint a session-bound child here;
+            // callers must first bind the parent at issuance time.
+            || self.session_id != child.session_id
         {
             return None;
         }
@@ -43,11 +70,15 @@ impl CapabilityScope {
             actions,
             executor: match (&self.executor, &child.executor) {
                 (Some(a), Some(b)) if a == b => Some(a.clone()),
-                (None, b) => b.clone(),
                 (a, None) => a.clone(),
+                (None, Some(_)) => return None,
                 _ => return None,
             },
-            child_thread: child.child_thread.clone(),
+            child_thread: match (&self.child_thread, &child.child_thread) {
+                (Some(parent), Some(child)) if parent == child => Some(child.clone()),
+                (None, None) => None,
+                _ => return None,
+            },
         })
     }
 }
@@ -89,21 +120,20 @@ impl CapabilityToken {
         Ok(())
     }
     pub fn derive_child(
-        &self,
+        &mut self,
         child_scope: CapabilityScope,
         now: DateTime<Utc>,
     ) -> Result<Self, CapabilityError> {
-        if self.revoked || now >= self.expires_at {
-            return Err(CapabilityError::ExpiredOrRevoked);
-        }
         let scope = self
             .scope
             .intersection(&child_scope)
             .ok_or(CapabilityError::ScopeExpansion)?;
+        let child_uses = self.remaining_uses.min(1);
+        self.consume(now)?;
         Ok(Self::new(
             scope,
             self.expires_at.min(now + chrono::Duration::hours(1)),
-            self.remaining_uses,
+            child_uses,
         ))
     }
 }
@@ -296,9 +326,50 @@ mod tests {
         assert_eq!(token.consume(now), Err(CapabilityError::Exhausted));
         let mut broader = scope();
         broader.resources.insert("repo:b".into());
-        let fresh = CapabilityToken::new(scope(), now + chrono::Duration::minutes(5), 1);
+        let mut fresh = CapabilityToken::new(scope(), now + chrono::Duration::minutes(5), 1);
         let child = fresh.derive_child(broader, now).unwrap();
         assert!(!child.scope.resources.contains("repo:b"));
+        assert_eq!(
+            fresh.remaining_uses, 0,
+            "child derivation consumes a delegation use"
+        );
+    }
+    #[test]
+    fn child_capability_cannot_cross_session_and_derivation_consumes_parent() {
+        let now = Utc::now();
+        let mut parent = CapabilityToken::new(scope(), now + chrono::Duration::minutes(5), 2);
+        let mut cross_session = scope();
+        cross_session.session_id = Some("other".into());
+        assert_eq!(
+            parent.derive_child(cross_session, now),
+            Err(CapabilityError::ScopeExpansion)
+        );
+        assert_eq!(parent.remaining_uses, 2);
+        let child = parent.derive_child(scope(), now).unwrap();
+        assert_eq!(child.remaining_uses, 1);
+        assert_eq!(parent.remaining_uses, 1);
+    }
+    #[test]
+    fn server_must_bind_executor_and_child_id_before_delegation() {
+        let mut unbound = scope();
+        unbound.executor = None;
+        unbound.child_thread = None;
+        let mut child_claim = unbound.clone();
+        child_claim.executor = Some("child-selected-executor".into());
+        child_claim.child_thread = Some("child-selected-id".into());
+        assert!(unbound.intersection(&child_claim).is_none());
+
+        let bound = unbound
+            .bind_executor("native")
+            .unwrap()
+            .bind_child_thread("server-child-id")
+            .unwrap();
+        let mut narrowed = bound.clone();
+        narrowed.resources = ["repo:a".into()].into_iter().collect();
+        narrowed.actions = ["read".into()].into_iter().collect();
+        let delegated = bound.intersection(&narrowed).unwrap();
+        assert_eq!(delegated.executor.as_deref(), Some("native"));
+        assert_eq!(delegated.child_thread.as_deref(), Some("server-child-id"));
     }
     #[test]
     fn projections_keep_source_hash_without_leaking_secret() {

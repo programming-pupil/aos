@@ -109,6 +109,40 @@ pub(crate) async fn test_sqlite_file_pool() -> (sqlx::SqlitePool, PathBuf) {
 
 #[cfg(test)]
 mod sqlite_baseline_tests {
+    use sha2::Digest;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use std::borrow::Cow;
+
+    #[test]
+    fn historical_semantic_kernel_migration_checksum_is_stable() {
+        let checksum = hex::encode(sha2::Sha384::digest(include_bytes!(
+            "../sqlite-migrations/0017_semantic_kernel_core.sql"
+        )));
+        assert_eq!(
+            checksum,
+            "58772fbbda2f10a4d1fb421caaf7eb3f55f20e06edb7c8cbcf9807992518676bd5f9e9a0db0ffe13889d079ef76e280f"
+        );
+    }
+
+    async fn migrate_through(pool: &sqlx::SqlitePool, max_version: i64) {
+        let full = sqlx::migrate!("./sqlite-migrations");
+        let partial = sqlx::migrate::Migrator {
+            migrations: Cow::Owned(
+                full.iter()
+                    .filter(|migration| migration.version <= max_version)
+                    .cloned()
+                    .collect(),
+            ),
+            ignore_missing: false,
+            locking: true,
+            no_tx: false,
+        };
+        partial
+            .run(pool)
+            .await
+            .unwrap_or_else(|error| panic!("migrate through {max_version}: {error}"));
+    }
+
     #[tokio::test]
     async fn baseline_migration_is_idempotent_and_seeds_setup_lock_once() {
         let pool = crate::test_sqlite_pool().await;
@@ -170,6 +204,174 @@ mod sqlite_baseline_tests {
         assert_eq!(api_key_profile_column_count, 1);
         assert_eq!(rd_spec_repository_ids_column_count, 1);
         pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn semantic_contract_scope_migration_maps_only_unambiguous_legacy_rows() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open legacy contract fixture");
+        sqlx::raw_sql(
+            "CREATE TABLE data_sources (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL);
+             CREATE TABLE nl2sql_metrics (id INTEGER PRIMARY KEY);
+             CREATE TABLE nl2sql_join_paths (id INTEGER PRIMARY KEY);
+             CREATE TABLE metric_contracts (
+               id TEXT NOT NULL, tenant_id TEXT NOT NULL, version INTEGER NOT NULL,
+               status TEXT NOT NULL, contract_json TEXT NOT NULL, valid_from TEXT NOT NULL,
+               valid_until TEXT, PRIMARY KEY(tenant_id, id, version));
+             CREATE TABLE join_contracts (
+               id TEXT NOT NULL, tenant_id TEXT NOT NULL, version INTEGER NOT NULL,
+               status TEXT NOT NULL, contract_json TEXT NOT NULL,
+               PRIMARY KEY(tenant_id, id, version));
+             INSERT INTO data_sources VALUES
+               ('single-ds', 'single-tenant'),
+               ('multi-a', 'multi-tenant'),
+               ('multi-b', 'multi-tenant');
+             INSERT INTO metric_contracts VALUES
+               ('orders', 'single-tenant', 1, 'published', '{}', '2026-01-01', NULL),
+               ('roi', 'multi-tenant', 2, 'published', '{}', '2026-01-01', NULL);
+             INSERT INTO join_contracts VALUES
+               ('orders-users', 'single-tenant', 1, 'published', '{}'),
+               ('revenue-cost', 'multi-tenant', 3, 'published', '{}');",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed legacy contract fixture");
+
+        sqlx::raw_sql(include_str!(
+            "../sqlite-migrations/0030_semantic_contract_production_scope.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("upgrade legacy semantic contracts");
+
+        let single_metric: (String, String) = sqlx::query_as(
+            "SELECT datasource_id, status FROM metric_contracts
+             WHERE tenant_id = 'single-tenant' AND id = 'orders'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(single_metric, ("single-ds".into(), "published".into()));
+
+        let ambiguous_metric: (String, String, String) = sqlx::query_as(
+            "SELECT datasource_id, status, lineage_json FROM metric_contracts
+             WHERE tenant_id = 'multi-tenant' AND id = 'roi'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ambiguous_metric.0, "__legacy_unscoped__");
+        assert_eq!(ambiguous_metric.1, "legacy_unscoped");
+        assert!(ambiguous_metric.2.contains("blocked_ambiguous_datasource"));
+
+        let join_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM join_contracts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(join_rows, 2);
+    }
+
+    #[tokio::test]
+    async fn n_minus_one_and_two_snapshots_upgrade_without_semantic_data_loss() {
+        for snapshot_version in [31_i64, 32_i64] {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .expect("open upgrade fixture");
+            migrate_through(&pool, snapshot_version).await;
+
+            sqlx::query(
+                "INSERT INTO metric_contracts
+                    (id, tenant_id, datasource_id, source_metric_id, version, status,
+                     contract_json, lineage_json, valid_from, valid_until)
+                 VALUES ('metric:legacy', 'tenant-upgrade', 'ds-upgrade', 7, 3, 'active',
+                         '{\"id\":\"metric:legacy\"}', '{\"source\":\"upgrade-fixture\"}',
+                         '2026-01-01T00:00:00Z', NULL)",
+            )
+            .execute(&pool)
+            .await
+            .expect("seed metric contract");
+            sqlx::query(
+                "INSERT INTO join_contracts
+                    (id, tenant_id, datasource_id, source_kind, source_id, version,
+                     status, contract_json, lineage_json, valid_from, valid_until)
+                 VALUES ('join:legacy', 'tenant-upgrade', 'ds-upgrade', 'join_path', 9, 2,
+                         'active', '{\"id\":\"join:legacy\"}',
+                         '{\"source\":\"upgrade-fixture\"}',
+                         '2026-01-01T00:00:00Z', NULL)",
+            )
+            .execute(&pool)
+            .await
+            .expect("seed join contract");
+            sqlx::query(
+                "INSERT INTO capability_tokens
+                    (id, tenant_id, user_id, session_id, tool_name, resource_scope,
+                     action_scope, executor_scope, child_scope, expires_at, remaining_uses)
+                 VALUES ('legacy-capability', 'tenant-upgrade', 'user-upgrade', 'session-upgrade',
+                         'read_file', 'workspace', 'read', 'native', NULL,
+                         '2099-01-01T00:00:00Z', 2)",
+            )
+            .execute(&pool)
+            .await
+            .expect("seed capability");
+
+            let full = sqlx::migrate!("./sqlite-migrations");
+            full.run(&pool).await.expect("upgrade snapshot to current");
+            full.run(&pool)
+                .await
+                .expect("repeated startup must keep the migration ledger stable");
+
+            let metric: (String, String, i64) = sqlx::query_as(
+                "SELECT contract_json, lineage_json, version FROM metric_contracts
+                 WHERE tenant_id = 'tenant-upgrade' AND datasource_id = 'ds-upgrade'
+                   AND id = 'metric:legacy'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("load upgraded metric contract");
+            assert_eq!(
+                metric,
+                (
+                    "{\"id\":\"metric:legacy\"}".into(),
+                    "{\"source\":\"upgrade-fixture\"}".into(),
+                    3,
+                )
+            );
+            let join: (String, String, i64) = sqlx::query_as(
+                "SELECT contract_json, lineage_json, version FROM join_contracts
+                 WHERE tenant_id = 'tenant-upgrade' AND datasource_id = 'ds-upgrade'
+                   AND id = 'join:legacy'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("load upgraded join contract");
+            assert_eq!(
+                join,
+                (
+                    "{\"id\":\"join:legacy\"}".into(),
+                    "{\"source\":\"upgrade-fixture\"}".into(),
+                    2,
+                )
+            );
+            let capability: (i64, String, Option<String>, Option<String>) = sqlx::query_as(
+                "SELECT remaining_uses, policy_version, parent_token_id, revoked_at
+                 FROM capability_tokens WHERE id = 'legacy-capability'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("load upgraded capability");
+            assert_eq!(capability, (2, "capability-policy-v1".into(), None, None));
+            let migration_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+                .fetch_one(&pool)
+                .await
+                .expect("count current migration ledger");
+            assert_eq!(migration_count, 33);
+            pool.close().await;
+        }
     }
 
     #[tokio::test]

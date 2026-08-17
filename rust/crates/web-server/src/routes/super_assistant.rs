@@ -2079,7 +2079,7 @@ pub async fn persist_key_info(
 ) -> usize {
     let mut persisted = 0usize;
     for item in items {
-        if let Err(error) = memory_engine::validate_memory_text(&item.content) {
+        if let Err(error) = memory_engine::MemoryEngine::admit_text(&item.content) {
             tracing::warn!(
                 tenant_id,
                 session_id,
@@ -2400,60 +2400,12 @@ impl runtime::CompactionHook for RuntimeCompactionHook {
         self.execution_kernel.clone()
     }
 
-    async fn before_compaction(
+    async fn prepare_compaction(
         &self,
         archived_messages: &[ConversationMessage],
         default_summary: &str,
-    ) -> Result<Option<String>, runtime::RuntimeError> {
-        // 1. Extract key info from the soon-to-be-discarded window and persist it
-        //    to Unified_Memory BEFORE compaction commits (先持久化再压缩).
-        //    Persistence failures are swallowed inside `persist_key_info`, so a
-        //    memory outage can never abort compaction (Req 4.10). Should a future
-        //    fatal error be surfaced here, the runtime downgrades it to "continue
-        //    with the uncompacted context" and records it to the session trace
-        //    (Req 1.7) rather than aborting the turn.
-        let extracted = extract_key_info_dual_channel_for_compaction(
-            self.config_registry.as_deref(),
-            &self.tenant_id,
-            &self.model,
-            archived_messages,
-        )
-        .await;
-        let _persisted = persist_key_info(
-            &self.db,
-            &self.tenant_id,
-            &self.user_id,
-            &self.session_id,
-            &self.app,
-            &extracted,
-        )
-        .await;
-        if let Err(error) = advance_memory_consolidation_cursor(
-            &self.db,
-            &self.tenant_id,
-            &self.user_id,
-            &self.app,
-            &self.session_id,
-            extracted
-                .iter()
-                .filter_map(|item| item.source_turn_id.as_deref())
-                .max()
-                .unwrap_or("compaction-boundary"),
-        )
-        .await
-        {
-            tracing::warn!(
-                tenant_id = %self.tenant_id,
-                session_id = %self.session_id,
-                error = %error,
-                "semantic memory consolidation cursor did not advance"
-            );
-        }
-
-        // Keep the compaction boundary in the semantic-kernel store as well as
-        // the runtime session log. The checkpoint contains only protected
-        // summary metadata and source coverage; the exact archived messages
-        // remain in the session archive and can be re-read by their owner.
+        trigger: &str,
+    ) -> Result<runtime::PreparedCompaction, runtime::RuntimeError> {
         let source_event_sequences = crate::semantic_kernel_store::ledger_sequences_for_thread(
             &self.db,
             &self.tenant_id,
@@ -2466,32 +2418,119 @@ impl runtime::CompactionHook for RuntimeCompactionHook {
                 "cannot commit compaction without durable source event coverage",
             ));
         }
-        let checkpoint = serde_json::json!({
-            "schemaVersion": "compaction-checkpoint-v1",
-            "threadId": self.session_id.as_str(),
-            "archivedMessageCount": archived_messages.len(),
-            "summary": default_summary,
-            "sourceCoverage": source_event_sequences.clone(),
-        });
-        crate::semantic_kernel_store::persist_compaction_checkpoint(
+
+        let extracted = extract_key_info_dual_channel_for_compaction(
+            self.config_registry.as_deref(),
+            &self.tenant_id,
+            &self.model,
+            archived_messages,
+        )
+        .await;
+        let observed_at = chrono::Utc::now().to_rfc3339();
+        let candidates = extracted
+            .iter()
+            .filter(|item| memory_engine::MemoryEngine::admit_text(&item.content).is_ok())
+            .map(|item| {
+                let kind = match item.kind {
+                    KeyInfoKind::Fact => "fact",
+                    KeyInfoKind::Constraint => "constraint",
+                    KeyInfoKind::Decision => "decision",
+                    KeyInfoKind::Preference => "preference",
+                    KeyInfoKind::AttachmentDigest => "attachment_digest",
+                };
+                let channel = memory_channel_for(item.kind);
+                let source_cursor = item
+                    .source_turn_id
+                    .clone()
+                    .unwrap_or_else(|| "compaction-boundary".to_string());
+                let evidence_hash = memory_engine::stable_source_hash(&item.content);
+                let id_seed = format!(
+                    "{}:{}:{}:{}:{}:{}",
+                    self.tenant_id,
+                    self.user_id,
+                    self.session_id,
+                    kind,
+                    source_cursor,
+                    evidence_hash
+                );
+                crate::semantic_kernel_store::CompactionMemoryCandidate {
+                    id: format!(
+                        "compaction-memory:{}",
+                        memory_engine::stable_source_hash(&id_seed)
+                    ),
+                    channel: channel.to_string(),
+                    kind: kind.to_string(),
+                    subject: serde_json::json!({
+                        "entityType": "conversation_session",
+                        "canonicalId": self.session_id,
+                    }),
+                    predicate: kind.to_string(),
+                    value: serde_json::Value::String(item.content.clone()),
+                    text: item.content.clone(),
+                    evidence_id: format!("turn:{source_cursor}"),
+                    evidence_hash,
+                    observed_at: observed_at.clone(),
+                    valid_until: None,
+                    confidence: item.confidence,
+                    sensitivity: "internal".to_string(),
+                    pinned: item.pinned,
+                    source_cursor,
+                }
+            })
+            .collect::<Vec<_>>();
+        let transaction_id = crate::semantic_kernel_store::prepare_compaction_transaction(
+            &self.db,
+            &self.tenant_id,
+            &self.user_id,
+            &self.session_id,
+            trigger,
+            &source_event_sequences,
+            archived_messages,
+            &candidates,
+        )
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let pinned: Vec<&ExtractedKeyInfo> = extracted.iter().filter(|item| item.pinned).collect();
+        Ok(runtime::PreparedCompaction {
+            transaction_id,
+            replacement_summary: Some(augment_summary_with_pinned(default_summary, &pinned)),
+        })
+    }
+
+    async fn commit_compaction(
+        &self,
+        prepared: &runtime::PreparedCompaction,
+        result: &CompactionResult,
+        trigger: &str,
+    ) -> Result<(), runtime::RuntimeError> {
+        crate::semantic_kernel_store::commit_compaction_transaction(
+            &self.db,
+            &self.tenant_id,
+            &self.user_id,
+            &self.session_id,
+            &self.app,
+            &prepared.transaction_id,
+            trigger,
+            result,
+        )
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))
+    }
+
+    async fn abort_compaction(
+        &self,
+        prepared: &runtime::PreparedCompaction,
+        reason: &str,
+    ) -> Result<(), runtime::RuntimeError> {
+        crate::semantic_kernel_store::abort_compaction_transaction(
             &self.db,
             &self.tenant_id,
             &self.session_id,
-            &source_event_sequences,
-            &checkpoint,
+            &prepared.transaction_id,
+            reason,
         )
         .await
-        .map_err(|error| {
-            runtime::RuntimeError::new(format!(
-                "durable compaction checkpoint failed; compaction was not committed: {error}"
-            ))
-        })?;
-
-        // 2. Protect pinned items: append their contents verbatim to the summary
-        //    so summarization can never drop them (Req 4.9). The runtime commits
-        //    with `compact_session_with_summary` using this returned summary.
-        let pinned: Vec<&ExtractedKeyInfo> = extracted.iter().filter(|item| item.pinned).collect();
-        Ok(Some(augment_summary_with_pinned(default_summary, &pinned)))
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))
     }
 }
 
@@ -15805,6 +15844,7 @@ mod on_demand_exact_path_tests {
 mod dual_channel_extraction_tests {
     use super::*;
     use proptest::prelude::*;
+    use runtime::{AgentExecutionKernel as _, CompactionHook as _};
 
     fn ki(content: &str, kind: KeyInfoKind, pinned: bool, confidence: f64) -> ExtractedKeyInfo {
         ExtractedKeyInfo {
@@ -15881,6 +15921,263 @@ mod dual_channel_extraction_tests {
     #[test]
     fn parse_llm_key_info_returns_none_without_array() {
         assert!(parse_llm_key_info("没有可抽取的关键信息").is_none());
+    }
+
+    #[tokio::test]
+    async fn production_compaction_extracts_both_memory_channels_and_rejects_secrets() {
+        let db = crate::test_sqlite_pool().await;
+        let kernel = crate::semantic_kernel_store::RuntimeExecutionKernel::new(
+            db.clone(),
+            "tenant",
+            "user",
+            "memory-session",
+        );
+        kernel
+            .start_turn(runtime::RuntimeTurnStart {
+                turn_id: "memory-turn".into(),
+                user_input: "establish durable memory".into(),
+            })
+            .await
+            .unwrap();
+        let hook =
+            RuntimeCompactionHook::new(db.clone(), "tenant", "user", "memory-session", "chat");
+        let archived = vec![
+            ConversationMessage::user_text("The primary datastore is the analytics warehouse."),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "We must finish verification before release.".into(),
+            }]),
+            ConversationMessage::user_text(
+                "The temporary API key is sk-fake-memory-secret-1234567890.",
+            ),
+        ];
+        let mut session = Session::new();
+        session.session_id = "memory-session".into();
+        session.tenant_id = Some("tenant".into());
+        session.user_id = Some("user".into());
+        session.messages = archived.clone();
+        session
+            .messages
+            .push(ConversationMessage::user_text("recent tail"));
+        let config = CompactionConfig {
+            preserve_recent_messages: 1,
+            max_estimated_tokens: 0,
+        };
+        let baseline = compact_session(&session, config);
+        assert_eq!(baseline.archived_messages, archived);
+        let prepared = hook
+            .prepare_compaction(&archived, "bounded summary", "test")
+            .await
+            .unwrap();
+        let before_commit: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_memory_items
+             WHERE tenant_id = 'tenant' AND session_key = 'memory-session'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(before_commit, 0, "prepare must not publish Memory");
+        let result = compact_session_with_summary(
+            &session,
+            config,
+            prepared
+                .replacement_summary
+                .clone()
+                .expect("hook supplies pinned-safe summary"),
+        );
+        hook.commit_compaction(&prepared, &result, "test")
+            .await
+            .unwrap();
+
+        let rows = sqlx::query_as::<sqlx::Sqlite, (String, Option<String>)>(
+            "SELECT content, metadata_json FROM agent_memory_items
+             WHERE tenant_id = 'tenant' AND user_id = 'user'
+               AND session_key = 'memory-session' AND source_type = 'compaction'",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        let channels = rows
+            .iter()
+            .filter_map(|(_, metadata)| metadata.as_deref())
+            .filter_map(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
+            .filter_map(|metadata| {
+                metadata
+                    .get("semanticChannel")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            channels,
+            std::collections::BTreeSet::from([
+                "continuity_state".to_string(),
+                "long_term_memory".to_string(),
+            ])
+        );
+        assert!(rows
+            .iter()
+            .all(|(content, _)| !content.contains("sk-fake-memory-secret")));
+        let structured_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM structured_memory_facts
+             WHERE tenant_id = 'tenant' AND user_id = 'user'
+               AND session_id = 'memory-session' AND current = 1",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(structured_count, 2);
+        let cursor: String = sqlx::query_scalar(
+            "SELECT cursor FROM agent_memory_consolidation_cursors
+             WHERE tenant_id = 'tenant' AND user_id = 'user'
+               AND session_key = 'memory-session'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(!cursor.is_empty());
+        let checkpoint_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM compaction_checkpoints
+             WHERE tenant_id = 'tenant' AND thread_id = 'memory-session'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(checkpoint_count, 1);
+        let (status, archive_ciphertext, replacement_ciphertext): (String, String, Option<String>) =
+            sqlx::query_as(
+                "SELECT status, source_archive_ciphertext, replacement_ciphertext
+                 FROM compaction_transactions
+                 WHERE tenant_id = 'tenant' AND thread_id = 'memory-session'",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(status, "committed");
+        assert!(replacement_ciphertext.is_some());
+        let exact_archive: serde_json::Value =
+            serde_json::from_str(&agent_gateway::crypto::decrypt(&archive_ciphertext).unwrap())
+                .unwrap();
+        let exact_messages: Vec<ConversationMessage> =
+            serde_json::from_value(exact_archive["messages"].clone()).unwrap();
+        assert_eq!(exact_messages, archived);
+
+        let uncovered =
+            RuntimeCompactionHook::new(db.clone(), "tenant", "user", "uncovered-session", "chat");
+        let error = uncovered
+            .prepare_compaction(&archived, "must not commit", "test")
+            .await
+            .expect_err("compaction without source events must fail before derived writes");
+        assert!(error.to_string().contains("source event coverage"));
+        let leaked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_memory_items
+             WHERE tenant_id = 'tenant' AND session_key = 'uncovered-session'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(leaked, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_compaction_commit_rolls_back_memory_cursor_checkpoint_and_ledger() {
+        let db = crate::test_sqlite_pool().await;
+        let kernel = crate::semantic_kernel_store::RuntimeExecutionKernel::new(
+            db.clone(),
+            "tenant",
+            "user",
+            "rollback-session",
+        );
+        kernel
+            .start_turn(runtime::RuntimeTurnStart {
+                turn_id: "rollback-turn".into(),
+                user_input: "prepare rollback fixture".into(),
+            })
+            .await
+            .unwrap();
+        let hook =
+            RuntimeCompactionHook::new(db.clone(), "tenant", "user", "rollback-session", "chat");
+        let mut system_message = ConversationMessage::user_text("system contract");
+        system_message.role = MessageRole::System;
+        let archived = vec![
+            system_message,
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "tool-1".into(),
+                name: "lookup".into(),
+                input: serde_json::json!({"key":"value"}).to_string(),
+            }]),
+            ConversationMessage::tool_result("tool-1", "lookup", "exact tool result", false),
+            ConversationMessage::user_text("The release region is APAC."),
+        ];
+        let mut session = Session::new();
+        session.session_id = "rollback-session".into();
+        session.tenant_id = Some("tenant".into());
+        session.user_id = Some("user".into());
+        session.messages = archived.clone();
+        session
+            .messages
+            .push(ConversationMessage::user_text("recent tail"));
+        let config = CompactionConfig {
+            preserve_recent_messages: 1,
+            max_estimated_tokens: 0,
+        };
+        let prepared = hook
+            .prepare_compaction(&archived, "rollback summary", "test-failure")
+            .await
+            .unwrap();
+        let result = compact_session_with_summary(
+            &session,
+            config,
+            prepared.replacement_summary.clone().unwrap(),
+        );
+        sqlx::query(
+            "CREATE TRIGGER fail_compaction_checkpoint
+             BEFORE INSERT ON execution_checkpoints
+             BEGIN SELECT RAISE(ABORT, 'injected checkpoint failure'); END",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let error = hook
+            .commit_compaction(&prepared, &result, "test-failure")
+            .await
+            .expect_err("injected final checkpoint failure must abort the transaction");
+        assert!(error.to_string().contains("injected checkpoint failure"));
+        hook.abort_compaction(&prepared, "injected checkpoint failure")
+            .await
+            .unwrap();
+        for table in [
+            "structured_memory_facts",
+            "agent_memory_items",
+            "agent_memory_consolidation_cursors",
+            "execution_checkpoints",
+            "compaction_checkpoints",
+        ] {
+            let count: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE tenant_id = 'tenant'"
+            ))
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            assert_eq!(count, 0, "{table} leaked a partial compaction write");
+        }
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM compaction_transactions
+             WHERE id = ? AND tenant_id = 'tenant'",
+        )
+        .bind(&prepared.transaction_id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(status, "aborted");
+        let ledger_kinds = sqlx::query_scalar::<_, String>(
+            "SELECT event_type FROM agent_event_ledger
+             WHERE tenant_id = 'tenant' AND thread_id = 'rollback-session'",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(ledger_kinds.len(), 1, "only turn_started may remain");
     }
 
     proptest! {

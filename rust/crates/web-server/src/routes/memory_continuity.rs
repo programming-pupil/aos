@@ -306,30 +306,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
 }
 
 pub fn memory_is_sensitive(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    let sensitive_needles = [
-        "api_key",
-        "apikey",
-        "secret",
-        "password",
-        "passwd",
-        "token=",
-        "bearer ",
-        "private key",
-        "access key",
-        "authorization:",
-        "cookie:",
-        "set-cookie:",
-        "sk-",
-    ];
-    if sensitive_needles
-        .iter()
-        .any(|needle| lower.contains(needle))
-    {
-        return true;
-    }
-    let digit_count = text.chars().filter(|ch| ch.is_ascii_digit()).count();
-    digit_count >= 14 && digit_count * 2 >= text.chars().count()
+    memory_engine::MemoryEngine::is_sensitive(text)
 }
 
 fn redact_exact_archive_secrets(content: &str) -> (String, bool) {
@@ -1340,6 +1317,157 @@ async fn list_memory_items(
     }))
 }
 
+/// Materialize every new Unified Memory write as a structured fact. The text
+/// row remains a searchable projection (and may carry an embedding), while
+/// current/superseded semantics are read from `structured_memory_facts`.
+/// Write the structured fact and disable superseded text projections on the
+/// caller's transaction. This is deliberately separate from the pool wrapper
+/// so a normal Memory upsert can commit the fact and searchable row atomically.
+async fn persist_structured_memory_projection_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tenant_id: &str,
+    user_id: &str,
+    item_id: &str,
+    scope: &str,
+    app: &str,
+    session_id: Option<&str>,
+    memory_type: &str,
+    content: &str,
+    source_type: &str,
+    confidence: f64,
+    pinned: bool,
+    metadata_json: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    let content_hash = memory_engine::stable_source_hash(content);
+    let session_key = session_id.unwrap_or_default();
+    let id = format!(
+        "structured-memory:{}",
+        memory_engine::stable_source_hash(&format!(
+            "{tenant_id}:{user_id}:{scope}:{app}:{session_key}:{memory_type}:{content_hash}"
+        ))
+    );
+    let subject = serde_json::json!({
+        "memoryType": memory_type,
+        "sessionId": session_id,
+        "sourceType": source_type,
+    });
+    let subject_json = subject.to_string();
+    let predicate = memory_type.to_string();
+    let evidence_id = metadata_json
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| value.get("sourceEvidence").cloned())
+        .and_then(|value| {
+            value
+                .get("turnId")
+                .and_then(serde_json::Value::as_str)
+                .map(|turn| format!("turn:{turn}"))
+        })
+        .unwrap_or_else(|| format!("memory:{item_id}"));
+    let candidate_json = serde_json::json!({
+        "projectionMemoryId": item_id,
+        "content": content,
+        "sourceType": source_type,
+        "pinned": pinned,
+        "confidence": confidence,
+    });
+    let result = sqlx::query(
+        "INSERT INTO structured_memory_facts
+            (id, tenant_id, user_id, scope, app, session_id, channel, kind,
+             subject_json, predicate, value_json, text, evidence_id, evidence_hash,
+             observed_at, valid_until, confidence, sensitivity, current,
+             conflict_group, projection_memory_id, candidate_json,
+             created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP,
+                 NULL, ?, 'internal', 1, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+         ON CONFLICT(id) DO UPDATE SET
+             text = excluded.text, value_json = excluded.value_json,
+             confidence = MAX(structured_memory_facts.confidence, excluded.confidence),
+             current = 1, projection_memory_id = excluded.projection_memory_id,
+             candidate_json = excluded.candidate_json,
+             updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(&id)
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(scope)
+    .bind(app)
+    .bind(session_id)
+    .bind(if source_type == "compaction" {
+        "continuity_state"
+    } else {
+        "long_term_memory"
+    })
+    .bind(memory_type)
+    .bind(&subject_json)
+    .bind(&predicate)
+    .bind(serde_json::Value::String(content.to_string()).to_string())
+    .bind(content)
+    .bind(&evidence_id)
+    .bind(&content_hash)
+    .bind(confidence.clamp(0.0, 1.0))
+    .bind(memory_engine::stable_source_hash(&format!(
+        "{subject_json}:{predicate}"
+    )))
+    .bind(item_id)
+    .bind(candidate_json.to_string())
+    .execute(&mut **tx)
+    .await;
+    match result {
+        Ok(_) => {
+            let old_projection_ids = sqlx::query_scalar::<_, String>(
+                "SELECT projection_memory_id FROM structured_memory_facts
+                 WHERE tenant_id = ? AND user_id = ? AND scope = ? AND app = ?
+                   AND (session_id = ? OR (session_id IS NULL AND ? IS NULL))
+                   AND subject_json = ? AND predicate = ? AND current = 1 AND id <> ?
+                   AND projection_memory_id IS NOT NULL",
+            )
+            .bind(tenant_id)
+            .bind(user_id)
+            .bind(scope)
+            .bind(app)
+            .bind(session_id)
+            .bind(session_id)
+            .bind(&subject_json)
+            .bind(&predicate)
+            .bind(&id)
+            .fetch_all(&mut **tx)
+            .await?;
+            sqlx::query(
+                "UPDATE structured_memory_facts
+                 SET current = 0, superseded_by = ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE tenant_id = ? AND user_id = ? AND scope = ? AND app = ?
+                   AND (session_id = ? OR (session_id IS NULL AND ? IS NULL))
+                   AND subject_json = ? AND predicate = ? AND current = 1 AND id <> ?",
+            )
+            .bind(&id)
+            .bind(tenant_id)
+            .bind(user_id)
+            .bind(scope)
+            .bind(app)
+            .bind(session_id)
+            .bind(session_id)
+            .bind(&subject_json)
+            .bind(&predicate)
+            .bind(&id)
+            .execute(&mut **tx)
+            .await?;
+            for projection_id in old_projection_ids {
+                sqlx::query(
+                    "UPDATE agent_memory_items SET enabled = 0, updated_at = CURRENT_TIMESTAMP
+                     WHERE tenant_id = ? AND user_id = ? AND id = ?",
+                )
+                .bind(tenant_id)
+                .bind(user_id)
+                .bind(projection_id)
+                .execute(&mut **tx)
+                .await?;
+            }
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn memory_list_order(left: &AgentMemoryItem, right: &AgentMemoryItem) -> Ordering {
     right
         .pinned
@@ -1627,11 +1755,10 @@ pub(crate) async fn update_memory_item_internal(
     memory_id: &str,
     req: MemoryPatchRequest,
 ) -> Result<AgentMemoryItem, AppError> {
-    let content = req.content.as_deref().map(str::trim);
-    if content.is_some_and(memory_is_sensitive) {
-        return Err(AppError::ValidationError(
-            "memory content contains sensitive material and was not saved".to_string(),
-        ));
+    if let Some(content) = req.content.as_deref() {
+        memory_engine::MemoryEngine::admit_text(content).map_err(|error| {
+            AppError::ValidationError(format!("memory content was rejected: {error}"))
+        })?;
     }
     let existing = get_unified_memory_item(db, tenant_id, user_id, memory_id)
         .await?
@@ -1986,12 +2113,12 @@ async fn consolidate_memory_internal(
         }));
     }
     for relation in &req.relations {
-        let relation_kind = relation.relation.trim().to_ascii_lowercase();
-        if !matches!(relation_kind.as_str(), "supersedes" | "conflicts_with") {
-            return Err(AppError::ValidationError(
-                "memory relation must be supersedes or conflicts_with".to_string(),
-            ));
-        }
+        let temporal_relation = memory_engine::MemoryEngine::temporal_relation(&relation.relation)
+            .map_err(|error| AppError::ValidationError(error.to_string()))?;
+        let relation_kind = match temporal_relation {
+            memory_engine::TemporalRelation::Supersedes => "supersedes",
+            memory_engine::TemporalRelation::ConflictsWith => "conflicts_with",
+        };
         let valid_ids: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_memory_items
              WHERE tenant_id = ? AND user_id = ? AND id IN (?, ?)",
@@ -2019,12 +2146,15 @@ async fn consolidate_memory_internal(
         .bind(user_id)
         .bind(&relation.from_memory_id)
         .bind(&relation.to_memory_id)
-        .bind(&relation_kind)
+        .bind(relation_kind)
         .bind(compact_text(&relation.reason, 1_000))
         .bind(&cursor)
         .execute(&mut *tx)
         .await?;
-        if relation_kind == "supersedes" {
+        if matches!(
+            temporal_relation,
+            memory_engine::TemporalRelation::Supersedes
+        ) {
             sqlx::query(
                 "UPDATE agent_memory_items
                  SET enabled = 0, stale_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
@@ -2096,16 +2226,9 @@ pub(crate) async fn create_memory_item_internal(
     req: MemoryUpsertRequest,
 ) -> Result<AgentMemoryItem, AppError> {
     let content = compact_text(&req.content, 2_000);
-    if content.trim().is_empty() {
-        return Err(AppError::ValidationError(
-            "memory content cannot be empty".to_string(),
-        ));
-    }
-    if memory_is_sensitive(&content) {
-        return Err(AppError::ValidationError(
-            "memory content contains sensitive material and was not saved".to_string(),
-        ));
-    }
+    memory_engine::MemoryEngine::admit_text(&content).map_err(|error| {
+        AppError::ValidationError(format!("memory content was rejected: {error}"))
+    })?;
     let scope = normalize_scope(req.scope.as_deref());
     let app = normalize_app(req.app.as_deref());
     let memory_type = normalize_memory_type(req.memory_type.as_deref());
@@ -2122,6 +2245,13 @@ pub(crate) async fn create_memory_item_internal(
     let confidence = req.confidence.unwrap_or(1.0).clamp(0.0, 1.0);
     let pinned = if req.pinned.unwrap_or(false) { 1 } else { 0 };
     let enabled = if req.enabled.unwrap_or(true) { 1 } else { 0 };
+    // Embedding is an external/local-model read and must happen before the
+    // short SQLite write transaction. All durable rows below then commit as a
+    // single unit so a failed structured projection cannot leave a searchable
+    // row without its authoritative fact.
+    let embedding = embed_memory_text_best_effort(db, tenant_id, &app, &content).await;
+    let mut tx = db.begin().await?;
+    crate::acquire_sqlite_write_lock(&mut tx).await?;
     let existing_id = sqlx::query_scalar::<_, String>(
         r#"
         SELECT id
@@ -2138,7 +2268,7 @@ pub(crate) async fn create_memory_item_internal(
     .bind(&session_key)
     .bind(&memory_type)
     .bind(&content_hash)
-    .fetch_optional(db)
+    .fetch_optional(&mut *tx)
     .await?;
     if let Some(existing_id) = existing_id {
         sqlx::query(
@@ -2168,15 +2298,40 @@ pub(crate) async fn create_memory_item_internal(
         .bind(tenant_id)
         .bind(user_id)
         .bind(&existing_id)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
+        if let Err(error) = persist_structured_memory_projection_in_transaction(
+            &mut tx,
+            tenant_id,
+            user_id,
+            &existing_id,
+            &scope,
+            &app,
+            session_id.as_deref(),
+            &memory_type,
+            &content,
+            &source_type,
+            confidence,
+            pinned != 0,
+            metadata_json.as_deref(),
+        )
+        .await
+        {
+            if !matches!(&error, sqlx::Error::Database(db_error) if db_error.message().contains("no such table: structured_memory_facts"))
+            {
+                let _ = tx.rollback().await;
+                return Err(AppError::Internal(format!(
+                    "structured memory projection failed: {error}"
+                )));
+            }
+        }
+        tx.commit().await?;
         return get_unified_memory_item(db, tenant_id, user_id, &existing_id)
             .await?
             .ok_or_else(|| {
                 AppError::Internal("updated memory item could not be reloaded".to_string())
             });
     }
-    let embedding = embed_memory_text_best_effort(db, tenant_id, &app, &content).await;
     sqlx::query(
         r#"
         INSERT INTO agent_memory_items
@@ -2215,7 +2370,7 @@ pub(crate) async fn create_memory_item_internal(
     .bind(enabled)
     .bind(req.stale_at)
     .bind(req.verified_at)
-    .bind(metadata_json)
+    .bind(metadata_json.as_deref())
     .bind(embedding.as_ref().map(|item| item.model.as_str()))
     .bind(
         embedding
@@ -2223,8 +2378,34 @@ pub(crate) async fn create_memory_item_internal(
             .map(|item| i32::try_from(item.vector.len()).unwrap_or(i32::MAX)),
     )
     .bind(embedding.as_ref().and_then(|item| serialize_memory_vector(&item.vector)))
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
+    if let Err(error) = persist_structured_memory_projection_in_transaction(
+        &mut tx,
+        tenant_id,
+        user_id,
+        &id,
+        &scope,
+        &app,
+        session_id.as_deref(),
+        &memory_type,
+        &content,
+        &source_type,
+        confidence,
+        pinned != 0,
+        metadata_json.as_deref(),
+    )
+    .await
+    {
+        if !matches!(&error, sqlx::Error::Database(db_error) if db_error.message().contains("no such table: structured_memory_facts"))
+        {
+            let _ = tx.rollback().await;
+            return Err(AppError::Internal(format!(
+                "structured memory projection failed: {error}"
+            )));
+        }
+    }
+    tx.commit().await?;
     let item = sqlx::query(
         r#"
         SELECT id, tenant_id, user_id, scope, app, session_id, memory_type, content,
@@ -2267,6 +2448,12 @@ pub(crate) async fn get_unified_memory_item(
                CAST(created_at AS TEXT) AS created_at, CAST(updated_at AS TEXT) AS updated_at
         FROM agent_memory_items
         WHERE tenant_id = ? AND user_id = ? AND id = ?
+          AND (source_type <> 'compaction' OR EXISTS (
+              SELECT 1 FROM structured_memory_facts fact
+              WHERE fact.projection_memory_id = agent_memory_items.id
+                AND fact.tenant_id = agent_memory_items.tenant_id
+                AND fact.current = 1
+          ))
         "#,
     )
     .bind(tenant_id)
@@ -2302,6 +2489,12 @@ pub(crate) async fn list_unified_memory_items(
                 FROM agent_memory_items
                 WHERE tenant_id = ? AND user_id = ? AND enabled = 1 AND session_id = ?
                   AND (? IS NULL OR app = ? OR app = 'shared')
+                  AND (source_type <> 'compaction' OR EXISTS (
+                      SELECT 1 FROM structured_memory_facts fact
+                      WHERE fact.projection_memory_id = agent_memory_items.id
+                        AND fact.tenant_id = agent_memory_items.tenant_id
+                        AND fact.current = 1
+                  ))
                 ORDER BY pinned DESC, updated_at DESC, id DESC
                 LIMIT ?
             ),
@@ -2310,6 +2503,12 @@ pub(crate) async fn list_unified_memory_items(
                 FROM agent_memory_items
                 WHERE tenant_id = ? AND user_id = ? AND enabled = 1 AND session_id IS NULL
                   AND (? IS NULL OR app = ? OR app = 'shared')
+                  AND (source_type <> 'compaction' OR EXISTS (
+                      SELECT 1 FROM structured_memory_facts fact
+                      WHERE fact.projection_memory_id = agent_memory_items.id
+                        AND fact.tenant_id = agent_memory_items.tenant_id
+                        AND fact.current = 1
+                  ))
                 ORDER BY pinned DESC, updated_at DESC, id DESC
                 LIMIT ?
             ),
@@ -2369,6 +2568,9 @@ pub(crate) async fn list_unified_memory_items(
         .push_bind(tenant_id)
         .push(" AND user_id = ")
         .push_bind(user_id);
+    query.push(
+        " AND (source_type <> 'compaction' OR EXISTS (SELECT 1 FROM structured_memory_facts fact WHERE fact.projection_memory_id = agent_memory_items.id AND fact.tenant_id = agent_memory_items.tenant_id AND fact.current = 1))",
+    );
     if let Some(scope) = scope {
         query.push(" AND scope = ").push_bind(scope);
     }
@@ -2839,7 +3041,10 @@ pub(crate) async fn search_memory_candidates_internal(
         .filter(|item| !memory_is_sensitive(&item.content))
         .filter(|item| memory_condition_matches_message(&item.content, &req.query))
         .map(|item| {
-            let mut lexical_score = score_text(&tokens, &item.content);
+            // Production retrieval shares the MemoryEngine lexical policy;
+            // embeddings remain an optional second signal.
+            let mut lexical_score =
+                memory_engine::MemoryEngine::lexical_relevance_terms(&tokens, &item.content);
             if exact_history_query
                 && lexical_score <= 0.0
                 && item.legacy_source.as_deref() == Some("agent_context_archives")
@@ -3789,24 +3994,18 @@ fn memory_hybrid_score(
     lexical_score: f64,
     semantic_score: Option<f64>,
 ) -> f64 {
-    if item.pinned {
-        return 1.0;
-    }
-    let semantic_relevance = semantic_score
-        .filter(|score| *score >= MEMORY_SEMANTIC_MIN_RELEVANCE)
-        .unwrap_or(0.0);
-    let relevance = match semantic_score {
-        Some(_) => {
-            semantic_relevance * MEMORY_SEMANTIC_WEIGHT + lexical_score * MEMORY_LEXICAL_WEIGHT
-        }
-        None => lexical_score * (MEMORY_SEMANTIC_WEIGHT + MEMORY_LEXICAL_WEIGHT),
-    };
-    if relevance <= 0.0 {
-        return 0.0;
-    }
-    let confidence = item.confidence.clamp(0.0, 1.0) * MEMORY_CONFIDENCE_WEIGHT;
-    let recency = recency_score(&item.updated_at) * MEMORY_RECENCY_WEIGHT;
-    (relevance + confidence + recency).clamp(0.0, 1.0)
+    memory_engine::MemoryEngine::retrieval_score(memory_engine::RetrievalSignals {
+        lexical: lexical_score,
+        semantic: semantic_score,
+        semantic_min_relevance: MEMORY_SEMANTIC_MIN_RELEVANCE,
+        semantic_weight: MEMORY_SEMANTIC_WEIGHT,
+        lexical_weight: MEMORY_LEXICAL_WEIGHT,
+        confidence: item.confidence,
+        confidence_weight: MEMORY_CONFIDENCE_WEIGHT,
+        recency: recency_score(&item.updated_at),
+        recency_weight: MEMORY_RECENCY_WEIGHT,
+        pinned: item.pinned,
+    })
 }
 
 fn recency_score(updated_at: &str) -> f64 {
@@ -3895,18 +4094,6 @@ fn tokenize(query: &str) -> Vec<String> {
         }
     }
     out
-}
-
-fn score_text(tokens: &[String], content: &str) -> f64 {
-    if tokens.is_empty() {
-        return 0.1;
-    }
-    let lower = content.to_ascii_lowercase();
-    let hits = tokens
-        .iter()
-        .filter(|token| lower.contains(token.as_str()) || content.contains(token.as_str()))
-        .count();
-    hits as f64 / tokens.len().max(1) as f64
 }
 
 fn excerpt_for_tokens(content: &str, tokens: &[String]) -> (String, usize, usize) {
@@ -4006,6 +4193,22 @@ mod tests {
         .execute(&pool)
         .await
         .expect("create memory table");
+        sqlx::query(
+            "CREATE TABLE structured_memory_facts (
+                id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, user_id TEXT NOT NULL,
+                scope TEXT NOT NULL, app TEXT NOT NULL, session_id TEXT,
+                channel TEXT NOT NULL, kind TEXT NOT NULL, subject_json TEXT NOT NULL,
+                predicate TEXT NOT NULL, value_json TEXT NOT NULL, text TEXT NOT NULL,
+                evidence_id TEXT NOT NULL, evidence_hash TEXT NOT NULL,
+                observed_at TEXT NOT NULL, valid_until TEXT, confidence REAL NOT NULL,
+                sensitivity TEXT NOT NULL, current INTEGER NOT NULL DEFAULT 1,
+                superseded_by TEXT, conflict_group TEXT, projection_memory_id TEXT,
+                candidate_json TEXT NOT NULL, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create structured memory table");
         pool
     }
 
@@ -4267,7 +4470,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conflict_consolidation_preserves_both_current_memories() {
+    async fn conflict_and_supersession_control_current_memory_retrieval() {
         let db = crate::test_sqlite_pool().await;
         insert_consolidation_fixture(&db, "left", "tenant", "user").await;
         insert_consolidation_fixture(&db, "right", "tenant", "user").await;
@@ -4287,6 +4490,46 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(enabled, vec![1, 1]);
+
+        insert_consolidation_fixture(&db, "old", "tenant", "user").await;
+        insert_consolidation_fixture(&db, "new", "tenant", "user").await;
+        consolidate_memory_internal(
+            &db,
+            "tenant",
+            "user",
+            consolidation_request("cursor-supersedes", "supersedes", "old", "new"),
+        )
+        .await
+        .expect("record supersession");
+        let results = search_memory_internal(
+            &db,
+            "tenant",
+            "user",
+            &MemorySearchRequest {
+                query: "memory".into(),
+                scope: Some("global".into()),
+                app: Some("chat".into()),
+                session_id: None,
+                include_legacy: Some(false),
+                pinned_only: None,
+                limit: Some(20),
+            },
+        )
+        .await
+        .expect("search current memories");
+        assert!(results.iter().any(|item| item.id == "new"));
+        assert!(!results.iter().any(|item| item.id == "old"));
+        let relation: String = sqlx::query_scalar(
+            "SELECT relation FROM agent_memory_relations
+             WHERE tenant_id = 'tenant' AND from_memory_id = 'old' AND to_memory_id = 'new'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            memory_engine::MemoryEngine::temporal_relation(&relation).unwrap(),
+            memory_engine::TemporalRelation::Supersedes
+        );
     }
 
     #[tokio::test]
@@ -4656,6 +4899,150 @@ mod tests {
         assert!(semantic > lexical_only);
         assert!(hybrid >= semantic);
         assert!(lexical_only > 0.0);
+    }
+
+    #[tokio::test]
+    async fn production_memory_adapter_uses_kernel_for_admission_ranking_and_relations() {
+        let db = crate::test_sqlite_pool().await;
+        let stored = create_memory_item_internal(
+            &db,
+            "tenant",
+            "user",
+            MemoryUpsertRequest {
+                scope: Some("session".into()),
+                app: Some("chat".into()),
+                session_id: Some("session".into()),
+                memory_type: Some("business_context".into()),
+                content: "ROI is calculated from net revenue after refunds".into(),
+                source_type: Some("manual".into()),
+                confidence: Some(0.9),
+                pinned: Some(false),
+                enabled: Some(true),
+                stale_at: None,
+                verified_at: None,
+                metadata: None,
+            },
+        )
+        .await
+        .expect("production adapter should admit a governed memory");
+
+        let rejected = create_memory_item_internal(
+            &db,
+            "tenant",
+            "user",
+            MemoryUpsertRequest {
+                scope: Some("session".into()),
+                app: Some("chat".into()),
+                session_id: Some("session".into()),
+                memory_type: Some("note".into()),
+                content: "authorization: Bearer tenant-secret".into(),
+                source_type: Some("manual".into()),
+                confidence: None,
+                pinned: None,
+                enabled: None,
+                stale_at: None,
+                verified_at: None,
+                metadata: None,
+            },
+        )
+        .await;
+        assert!(matches!(rejected, Err(AppError::ValidationError(_))));
+
+        let results = search_memory_internal(
+            &db,
+            "tenant",
+            "user",
+            &MemorySearchRequest {
+                query: "ROI net revenue refunds".into(),
+                scope: Some("session".into()),
+                app: Some("chat".into()),
+                session_id: Some("session".into()),
+                include_legacy: Some(false),
+                pinned_only: Some(false),
+                limit: Some(5),
+            },
+        )
+        .await
+        .expect("production search");
+        assert_eq!(
+            results.first().map(|item| item.id.as_str()),
+            Some(stored.id.as_str())
+        );
+        assert!(results[0].lexical_score > 0.0);
+        assert!(search_memory_internal(
+            &db,
+            "other-tenant",
+            "user",
+            &MemorySearchRequest {
+                query: "ROI net revenue refunds".into(),
+                scope: None,
+                app: Some("chat".into()),
+                session_id: Some("session".into()),
+                include_legacy: Some(false),
+                pinned_only: None,
+                limit: Some(5),
+            },
+        )
+        .await
+        .unwrap()
+        .is_empty());
+
+        assert_eq!(
+            memory_engine::MemoryEngine::temporal_relation("conflicts_with").unwrap(),
+            memory_engine::TemporalRelation::ConflictsWith
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_fact_failure_rolls_back_searchable_memory_projection() {
+        let db = crate::test_sqlite_pool().await;
+        sqlx::query(
+            "CREATE TRIGGER reject_structured_memory_insert
+             BEFORE INSERT ON structured_memory_facts
+             BEGIN
+               SELECT RAISE(ABORT, 'forced structured memory failure');
+             END",
+        )
+        .execute(&db)
+        .await
+        .expect("install failure injection trigger");
+
+        let result = create_memory_item_internal(
+            &db,
+            "tenant",
+            "user",
+            MemoryUpsertRequest {
+                content: "The approved reporting timezone is Asia/Shanghai".to_string(),
+                scope: Some("global".to_string()),
+                app: Some("chat".to_string()),
+                memory_type: Some("constraint".to_string()),
+                source_type: Some("manual".to_string()),
+                session_id: None,
+                confidence: Some(1.0),
+                pinned: Some(false),
+                enabled: Some(true),
+                stale_at: None,
+                verified_at: None,
+                metadata: None,
+            },
+        )
+        .await;
+        assert!(result.is_err(), "structured write failure must fail closed");
+
+        let projection_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_memory_items WHERE tenant_id = 'tenant' AND user_id = 'user'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("count searchable projections");
+        let fact_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM structured_memory_facts WHERE tenant_id = 'tenant' AND user_id = 'user'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("count structured facts");
+        assert_eq!(projection_count, 0);
+        assert_eq!(fact_count, 0);
     }
 
     #[test]

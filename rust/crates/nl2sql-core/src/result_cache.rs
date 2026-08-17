@@ -35,22 +35,42 @@ pub struct CacheHit {
     pub result_snapshot: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheLineage {
+    pub intent_hash: String,
+    pub schema_hash: String,
+    pub metric_contracts_hash: String,
+    pub join_contracts_hash: String,
+    pub policy_hash: String,
+    pub compiler_version: String,
+}
+
 pub async fn lookup(
     db: &SqlitePool,
     tenant_id: &str,
     datasource_id: &str,
     hash: &str,
+    lineage: &CacheLineage,
 ) -> Option<CacheHit> {
     let row: Option<(String, Option<String>)> = sqlx::query_as(
         "SELECT generated_sql, result_snapshot \
          FROM nl2sql_result_cache \
          WHERE tenant_id = ? AND datasource_id = ? AND question_hash = ? \
+           AND intent_hash = ? AND schema_hash = ? \
+           AND metric_contracts_hash = ? AND join_contracts_hash = ? \
+           AND policy_hash = ? AND compiler_version = ? \
            AND expires_at > CURRENT_TIMESTAMP AND invalidated_at IS NULL \
          LIMIT 1",
     )
     .bind(tenant_id)
     .bind(datasource_id)
     .bind(hash)
+    .bind(&lineage.intent_hash)
+    .bind(&lineage.schema_hash)
+    .bind(&lineage.metric_contracts_hash)
+    .bind(&lineage.join_contracts_hash)
+    .bind(&lineage.policy_hash)
+    .bind(&lineage.compiler_version)
     .fetch_optional(db)
     .await
     .ok()
@@ -103,6 +123,7 @@ pub async fn store(
     generated_sql: &str,
     query_id: Option<&str>,
     rows: Option<&[serde_json::Value]>,
+    lineage: &CacheLineage,
 ) {
     let snapshot = rows
         .map(|r| {
@@ -113,12 +134,21 @@ pub async fn store(
 
     if let Err(e) = sqlx::query(
         "INSERT INTO nl2sql_result_cache \
-           (tenant_id, datasource_id, question_hash, question, generated_sql, query_id, result_snapshot, expires_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, datetime(CURRENT_TIMESTAMP, printf('%+d hours', ?))) \
+           (tenant_id, datasource_id, question_hash, question, generated_sql, query_id,
+            result_snapshot, expires_at, intent_hash, schema_hash,
+            metric_contracts_hash, join_contracts_hash, policy_hash, compiler_version) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, datetime(CURRENT_TIMESTAMP, printf('%+d hours', ?)),
+                 ?, ?, ?, ?, ?, ?) \
          ON CONFLICT DO UPDATE SET \
            generated_sql = excluded.generated_sql, \
            query_id = COALESCE(query_id, excluded.query_id), \
            result_snapshot = COALESCE(excluded.result_snapshot, result_snapshot), \
+           intent_hash = excluded.intent_hash, \
+           schema_hash = excluded.schema_hash, \
+           metric_contracts_hash = excluded.metric_contracts_hash, \
+           join_contracts_hash = excluded.join_contracts_hash, \
+           policy_hash = excluded.policy_hash, \
+           compiler_version = excluded.compiler_version, \
            expires_at = excluded.expires_at, \
            invalidated_at = NULL, \
            hit_count = 0",
@@ -131,6 +161,12 @@ pub async fn store(
     .bind(query_id)
     .bind(snapshot)
     .bind(ttl_hours())
+    .bind(&lineage.intent_hash)
+    .bind(&lineage.schema_hash)
+    .bind(&lineage.metric_contracts_hash)
+    .bind(&lineage.join_contracts_hash)
+    .bind(&lineage.policy_hash)
+    .bind(&lineage.compiler_version)
     .execute(db)
     .await
     {
@@ -243,38 +279,17 @@ pub async fn update_snapshot(
 ) {
     let capped: Vec<_> = rows.iter().take(max_rows()).cloned().collect();
     let snapshot = serde_json::to_string(&capped).ok();
-    let question = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT question FROM nl2sql_queries WHERE id = ? AND tenant_id = ? LIMIT 1",
-    )
-    .bind(query_id)
-    .bind(tenant_id)
-    .fetch_optional(db)
-    .await
-    .ok()
-    .flatten()
-    .flatten()
-    .unwrap_or_else(|| query_id.to_string());
-    let hash = question_hash(tenant_id, datasource_id, &question);
-
     if let Err(e) = sqlx::query(
-        "INSERT INTO nl2sql_result_cache \
-           (tenant_id, datasource_id, question_hash, question, generated_sql, query_id, result_snapshot, expires_at, invalidated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, datetime(CURRENT_TIMESTAMP, printf('%+d hours', ?)), NULL) \
-         ON CONFLICT DO UPDATE SET \
-           generated_sql = excluded.generated_sql, \
-           query_id = excluded.query_id, \
-           result_snapshot = excluded.result_snapshot, \
-           expires_at = excluded.expires_at, \
-           invalidated_at = NULL",
+        "UPDATE nl2sql_result_cache
+         SET result_snapshot = ?, generated_sql = ?, updated_at = CURRENT_TIMESTAMP
+         WHERE tenant_id = ? AND datasource_id = ? AND query_id = ?
+           AND expires_at > CURRENT_TIMESTAMP AND invalidated_at IS NULL",
     )
+    .bind(snapshot)
+    .bind(generated_sql)
     .bind(tenant_id)
     .bind(datasource_id)
-    .bind(&hash)
-    .bind(&question)
-    .bind(generated_sql)
     .bind(query_id)
-    .bind(snapshot)
-    .bind(ttl_hours())
     .execute(db)
     .await
     {
@@ -285,5 +300,147 @@ pub async fn update_snapshot(
             datasource_id = %datasource_id,
             "nl2sql result cache: failed to upsert result snapshot"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn cache_db() -> SqlitePool {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE nl2sql_result_cache (
+                tenant_id TEXT NOT NULL,
+                datasource_id TEXT NOT NULL,
+                question_hash TEXT NOT NULL,
+                question TEXT NOT NULL,
+                generated_sql TEXT NOT NULL,
+                query_id TEXT,
+                result_snapshot TEXT,
+                intent_hash TEXT NOT NULL DEFAULT '',
+                schema_hash TEXT NOT NULL DEFAULT '',
+                metric_contracts_hash TEXT NOT NULL DEFAULT '',
+                join_contracts_hash TEXT NOT NULL DEFAULT '',
+                policy_hash TEXT NOT NULL DEFAULT '',
+                compiler_version TEXT NOT NULL DEFAULT '',
+                expires_at TEXT NOT NULL,
+                invalidated_at TEXT,
+                hit_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (tenant_id, datasource_id, question_hash)
+            )",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        db
+    }
+
+    fn lineage() -> CacheLineage {
+        CacheLineage {
+            intent_hash: "intent-v1".into(),
+            schema_hash: "schema-v1".into(),
+            metric_contracts_hash: "metrics-v1".into(),
+            join_contracts_hash: "joins-v1".into(),
+            policy_hash: "policy-v1".into(),
+            compiler_version: "compiler-v1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_requires_the_complete_semantic_lineage() {
+        let db = cache_db().await;
+        let hash = question_hash("tenant", "datasource", "orders yesterday");
+        let baseline = lineage();
+        store(
+            &db,
+            "tenant",
+            "datasource",
+            &hash,
+            "orders yesterday",
+            "SELECT COUNT(*) FROM orders",
+            Some("query-1"),
+            None,
+            &baseline,
+        )
+        .await;
+        assert!(lookup(&db, "tenant", "datasource", &hash, &baseline)
+            .await
+            .is_some());
+
+        for changed in [
+            CacheLineage {
+                schema_hash: "schema-v2".into(),
+                ..baseline.clone()
+            },
+            CacheLineage {
+                metric_contracts_hash: "metrics-v2".into(),
+                ..baseline.clone()
+            },
+            CacheLineage {
+                join_contracts_hash: "joins-v2".into(),
+                ..baseline.clone()
+            },
+            CacheLineage {
+                policy_hash: "policy-v2".into(),
+                ..baseline.clone()
+            },
+            CacheLineage {
+                compiler_version: "compiler-v2".into(),
+                ..baseline.clone()
+            },
+            CacheLineage {
+                intent_hash: "intent-v2".into(),
+                ..baseline.clone()
+            },
+        ] {
+            assert!(lookup(&db, "tenant", "datasource", &hash, &changed)
+                .await
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_or_unbound_cache_rows_are_never_released() {
+        let db = cache_db().await;
+        let hash = question_hash("tenant", "datasource", "roi");
+        sqlx::query(
+            "INSERT INTO nl2sql_result_cache
+                (tenant_id, datasource_id, question_hash, question, generated_sql, expires_at)
+             VALUES ('tenant', 'datasource', ?, 'roi', 'SELECT secret FROM wrong_table',
+                     datetime(CURRENT_TIMESTAMP, '+1 hour'))",
+        )
+        .bind(&hash)
+        .execute(&db)
+        .await
+        .unwrap();
+        assert!(lookup(&db, "tenant", "datasource", &hash, &lineage())
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshot_update_cannot_create_or_widen_a_cache_binding() {
+        let db = cache_db().await;
+        update_snapshot(
+            &db,
+            "tenant",
+            "query-missing",
+            "datasource",
+            "SELECT * FROM wrong_table",
+            &[serde_json::json!({"secret": true})],
+        )
+        .await;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nl2sql_result_cache")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

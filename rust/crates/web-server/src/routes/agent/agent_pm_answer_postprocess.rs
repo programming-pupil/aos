@@ -577,7 +577,7 @@ fn score_claim_to_tool_hit(claim: &str, hit: &PmToolEvidenceHit) -> f64 {
 /// evidence fields must survive a lightweight deterministic check. This is
 /// intentionally conservative: numeric/date/unit mismatches become a gap and
 /// are left for the model or a later source to repair.
-fn claim_evidence_semantically_supported(claim: &str, excerpt: &str) -> bool {
+pub(super) fn claim_evidence_semantically_supported(claim: &str, excerpt: &str) -> bool {
     let claim_lower = claim.to_ascii_lowercase();
     let evidence_lower = excerpt.to_ascii_lowercase();
     let number_pattern =
@@ -621,6 +621,65 @@ fn claim_evidence_semantically_supported(claim: &str, excerpt: &str) -> bool {
         }
     };
     if currency(&claim_lower).is_some() && currency(&claim_lower) != currency(&evidence_lower) {
+        return false;
+    }
+    let entity_pattern =
+        regex::Regex::new(r"\b[A-Za-z][A-Za-z0-9_-]{1,}\b").expect("static claim entity regex");
+    let generic_entities = [
+        "the", "and", "for", "with", "that", "this", "from", "platform", "supports", "support",
+        "report", "data", "user", "users",
+    ];
+    let claim_entities = entity_pattern
+        .find_iter(claim)
+        .map(|value| value.as_str().to_ascii_lowercase())
+        .filter(|value| !generic_entities.contains(&value.as_str()))
+        .collect::<std::collections::BTreeSet<_>>();
+    let evidence_entities = entity_pattern
+        .find_iter(excerpt)
+        .map(|value| value.as_str().to_ascii_lowercase())
+        .collect::<std::collections::BTreeSet<_>>();
+    if !claim_entities.is_subset(&evidence_entities) {
+        return false;
+    }
+    let negated = |text: &str| {
+        [
+            "不支持",
+            "未支持",
+            "没有",
+            "并非",
+            "不是",
+            " no ",
+            " not ",
+            "never",
+        ]
+        .iter()
+        .any(|marker| text.contains(marker))
+    };
+    if negated(&claim_lower) != negated(&evidence_lower) {
+        return false;
+    }
+    let stop_words = [
+        "the", "and", "for", "with", "that", "this", "from", "是", "的", "了", "在", "与", "及",
+        "和", "一个", "这个",
+    ];
+    let claim_terms = tokenize_for_match(claim)
+        .into_iter()
+        .filter(|term| !stop_words.contains(&term.as_str()))
+        .collect::<Vec<_>>();
+    if claim_terms.is_empty() {
+        return false;
+    }
+    let evidence_terms = tokenize_for_match(excerpt);
+    let matched_terms = claim_terms
+        .iter()
+        .filter(|term| evidence_terms.iter().any(|candidate| candidate == *term))
+        .count();
+    // Numeric/unit checks above are necessary but not sufficient: a random
+    // excerpt containing the same number must still share topical evidence.
+    let minimum_overlap = if claim_terms.len() <= 3 { 1 } else { 2 };
+    if matched_terms < minimum_overlap
+        || (claim_terms.len() >= 4 && (matched_terms as f64 / claim_terms.len() as f64) < 0.2)
+    {
         return false;
     }
     let directional_groups: &[(&[&str], &[&str])] = &[
@@ -1329,6 +1388,22 @@ rewarded ads payout threshold\n\
         assert!(!claim_evidence_semantically_supported(
             "成本为 10 美元",
             "成本为 10 元"
+        ));
+        assert!(!claim_evidence_semantically_supported(
+            "平台支持长任务恢复和移动端通知",
+            "这是一篇介绍数据库索引优化的文章"
+        ));
+        assert!(claim_evidence_semantically_supported(
+            "平台支持长任务恢复和移动端通知",
+            "该平台提供长任务恢复机制，并在移动端发送通知"
+        ));
+        assert!(!claim_evidence_semantically_supported(
+            "AOS 支持长任务恢复",
+            "Codex 支持长任务恢复"
+        ));
+        assert!(!claim_evidence_semantically_supported(
+            "平台不支持长任务恢复",
+            "平台支持长任务恢复"
         ));
     }
 }

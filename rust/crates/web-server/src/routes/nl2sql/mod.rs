@@ -1231,7 +1231,7 @@ pub(crate) async fn load_manual_foreign_keys(
         sqlx::query_as::<_, (String, String, String, String, String, String)>(
             "SELECT source_table, source_column, source_type, target_table, target_column, target_type \
              FROM nl2sql_foreign_keys \
-             WHERE tenant_id = ? AND datasource_id = ? AND deleted_at IS NULL",
+             WHERE tenant_id = ? AND datasource_id = ? AND status = 'published' AND deleted_at IS NULL",
         )
         .bind(tenant_id)
         .bind(datasource_id)
@@ -3047,6 +3047,17 @@ async fn send_generation_request_with_sql_tools(
     ))
 }
 
+fn append_canonical_semantic_intent(system_prompt: &mut String, semantic_intent_json: &str) {
+    debug_assert!(!semantic_intent_json.trim().is_empty());
+    system_prompt.push_str(
+        "\n\nCanonical analytic intent (authoritative semantic input; do not ignore or silently broaden it):\n",
+    );
+    system_prompt.push_str(semantic_intent_json);
+    system_prompt.push_str(
+        "\nGenerate SQL that satisfies every resolved metric, dimension, population, time and unresolved-field constraint. If an unresolved field changes the result, return CLARIFICATION_NEEDED instead of guessing.",
+    );
+}
+
 pub(crate) async fn generate_sql(
     state: &AppState,
     claims: &Claims,
@@ -3067,7 +3078,13 @@ pub(crate) async fn generate_sql(
     business_domain_context: Option<&str>,
     preferred_model: Option<&str>,
     allow_tool_loop: bool,
+    semantic_intent_json: &str,
 ) -> Result<GenerateSqlResult> {
+    if semantic_intent_json.trim().is_empty() {
+        return Err(AppError::ValidationError(
+            "canonical analytic intent is required before SQL generation".to_string(),
+        ));
+    }
     let gen_started = std::time::Instant::now();
     let mut chat_candidates = crate::nl2sql::resolve_chat_config_candidates(
         state.config_registry(),
@@ -3224,6 +3241,7 @@ pub(crate) async fn generate_sql(
         system_prompt.push_str("\n\n");
         system_prompt.push_str(context);
     }
+    append_canonical_semantic_intent(&mut system_prompt, semantic_intent_json);
 
     let history_section = if history.messages.is_empty() {
         String::new()
@@ -4510,7 +4528,7 @@ pub(crate) async fn query(
             Option<serde_json::Value>,
         )> = sqlx::query_as(
             "SELECT metric_name, metric_aliases, expression, filter_conditions FROM nl2sql_metrics \
-             WHERE tenant_id = ? AND datasource_id = ? AND deleted_at IS NULL",
+             WHERE tenant_id = ? AND datasource_id = ? AND status = 'published' AND deleted_at IS NULL",
         )
         .bind(&claims.tenant_id)
         .bind(&req.data_source_id)
@@ -4531,7 +4549,7 @@ pub(crate) async fn query(
     let metrics: Vec<(String, String, Option<String>)> = {
         let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
             "SELECT metric_name, expression, filter_conditions FROM nl2sql_metrics \
-             WHERE tenant_id = ? AND datasource_id = ? AND deleted_at IS NULL",
+             WHERE tenant_id = ? AND datasource_id = ? AND status = 'published' AND deleted_at IS NULL",
         )
         .bind(&claims.tenant_id)
         .bind(&req.data_source_id)
@@ -4660,6 +4678,7 @@ pub(crate) async fn query(
     match crate::semantic_kernel_store::load_metric_contracts(
         &state.db,
         &claims.tenant_id,
+        &req.data_source_id,
         &question_intent
             .metrics
             .iter()
@@ -4708,6 +4727,7 @@ pub(crate) async fn query(
     let loaded_join_contracts = match crate::semantic_kernel_store::load_join_contracts(
         &state.db,
         &claims.tenant_id,
+        &req.data_source_id,
     )
     .await
     {
@@ -4720,31 +4740,6 @@ pub(crate) async fn query(
             Vec::new()
         }
     };
-    if let Err(error) = crate::semantic_kernel_store::persist_nl2sql_intent_ir(
-        &state.db,
-        &claims.tenant_id,
-        &conversation_id,
-        &query_id,
-        &query_id,
-        &serde_json::to_value(&question_intent).unwrap_or_else(|_| serde_json::json!({})),
-    )
-    .await
-    {
-        return Err(AppError::Internal(format!(
-            "failed to persist analytic intent before SQL generation: {error}"
-        )));
-    }
-    push_rule_hit(
-        &mut applied_rules,
-        "semantic_ir_compiled_before_sql",
-        "Analytics Semantic Compiler",
-        Some(format!(
-            "metrics={}, dimensions={}, unresolved={}",
-            question_intent.metrics.len(),
-            question_intent.dimensions.len(),
-            question_intent.unresolved.len()
-        )),
-    );
     if let Some(domain_match) = matched_business_domain.as_ref() {
         push_rule_hit(
             &mut applied_rules,
@@ -4859,6 +4854,9 @@ pub(crate) async fn query(
                 )),
             );
         }
+    }
+    if let Some(qu) = qu_result.as_ref() {
+        semantic_audit::apply_query_understanding(&mut question_intent, qu);
     }
     if let Some(qu) = qu_result.as_ref() {
         push_rule_hit(
@@ -5052,6 +5050,40 @@ pub(crate) async fn query(
             schema_tables = filter_schema_tables_by_allowlist(&schema_tables, allowed_tables);
         }
     }
+    let explicit_dimension_columns = synonym_hits
+        .iter()
+        .map(|(_, _, column)| column.clone())
+        .collect::<Vec<_>>();
+    semantic_audit::bind_schema_dimensions(
+        &mut question_intent,
+        &schema_tables,
+        &explicit_dimension_columns,
+    );
+    if let Err(error) = crate::semantic_kernel_store::persist_nl2sql_intent_ir(
+        &state.db,
+        &claims.tenant_id,
+        &conversation_id,
+        &query_id,
+        &query_id,
+        &serde_json::to_value(&question_intent).unwrap_or_else(|_| serde_json::json!({})),
+    )
+    .await
+    {
+        return Err(AppError::Internal(format!(
+            "failed to persist bound analytic intent before SQL generation: {error}"
+        )));
+    }
+    push_rule_hit(
+        &mut applied_rules,
+        "semantic_ir_compiled_before_sql",
+        "Analytics Semantic Compiler",
+        Some(format!(
+            "metrics={}, dimensions={}, unresolved={}",
+            question_intent.metrics.len(),
+            question_intent.dimensions.len(),
+            question_intent.unresolved.len()
+        )),
+    );
     let mut used_references: Vec<ReferenceUsageDto> = reference_snippets
         .iter()
         .map(ReferencePromptSnippet::to_usage_dto)
@@ -5117,6 +5149,27 @@ pub(crate) async fn query(
     }
 
     // ── Result Cache lookup ───────────────────────────────────────────────────
+    let cache_lineage = crate::nl2sql::result_cache::CacheLineage {
+        intent_hash: crate::semantic_kernel_store::sha256_json(
+            &serde_json::to_value(&question_intent).unwrap_or_default(),
+        ),
+        schema_hash: crate::semantic_kernel_store::sha256_json(&schema_tables),
+        metric_contracts_hash: crate::semantic_kernel_store::sha256_json(
+            &serde_json::to_value(&loaded_metric_contracts).unwrap_or_default(),
+        ),
+        join_contracts_hash: crate::semantic_kernel_store::sha256_json(
+            &serde_json::to_value(&loaded_join_contracts).unwrap_or_default(),
+        ),
+        policy_hash: self::queries::query_policy_lineage_hash(
+            &state.db,
+            &claims.tenant_id,
+            &req.data_source_id,
+            &claims.sub,
+            &claims.email,
+        )
+        .await?,
+        compiler_version: "analytics-semantic-compiler-v2".into(),
+    };
     let cache_hash = crate::nl2sql::result_cache::question_hash(
         &claims.tenant_id,
         &req.data_source_id,
@@ -5130,62 +5183,154 @@ pub(crate) async fn query(
             &claims.tenant_id,
             &req.data_source_id,
             &cache_hash,
+            &cache_lineage,
         )
         .await
         {
-            push_rule_hit(
-                &mut applied_rules,
-                "result_cache_hit",
-                "Result Cache",
-                Some("query served from cache".to_string()),
-            );
-            self::query_async::emit_stage("done", "命中缓存，已返回 SQL");
-            tracing::debug!(
-                tenant_id = %claims.tenant_id,
-                datasource_id = %req.data_source_id,
-                "nl2sql result cache hit"
-            );
-            let query_id_cached = uuid::Uuid::new_v4().to_string();
-            sqlx::query(
-                "INSERT INTO nl2sql_queries \
-                 (id, tenant_id, user_id, data_source_id, conversation_id, question, generated_sql, executed, planning_ms, route_confidence, routing_method, semantic_context, applied_rules_json) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)",
+            let mut cached_sql = hit.generated_sql;
+            let cache_policy = enforce_query_policy(
+                &state.db,
+                &claims.tenant_id,
+                &req.data_source_id,
+                &claims.sub,
+                &claims.email,
+                &extract_tables_from_sql(&cached_sql),
+                &extract_columns_from_sql(&cached_sql),
             )
-            .bind(&query_id_cached)
-            .bind(&claims.tenant_id)
-            .bind(&claims.sub)
-            .bind(&req.data_source_id)
-            .bind(&conversation_id)
-            .bind(&req.question)
-            .bind(&hit.generated_sql)
-            .bind(route_confidence)
-            .bind(routing_method.as_deref())
-            .bind(semantic_context.clone())
-            .bind(applied_rules_json_value(&applied_rules))
-            .execute(&state.db)
             .await?;
-            tracing::info!(
-                datasource_id = %req.data_source_id,
-                cache_lookup_ms = cache_lookup_started.elapsed().as_millis() as u64,
-                total_elapsed_ms = req_started_at.elapsed().as_millis() as u64,
-                "nl2sql /query finished from cache"
-            );
-            return Ok(Json(QueryResponse {
-                sql: Some(hit.generated_sql),
-                explanation: None,
-                error: None,
-                clarification_question: None,
-                confirmed_requirements: None,
-                missing_requirements: None,
-                query_id: query_id_cached,
-                conversation_id: Some(conversation_id),
-                summary_version: None,
-                query_understanding: qu_result.clone(),
-                intent: qu_result.as_ref().map(|q| q.intent.to_string()),
-                cache_hit: true,
-                applied_rules,
-                used_references: Vec::new(),
-            }));
+            let mut cache_release_error = cache_policy
+                .is_denied()
+                .then(|| query_policy_denial_message(&cache_policy));
+            if cache_release_error.is_none() {
+                if let Some(row_filter) = cache_policy.row_filter_expr.as_deref() {
+                    cached_sql = inject_query_policy_row_filter(&cached_sql, row_filter).map_err(
+                        |error| {
+                            AppError::ValidationError(format!(
+                                "cached SQL policy filter could not be applied safely: {error}"
+                            ))
+                        },
+                    )?;
+                }
+                match semantic_audit::compile_canonical_intent_with_contracts_and_joins(
+                    &question_intent,
+                    &cached_sql,
+                    &loaded_metric_contracts,
+                    &loaded_join_contracts,
+                ) {
+                    Some(audit) => {
+                        let verification = semantic_audit::verification_json(&audit);
+                        let decision = serde_json::to_string(&audit.verification.release_decision)
+                            .unwrap_or_else(|_| "\"Reject\"".into())
+                            .trim_matches('"')
+                            .to_string();
+                        if let Err(error) =
+                            semantic_audit::require_execution_validation_decision(&decision)
+                        {
+                            crate::semantic_kernel_store::persist_nl2sql_repair_verification(
+                                &state.db,
+                                &claims.tenant_id,
+                                &query_id,
+                                &cached_sql,
+                                &verification,
+                                &decision,
+                                f64::from(audit.verification.confidence_basis.calibrated_score),
+                            )
+                            .await
+                            .map_err(|persist_error| {
+                                AppError::Internal(format!(
+                                    "failed to persist rejected cache verification: {persist_error}"
+                                ))
+                            })?;
+                            cache_release_error = Some(error);
+                        } else {
+                            crate::semantic_kernel_store::persist_nl2sql_semantic_audit(
+                                &state.db,
+                                &claims.tenant_id,
+                                &req.data_source_id,
+                                &conversation_id,
+                                &query_id,
+                                &semantic_audit::intent_json(&audit),
+                                &verification,
+                                &decision,
+                                f64::from(audit.verification.confidence_basis.calibrated_score),
+                            )
+                            .await
+                            .map_err(|persist_error| {
+                                AppError::Internal(format!(
+                                    "failed to persist cache semantic release: {persist_error}"
+                                ))
+                            })?;
+                        }
+                    }
+                    None => {
+                        cache_release_error =
+                            Some("cached SQL could not be parsed by the semantic verifier".into());
+                    }
+                }
+            }
+            if let Some(error) = cache_release_error {
+                tracing::warn!(
+                    tenant_id = %claims.tenant_id,
+                    datasource_id = %req.data_source_id,
+                    query_id = %query_id,
+                    error,
+                    "NL2SQL cache candidate failed current semantic release; invalidating cache"
+                );
+                crate::nl2sql::result_cache::invalidate_datasource(
+                    &state.db,
+                    &claims.tenant_id,
+                    &req.data_source_id,
+                )
+                .await;
+            } else {
+                push_rule_hit(
+                    &mut applied_rules,
+                    "result_cache_hit",
+                    "Result Cache",
+                    Some("cache lineage and semantic release re-verified".to_string()),
+                );
+                self::query_async::emit_stage("done", "命中缓存，已重新验证 SQL");
+                sqlx::query(
+                    "INSERT INTO nl2sql_queries \
+                     (id, tenant_id, user_id, data_source_id, conversation_id, question, generated_sql, executed, planning_ms, route_confidence, routing_method, semantic_context, applied_rules_json) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)",
+                )
+                .bind(&query_id)
+                .bind(&claims.tenant_id)
+                .bind(&claims.sub)
+                .bind(&req.data_source_id)
+                .bind(&conversation_id)
+                .bind(&req.question)
+                .bind(&cached_sql)
+                .bind(route_confidence)
+                .bind(routing_method.as_deref())
+                .bind(semantic_context.clone())
+                .bind(applied_rules_json_value(&applied_rules))
+                .execute(&state.db)
+                .await?;
+                tracing::info!(
+                    datasource_id = %req.data_source_id,
+                    cache_lookup_ms = cache_lookup_started.elapsed().as_millis() as u64,
+                    total_elapsed_ms = req_started_at.elapsed().as_millis() as u64,
+                    "nl2sql /query finished from verified cache"
+                );
+                return Ok(Json(QueryResponse {
+                    sql: Some(cached_sql),
+                    explanation: None,
+                    error: None,
+                    clarification_question: None,
+                    confirmed_requirements: None,
+                    missing_requirements: None,
+                    query_id,
+                    conversation_id: Some(conversation_id),
+                    summary_version: None,
+                    query_understanding: qu_result.clone(),
+                    intent: qu_result.as_ref().map(|q| q.intent.to_string()),
+                    cache_hit: true,
+                    applied_rules,
+                    used_references: Vec::new(),
+                }));
+            }
         }
     } else {
         let (rule_id, reason) = if !used_references.is_empty() {
@@ -5431,6 +5576,9 @@ pub(crate) async fn query(
 
     let planning_start = std::time::Instant::now();
     self::query_async::emit_stage("generate_sql", "正在生成 SQL");
+    let semantic_intent_json = serde_json::to_string(&question_intent).map_err(|error| {
+        AppError::Internal(format!("failed to serialize analytic intent: {error}"))
+    })?;
     let sql_result = generate_sql(
         &state,
         &claims,
@@ -5453,6 +5601,7 @@ pub(crate) async fn query(
         business_domain_context.as_deref(),
         None,
         true,
+        &semantic_intent_json,
     )
     .await;
 
@@ -6057,66 +6206,65 @@ pub(crate) async fn query(
 
     // Semantic compiler gate: parse the final policy-rewritten SQL and persist
     // the deterministic intent/verifier result before the legacy query row is
-    // exposed as a releasable candidate.  Missing semantic evidence is kept as
-    // NeedsClarification for audit/UX; only an explicit verifier rejection is
-    // allowed to stop the request.
-    if let Some(audit) = semantic_audit::compile_and_verify_with_contracts_and_joins(
-        &claims.tenant_id,
-        &req.data_source_id,
-        &semantic_question,
+    // exposed as a releasable candidate. Every non-Release decision is
+    // fail-closed: a repair or unresolved semantic ambiguity must never leak a
+    // SQL candidate to execution merely because it parses.
+    let audit = semantic_audit::compile_canonical_intent_with_contracts_and_joins(
+        &question_intent,
         &sql,
-        &matched_metrics,
         &loaded_metric_contracts,
         &loaded_join_contracts,
-    ) {
-        let intent_json = semantic_audit::intent_json(&audit);
-        let verification_json = semantic_audit::verification_json(&audit);
-        let release_decision = serde_json::to_string(&audit.verification.release_decision)
-            .unwrap_or_else(|_| "\"NeedsClarification\"".to_string())
-            .trim_matches('"')
-            .to_string();
-        let calibrated_score = f64::from(audit.verification.confidence_basis.calibrated_score);
-        if let Err(error) = crate::semantic_kernel_store::persist_nl2sql_semantic_audit(
-            &state.db,
-            &claims.tenant_id,
-            &req.data_source_id,
-            &conversation_id,
-            &query_id,
-            &intent_json,
-            &verification_json,
-            &release_decision,
-            calibrated_score,
+    )
+    .ok_or_else(|| {
+        AppError::ValidationError(
+            "Semantic compiler could not produce a verifiable intent for this SQL candidate."
+                .to_string(),
         )
-        .await
-        {
-            tracing::error!(
-                tenant_id = %claims.tenant_id,
-                datasource_id = %req.data_source_id,
-                query_id = %query_id,
-                error = %error,
-                "failed to persist NL2SQL semantic audit; query remains on legacy path"
-            );
-            push_rule_hit(
-                &mut applied_rules,
-                "semantic_audit_persistence_failed",
-                "Semantic Audit",
-                Some("semantic IR was computed but could not be persisted".to_string()),
-            );
-        } else {
-            push_rule_hit(
-                &mut applied_rules,
-                "semantic_verifier_release_decision",
-                "Semantic Verifier",
-                Some(format!(
-                    "decision={release_decision}; calibrated_score={calibrated_score:.3}"
-                )),
-            );
-        }
-        if release_decision == "Reject" {
-            return Err(AppError::ValidationError(
-                "Semantic verification rejected this SQL candidate because its safety or join-cardinality contract failed. Please retry with a narrower, read-only request.".to_string(),
-            ));
-        }
+    })?;
+    let intent_json = semantic_audit::intent_json(&audit);
+    let verification_json = semantic_audit::verification_json(&audit);
+    let release_decision = serde_json::to_string(&audit.verification.release_decision)
+        .unwrap_or_else(|_| "\"NeedsClarification\"".to_string())
+        .trim_matches('"')
+        .to_string();
+    let calibrated_score = f64::from(audit.verification.confidence_basis.calibrated_score);
+    if let Err(error) = crate::semantic_kernel_store::persist_nl2sql_semantic_audit(
+        &state.db,
+        &claims.tenant_id,
+        &req.data_source_id,
+        &conversation_id,
+        &query_id,
+        &intent_json,
+        &verification_json,
+        &release_decision,
+        calibrated_score,
+    )
+    .await
+    {
+        tracing::error!(
+            tenant_id = %claims.tenant_id,
+            datasource_id = %req.data_source_id,
+            query_id = %query_id,
+            error = %error,
+            "failed to persist NL2SQL semantic audit; candidate is blocked"
+        );
+        return Err(AppError::Internal(format!(
+            "failed to persist semantic verification before SQL release: {error}"
+        )));
+    } else {
+        push_rule_hit(
+            &mut applied_rules,
+            "semantic_verifier_release_decision",
+            "Semantic Verifier",
+            Some(format!(
+                "decision={release_decision}; calibrated_score={calibrated_score:.3}"
+            )),
+        );
+    }
+    if let Err(reason) = semantic_audit::require_execution_validation_decision(&release_decision) {
+        return Err(AppError::ValidationError(format!(
+            "{reason}. Resolve the metric, grain, population, time or join ambiguity and retry."
+        )));
     }
 
     let persist_started = std::time::Instant::now();
@@ -6166,6 +6314,7 @@ pub(crate) async fn query(
             let q = req.question.clone();
             let s = sql.clone();
             let query_id_clone = query_id.clone();
+            let lineage = cache_lineage.clone();
             tokio::spawn(async move {
                 crate::nl2sql::result_cache::store(
                     &db2,
@@ -6176,6 +6325,7 @@ pub(crate) async fn query(
                     &s,
                     Some(&query_id_clone),
                     None,
+                    &lineage,
                 )
                 .await;
             });
@@ -7088,7 +7238,9 @@ pub fn routes(state: AppState) -> Router<AppState> {
         list_domain_table_mappings, list_domains_for_datasource, rediscover_domains,
         unassign_tables_from_domain, update_domain,
     };
-    use self::feedback::{clear_result_cache, get_feedback_stats, submit_feedback};
+    use self::feedback::{
+        clear_result_cache, get_feedback_stats, set_feedback_learning_approval, submit_feedback,
+    };
     use self::foreign_keys::{cancel_clarify, get_clarify};
     use self::foreign_keys::{
         create_foreign_key, delete_foreign_key, list_foreign_keys, update_foreign_key,
@@ -7506,6 +7658,10 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/analytics/trends", routing_get(analytics_trends))
         // Feedback
         .route("/feedback", routing_post(submit_feedback))
+        .route(
+            "/feedback/{feedback_id}/approval",
+            routing_post(set_feedback_learning_approval),
+        )
         .route(
             "/feedback/stats/{datasource_id}",
             routing_get(get_feedback_stats),
@@ -7945,6 +8101,12 @@ struct MetricItem {
     filter_conditions: Option<serde_json::Value>,
     description: Option<String>,
     granularity: String,
+    time_column: Option<String>,
+    timezone: String,
+    population: serde_json::Value,
+    allowed_grains: Vec<String>,
+    invariants: serde_json::Value,
+    join_contract_ids: Vec<String>,
     created_by: Option<String>,
     created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -7970,10 +8132,40 @@ struct CreateMetricRequest {
     description: Option<String>,
     #[serde(default = "default_granularity")]
     granularity: String,
+    #[serde(default)]
+    time_column: Option<String>,
+    #[serde(default = "default_metric_timezone")]
+    timezone: String,
+    #[serde(default = "default_metric_population")]
+    population: serde_json::Value,
+    #[serde(default)]
+    allowed_grains: Vec<String>,
+    #[serde(default = "default_metric_invariants")]
+    invariants: serde_json::Value,
+    #[serde(default)]
+    join_contract_ids: Vec<String>,
 }
 #[allow(dead_code)]
 fn default_granularity() -> String {
     "day".to_string()
+}
+#[allow(dead_code)]
+fn default_metric_timezone() -> String {
+    "UTC".to_string()
+}
+#[allow(dead_code)]
+fn default_metric_population() -> serde_json::Value {
+    serde_json::json!({
+        "subject": "query_rows",
+        "dedup_key": null,
+        "exclude_test_users": false,
+        "exclude_internal_users": false,
+        "valid_record_rule": null
+    })
+}
+#[allow(dead_code)]
+fn default_metric_invariants() -> serde_json::Value {
+    serde_json::json!([])
 }
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
@@ -7985,6 +8177,12 @@ struct UpdateMetricRequest {
     filter_conditions: Option<serde_json::Value>,
     description: Option<String>,
     granularity: Option<String>,
+    time_column: Option<String>,
+    timezone: Option<String>,
+    population: Option<serde_json::Value>,
+    allowed_grains: Option<Vec<String>>,
+    invariants: Option<serde_json::Value>,
+    join_contract_ids: Option<Vec<String>>,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -8029,6 +8227,11 @@ struct JoinPathItem {
     sql_joins: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     notes: Option<String>,
+    cardinality: Option<String>,
+    temporal_condition: Option<String>,
+    nullable: bool,
+    dedup_strategy: Option<String>,
+    allowed_grains: Vec<String>,
 }
 
 impl JoinPathItem {
@@ -8049,6 +8252,11 @@ impl JoinPathItem {
         target_column: Option<String>,
         join_type: Option<String>,
         notes: Option<String>,
+        cardinality: Option<String>,
+        temporal_condition: Option<String>,
+        nullable: bool,
+        dedup_strategy: Option<String>,
+        allowed_grains: Vec<String>,
     ) -> Self {
         let mut path: Vec<String> = Vec::new();
         let mut join_columns: Vec<String> = Vec::new();
@@ -8100,6 +8308,11 @@ impl JoinPathItem {
             path_text: Some(path_text.to_string()),
             sql_joins: None,
             notes,
+            cardinality,
+            temporal_condition,
+            nullable,
+            dedup_strategy,
+            allowed_grains,
         }
     }
 }
@@ -8414,6 +8627,184 @@ pub(crate) struct SlowQueriesResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sql_generator_prompt_receives_the_canonical_intent() {
+        let mut prompt = "base generator contract".to_string();
+        append_canonical_semantic_intent(
+            &mut prompt,
+            r#"{"objective":"Trend","metrics":[{"id":"orders"}]}"#,
+        );
+        assert!(prompt.contains("Canonical analytic intent"));
+        assert!(prompt.contains(r#""objective":"Trend""#));
+        assert!(prompt.contains("CLARIFICATION_NEEDED"));
+    }
+
+    #[tokio::test]
+    async fn nl2sql_production_flow_uses_canonical_ir_before_and_after_generation() {
+        let db = crate::test_sqlite_pool().await;
+        let understanding = crate::nl2sql::query_understanding::QueryUnderstandingResult {
+            rewritten_question: "按日期统计已支付订单数，范围为 2026-08-01 到 2026-08-08".into(),
+            intent: crate::nl2sql::query_understanding::Intent::Trend,
+            entities: crate::nl2sql::query_understanding::QueryEntities {
+                time: Some(crate::nl2sql::query_understanding::TimeEntity {
+                    raw: "2026-08-01 到 2026-08-08".into(),
+                    resolved_type: "explicit".into(),
+                    granularity: "day".into(),
+                    ranges: vec![("2026-08-01".into(), "2026-08-08".into())],
+                }),
+                subject: Some(crate::nl2sql::query_understanding::SubjectEntity {
+                    tables: vec!["orders".into()],
+                    columns: vec!["stat_date".into(), "status".into()],
+                    raw: "orders".into(),
+                }),
+                filters: vec![crate::nl2sql::query_understanding::FilterEntity {
+                    column: "status".into(),
+                    value: "paid".into(),
+                    op: "=".into(),
+                    raw: "已支付订单".into(),
+                }],
+                aggregations: vec!["COUNT".into()],
+                comparisons: Vec::new(),
+            },
+            confidence: 0.93,
+        };
+        let durable = semantic_audit::compile_bind_and_persist_intent(
+            &db,
+            "tenant",
+            "datasource",
+            "conversation",
+            "clarification-query",
+            "按日期统计订单数",
+            &["orders".into()],
+            &serde_json::json!([{
+                "table_name": "orders",
+                "columns": [{"name": "stat_date"}, {"name": "order_id"}, {"name": "status"}]
+            }]),
+            &[],
+            Some(&understanding),
+        )
+        .await
+        .expect("canonical intent must be durable before provider generation");
+        let canonical = crate::semantic_kernel_store::load_nl2sql_intent_ir(
+            &db,
+            "tenant",
+            "clarification-query",
+        )
+        .await
+        .unwrap()
+        .expect("durable canonical intent");
+        assert_eq!(canonical, durable.intent);
+        assert_eq!(canonical.dimensions[0].column, "stat_date");
+
+        let canonical_json = durable.intent_json().unwrap();
+        let mut prompt = "base generator contract".to_string();
+        append_canonical_semantic_intent(&mut prompt, &canonical_json);
+        assert!(prompt.contains(&canonical_json));
+
+        let audit = semantic_audit::compile_canonical_intent_with_contracts_and_joins(
+            &canonical,
+            "SELECT stat_date, COUNT(*) AS order_count FROM orders WHERE stat_date >= '2026-08-01' AND stat_date < '2026-08-08' AND status = 'paid' GROUP BY stat_date",
+            &durable.metric_contracts,
+            &durable.join_contracts,
+        )
+        .unwrap();
+        assert_eq!(audit.intent, canonical);
+        assert_eq!(
+            audit.verification.release_decision,
+            nl2sql_core::semantic_ir::QueryReleaseDecision::Release
+        );
+        let release_decision = serde_json::to_string(&audit.verification.release_decision)
+            .unwrap()
+            .trim_matches('"')
+            .to_string();
+        crate::semantic_kernel_store::persist_nl2sql_semantic_audit(
+            &db,
+            "tenant",
+            "datasource",
+            "conversation",
+            "clarification-query",
+            &semantic_audit::intent_json(&audit),
+            &semantic_audit::verification_json(&audit),
+            &release_decision,
+            f64::from(audit.verification.confidence_basis.calibrated_score),
+        )
+        .await
+        .expect("semantic release must be durable before SQL exposure");
+
+        let drifting = semantic_audit::compile_canonical_intent_with_contracts_and_joins(
+            &canonical,
+            "SELECT COUNT(*) AS order_count FROM orders",
+            &durable.metric_contracts,
+            &durable.join_contracts,
+        )
+        .expect("drift audit");
+        assert_ne!(
+            drifting.verification.release_decision,
+            nl2sql_core::semantic_ir::QueryReleaseDecision::Release
+        );
+
+        let today = chrono::Utc::now()
+            .with_timezone(&chrono_tz::Asia::Shanghai)
+            .date_naive();
+        let yesterday = today.pred_opt().unwrap();
+        let misleading_understanding =
+            crate::nl2sql::query_understanding::QueryUnderstandingResult {
+                rewritten_question: "查询昨天订单数".into(),
+                intent: crate::nl2sql::query_understanding::Intent::Count,
+                entities: crate::nl2sql::query_understanding::QueryEntities {
+                    time: Some(crate::nl2sql::query_understanding::TimeEntity {
+                        raw: "昨天".into(),
+                        resolved_type: "relative".into(),
+                        granularity: "day".into(),
+                        ranges: vec![("1999-01-01".into(), "1999-01-02".into())],
+                    }),
+                    subject: None,
+                    filters: Vec::new(),
+                    aggregations: vec!["COUNT".into()],
+                    comparisons: Vec::new(),
+                },
+                confidence: 0.99,
+            };
+        let relative = semantic_audit::compile_bind_and_persist_intent(
+            &db,
+            "tenant",
+            "datasource",
+            "relative-conversation",
+            "relative-query",
+            "查询昨天订单数",
+            &["orders".into()],
+            &serde_json::json!([{
+                "table_name": "orders",
+                "columns": [{"name": "business_date"}, {"name": "order_id"}]
+            }]),
+            &[],
+            Some(&misleading_understanding),
+        )
+        .await
+        .expect("relative time must be resolved by the deterministic compiler");
+        let relative_time = relative.intent.time.as_ref().unwrap();
+        assert_eq!(
+            relative_time.start_inclusive,
+            yesterday.format("%Y-%m-%d").to_string()
+        );
+        assert_eq!(
+            relative_time.end_exclusive,
+            today.format("%Y-%m-%d").to_string()
+        );
+        let wrong_window = semantic_audit::compile_canonical_intent_with_contracts_and_joins(
+            &relative.intent,
+            "SELECT COUNT(*) AS order_count FROM orders WHERE business_date >= '1999-01-01' AND business_date < '1999-01-02'",
+            &relative.metric_contracts,
+            &relative.join_contracts,
+        )
+        .expect("wrong-window SQL remains parseable audit evidence");
+        assert_ne!(
+            wrong_window.verification.release_decision,
+            nl2sql_core::semantic_ir::QueryReleaseDecision::Release,
+            "a model-proposed date must not override the kernel-resolved relative window"
+        );
+    }
 
     #[test]
     fn stale_concurrent_success_does_not_clear_a_new_candidate_failure() {

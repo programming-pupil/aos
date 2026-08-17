@@ -3845,12 +3845,13 @@ async fn execute_or_join_subtask(
                 "parent turn no longer accepts new subtasks".to_string(),
             ));
         }
-        sqlx::query::<sqlx::Sqlite>(
+        let inserted = sqlx::query_as::<sqlx::Sqlite, (String, String)>(
             "INSERT INTO super_assistant_subtasks
                 (id, tenant_id, user_id, parent_turn_id, runtime_turn_id, tool_call_id,
                  engine, status, permission_snapshot_json, input_json)
              VALUES (?, ?, ?, ?, NULL, ?, ?, 'queued', ?, ?)
-             ON CONFLICT DO UPDATE SET updated_at = updated_at",
+             ON CONFLICT DO UPDATE SET updated_at = updated_at
+             RETURNING id, tool_call_id",
         )
         .bind(&subtask_id)
         .bind(&claims.tenant_id)
@@ -3860,30 +3861,28 @@ async fn execute_or_join_subtask(
         .bind(engine)
         .bind(&permission_snapshot)
         .bind(&parsed)
-        .execute(&mut *transaction)
+        .fetch_one(&mut *transaction)
         .await?;
+        crate::semantic_kernel_store::record_child_spawn_in_transaction(
+            &mut transaction,
+            &claims.tenant_id,
+            &claims.sub,
+            &parent.session_id,
+            &inserted.0,
+            &inserted.1,
+            false,
+        )
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
         transaction.commit().await?;
-        (subtask_id, false)
+        let reused = inserted.0 != subtask_id;
+        (inserted.0, reused)
     };
     let mut subtask = if reused_existing {
         load_subtask_by_id(state, claims, parent, &effective_subtask_id).await?
     } else {
         load_subtask_by_call(state, claims, parent, &tool.tool_use_id).await?
     };
-    // Specialist tasks are also child threads in the unified execution model.
-    // Record lineage before starting/rejoining the external worker so a crash
-    // between spawn and the first progress event is still recoverable.
-    crate::semantic_kernel_store::record_child_spawn(
-        &state.db,
-        &claims.tenant_id,
-        &claims.sub,
-        &parent.session_id,
-        &subtask.id,
-        &tool.tool_use_id,
-        false,
-    )
-    .await
-    .map_err(|error| AppError::Internal(error.to_string()))?;
     if is_terminal(&subtask.status) {
         let settlement = match subtask.status.as_str() {
             "completed" => "completed",
@@ -4190,8 +4189,8 @@ async fn insert_or_reuse_specialist_subtask(
             "parent turn no longer accepts new subtasks".to_string(),
         ));
     }
-    let existing = sqlx::query_scalar::<sqlx::Sqlite, String>(
-        "SELECT id FROM super_assistant_subtasks
+    let existing = sqlx::query_as::<sqlx::Sqlite, (String, String)>(
+        "SELECT id, tool_call_id FROM super_assistant_subtasks
          WHERE tenant_id = ? AND user_id = ? AND parent_turn_id = ?
            AND engine = ?
            AND status IN ('queued', 'running', 'completed')
@@ -4203,7 +4202,18 @@ async fn insert_or_reuse_specialist_subtask(
     .bind(engine)
     .fetch_optional(&mut *transaction)
     .await?;
-    if let Some(existing_id) = existing {
+    if let Some((existing_id, existing_tool_call_id)) = existing {
+        crate::semantic_kernel_store::record_child_spawn_in_transaction(
+            &mut transaction,
+            &claims.tenant_id,
+            &claims.sub,
+            &parent.session_id,
+            &existing_id,
+            &existing_tool_call_id,
+            false,
+        )
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
         transaction.commit().await?;
         tracing::info!(
             turn_id = %parent.turn_id,
@@ -4230,6 +4240,17 @@ async fn insert_or_reuse_specialist_subtask(
     .bind(parsed)
     .execute(&mut *transaction)
     .await?;
+    crate::semantic_kernel_store::record_child_spawn_in_transaction(
+        &mut transaction,
+        &claims.tenant_id,
+        &claims.sub,
+        &parent.session_id,
+        subtask_id,
+        &tool.tool_use_id,
+        false,
+    )
+    .await
+    .map_err(|error| AppError::Internal(error.to_string()))?;
     transaction.commit().await?;
     Ok((subtask_id.to_string(), false))
 }
@@ -6396,6 +6417,15 @@ async fn validate_subtask_permission_snapshot(
     parent: &UnifiedParentTurnInput,
     subtask_id: &str,
 ) -> Result<()> {
+    crate::semantic_kernel_store::validate_child_capability(
+        &state.db,
+        &claims.tenant_id,
+        &claims.sub,
+        &parent.session_id,
+        subtask_id,
+    )
+    .await
+    .map_err(|_| AppError::Forbidden)?;
     let raw = sqlx::query_scalar::<sqlx::Sqlite, Option<String>>(
         "SELECT CAST(permission_snapshot_json AS TEXT)
          FROM super_assistant_subtasks

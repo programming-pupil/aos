@@ -66,7 +66,7 @@ pub(crate) async fn list_foreign_keys(
         "SELECT CAST(id AS TEXT) AS id, source_table, source_column, source_type, target_table, \
              target_column, target_type, created_by, updated_by, CAST(created_at AS TEXT) AS created_at \
              FROM nl2sql_foreign_keys \
-             WHERE tenant_id = ? AND datasource_id = ? AND deleted_at IS NULL",
+             WHERE tenant_id = ? AND datasource_id = ? AND status = 'published' AND deleted_at IS NULL",
     )
     .bind(&claims.tenant_id)
     .bind(&datasource_id)
@@ -739,6 +739,39 @@ pub(crate) async fn clarify(
             .collect()
     };
 
+    let matched_metrics = metrics
+        .iter()
+        .filter(|(name, _, _)| {
+            question_text
+                .to_ascii_lowercase()
+                .contains(&name.to_ascii_lowercase())
+        })
+        .map(|(name, _, _)| name.clone())
+        .collect::<Vec<_>>();
+    let query_id = uuid::Uuid::new_v4().to_string();
+    let durable_intent = super::semantic_audit::compile_bind_and_persist_intent(
+        &state.db,
+        tenant_id,
+        &data_source_id,
+        &conv_id,
+        &query_id,
+        &question_text,
+        &matched_metrics,
+        &schema_tables,
+        &[],
+        qu_result.as_ref(),
+    )
+    .await
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "failed to persist bound analytic intent before clarification SQL generation: {error}"
+        ))
+    })?;
+    let semantic_intent_json = durable_intent.intent_json().map_err(|error| {
+        AppError::Internal(format!(
+            "failed to serialize clarification analytic intent: {error}"
+        ))
+    })?;
     let planning_start = std::time::Instant::now();
     let sql_result = generate_sql(
         &state,
@@ -757,16 +790,16 @@ pub(crate) async fn clarify(
             .iter()
             .map(|(n, e, f)| (n.clone(), e.clone(), f.as_deref()))
             .collect::<Vec<_>>(),
-        &[],
+        &matched_metrics,
         &[],
         None,
         None,
         true,
+        &semantic_intent_json,
     )
     .await;
 
     let planning_ms = planning_start.elapsed().as_millis() as i64;
-    let query_id = uuid::Uuid::new_v4().to_string();
 
     let (sql, _err): (Option<String>, Option<String>) = match &sql_result {
         Ok(r) => (Some(r.sql.clone()), None),
@@ -829,6 +862,52 @@ pub(crate) async fn clarify(
             }));
         }
     };
+
+    let final_sql = sql.as_deref().ok_or_else(|| {
+        AppError::ValidationError(
+            "clarification completed without a SQL candidate; retry the request".to_string(),
+        )
+    })?;
+    let audit = super::semantic_audit::compile_canonical_intent_with_contracts_and_joins(
+        &durable_intent.intent,
+        final_sql,
+        &durable_intent.metric_contracts,
+        &durable_intent.join_contracts,
+    )
+    .ok_or_else(|| {
+        AppError::ValidationError(
+            "clarification SQL could not be verified against the canonical analytic intent"
+                .to_string(),
+        )
+    })?;
+    let release_decision = serde_json::to_string(&audit.verification.release_decision)
+        .unwrap_or_else(|_| "\"NeedsClarification\"".to_string())
+        .trim_matches('"')
+        .to_string();
+    crate::semantic_kernel_store::persist_nl2sql_semantic_audit(
+        &state.db,
+        tenant_id,
+        &data_source_id,
+        &conv_id,
+        &query_id,
+        &super::semantic_audit::intent_json(&audit),
+        &super::semantic_audit::verification_json(&audit),
+        &release_decision,
+        f64::from(audit.verification.confidence_basis.calibrated_score),
+    )
+    .await
+    .map_err(|error| {
+        AppError::Internal(format!(
+            "failed to persist clarification semantic verification: {error}"
+        ))
+    })?;
+    super::semantic_audit::require_execution_validation_decision(&release_decision).map_err(
+        |reason| {
+            AppError::ValidationError(format!(
+            "{reason}. Resolve the metric, grain, population, time or join ambiguity and retry."
+        ))
+        },
+    )?;
 
     sqlx::query::<sqlx::Sqlite>(
         "INSERT INTO nl2sql_queries \

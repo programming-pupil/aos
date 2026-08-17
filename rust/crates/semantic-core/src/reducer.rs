@@ -1,4 +1,7 @@
-use crate::{AssertionStatus, EvidenceLedger, ProposedStateDelta, SemanticSnapshot};
+use crate::{
+    AssertionStatus, DecisionStatus, EvidenceAuthority, EvidenceLedger, ProposedStateDelta,
+    SemanticSnapshot,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -50,6 +53,14 @@ impl SemanticReducer {
                             evidence_id: source.evidence_id.clone(),
                         });
                     }
+                }
+                let has_non_model_authority = candidate.source_refs.iter().any(|source| {
+                    evidence
+                        .get(&source.evidence_id)
+                        .is_some_and(|entry| entry.authority != EvidenceAuthority::Model)
+                });
+                if candidate.status == AssertionStatus::Confirmed && !has_non_model_authority {
+                    candidate.status = AssertionStatus::Proposed;
                 }
                 if let Some(existing) = next.assertions.get(&candidate.id) {
                     // Derived conflict/supersession edges are reducer output;
@@ -115,7 +126,24 @@ impl SemanticReducer {
                 next.assertions.insert(id.clone(), candidate);
                 outcome.accepted.push(id);
             }
-            ProposedStateDelta::UpsertDecision(decision) => {
+            ProposedStateDelta::UpsertDecision(mut decision) => {
+                for source in &decision.rationale {
+                    if !evidence.contains(&source.evidence_id) {
+                        return Err(ReductionError::UnknownEvidence {
+                            assertion_id: decision.id.clone(),
+                            evidence_id: source.evidence_id.clone(),
+                        });
+                    }
+                }
+                let has_non_model_authority = decision.rationale.iter().any(|source| {
+                    evidence
+                        .get(&source.evidence_id)
+                        .is_some_and(|entry| entry.authority != EvidenceAuthority::Model)
+                });
+                if decision.status == DecisionStatus::Accepted && !has_non_model_authority {
+                    decision.status = DecisionStatus::Proposed;
+                    outcome.needs_confirmation.push(decision.id.clone());
+                }
                 let id = decision.id.clone();
                 if next.decisions.get(&id) == Some(&decision) {
                     return Ok(outcome);

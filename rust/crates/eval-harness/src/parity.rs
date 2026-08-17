@@ -64,6 +64,16 @@ pub enum AdapterConfig {
     Command(CommandAdapterConfig),
     AosHttp(AosHttpAdapterConfig),
     CodexCli(CodexCliAdapterConfig),
+    Recorded(RecordedAdapterConfig),
+}
+
+/// Deterministic adapter outcomes exported from an explicitly reviewed trace
+/// fixture. This mode exercises the complete parity/blinding pipeline without
+/// network access; it never assigns or manufactures a correctness score.
+#[derive(Debug, Clone)]
+pub struct RecordedAdapterConfig {
+    pub model: String,
+    pub outcomes: BTreeMap<String, AdapterOutcome>,
 }
 
 #[derive(Debug, Clone)]
@@ -305,7 +315,25 @@ async fn run_adapter(
             run_aos_http_adapter(config, case, seed, repetition).await
         }
         AdapterConfig::CodexCli(config) => run_codex_cli_adapter(config, case).await,
+        AdapterConfig::Recorded(config) => config
+            .outcomes
+            .get(&recorded_outcome_key(&case.case_id, repetition))
+            .cloned()
+            .unwrap_or_else(|| AdapterOutcome {
+                completed: false,
+                answer: String::new(),
+                raw_trace: String::new(),
+                elapsed_ms: 0,
+                error: Some(format!(
+                    "recorded adapter {} has no outcome for {} repetition {}",
+                    config.model, case.case_id, repetition
+                )),
+            }),
     }
+}
+
+fn recorded_outcome_key(case_id: &str, repetition: usize) -> String {
+    format!("{case_id}#{repetition}")
 }
 
 async fn run_codex_cli_adapter(
@@ -723,8 +751,9 @@ mod tests {
 
     #[test]
     fn checked_in_manifest_expands_to_the_required_180_cases() {
-        let path = Path::new("../../../eval/datasets/super-assistant-parity-180.json");
-        let dataset = load_parity_dataset(path).expect("parity dataset should load");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../eval/datasets/super-assistant-parity-180.json");
+        let dataset = load_parity_dataset(&path).expect("parity dataset should load");
         let cases = expand_parity_cases(&dataset).expect("parity dataset should expand");
 
         assert_eq!(cases.len(), 180);
@@ -741,6 +770,79 @@ mod tests {
                 ("web".to_string(), 20),
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn real_parity_runner_persists_traces_and_pending_blind_review() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../eval/datasets/super-assistant-parity-180.json");
+        let dataset = load_parity_dataset(&path).expect("parity dataset should load");
+        let cases = expand_parity_cases(&dataset).expect("parity dataset should expand");
+        let recorded = |source: &str| {
+            cases
+                .iter()
+                .flat_map(|case| {
+                    (1..=dataset.repetitions).map(move |repetition| {
+                        (
+                            recorded_outcome_key(&case.case_id, repetition),
+                            AdapterOutcome {
+                                completed: true,
+                                answer: format!("{source} answer for {}", case.case_id),
+                                raw_trace: format!(
+                                    "recorded {source} trace for {} repetition {repetition}",
+                                    case.case_id
+                                ),
+                                elapsed_ms: repetition as u64,
+                                error: None,
+                            },
+                        )
+                    })
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let output_root = std::env::temp_dir().join(format!(
+            "aos-real-parity-runner-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let summary = run_real_parity(
+            &dataset,
+            &ParityRunConfig {
+                aos: AdapterConfig::Recorded(RecordedAdapterConfig {
+                    model: "recorded-aos".into(),
+                    outcomes: recorded("aos"),
+                }),
+                codex: AdapterConfig::Recorded(RecordedAdapterConfig {
+                    model: "recorded-codex".into(),
+                    outcomes: recorded("codex"),
+                }),
+                output_root: output_root.clone(),
+            },
+        )
+        .await
+        .expect("recorded parity run");
+        assert_eq!(summary.case_count, 180);
+        assert_eq!(summary.attempted_adapter_runs, 1_080);
+        assert_eq!(summary.completed_adapter_runs, 1_080);
+        assert_eq!(summary.failed_adapter_runs, 0);
+        assert_eq!(summary.correctness_status, "pending_blind_review");
+
+        let output = PathBuf::from(&summary.output_directory);
+        let blind_review: Value = serde_json::from_slice(
+            &std::fs::read(output.join("blind-review.json")).expect("blind review"),
+        )
+        .unwrap();
+        let blind_key: Value = serde_json::from_slice(
+            &std::fs::read(output.join("blind-key.json")).expect("blind key"),
+        )
+        .unwrap();
+        assert_eq!(blind_review.as_array().map(Vec::len), Some(540));
+        assert_eq!(blind_key.as_array().map(Vec::len), Some(540));
+        assert!(output.join("raw/aos").read_dir().unwrap().count() >= 180);
+        assert!(output.join("raw/codex").read_dir().unwrap().count() >= 180);
+        std::fs::remove_dir_all(output_root).unwrap();
     }
 
     #[test]

@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use telemetry::SessionTracer;
 
 use crate::compact::{
@@ -12,7 +14,8 @@ use crate::compact::{
 use crate::config::RuntimeFeatureConfig;
 use crate::execution_kernel::{
     AgentExecutionKernel, RuntimeApprovalDecision, RuntimeApprovalRequest,
-    RuntimeApprovalResolution, RuntimeContextManifestInput, RuntimeModelBudgetStage,
+    RuntimeApprovalResolution, RuntimeContextManifestInput, RuntimeContextSupplement,
+    RuntimeContextSupplementRequest, RuntimeModelBudgetStage, RuntimeToolContract,
     RuntimeToolIntent, RuntimeToolOutcome, RuntimeToolOutcomeKind, RuntimeTurnStart,
     RuntimeTurnTerminalStatus,
 };
@@ -21,13 +24,288 @@ use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session, SessionTurnStatus};
-use crate::token_estimator::{estimate_session_tokens, estimate_text_tokens};
+use crate::token_estimator::{
+    estimate_message_tokens, estimate_session_tokens, estimate_text_tokens,
+};
 use crate::trident::{trident_compact_session, TridentConfig};
 use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
 const TRIDENT_COMPACTION_ENV_VAR: &str = "AOS_RUNTIME_TRIDENT_COMPACTION";
+const CONTEXT_COMPILER_MAX_TOKENS_ENV_VAR: &str = "AOS_CONTEXT_COMPILER_MAX_TOKENS";
+static PROVIDER_REQUEST_GROUP_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn context_compiler_max_tokens() -> u64 {
+    std::env::var(CONTEXT_COMPILER_MAX_TOKENS_ENV_VAR)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(131_072)
+        .clamp(1_024, 1_048_576)
+}
+
+#[derive(Debug)]
+struct CompiledModelVisibleRequest {
+    system_prompt: Vec<String>,
+    messages: Vec<ConversationMessage>,
+    context_packet: semantic_core::ContextPacket,
+}
+
+fn message_context_block(
+    index: usize,
+    message: &ConversationMessage,
+    current_user_index: Option<usize>,
+) -> semantic_core::ContextBlock {
+    let is_current_user = current_user_index == Some(index);
+    semantic_core::ContextBlock {
+        block_id: format!("message:{index}"),
+        source: if is_current_user {
+            "current_user_request".to_string()
+        } else {
+            "recent_interaction".to_string()
+        },
+        content: serde_json::to_string(message).unwrap_or_else(|_| format!("message:{index}")),
+        tokens: estimate_message_tokens(message) as u64,
+        truncated: false,
+        source_hash: hex::encode(Sha256::digest(
+            serde_json::to_vec(message).unwrap_or_default(),
+        )),
+        policy_version: "context-compiler-v2".to_string(),
+        layer: if is_current_user {
+            semantic_core::PromptLayer::TaskPacket
+        } else {
+            semantic_core::PromptLayer::RecentInteraction
+        },
+        selection_reason: if is_current_user {
+            "latest user objective is mandatory".into()
+        } else {
+            "recent interaction selected within remaining budget".into()
+        },
+        trust: semantic_core::ContextTrust::UntrustedData,
+    }
+}
+
+fn compile_model_visible_context_with_budget(
+    system_prompt: Vec<String>,
+    messages: Vec<ConversationMessage>,
+    supplement: RuntimeContextSupplement,
+    max_tokens: u64,
+) -> Result<CompiledModelVisibleRequest, RuntimeError> {
+    let current_user_index = messages
+        .iter()
+        .rposition(|message| matches!(message.role, MessageRole::User));
+    let mut blocks =
+        Vec::with_capacity(system_prompt.len() + messages.len() + supplement.blocks.len());
+    for (index, section) in system_prompt.iter().enumerate() {
+        blocks.push(semantic_core::ContextBlock {
+            block_id: format!("system:{index}"),
+            source: "stable_system".to_string(),
+            content: section.clone(),
+            tokens: estimate_text_tokens(section) as u64,
+            truncated: false,
+            source_hash: hex::encode(Sha256::digest(section.as_bytes())),
+            policy_version: "context-compiler-v2".to_string(),
+            layer: if index == 0 {
+                semantic_core::PromptLayer::StableSystem
+            } else {
+                semantic_core::PromptLayer::DomainContract
+            },
+            selection_reason: if index == 0 {
+                "stable system authority is mandatory".into()
+            } else {
+                "domain/runtime contract is mandatory".into()
+            },
+            trust: semantic_core::ContextTrust::Instruction,
+        });
+    }
+    for (index, message) in messages.iter().enumerate() {
+        blocks.push(message_context_block(index, message, current_user_index));
+    }
+    blocks.extend(supplement.blocks.iter().cloned());
+    let packet = semantic_core::ContextCompiler::default()
+        .compile_for_model(
+            semantic_core::ContextSelection {
+                objective: "provider request".to_string(),
+                envelope: supplement.envelope.clone(),
+                blocks,
+            },
+            max_tokens,
+        )
+        .map_err(|error| {
+            RuntimeError::new(format!("context compiler rejected request: {error}"))
+        })?;
+    let selected = packet
+        .blocks
+        .iter()
+        .map(|block| block.block_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let sections = system_prompt
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, section)| {
+            selected
+                .contains(format!("system:{index}").as_str())
+                .then_some(section)
+        })
+        .collect::<Vec<_>>();
+    let selected_supplemental = supplement
+        .blocks
+        .iter()
+        .filter(|block| selected.contains(block.block_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut selected_messages = messages
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            selected
+                .contains(format!("message:{index}").as_str())
+                .then_some((index, message))
+        })
+        .collect::<Vec<_>>();
+    // ToolUse/ToolResult is a transaction boundary: budget selection may keep
+    // both halves or neither, but never expose a dangling protocol frame.
+    let selected_tool_uses = selected_messages
+        .iter()
+        .flat_map(|(_, message)| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let selected_tool_results = selected_messages
+        .iter()
+        .flat_map(|(_, message)| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let complete_tool_transactions = selected_tool_uses
+        .intersection(&selected_tool_results)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for (_, message) in &mut selected_messages {
+        message.blocks.retain(|block| match block {
+            ContentBlock::ToolResult { tool_use_id, .. } => {
+                complete_tool_transactions.contains(tool_use_id)
+            }
+            ContentBlock::ToolUse { id, .. } => complete_tool_transactions.contains(id),
+            _ => true,
+        });
+    }
+    selected_messages.retain(|(_, message)| !message.blocks.is_empty());
+    let mut exact_blocks = Vec::new();
+    for (index, section) in sections.iter().enumerate() {
+        exact_blocks.push(semantic_core::ContextBlock {
+            block_id: format!("compiled-system:{index}"),
+            source: if index == 0 {
+                "stable_system".into()
+            } else {
+                "domain_contract".into()
+            },
+            content: section.clone(),
+            tokens: estimate_text_tokens(section) as u64,
+            truncated: false,
+            source_hash: hex::encode(Sha256::digest(section.as_bytes())),
+            policy_version: "context-compiler-v2".into(),
+            layer: if index == 0 {
+                semantic_core::PromptLayer::StableSystem
+            } else {
+                semantic_core::PromptLayer::DomainContract
+            },
+            selection_reason: "selected model-visible instruction section".into(),
+            trust: semantic_core::ContextTrust::Instruction,
+        });
+    }
+
+    // Governed state, Memory, Evidence, and Artifact excerpts are data. They
+    // must never be promoted into the provider's system channel. Insert one
+    // explicit data message immediately before the latest user objective so
+    // the user request remains the final instruction-bearing message.
+    let data_message = (!selected_supplemental.is_empty()).then(|| ConversationMessage {
+        role: MessageRole::User,
+        blocks: selected_supplemental
+            .iter()
+            .map(|block| ContentBlock::Text {
+                text: block.content.clone(),
+            })
+            .collect(),
+        thinking: None,
+        thinking_signature: None,
+        usage: None,
+    });
+    let insertion_index = selected_messages
+        .iter()
+        .position(|(index, _)| Some(*index) == current_user_index)
+        .unwrap_or(0);
+    let mut provider_messages =
+        Vec::with_capacity(selected_messages.len() + usize::from(data_message.is_some()));
+    for (position, (index, message)) in selected_messages.into_iter().enumerate() {
+        if position == insertion_index {
+            if let Some(data_message) = data_message.as_ref() {
+                provider_messages.push(data_message.clone());
+                exact_blocks.extend(selected_supplemental.iter().cloned());
+            }
+        }
+        exact_blocks.push(message_context_block(index, &message, current_user_index));
+        provider_messages.push(message);
+    }
+    if provider_messages.is_empty() {
+        if let Some(data_message) = data_message {
+            provider_messages.push(data_message);
+            exact_blocks.extend(selected_supplemental);
+        }
+    }
+    let mut envelope = packet.envelope;
+    envelope.recent_messages = exact_blocks
+        .iter()
+        .filter(|block| {
+            matches!(
+                block.source.as_str(),
+                "recent_interaction" | "current_user_request"
+            )
+        })
+        .map(|block| semantic_core::ContextReference {
+            id: block.block_id.clone(),
+            version: None,
+            content_hash: block.source_hash.clone(),
+        })
+        .collect();
+    let mut context_packet = semantic_core::ContextCompiler::default()
+        .compile(
+            semantic_core::ContextSelection {
+                objective: packet.objective,
+                envelope,
+                blocks: exact_blocks,
+            },
+            max_tokens,
+        )
+        .map_err(|error| {
+            RuntimeError::new(format!("context compiler rejected request: {error}"))
+        })?;
+    context_packet.manifest.snapshot_version = supplement.semantic_snapshot_version;
+    Ok(CompiledModelVisibleRequest {
+        system_prompt: sections,
+        messages: provider_messages,
+        context_packet,
+    })
+}
+
+#[cfg(test)]
+fn compile_model_visible_request_with_budget(
+    system_prompt: Vec<String>,
+    messages: Vec<ConversationMessage>,
+    max_tokens: u64,
+) -> Result<(Vec<String>, Vec<ConversationMessage>), RuntimeError> {
+    let compiled = compile_model_visible_context_with_budget(
+        system_prompt,
+        messages,
+        RuntimeContextSupplement::default(),
+        max_tokens,
+    )?;
+    Ok((compiled.system_prompt, compiled.messages))
+}
 
 fn should_auto_compact(
     input_tokens_since_compaction: u32,
@@ -48,6 +326,41 @@ fn stale_tool_alias_is_allowed(client: &impl ApiClient, tool_name: &str) -> bool
 pub struct ApiRequest {
     pub system_prompt: Vec<String>,
     pub messages: Vec<ConversationMessage>,
+    /// Stable identity carried through provider retargeting, native-search
+    /// fallbacks and output-budget retries. The gateway persists every final
+    /// wire attempt against this root before network dispatch.
+    pub trace: ProviderRequestTrace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderRequestTrace {
+    pub turn_id: Option<String>,
+    pub iteration: Option<usize>,
+    pub request_group_id: String,
+    pub context_manifest_key: Option<String>,
+}
+
+impl ProviderRequestTrace {
+    #[must_use]
+    pub fn turn(turn_id: &str, iteration: usize) -> Self {
+        Self {
+            turn_id: Some(turn_id.to_string()),
+            iteration: Some(iteration),
+            request_group_id: format!("turn:{turn_id}:iteration:{iteration}"),
+            context_manifest_key: Some(format!("{turn_id}:{iteration}")),
+        }
+    }
+
+    #[must_use]
+    pub fn background(label: &str) -> Self {
+        let sequence = PROVIDER_REQUEST_GROUP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        Self {
+            turn_id: None,
+            iteration: None,
+            request_group_id: format!("background:{label}:{sequence}"),
+            context_manifest_key: None,
+        }
+    }
 }
 
 /// Streamed events emitted while processing a single assistant turn.
@@ -84,6 +397,16 @@ pub struct PromptCacheEvent {
 /// Minimal streaming API contract required by [`ConversationRuntime`].
 #[::async_trait::async_trait]
 pub trait ApiClient: Send + Sync {
+    /// Model-specific prompt variant selected by the production registry.
+    /// Its sections are authoritative input, not audit-only metadata.
+    fn prompt_variant(&self) -> Option<agent_protocol::PromptVariant> {
+        None
+    }
+
+    fn context_domain(&self) -> String {
+        "general".into()
+    }
+
     /// Provider/model identifier and currently exposed tools for the durable
     /// prompt manifest. Generic clients may omit both.
     fn model_version(&self) -> Option<String> {
@@ -92,6 +415,12 @@ pub trait ApiClient: Send + Sync {
 
     fn active_tool_names(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Effective provider context window. The compiler reserves headroom for
+    /// tool schemas and output before constructing the actual request.
+    fn context_window_tokens(&self) -> Option<u64> {
+        None
     }
 
     /// Apply a per-iteration request policy before the next model call.
@@ -153,9 +482,40 @@ pub trait ApiClient: Send + Sync {
     }
 }
 
+fn latest_user_objective(messages: &[ConversationMessage]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|message| matches!(message.role, MessageRole::User))
+        .map(|message| {
+            message
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "continue current turn".into())
+}
+
 /// Trait implemented by tool dispatchers that execute model-requested tools.
 pub trait ToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError>;
+
+    fn tool_contract(&self, _tool_name: &str) -> Option<RuntimeToolContract> {
+        None
+    }
+
+    /// Production registries opt into fail-closed contract enforcement. Test
+    /// and compatibility executors remain explicit about not providing the
+    /// production tool surface.
+    fn requires_tool_contracts(&self) -> bool {
+        false
+    }
 
     /// Execute a tool with support for durable, externally-completed calls.
     ///
@@ -179,6 +539,25 @@ pub trait ToolExecutor {
             .map(|request| self.execute(&request.tool_name, &request.input))
             .collect()
     }
+}
+
+fn resolve_executor_tool_contract<E: ToolExecutor>(
+    executor: &E,
+    tool_name: &str,
+) -> Result<RuntimeToolContract, RuntimeError> {
+    let contract = match executor.tool_contract(tool_name) {
+        Some(contract) => contract,
+        None if !executor.requires_tool_contracts() => {
+            RuntimeToolContract::test_read_only(tool_name)
+        }
+        None => {
+            return Err(RuntimeError::new(format!(
+                "tool `{tool_name}` is unavailable because its production lifecycle contract is missing"
+            )))
+        }
+    };
+    contract.validate(tool_name)?;
+    Ok(contract)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,6 +634,7 @@ struct PreparedToolUse {
     effective_input: String,
     pre_hook_result: HookRunResult,
     permission_outcome: PermissionOutcome,
+    contract: RuntimeToolContract,
 }
 
 enum PreparedToolExecution {
@@ -265,6 +645,7 @@ enum PreparedToolExecution {
 impl PreparedToolUse {
     fn is_allowed_parallel<E: ToolExecutor>(&self, executor: &E) -> bool {
         matches!(self.permission_outcome, PermissionOutcome::Allow)
+            && self.contract.can_parallel
             && executor.supports_parallel_tool_calls(&self.tool_name)
     }
 }
@@ -356,17 +737,26 @@ pub struct AutoCompactionEvent {
     pub retained_tail: Vec<ConversationMessage>,
 }
 
-/// Injection seam for the "extract → persist → compact" closure (先持久化再压缩).
+/// Durable preparation returned by a [`CompactionHook`].  The opaque id binds
+/// the pure source window to the eventual commit/abort decision without making
+/// the runtime depend on a storage implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedCompaction {
+    pub transaction_id: String,
+    pub replacement_summary: Option<String>,
+}
+
+/// Injection seam for the transactional compaction coordinator.
 ///
 /// `conversation.rs` lives in the `runtime` crate and must not depend on the
 /// `web-server` crate where the memory / persistence orchestration
 /// (`orchestrate_compaction` / `extract_key_info` / `persist_key_info`) lives.
 /// Higher layers implement this trait and inject it via
 /// [`ConversationRuntime::with_compaction_hook`] so that, when the runtime's
-/// auto-compaction trigger fires, key information is extracted from the
-/// soon-to-be-discarded window and persisted to durable storage **before**
-/// compaction commits, and pinned items are protected in the retained summary
-/// (Req 4.1 / 4.3 / 4.9).
+/// auto-compaction trigger fires, the source and derived candidates are first
+/// prepared without changing projections.  Only after the runtime validates
+/// the replacement boundary and growth invariant may the hook atomically
+/// commit Memory, cursor, exact archive, checkpoint and Ledger projections.
 ///
 /// Reuse-first: the runtime never reimplements memory or persistence — it only
 /// exposes this strategy point and reuses [`compact_session`] /
@@ -380,31 +770,37 @@ pub trait CompactionHook: Send + Sync {
         None
     }
 
-    /// Called once the compaction window has been discovered (via a pure,
-    /// non-committing [`compact_session`] pass) but **before** the compacted
-    /// session is committed.
+    /// Prepare a stable compaction transaction after a pure window-discovery
+    /// pass. Implementations must not mutate Memory/cursors or publish a
+    /// checkpoint here; only an opaque `prepared` row is permitted.
     ///
     /// * `archived_messages` — the verbatim messages slated for removal.
     /// * `default_summary` — the runtime's heuristic summary for that window.
     ///
-    /// Implementations may persist extracted key info as a side effect and
-    /// return an optional replacement summary (for example, one augmented to
-    /// retain pinned items verbatim). Returning `Ok(None)` keeps
-    /// `default_summary` and the default heuristic compaction.
-    ///
-    /// Implementations SHOULD prefer to swallow best-effort persistence errors
-    /// internally (returning `Ok`) so a transient memory outage does not disturb
-    /// compaction. When an implementation does surface an `Err`, the runtime
-    /// treats the in-turn compaction as failed and **degrades gracefully**: it
-    /// records the error to the session trace and continues the current turn
-    /// with the *uncompacted* context (as if `Ok(None)` had been returned)
-    /// rather than aborting the turn (Req 1.7). Only unrecoverable session
-    /// persistence (disk) IO retains abort semantics.
-    async fn before_compaction(
+    async fn prepare_compaction(
         &self,
         archived_messages: &[ConversationMessage],
         default_summary: &str,
-    ) -> Result<Option<String>, RuntimeError>;
+        trigger: &str,
+    ) -> Result<PreparedCompaction, RuntimeError>;
+
+    /// Atomically publish every durable side effect for a validated
+    /// replacement. Returning success is the commit point after which the
+    /// runtime may replace its in-memory Session.
+    async fn commit_compaction(
+        &self,
+        prepared: &PreparedCompaction,
+        result: &CompactionResult,
+        trigger: &str,
+    ) -> Result<(), RuntimeError>;
+
+    /// Mark a prepared transaction aborted. This method must never create
+    /// Memory/cursor/checkpoint side effects.
+    async fn abort_compaction(
+        &self,
+        prepared: &PreparedCompaction,
+        reason: &str,
+    ) -> Result<(), RuntimeError>;
 }
 
 /// Coordinates the model loop, tool execution, hooks, and session updates.
@@ -605,6 +1001,35 @@ where
 
     pub fn set_execution_kernel(&mut self, kernel: Option<Arc<dyn AgentExecutionKernel>>) {
         self.execution_kernel = kernel;
+    }
+
+    /// Append a message produced by an external orchestrator while preserving
+    /// the execution ledger as the recovery authority.
+    pub async fn append_visible_message(
+        &mut self,
+        message: ConversationMessage,
+    ) -> Result<(), RuntimeError> {
+        let mut projected_session = self.session.clone();
+        projected_session
+            .push_message(message.clone())
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let kernel = self.execution_kernel.clone().ok_or_else(|| {
+            RuntimeError::new(
+                "cannot append an external visible message without a durable execution kernel",
+            )
+        })?;
+        let message_payload = serde_json::to_vec(&message).map_err(|error| {
+            RuntimeError::new(format!("cannot serialize visible message: {error}"))
+        })?;
+        let message_id = format!(
+            "{}:{}:{}",
+            self.session.session_id,
+            self.session.messages.len(),
+            hex::encode(Sha256::digest(message_payload))
+        );
+        kernel.record_visible_message(&message_id, &message).await?;
+        self.session = projected_session;
+        Ok(())
     }
 
     fn run_pre_tool_use_hook(&mut self, tool_name: &str, input: &str) -> HookRunResult {
@@ -964,12 +1389,14 @@ where
                     self.permission_policy
                         .authorize_approved(&tool_name, &effective_input)
                 };
+            let contract = resolve_executor_tool_contract(&self.tool_executor, &tool_name)?;
             let prepared = PreparedToolUse {
                 tool_use_id,
                 tool_name,
                 effective_input,
                 pre_hook_result,
                 permission_outcome,
+                contract,
             };
             match self
                 .execute_prepared_tool_use_outcome(&turn.turn_id, 0, &prepared, &mut reporter)
@@ -1219,8 +1646,41 @@ where
             .map_err(|error| RuntimeError::new(error.to_string()))
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn continue_resumable_turn<R: RuntimeEventReporter>(
+        &mut self,
+        turn_id: &str,
+        prompter: Option<&mut (dyn PermissionPrompter + Send)>,
+        reporter: &mut R,
+        accumulator: TurnAccumulator,
+    ) -> Result<ResumableTurnOutcome, RuntimeError> {
+        match self
+            .continue_resumable_turn_inner(turn_id, prompter, reporter, accumulator)
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                self.record_turn_failed(0, &error);
+                self.complete_session_turn(turn_id, SessionTurnStatus::Failed);
+                let detail = error.to_string();
+                if let Err(terminal_error) = self
+                    .finish_turn_in_kernel(
+                        turn_id,
+                        RuntimeTurnTerminalStatus::Failed,
+                        Some(&detail),
+                    )
+                    .await
+                {
+                    return Err(RuntimeError::new(format!(
+                        "{error}; durable failed-turn commit also failed: {terminal_error}"
+                    )));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn continue_resumable_turn_inner<R: RuntimeEventReporter>(
         &mut self,
         turn_id: &str,
         mut prompter: Option<&mut (dyn PermissionPrompter + Send)>,
@@ -1276,9 +1736,75 @@ where
                         .join(", ")
                 ));
             }
-            let request = ApiRequest {
+            let prompt_variant = self.api_client.prompt_variant();
+            if let Some(variant) = prompt_variant.as_ref() {
+                if !variant.stable_system.trim().is_empty()
+                    && !system_prompt
+                        .iter()
+                        .any(|value| value == &variant.stable_system)
+                {
+                    system_prompt.insert(0, variant.stable_system.clone());
+                }
+                if !variant.domain_contract.trim().is_empty()
+                    && !system_prompt
+                        .iter()
+                        .any(|value| value == &variant.domain_contract)
+                {
+                    system_prompt.push(variant.domain_contract.clone());
+                }
+            }
+            let hard_input_budget = self
+                .api_client
+                .context_window_tokens()
+                .map(|window| window.saturating_mul(65) / 100)
+                .unwrap_or_else(context_compiler_max_tokens)
+                .min(context_compiler_max_tokens())
+                .max(1);
+            let active_tools = self.api_client.active_tool_names();
+            let model_version = self.api_client.model_version();
+            let objective = latest_user_objective(&request_messages);
+            let domain = self.api_client.context_domain();
+            let supplement = match self.execution_kernel.clone() {
+                Some(kernel) => kernel
+                    .load_context_supplement(RuntimeContextSupplementRequest {
+                        turn_id: turn_id.to_string(),
+                        iteration: accumulator.iterations,
+                        objective,
+                        domain,
+                        max_input_tokens: hard_input_budget,
+                        model_version: model_version.clone(),
+                        active_tools: active_tools.clone(),
+                    })
+                    .await
+                    .map_err(|error| {
+                        self.complete_session_turn(turn_id, SessionTurnStatus::Failed);
+                        RuntimeError::new(format!(
+                            "failed to compile governed semantic context: {error}"
+                        ))
+                    })?,
+                None => RuntimeContextSupplement::default(),
+            };
+            let compiled = compile_model_visible_context_with_budget(
                 system_prompt,
-                messages: request_messages,
+                request_messages,
+                supplement,
+                hard_input_budget,
+            )?;
+            let prompt_manifest = prompt_variant.as_ref().map(|variant| {
+                let tool_schema_hash = hex::encode(Sha256::digest(
+                    serde_json::to_vec(&active_tools).unwrap_or_default(),
+                ));
+                agent_protocol::PromptRegistry::manifest(
+                    variant,
+                    &tool_schema_hash,
+                    hard_input_budget,
+                    16_384,
+                )
+            });
+            let request = ApiRequest {
+                system_prompt: compiled.system_prompt,
+                messages: compiled.messages,
+                trace: ProviderRequestTrace::turn(turn_id, accumulator.iterations),
             };
             if let Some(kernel) = self.execution_kernel.clone() {
                 kernel
@@ -1286,6 +1812,7 @@ where
                         turn_id: turn_id.to_string(),
                         iteration: accumulator.iterations,
                         budget_stage,
+                        max_input_tokens: hard_input_budget,
                         estimated_tokens: request
                             .messages
                             .iter()
@@ -1298,9 +1825,14 @@ where
                                 .sum::<usize>(),
                         system_sections: request.system_prompt.clone(),
                         messages: request.messages.clone(),
-                        model_version: self.api_client.model_version(),
-                        active_tools: self.api_client.active_tool_names(),
-                        semantic_snapshot_version: None,
+                        model_version,
+                        active_tools,
+                        semantic_snapshot_version: compiled
+                            .context_packet
+                            .manifest
+                            .snapshot_version,
+                        context_packet: compiled.context_packet,
+                        prompt_manifest,
                     })
                     .await
                     .map_err(|error| {
@@ -1456,12 +1988,14 @@ where
                     )
                 };
 
+                let contract = resolve_executor_tool_contract(&self.tool_executor, &tool_name)?;
                 prepared_tool_uses.push(PreparedToolUse {
                     tool_use_id,
                     tool_name,
                     effective_input,
                     pre_hook_result,
                     permission_outcome,
+                    contract,
                 });
             }
 
@@ -1596,6 +2130,88 @@ where
     #[must_use]
     pub fn compact(&self, config: CompactionConfig) -> CompactionResult {
         compact_runtime_session(&self.session, config)
+    }
+
+    /// Run every compaction trigger through the same two-phase coordinator.
+    /// Preparation may persist only an opaque transaction. The candidate is
+    /// then checked against the exact discovered window and the growth guard;
+    /// durable side effects commit before the in-memory Session is replaced.
+    pub async fn compact_transactionally(
+        &mut self,
+        config: CompactionConfig,
+        trigger: &str,
+        summary_override: Option<String>,
+    ) -> Result<Option<CompactionResult>, RuntimeError> {
+        let baseline = compact_session(&self.session, config);
+        if baseline.removed_message_count == 0 {
+            return Ok(None);
+        }
+        let requested_summary = summary_override.unwrap_or_else(|| baseline.summary.clone());
+        let hook = self.compaction_hook.clone();
+        let prepared = match hook.as_ref() {
+            Some(hook) => Some(
+                hook.prepare_compaction(&baseline.archived_messages, &requested_summary, trigger)
+                    .await?,
+            ),
+            None => None,
+        };
+        let replacement_summary = prepared
+            .as_ref()
+            .and_then(|item| item.replacement_summary.clone())
+            .unwrap_or(requested_summary);
+        let result = compact_session_with_summary(&self.session, config, replacement_summary);
+
+        let abort = |reason: String| async {
+            if let (Some(hook), Some(prepared)) = (hook.as_ref(), prepared.as_ref()) {
+                hook.abort_compaction(prepared, &reason).await?;
+            }
+            Err(RuntimeError::new(reason))
+        };
+        if result.archived_messages != baseline.archived_messages
+            || result.removed_message_count != baseline.removed_message_count
+        {
+            return abort("compaction source window changed after preparation".to_string()).await;
+        }
+        let source_tokens = result
+            .archived_messages
+            .iter()
+            .map(crate::token_estimator::estimate_message_tokens)
+            .sum::<usize>();
+        let replacement_tokens = result
+            .compacted_session
+            .messages
+            .first()
+            .map(crate::token_estimator::estimate_message_tokens)
+            .unwrap_or_default();
+        if replacement_tokens >= source_tokens {
+            return abort(format!(
+                "framed compaction replacement was not smaller than its source window ({replacement_tokens} >= {source_tokens})"
+            ))
+            .await;
+        }
+
+        if let (Some(hook), Some(prepared)) = (hook.as_ref(), prepared.as_ref()) {
+            if let Err(error) = hook.commit_compaction(prepared, &result, trigger).await {
+                let _ = hook
+                    .abort_compaction(prepared, &format!("commit failed: {error}"))
+                    .await;
+                return Err(error);
+            }
+        } else if let Some(kernel) = self.execution_kernel.clone() {
+            kernel
+                .checkpoint_session(&format!("{trigger}_compaction"), &result.compacted_session)
+                .await?;
+        }
+
+        self.session = result.compacted_session.clone();
+        // JSONL is an export sink, not the recovery authority. A failed export
+        // must not roll back a compaction that already committed atomically.
+        if let Some(path) = self.session.persistence_path().map(ToOwned::to_owned) {
+            if let Err(error) = self.session.save_to_path(path) {
+                tracing::warn!(trigger, error = %error, "session JSONL export failed after durable compaction commit");
+            }
+        }
+        Ok(Some(result))
     }
 
     #[must_use]
@@ -1738,68 +2354,18 @@ where
             ..CompactionConfig::default()
         };
 
-        let result = if let Some(hook) = self.compaction_hook.clone() {
-            // Persist-then-compact: discover the exact window that will be
-            // removed via a pure, non-committing pass, hand it to the injected
-            // hook to extract + persist key info (and optionally return a
-            // pinned-augmented summary), then commit with the reused
-            // `compact_session_with_summary` engine so tail preservation and the
-            // verbatim archive boundary handling are not reimplemented here
-            // (Req 1.3 / 1.4). This mirrors the window discovery used by
-            // `compact_session_with_summary` (both build on `compact_session`),
-            // so the removed window stays consistent.
-            let baseline = compact_session(&self.session, config);
-            if baseline.removed_message_count == 0 {
+        let result = match self.compact_transactionally(config, "auto", None).await {
+            Ok(Some(result)) => result,
+            Ok(None) => {
                 self.last_auto_compaction_input_tokens = cumulative_input_tokens;
                 return Ok(None);
             }
-            // Failure downgrade (Req 1.7): the hook's "extract → persist" work
-            // (and any pinned-augmented summary it produces) is best-effort. If
-            // it surfaces an error, the in-turn compaction is treated as failed:
-            // we record the error to the session trace and continue this turn
-            // with the *uncompacted* context by returning `Ok(None)`, rather than
-            // aborting the turn. The reused `compact_session_with_summary` commit
-            // engine below is infallible, so the hook is the only fallible stage
-            // here; only session disk persistence (`save_to_path`) keeps `Err`
-            // abort semantics.
-            match hook
-                .before_compaction(&baseline.archived_messages, &baseline.summary)
-                .await
-            {
-                Ok(Some(summary)) => compact_session_with_summary(&self.session, config, summary),
-                Ok(None) => baseline,
-                Err(error) => {
-                    self.last_auto_compaction_input_tokens = cumulative_input_tokens;
-                    self.record_in_turn_compaction_failed(&error);
-                    return Ok(None);
-                }
+            Err(error) => {
+                self.last_auto_compaction_input_tokens = cumulative_input_tokens;
+                self.record_in_turn_compaction_failed(&error);
+                return Ok(None);
             }
-        } else {
-            compact_runtime_session(&self.session, config)
         };
-
-        if result.removed_message_count == 0 {
-            self.last_auto_compaction_input_tokens = cumulative_input_tokens;
-            return Ok(None);
-        }
-        let source_tokens = result
-            .archived_messages
-            .iter()
-            .map(crate::token_estimator::estimate_message_tokens)
-            .sum::<usize>();
-        let replacement_tokens = result
-            .compacted_session
-            .messages
-            .first()
-            .map(crate::token_estimator::estimate_message_tokens)
-            .unwrap_or_default();
-        if replacement_tokens >= source_tokens {
-            self.last_auto_compaction_input_tokens = cumulative_input_tokens;
-            self.record_in_turn_compaction_failed(&RuntimeError::new(format!(
-                "framed compaction replacement was not smaller than its source window ({replacement_tokens} >= {source_tokens})"
-            )));
-            return Ok(None);
-        }
 
         // Field-complete `session_compacted` payload (Req 1.5). All fields are
         // reused directly from the shared compaction engine's `CompactionResult`
@@ -1823,17 +2389,7 @@ where
             .collect();
         let archived_messages = result.archived_messages;
 
-        self.session = result.compacted_session;
         self.last_auto_compaction_input_tokens = cumulative_input_tokens;
-        // Unrecoverable session persistence (disk) IO retains abort semantics
-        // (Req 1.7): unlike hook/commit failures which degrade to "continue
-        // uncompacted", a failed session flush leaves durable state inconsistent,
-        // so we surface it as `Err` and let the turn loop abort.
-        if let Some(path) = self.session.persistence_path().map(ToOwned::to_owned) {
-            self.session
-                .save_to_path(path)
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
-        }
 
         // Emit exactly one field-complete `session_compacted` trace event per
         // committed compaction (Req 1.5). Because the turn loop calls this on
@@ -1970,6 +2526,7 @@ where
                     input: prepared.effective_input.clone(),
                     iteration,
                     request: request.clone(),
+                    contract: prepared.contract.clone(),
                 })
                 .await?;
             reporter.on_runtime_status(
@@ -2011,6 +2568,38 @@ where
                         ))
                     }
                     ToolExecutionOutcome::Deferred { metadata } => {
+                        if !prepared.contract.supports_deferred {
+                            let output = format!(
+                                "tool `{}` violated its lifecycle contract by returning deferred work",
+                                prepared.tool_name
+                            );
+                            let projected = self
+                                .finish_tool_in_kernel(RuntimeToolOutcome {
+                                    turn_id: turn_id.to_string(),
+                                    invocation_id: prepared.tool_use_id.clone(),
+                                    tool_name: prepared.tool_name.clone(),
+                                    input: prepared.effective_input.clone(),
+                                    output: output.clone(),
+                                    iteration,
+                                    outcome: RuntimeToolOutcomeKind::Failed,
+                                })
+                                .await?;
+                            reporter.on_tool_result(
+                                &prepared.tool_name,
+                                &prepared.effective_input,
+                                &output,
+                                true,
+                            );
+                            reporter.on_tool_use_end();
+                            return Ok(PreparedToolExecution::Completed(
+                                ConversationMessage::tool_result(
+                                    prepared.tool_use_id.clone(),
+                                    prepared.tool_name.clone(),
+                                    projected.model_output,
+                                    true,
+                                ),
+                            ));
+                        }
                         let _ = self
                             .finish_tool_in_kernel(RuntimeToolOutcome {
                                 turn_id: turn_id.to_string(),
@@ -2161,7 +2750,7 @@ where
             }
         };
         kernel
-            .authorize_tool(&RuntimeToolIntent::new(
+            .authorize_tool(&RuntimeToolIntent::new_with_contract(
                 turn_id,
                 &prepared.tool_use_id,
                 &prepared.tool_name,
@@ -2169,6 +2758,7 @@ where
                 iteration,
                 authorized,
                 denial_reason,
+                prepared.contract.clone(),
             ))
             .await
             .map_err(|error| {
@@ -2189,7 +2779,7 @@ where
             return Ok(());
         };
         kernel
-            .start_tool(&RuntimeToolIntent::new(
+            .start_tool(&RuntimeToolIntent::new_with_contract(
                 turn_id,
                 &prepared.tool_use_id,
                 &prepared.tool_name,
@@ -2197,6 +2787,7 @@ where
                 iteration,
                 true,
                 None,
+                prepared.contract.clone(),
             ))
             .await
             .map_err(|error| {
@@ -2224,7 +2815,19 @@ where
         detail: Option<&str>,
     ) -> Result<(), RuntimeError> {
         match self.execution_kernel.clone() {
-            Some(kernel) => kernel.finish_turn(turn_id, status, detail).await,
+            Some(kernel) => {
+                kernel.finish_turn(turn_id, status, detail).await?;
+                kernel
+                    .checkpoint_session("turn_terminal", &self.session)
+                    .await
+            }
+            None => Ok(()),
+        }
+    }
+
+    pub async fn checkpoint_session_in_kernel(&self, reason: &str) -> Result<(), RuntimeError> {
+        match self.execution_kernel.clone() {
+            Some(kernel) => kernel.checkpoint_session(reason, &self.session).await,
             None => Ok(()),
         }
     }
@@ -2932,18 +3535,20 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, message_tool_result, parse_auto_compaction_threshold,
-        should_auto_compact, ApiClient, ApiRequest, AssistantEvent, CompactionHook,
-        ConversationRuntime, DeferredApprovalDecision, DeferredToolResult, PromptCacheEvent,
-        ResumableTurnOutcome, RuntimeError, StaticToolExecutor, ToolExecutionOutcome,
-        ToolExecutionRequest, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        build_assistant_message, compile_model_visible_request_with_budget, message_tool_result,
+        parse_auto_compaction_threshold, should_auto_compact, ApiClient, ApiRequest,
+        AssistantEvent, CompactionHook, ConversationRuntime, DeferredApprovalDecision,
+        DeferredToolResult, PreparedCompaction, PromptCacheEvent, ResumableTurnOutcome,
+        RuntimeError, StaticToolExecutor, ToolExecutionOutcome, ToolExecutionRequest, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
-    use crate::compact::CompactionConfig;
+    use crate::compact::{CompactionConfig, CompactionResult};
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::execution_kernel::{
         AgentExecutionKernel, RuntimeApprovalDecision, RuntimeApprovalRequest,
-        RuntimeApprovalResolution, RuntimeContextManifestInput, RuntimeToolIntent,
-        RuntimeToolOutcome, RuntimeToolProjection, RuntimeTurnStart, RuntimeTurnTerminalStatus,
+        RuntimeApprovalResolution, RuntimeContextManifestInput, RuntimeToolContract,
+        RuntimeToolIntent, RuntimeToolOutcome, RuntimeToolProjection, RuntimeTurnStart,
+        RuntimeTurnTerminalStatus,
     };
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
@@ -2967,6 +3572,108 @@ mod tests {
     /// must still fail closed for a replacement that grows the context.
     fn compaction_fixture_text(label: &str) -> String {
         format!("{label}: {}", "important context ".repeat(48))
+    }
+
+    #[test]
+    fn context_compiler_changes_the_actual_provider_request() {
+        let (system, messages) = compile_model_visible_request_with_budget(
+            vec!["stable instructions".into()],
+            vec![
+                ConversationMessage::user_text("old request"),
+                ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "old answer".into(),
+                }]),
+                ConversationMessage::user_text("current request"),
+            ],
+            16,
+        )
+        .expect("request should fit after dropping old context");
+        assert_eq!(system, vec!["stable instructions"]);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0],
+            ConversationMessage::user_text("current request")
+        );
+    }
+
+    #[test]
+    fn context_compiler_never_emits_half_a_tool_transaction() {
+        let assistant_tool = ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+            id: "tool-1".into(),
+            name: "large_tool".into(),
+            input: "large input ".repeat(200),
+        }]);
+        let result =
+            ConversationMessage::tool_result("tool-1", "large_tool", "short result", false);
+        let (_, messages) = compile_model_visible_request_with_budget(
+            vec!["system".into()],
+            vec![
+                ConversationMessage::user_text("old request"),
+                assistant_tool,
+                result,
+                ConversationMessage::user_text("current request"),
+            ],
+            24,
+        )
+        .expect("request selection");
+        assert!(messages
+            .iter()
+            .all(|message| message.blocks.iter().all(|block| !matches!(
+                block,
+                ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
+            ))));
+        assert!(messages
+            .iter()
+            .any(|message| message == &ConversationMessage::user_text("current request")));
+    }
+
+    #[tokio::test]
+    async fn context_compiler_budget_controls_the_request_observed_by_provider() {
+        struct CapturingApi {
+            request: Arc<Mutex<Option<ApiRequest>>>,
+        }
+        #[::async_trait::async_trait]
+        impl ApiClient for CapturingApi {
+            fn context_window_tokens(&self) -> Option<u64> {
+                Some(96)
+            }
+            async fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                *self.request.lock().unwrap() = Some(request);
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".into()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+        let captured = Arc::new(Mutex::new(None));
+        let mut session = Session::new();
+        session
+            .messages
+            .push(ConversationMessage::user_text("old context ".repeat(120)));
+        session
+            .messages
+            .push(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "old answer ".repeat(120),
+            }]));
+        let mut runtime = ConversationRuntime::new(
+            session,
+            CapturingApi {
+                request: captured.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["stable system".into()],
+        );
+        runtime.run_turn("current request", None, ()).await.unwrap();
+        let request = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(request.system_prompt, vec!["stable system"]);
+        assert_eq!(
+            request.messages,
+            vec![ConversationMessage::user_text("current request")]
+        );
     }
 
     struct ScriptedApiClient {
@@ -3105,6 +3812,9 @@ mod tests {
         authorized: Vec<RuntimeToolIntent>,
         started: BTreeSet<String>,
         finished: Vec<RuntimeToolOutcome>,
+        visible_messages: Vec<(String, ConversationMessage)>,
+        visible_attempt_ids: Vec<String>,
+        reject_visible_message: bool,
     }
 
     struct ApprovalTestKernel {
@@ -3142,6 +3852,22 @@ mod tests {
             _iteration: usize,
             _message: &ConversationMessage,
         ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn record_visible_message(
+            &self,
+            message_id: &str,
+            message: &ConversationMessage,
+        ) -> Result<(), RuntimeError> {
+            let mut state = self.state.lock().unwrap();
+            state.visible_attempt_ids.push(message_id.to_string());
+            if state.reject_visible_message {
+                return Err(RuntimeError::new("durable visible message write failed"));
+            }
+            state
+                .visible_messages
+                .push((message_id.to_string(), message.clone()));
             Ok(())
         }
 
@@ -3208,6 +3934,56 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn external_visible_message_is_recorded_before_memory_and_retries_idempotently() {
+        struct NoopApi;
+
+        #[::async_trait::async_trait]
+        impl ApiClient for NoopApi {
+            async fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                unreachable!("visible-message append must not call the provider")
+            }
+        }
+
+        let kernel = Arc::new(ApprovalTestKernel::new());
+        kernel.state.lock().unwrap().reject_visible_message = true;
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::ReadOnly),
+            Vec::new(),
+        )
+        .with_execution_kernel(kernel.clone());
+        let user = ConversationMessage::user_text("background request");
+        let error = runtime
+            .append_visible_message(user.clone())
+            .await
+            .expect_err("a failed ledger write must block the in-memory projection");
+        assert!(error
+            .to_string()
+            .contains("durable visible message write failed"));
+        assert!(runtime.session().messages.is_empty());
+
+        kernel.state.lock().unwrap().reject_visible_message = false;
+        runtime.append_visible_message(user.clone()).await.unwrap();
+        let assistant = ConversationMessage::assistant(vec![ContentBlock::Text {
+            text: "background result".into(),
+        }]);
+        runtime
+            .append_visible_message(assistant.clone())
+            .await
+            .unwrap();
+        assert_eq!(runtime.session().messages, vec![user, assistant]);
+        let state = kernel.state.lock().unwrap();
+        assert_eq!(state.visible_messages.len(), 2);
+        assert_eq!(state.visible_attempt_ids[0], state.visible_attempt_ids[1]);
+        assert_ne!(state.visible_attempt_ids[1], state.visible_attempt_ids[2]);
+    }
+
     fn approval_runtime(
         executions: Arc<AtomicUsize>,
         kernel: Arc<ApprovalTestKernel>,
@@ -3263,10 +4039,11 @@ mod tests {
             .expect("approved turn should resume");
         assert!(matches!(outcome, ResumableTurnOutcome::Completed(_)));
         assert_eq!(executions.load(Ordering::SeqCst), 1);
-        let state = kernel.state.lock().unwrap();
-        assert_eq!(state.started.len(), 1);
-        assert_eq!(state.finished.len(), 1);
-        drop(state);
+        {
+            let state = kernel.state.lock().unwrap();
+            assert_eq!(state.started.len(), 1);
+            assert_eq!(state.finished.len(), 1);
+        }
 
         assert!(runtime
             .resume_turn_with_approval_decisions(
@@ -3461,6 +4238,14 @@ mod tests {
             Err(ToolError::new(format!(
                 "unexpected immediate tool: {tool_name}"
             )))
+        }
+
+        fn tool_contract(&self, tool_name: &str) -> Option<RuntimeToolContract> {
+            (tool_name == "deep_research_start").then(|| {
+                let mut contract = RuntimeToolContract::test_read_only(tool_name);
+                contract.supports_deferred = true;
+                contract
+            })
         }
 
         fn execute_outcome(&mut self, tool_name: &str, _input: &str) -> ToolExecutionOutcome {
@@ -3669,6 +4454,14 @@ mod tests {
             )))
         }
 
+        fn tool_contract(&self, tool_name: &str) -> Option<RuntimeToolContract> {
+            matches!(tool_name, "deep_research_start" | "nl2sql_analyze").then(|| {
+                let mut contract = RuntimeToolContract::test_read_only(tool_name);
+                contract.supports_deferred = true;
+                contract
+            })
+        }
+
         fn execute_outcome(&mut self, tool_name: &str, _input: &str) -> ToolExecutionOutcome {
             assert!(matches!(
                 tool_name,
@@ -3788,6 +4581,14 @@ mod tests {
     impl ToolExecutor for BatchRecordingToolExecutor {
         fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
             Ok(format!("{tool_name}:{input}"))
+        }
+
+        fn tool_contract(&self, tool_name: &str) -> Option<RuntimeToolContract> {
+            matches!(tool_name, "safe_read" | "safe_search" | "safe_memory").then(|| {
+                let mut contract = RuntimeToolContract::test_read_only(tool_name);
+                contract.can_parallel = true;
+                contract
+            })
         }
 
         fn supports_parallel_tool_calls(&self, tool_name: &str) -> bool {
@@ -4888,12 +5689,33 @@ mod tests {
         struct OversizedSummaryHook;
         #[::async_trait::async_trait]
         impl CompactionHook for OversizedSummaryHook {
-            async fn before_compaction(
+            async fn prepare_compaction(
                 &self,
                 _archived_messages: &[ConversationMessage],
                 _default_summary: &str,
-            ) -> Result<Option<String>, RuntimeError> {
-                Ok(Some("oversized replacement ".repeat(4_096)))
+                _trigger: &str,
+            ) -> Result<PreparedCompaction, RuntimeError> {
+                Ok(PreparedCompaction {
+                    transaction_id: "oversized".to_string(),
+                    replacement_summary: Some("oversized replacement ".repeat(4_096)),
+                })
+            }
+
+            async fn commit_compaction(
+                &self,
+                _prepared: &PreparedCompaction,
+                _result: &CompactionResult,
+                _trigger: &str,
+            ) -> Result<(), RuntimeError> {
+                Ok(())
+            }
+
+            async fn abort_compaction(
+                &self,
+                _prepared: &PreparedCompaction,
+                _reason: &str,
+            ) -> Result<(), RuntimeError> {
+                Ok(())
             }
         }
 
@@ -5507,12 +6329,30 @@ mod tests {
 
         #[::async_trait::async_trait]
         impl CompactionHook for FailingCompactionHook {
-            async fn before_compaction(
+            async fn prepare_compaction(
                 &self,
                 _archived_messages: &[ConversationMessage],
                 _default_summary: &str,
-            ) -> Result<Option<String>, RuntimeError> {
+                _trigger: &str,
+            ) -> Result<PreparedCompaction, RuntimeError> {
                 Err(RuntimeError::new(self.error_message.clone()))
+            }
+
+            async fn commit_compaction(
+                &self,
+                _prepared: &PreparedCompaction,
+                _result: &CompactionResult,
+                _trigger: &str,
+            ) -> Result<(), RuntimeError> {
+                Ok(())
+            }
+
+            async fn abort_compaction(
+                &self,
+                _prepared: &PreparedCompaction,
+                _reason: &str,
+            ) -> Result<(), RuntimeError> {
+                Ok(())
             }
         }
 
@@ -5849,15 +6689,15 @@ mod tests {
                     cache_read_input_tokens: 0,
                 });
                 if self.call_count <= 2 {
-                    Ok(vec![
-                        AssistantEvent::ToolUse {
-                            id: format!("tool-{}", self.call_count),
+                    let mut events = (0..8)
+                        .map(|tool_index| AssistantEvent::ToolUse {
+                            id: format!("tool-{}-{tool_index}", self.call_count),
                             name: "echo".to_string(),
-                            input: format!("payload-{}", self.call_count),
-                        },
-                        usage,
-                        AssistantEvent::MessageStop,
-                    ])
+                            input: format!("payload-{}-{tool_index}", self.call_count),
+                        })
+                        .collect::<Vec<_>>();
+                    events.extend([usage, AssistantEvent::MessageStop]);
+                    Ok(events)
                 } else {
                     Ok(vec![
                         AssistantEvent::TextDelta("done".to_string()),
@@ -5874,7 +6714,10 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(index, text)| {
-                    let text = compaction_fixture_text(text);
+                    // Keep the retained tail materially larger than the merged
+                    // summary so the second compaction also passes the growth
+                    // guard instead of being correctly rejected as lossy.
+                    let text = format!("{text}: {}", "important context ".repeat(256));
                     if index % 2 == 0 {
                         ConversationMessage::user_text(text)
                     } else {
@@ -5890,7 +6733,9 @@ mod tests {
 
             #[test]
             fn repeated_over_threshold_iterations_compact_more_than_once_and_continue(
-                contents in proptest::collection::vec("[a-z ]{1,24}", 8..24),
+                // Keep a sufficiently large source window after each compaction
+                // so the property can exercise two distinct in-turn passes.
+                contents in proptest::collection::vec("[a-z ]{1,24}", 12..24),
                 extra in 0u32..=100_000,
                 user_input in "[a-z ]{1,24}",
             ) {
@@ -5919,7 +6764,6 @@ mod tests {
                         .run_turn(user_input, None, ())
                         .await
                         .expect("each in-turn compaction must continue the turn");
-
                     prop_assert_eq!(
                         summary.iterations,
                         3,
@@ -5927,7 +6771,7 @@ mod tests {
                     );
                     prop_assert_eq!(
                         summary.tool_results.len(),
-                        2,
+                        16,
                         "tool calls after compaction must still execute"
                     );
 

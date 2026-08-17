@@ -1,11 +1,14 @@
 //! Analytics Semantic Compiler contracts.
 //!
-//! The web layer may still use the legacy SQL generator, but every new or
-//! repaired query can carry this IR and a deterministic verification result.
-//! A SQL string being parseable is deliberately not treated as semantic proof.
+//! Provider-backed SQL generation is downstream of this IR. Every new or
+//! repaired query must carry the same immutable intent into deterministic
+//! verification; a parseable SQL string is never semantic proof by itself.
 
 use serde::{Deserialize, Serialize};
-use sqlparser::ast::Statement;
+use sqlparser::ast::{
+    BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
+    Query, SelectItem, SetExpr, Statement,
+};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::BTreeSet;
@@ -83,9 +86,22 @@ pub struct PopulationDefinition {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SemanticFilter {
-    Equals { field: String, value: String },
-    In { field: String, values: Vec<String> },
-    RawBounded { expression: String },
+    Equals {
+        field: String,
+        value: String,
+    },
+    In {
+        field: String,
+        values: Vec<String>,
+    },
+    Compare {
+        field: String,
+        operator: String,
+        value: String,
+    },
+    RawBounded {
+        expression: String,
+    },
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimeSemantics {
@@ -171,6 +187,88 @@ pub enum MetricExpressionIR {
     },
     Literal(String),
 }
+
+/// Parse one metric expression into the canonical contract representation.
+/// The parser rejects statement injection and preserves complex, valid SQL as
+/// a literal expression rather than inventing semantics for syntax it cannot
+/// decompose deterministically.
+pub fn parse_metric_expression_ir(sql: &str) -> Result<MetricExpressionIR, String> {
+    let trimmed = sql.trim();
+    if trimmed.is_empty() {
+        return Err("metric expression is empty".into());
+    }
+    let wrapped = format!("SELECT {trimmed}");
+    let statements = Parser::parse_sql(&GenericDialect {}, &wrapped)
+        .map_err(|error| format!("invalid metric expression: {error}"))?;
+    if statements.len() != 1 {
+        return Err("metric expression must contain exactly one expression".into());
+    }
+    let Statement::Query(query) = &statements[0] else {
+        return Err("metric expression must be a SELECT expression".into());
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Err("metric expression cannot contain set operations".into());
+    };
+    if select.projection.len() != 1 || !select.from.is_empty() || select.selection.is_some() {
+        return Err("metric expression cannot contain a query body".into());
+    }
+    let expression = match &select.projection[0] {
+        SelectItem::UnnamedExpr(expression)
+        | SelectItem::ExprWithAlias {
+            expr: expression, ..
+        } => expression,
+        _ => return Err("metric expression cannot be a wildcard projection".into()),
+    };
+    Ok(metric_expression_from_ast(expression))
+}
+
+fn metric_expression_from_ast(expression: &Expr) -> MetricExpressionIR {
+    match expression {
+        Expr::Identifier(identifier) => MetricExpressionIR::Column(identifier.value.clone()),
+        Expr::CompoundIdentifier(identifiers) => MetricExpressionIR::Column(
+            identifiers
+                .iter()
+                .map(|identifier| identifier.value.as_str())
+                .collect::<Vec<_>>()
+                .join("."),
+        ),
+        Expr::Nested(expression) => metric_expression_from_ast(expression),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Divide,
+            right,
+        } => MetricExpressionIR::Ratio {
+            numerator: Box::new(metric_expression_from_ast(left)),
+            denominator: Box::new(metric_expression_from_ast(right)),
+        },
+        Expr::Function(function) => {
+            let FunctionArguments::List(arguments) = &function.args else {
+                return MetricExpressionIR::Literal(expression.to_string());
+            };
+            if arguments.args.len() != 1 || !arguments.clauses.is_empty() {
+                return MetricExpressionIR::Literal(expression.to_string());
+            }
+            let argument = match &arguments.args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(argument)) => {
+                    metric_expression_from_ast(argument)
+                }
+                FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
+                    MetricExpressionIR::Literal("*".into())
+                }
+                _ => return MetricExpressionIR::Literal(expression.to_string()),
+            };
+            MetricExpressionIR::Aggregate {
+                function: function.name.to_string().to_ascii_uppercase(),
+                expression: Box::new(argument),
+                distinct: matches!(
+                    arguments.duplicate_treatment,
+                    Some(DuplicateTreatment::Distinct)
+                ),
+            }
+        }
+        _ => MetricExpressionIR::Literal(expression.to_string()),
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MetricContract {
     pub id: String,
@@ -228,6 +326,162 @@ pub enum ResultInvariant {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResultInvariantObservation {
+    pub invariant: ResultInvariant,
+    pub status: CheckStatus,
+    pub code: String,
+    pub message: String,
+    pub rows_checked: usize,
+}
+
+fn numeric_result_field(row: &serde_json::Value, field: &str) -> Option<f64> {
+    let value = row.as_object()?.get(field)?;
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+}
+
+/// Evaluate metric-contract invariants against the bounded result returned by
+/// the datasource. Missing fields and empty results are `NotChecked`, never a
+/// vacuous pass. This is the second phase of semantic release.
+pub fn evaluate_result_invariants(
+    invariants: &[ResultInvariant],
+    rows: &[serde_json::Value],
+) -> Vec<ResultInvariantObservation> {
+    invariants
+        .iter()
+        .cloned()
+        .map(|invariant| {
+            if rows.is_empty() {
+                return ResultInvariantObservation {
+                    invariant,
+                    status: CheckStatus::NotChecked,
+                    code: "result_invariant_no_rows".into(),
+                    message: "the datasource returned no rows, so the invariant was not observed"
+                        .into(),
+                    rows_checked: 0,
+                };
+            }
+            let (status, code, message, rows_checked) = match &invariant {
+                ResultInvariant::NonNegative { field } => {
+                    let values = rows
+                        .iter()
+                        .filter_map(|row| numeric_result_field(row, field))
+                        .collect::<Vec<_>>();
+                    if values.len() != rows.len() {
+                        (
+                            CheckStatus::NotChecked,
+                            "result_invariant_field_missing",
+                            format!("result field `{field}` is missing or non-numeric"),
+                            values.len(),
+                        )
+                    } else if values.iter().all(|value| *value >= 0.0) {
+                        (
+                            CheckStatus::Pass,
+                            "result_non_negative",
+                            format!("all `{field}` values are non-negative"),
+                            values.len(),
+                        )
+                    } else {
+                        (
+                            CheckStatus::Fail,
+                            "result_negative_value",
+                            format!("`{field}` contains a negative value"),
+                            values.len(),
+                        )
+                    }
+                }
+                ResultInvariant::RatioBounded {
+                    field,
+                    lower,
+                    upper,
+                } => {
+                    let values = rows
+                        .iter()
+                        .filter_map(|row| numeric_result_field(row, field))
+                        .collect::<Vec<_>>();
+                    if values.len() != rows.len() {
+                        (
+                            CheckStatus::NotChecked,
+                            "result_invariant_field_missing",
+                            format!("result field `{field}` is missing or non-numeric"),
+                            values.len(),
+                        )
+                    } else if values
+                        .iter()
+                        .all(|value| *value >= *lower as f64 && *value <= *upper as f64)
+                    {
+                        (
+                            CheckStatus::Pass,
+                            "result_ratio_bounded",
+                            format!("all `{field}` values are within [{lower}, {upper}]"),
+                            values.len(),
+                        )
+                    } else {
+                        (
+                            CheckStatus::Fail,
+                            "result_ratio_out_of_bounds",
+                            format!("`{field}` contains a value outside [{lower}, {upper}]"),
+                            values.len(),
+                        )
+                    }
+                }
+                ResultInvariant::SumMatches {
+                    total_field,
+                    parts_field,
+                } => {
+                    let matches = rows
+                        .iter()
+                        .filter_map(|row| {
+                            let object = row.as_object()?;
+                            let total = numeric_result_field(row, total_field)?;
+                            let parts = object.get(parts_field)?;
+                            let sum = if let Some(values) = parts.as_array() {
+                                values.iter().map(serde_json::Value::as_f64).sum::<Option<f64>>()?
+                            } else {
+                                numeric_result_field(row, parts_field)?
+                            };
+                            Some((total - sum).abs() <= 1e-9)
+                        })
+                        .collect::<Vec<_>>();
+                    if matches.len() != rows.len() {
+                        (
+                            CheckStatus::NotChecked,
+                            "result_invariant_field_missing",
+                            format!(
+                                "result fields `{total_field}` and `{parts_field}` are missing or non-numeric"
+                            ),
+                            matches.len(),
+                        )
+                    } else if matches.iter().all(|matches| *matches) {
+                        (
+                            CheckStatus::Pass,
+                            "result_sum_matches",
+                            format!("`{total_field}` equals `{parts_field}` for every row"),
+                            matches.len(),
+                        )
+                    } else {
+                        (
+                            CheckStatus::Fail,
+                            "result_sum_mismatch",
+                            format!("`{total_field}` does not equal `{parts_field}`"),
+                            matches.len(),
+                        )
+                    }
+                }
+            };
+            ResultInvariantObservation {
+                invariant,
+                status,
+                code: code.into(),
+                message,
+                rows_checked,
+            }
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CheckStatus {
     Pass,
@@ -243,6 +497,10 @@ pub struct CheckResult {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum QueryReleaseDecision {
+    /// Static semantics are proven, but metric-contract result invariants
+    /// still require bounded datasource execution. This state may cross the
+    /// execution gate, but it is not a releasable user result.
+    ValidateResult,
     Release,
     NeedsClarification,
     Repair,
@@ -253,11 +511,16 @@ pub struct SemanticVerification {
     pub safety: CheckResult,
     pub schema_binding: CheckResult,
     pub metric_equivalence: CheckResult,
+    pub denominator_equivalence: CheckResult,
     pub population_equivalence: CheckResult,
     pub grain_consistency: CheckResult,
     pub time_consistency: CheckResult,
+    pub comparison_consistency: CheckResult,
     pub join_cardinality: CheckResult,
     pub filter_completeness: CheckResult,
+    pub null_semantics: CheckResult,
+    pub ordering_consistency: CheckResult,
+    pub limit_consistency: CheckResult,
     pub policy_compliance: CheckResult,
     pub result_invariants: Vec<CheckResult>,
     pub executable: Option<CheckResult>,
@@ -339,7 +602,8 @@ impl SemanticVerifier {
         metric_contracts: &[MetricContract],
         sql: &str,
     ) -> SemanticVerification {
-        let safety = if is_single_read_only_query(sql) {
+        let query_shape = ParsedQueryShape::parse(sql);
+        let safety = if query_shape.is_some() {
             pass("safe", "read-only SELECT candidate")
         } else {
             fail(
@@ -348,15 +612,24 @@ impl SemanticVerifier {
             )
         };
         let required: BTreeSet<_> = ir.dimensions.iter().map(|d| d.column.as_str()).collect();
-        let selected: BTreeSet<_> = selected_columns.iter().map(String::as_str).collect();
-        let schema_binding = if required.is_subset(&selected) {
+        let dimension_is_selected = |dimension: &&str| {
+            selected_columns
+                .iter()
+                .any(|selected| semantic_identifier_matches(dimension, selected))
+        };
+        let schema_binding = if required.iter().all(dimension_is_selected) {
             pass("schema_bound", "all requested dimensions are selected")
         } else {
             fail("missing_dimension", "a requested dimension is not selected")
         };
         let grain_consistency = match ir.grain {
             Grain::Row => pass("grain_row", "row grain does not require grouping"),
-            _ if required.iter().all(|d| group_by.iter().any(|g| g == d)) => {
+            _ if required.iter().all(|dimension| {
+                group_by
+                    .iter()
+                    .any(|group| semantic_identifier_matches(dimension, group))
+            }) =>
+            {
                 pass("grain_bound", "grouping matches requested dimensions")
             }
             _ => fail("grain_mismatch", "GROUP BY does not match requested grain"),
@@ -403,6 +676,7 @@ impl SemanticVerifier {
                 })
             })
             .collect::<Vec<_>>();
+        let metric_required = !matches!(ir.objective, AnalyticObjective::Lookup);
         let metric_equivalence = if !ir.metrics.is_empty()
             && bound_contracts.len() == ir.metrics.len()
             && bound_contracts.iter().all(|contract| {
@@ -414,10 +688,23 @@ impl SemanticVerifier {
                 "metric_equivalent",
                 "selected metric expressions match their contracts",
             )
-        } else if ir.metrics.is_empty() {
+        } else if !ir.metrics.is_empty()
+            && bound_contracts.is_empty()
+            && inferred_metrics_match(&ir.metrics, selected_columns)
+        {
+            pass(
+                "metric_inferred_equivalent",
+                "requested metrics are represented by selected aggregate expressions",
+            )
+        } else if ir.metrics.is_empty() && metric_required {
             fail(
                 "metric_missing",
                 "no metric is bound for an analytic request",
+            )
+        } else if ir.metrics.is_empty() {
+            pass(
+                "metric_not_required",
+                "lookup request does not require an aggregate metric",
             )
         } else if bound_contracts.len() == ir.metrics.len() {
             fail(
@@ -430,17 +717,45 @@ impl SemanticVerifier {
                 "metric name is inferred but no versioned contract is bound",
             )
         };
+        let denominator_equivalence = verify_denominator(ir, &bound_contracts, selected_columns);
         let population_equivalence = if ir.population.subject.trim().is_empty() {
             fail("population_missing", "population subject is empty")
+        } else if !population_subject_is_proven(sql, &ir.population.subject) {
+            fail(
+                "population_subject_unproven",
+                "the requested population is not represented by the SQL candidate",
+            )
         } else if ir
             .population
             .dedup_key
             .as_deref()
-            .is_some_and(|key| !contains_identifier(sql, key))
+            .is_some_and(|key| !population_dedup_is_proven(sql, key))
         {
-            warn(
+            fail(
                 "population_dedup_unproven",
-                "the population deduplication key is not visible in the SQL candidate",
+                "the population deduplication policy is not proven by DISTINCT semantics",
+            )
+        } else if ir.population.exclude_test_users && !population_exclusion_is_proven(sql, "test") {
+            fail(
+                "test_population_exclusion_unproven",
+                "test-user exclusion is required but is not proven in SQL",
+            )
+        } else if ir.population.exclude_internal_users
+            && !population_exclusion_is_proven(sql, "internal")
+        {
+            fail(
+                "internal_population_exclusion_unproven",
+                "internal-user exclusion is required but is not proven in SQL",
+            )
+        } else if ir
+            .population
+            .valid_record_rule
+            .as_deref()
+            .is_some_and(|rule| !normalized_sql(sql).contains(&normalized_sql(rule)))
+        {
+            fail(
+                "valid_record_rule_unproven",
+                "the certified valid-record rule is not present in SQL",
             )
         } else {
             pass(
@@ -449,7 +764,7 @@ impl SemanticVerifier {
             )
         };
         let time_consistency = if let Some(time) = ir.time.as_ref() {
-            if contains_identifier(sql, &time.column) && sql_has_filter_clause(sql) {
+            if sql_matches_time_semantics(sql, time) && sql_matches_timezone_semantics(sql, time) {
                 pass(
                     "time_bound",
                     "time column, boundary semantics and timezone are represented",
@@ -460,19 +775,61 @@ impl SemanticVerifier {
                     "the requested time column/filter is not proven in SQL",
                 )
             }
+        } else if matches!(
+            ir.objective,
+            AnalyticObjective::Trend | AnalyticObjective::Comparison
+        ) {
+            fail(
+                "time_missing",
+                "trend/comparison intent requires explicit time semantics",
+            )
         } else {
-            warn("time_missing", "time semantics are not explicit")
+            pass(
+                "time_not_requested",
+                "the intent does not require a time window",
+            )
         };
-        let policy_compliance = pass("policy_checked", "tenant scope is present");
+        let comparison_consistency = verify_comparison(ir, sql);
+        let null_semantics = verify_null_semantics(ir, query_shape.as_ref());
+        let ordering_consistency = verify_ordering(ir, query_shape.as_ref());
+        let limit_consistency = verify_limit(ir, query_shape.as_ref());
+        let policy_compliance = if ir.security_scope.tenant_id.trim().is_empty()
+            || ir.security_scope.datasource_id.trim().is_empty()
+            || ir.security_scope.scope_hash.trim().is_empty()
+        {
+            fail(
+                "policy_scope_unproven",
+                "tenant, datasource and policy scope hash must all be bound",
+            )
+        } else {
+            pass(
+                "policy_scope_bound",
+                "tenant, datasource and immutable policy scope are bound",
+            )
+        };
+        let result_invariants = bound_contracts
+            .iter()
+            .flat_map(|contract| contract.invariants.iter())
+            .map(|invariant| CheckResult {
+                status: CheckStatus::NotChecked,
+                code: "result_invariant_pending".into(),
+                message: format!("result invariant requires execution evidence: {invariant:?}"),
+            })
+            .collect::<Vec<_>>();
         let checks = [
             &safety,
             &schema_binding,
             &metric_equivalence,
+            &denominator_equivalence,
             &population_equivalence,
             &grain_consistency,
             &time_consistency,
+            &comparison_consistency,
             &join_cardinality,
             &filter_completeness,
+            &null_semantics,
+            &ordering_consistency,
+            &limit_consistency,
             &policy_compliance,
         ];
         let passed = checks
@@ -480,44 +837,53 @@ impl SemanticVerifier {
             .filter(|c| c.status == CheckStatus::Pass)
             .count() as f32
             / checks.len() as f32;
-        let decision =
-            if safety.status == CheckStatus::Fail || join_cardinality.status == CheckStatus::Fail {
-                QueryReleaseDecision::Reject
-            } else if schema_binding.status == CheckStatus::Fail
-                || metric_equivalence.status == CheckStatus::Fail
-            {
-                QueryReleaseDecision::Repair
-            } else if unresolved > 0
-                || filter_completeness.status == CheckStatus::Warn
-                || grain_consistency.status == CheckStatus::Fail
-                || metric_equivalence.status == CheckStatus::Warn
-                || population_equivalence.status != CheckStatus::Pass
-                || time_consistency.status == CheckStatus::Fail
-            {
-                QueryReleaseDecision::NeedsClarification
-            } else {
-                QueryReleaseDecision::Release
-            };
+        let decision = if safety.status == CheckStatus::Fail
+            || join_cardinality.status == CheckStatus::Fail
+            || policy_compliance.status == CheckStatus::Fail
+        {
+            QueryReleaseDecision::Reject
+        } else if schema_binding.status == CheckStatus::Fail
+            || metric_equivalence.status == CheckStatus::Fail
+            || denominator_equivalence.status == CheckStatus::Fail
+        {
+            QueryReleaseDecision::Repair
+        } else if unresolved > 0
+            || filter_completeness.status == CheckStatus::Warn
+            || grain_consistency.status == CheckStatus::Fail
+            || metric_equivalence.status == CheckStatus::Warn
+            || population_equivalence.status != CheckStatus::Pass
+            || time_consistency.status != CheckStatus::Pass
+            || comparison_consistency.status != CheckStatus::Pass
+            || null_semantics.status != CheckStatus::Pass
+            || ordering_consistency.status != CheckStatus::Pass
+            || limit_consistency.status != CheckStatus::Pass
+        {
+            QueryReleaseDecision::NeedsClarification
+        } else if result_invariants
+            .iter()
+            .any(|check| check.status != CheckStatus::Pass)
+        {
+            QueryReleaseDecision::ValidateResult
+        } else {
+            QueryReleaseDecision::Release
+        };
         let schema_is_pass = schema_binding.status == CheckStatus::Pass;
         SemanticVerification {
             safety,
             schema_binding,
             metric_equivalence,
+            denominator_equivalence,
             population_equivalence,
             grain_consistency,
             time_consistency,
+            comparison_consistency,
             join_cardinality,
             filter_completeness,
+            null_semantics,
+            ordering_consistency,
+            limit_consistency,
             policy_compliance,
-            result_invariants: bound_contracts
-                .iter()
-                .flat_map(|contract| contract.invariants.iter())
-                .map(|invariant| CheckResult {
-                    status: CheckStatus::NotChecked,
-                    code: "result_invariant_pending".into(),
-                    message: format!("result invariant requires execution evidence: {invariant:?}"),
-                })
-                .collect(),
+            result_invariants,
             executable: None,
             confidence_basis: ConfidenceBasis {
                 binding_margin: if schema_is_pass { 1.0 } else { 0.0 },
@@ -537,12 +903,367 @@ impl SemanticVerifier {
     }
 }
 
-fn is_single_read_only_query(sql: &str) -> bool {
-    Parser::parse_sql(&GenericDialect {}, sql)
-        .ok()
-        .is_some_and(|statements| {
-            statements.len() == 1 && matches!(statements.first(), Some(Statement::Query(_)))
+#[derive(Debug, Clone)]
+struct ParsedQueryShape {
+    projection: Vec<String>,
+    selection: Option<String>,
+    order_by: Vec<(String, bool)>,
+    limit: Option<u64>,
+    has_aggregate: bool,
+}
+
+impl ParsedQueryShape {
+    fn parse(sql: &str) -> Option<Self> {
+        let statements = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
+        if statements.len() != 1 {
+            return None;
+        }
+        let Statement::Query(query) = statements.into_iter().next()? else {
+            return None;
+        };
+        Self::from_query(&query)
+    }
+
+    fn from_query(query: &Query) -> Option<Self> {
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return None;
+        };
+        let projection = select
+            .projection
+            .iter()
+            .filter_map(|item| match item {
+                SelectItem::UnnamedExpr(expression) => Some(expression.to_string()),
+                SelectItem::ExprWithAlias { expr, alias } => Some(format!("{expr} AS {alias}")),
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => None,
+            })
+            .collect::<Vec<_>>();
+        let has_aggregate = projection.iter().any(|expression| {
+            let lower = expression.to_ascii_lowercase();
+            ["count(", "sum(", "avg(", "min(", "max(", "approx_distinct("]
+                .iter()
+                .any(|needle| lower.contains(needle))
+        });
+        let order_by = query
+            .order_by
+            .as_ref()
+            .map(|order| {
+                order
+                    .exprs
+                    .iter()
+                    .map(|item| (item.expr.to_string(), item.asc != Some(false)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let limit = query
+            .limit
+            .as_ref()
+            .and_then(|value| value.to_string().parse::<u64>().ok());
+        Some(Self {
+            projection,
+            selection: select.selection.as_ref().map(ToString::to_string),
+            order_by,
+            limit,
+            has_aggregate,
         })
+    }
+}
+
+fn verify_denominator(
+    ir: &AnalyticIntentIR,
+    contracts: &[&MetricContract],
+    selected_columns: &[String],
+) -> CheckResult {
+    let mut expected = Vec::new();
+    if let Some(denominator) = ir.denominator.as_ref() {
+        expected.push(denominator.expression.clone());
+    }
+    expected.extend(
+        contracts
+            .iter()
+            .filter_map(|contract| contract.denominator.as_ref())
+            .map(metric_expression_sql),
+    );
+    if expected.is_empty() {
+        return pass(
+            "denominator_not_required",
+            "the intent and metric contracts do not require a denominator",
+        );
+    }
+    let selected = selected_columns
+        .iter()
+        .map(|value| metric_expression_canonical(strip_select_alias(value)))
+        .collect::<Vec<_>>();
+    if expected.iter().all(|denominator| {
+        let expected = metric_expression_canonical(denominator);
+        selected.iter().any(|actual| {
+            actual.contains(&expected)
+                || unqualified_sql(actual).contains(&unqualified_sql(&expected))
+        })
+    }) {
+        pass(
+            "denominator_equivalent",
+            "every required denominator is present in a selected metric expression",
+        )
+    } else {
+        fail(
+            "denominator_unproven",
+            "a required metric denominator is missing or semantically different",
+        )
+    }
+}
+
+fn population_subject_is_proven(sql: &str, subject: &str) -> bool {
+    let subject = subject.trim();
+    if subject.eq_ignore_ascii_case("query_rows") {
+        return true;
+    }
+    let sql = normalized_sql(sql);
+    let subject = normalized_sql(subject);
+    if subject.is_empty() {
+        return false;
+    }
+    let singular = subject.strip_suffix('s').unwrap_or(&subject);
+    sql.contains(&subject) || (!singular.is_empty() && sql.contains(singular))
+}
+
+fn population_dedup_is_proven(sql: &str, key: &str) -> bool {
+    let sql = unqualified_sql(&normalized_sql(sql));
+    let key = unqualified_sql(&normalized_sql(key));
+    if key.is_empty() {
+        return false;
+    }
+    sql.contains(&format!("count(distinct{key}"))
+        || sql.contains(&format!("approxdistinct({key}"))
+        || sql.contains(&format!("selectdistinct{key}"))
+}
+
+fn population_exclusion_is_proven(sql: &str, marker: &str) -> bool {
+    let sql = normalized_sql(sql);
+    sql.contains(marker)
+        && (sql.contains("!=")
+            || sql.contains("<>")
+            || sql.contains("=false")
+            || sql.contains("=0")
+            || sql.contains("notin"))
+}
+
+fn verify_comparison(ir: &AnalyticIntentIR, sql: &str) -> CheckResult {
+    let Some(comparison) = ir.comparison.as_ref() else {
+        return pass(
+            "comparison_not_required",
+            "the intent does not require a comparison",
+        );
+    };
+    let sql = normalized_sql(sql);
+    let baseline = normalized_sql(&comparison.baseline);
+    let treatment = normalized_sql(&comparison.treatment);
+    let method = normalized_sql(&comparison.method);
+    let values_proven = !baseline.is_empty()
+        && !treatment.is_empty()
+        && sql.contains(&baseline)
+        && sql.contains(&treatment);
+    let method_proven = method.is_empty()
+        || sql.contains(&method)
+        || (method.contains("difference") && (sql.contains('-') || sql.contains("lag(")))
+        || (method.contains("ratio") && sql.contains('/'))
+        || (method.contains("percent") && sql.contains('/'));
+    if values_proven && method_proven {
+        pass(
+            "comparison_proven",
+            "comparison cohorts/windows and method are represented in SQL",
+        )
+    } else {
+        fail(
+            "comparison_unproven",
+            "comparison baseline, treatment or method is not proven in SQL",
+        )
+    }
+}
+
+fn verify_null_semantics(ir: &AnalyticIntentIR, shape: Option<&ParsedQueryShape>) -> CheckResult {
+    let Some(shape) = shape else {
+        return fail("null_semantics_unproven", "SQL shape could not be parsed");
+    };
+    let rendered = shape
+        .projection
+        .iter()
+        .chain(shape.selection.iter())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    match ir.null_policy {
+        NullPolicy::Ignore if shape.has_aggregate || rendered.contains("is not null") => pass(
+            "nulls_ignored",
+            "aggregate or explicit predicate implements ignore-null semantics",
+        ),
+        NullPolicy::Ignore => fail(
+            "null_ignore_unproven",
+            "ignore-null semantics require an aggregate or explicit IS NOT NULL predicate",
+        ),
+        NullPolicy::Zero
+            if rendered.contains("coalesce(")
+                || rendered.contains("ifnull(")
+                || rendered.contains("nvl(") =>
+        {
+            pass(
+                "nulls_zeroed",
+                "NULL values are explicitly converted to zero",
+            )
+        }
+        NullPolicy::SeparateBucket
+            if (rendered.contains("coalesce(") || rendered.contains("case"))
+                && rendered.contains("null") =>
+        {
+            pass(
+                "null_bucketed",
+                "NULL values are represented as a separate result bucket",
+            )
+        }
+        NullPolicy::Fail => CheckResult {
+            status: CheckStatus::NotChecked,
+            code: "null_fail_requires_result_evidence".into(),
+            message: "fail-on-null requires execution/result evidence".into(),
+        },
+        _ => fail(
+            "null_policy_mismatch",
+            "the SQL candidate does not implement the requested NULL policy",
+        ),
+    }
+}
+
+fn verify_ordering(ir: &AnalyticIntentIR, shape: Option<&ParsedQueryShape>) -> CheckResult {
+    if ir.ordering.is_empty() {
+        return pass(
+            "ordering_not_required",
+            "the intent does not require ordering",
+        );
+    }
+    let Some(shape) = shape else {
+        return fail("ordering_unproven", "SQL shape could not be parsed");
+    };
+    if ir.ordering.len() != shape.order_by.len() {
+        return fail(
+            "ordering_mismatch",
+            "ORDER BY expression count differs from the canonical intent",
+        );
+    }
+    if ir
+        .ordering
+        .iter()
+        .zip(&shape.order_by)
+        .all(|(expected, actual)| {
+            semantic_identifier_matches(&expected.expression, &actual.0)
+                && expected.descending == !actual.1
+        })
+    {
+        pass(
+            "ordering_proven",
+            "ORDER BY expressions and directions match the canonical intent",
+        )
+    } else {
+        fail(
+            "ordering_mismatch",
+            "ORDER BY expressions or directions differ from the canonical intent",
+        )
+    }
+}
+
+fn verify_limit(ir: &AnalyticIntentIR, shape: Option<&ParsedQueryShape>) -> CheckResult {
+    let Some(expected) = ir.limit else {
+        return pass(
+            "limit_not_required",
+            "the intent does not require a row limit",
+        );
+    };
+    let Some(actual) = shape.and_then(|shape| shape.limit) else {
+        return fail(
+            "limit_missing",
+            "the canonical row limit is missing from SQL",
+        );
+    };
+    if actual <= expected {
+        pass(
+            "limit_proven",
+            "the SQL row limit is no broader than the canonical intent",
+        )
+    } else {
+        fail(
+            "limit_broadened",
+            "the SQL row limit is broader than the canonical intent",
+        )
+    }
+}
+
+fn semantic_identifier_matches(required: &str, actual: &str) -> bool {
+    let normalized = |value: &str| {
+        value
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    };
+    let required = normalized(required);
+    let actual = normalized(actual);
+    if actual.contains(&required) {
+        return true;
+    }
+    let family_matches = |family: &[&str]| {
+        family.iter().any(|term| required.contains(term))
+            && family.iter().any(|term| actual.contains(term))
+    };
+    family_matches(&[
+        "business_date",
+        "event_date",
+        "stat_date",
+        "date",
+        "day",
+        "dt",
+    ]) || family_matches(&["device", "terminal"])
+        || family_matches(&["app", "product", "channel"])
+}
+
+fn inferred_metrics_match(metrics: &[MetricRef], selected_columns: &[String]) -> bool {
+    let aggregates = selected_columns
+        .iter()
+        .filter(|expression| {
+            let lower = expression.to_ascii_lowercase();
+            ["count(", "sum(", "avg(", "min(", "max(", "approx_distinct("]
+                .iter()
+                .any(|needle| lower.contains(needle))
+        })
+        .collect::<Vec<_>>();
+    if aggregates.len() < metrics.len() {
+        return false;
+    }
+    metrics.iter().all(|metric| {
+        let id = metric.id.to_ascii_lowercase();
+        let display_name = metric.display_name.to_ascii_lowercase();
+        aggregates.iter().any(|expression| {
+            let expression = expression.to_ascii_lowercase();
+            let count_shape =
+                expression.contains("count(") || expression.contains("approx_distinct(");
+            let sum_shape = expression.contains("sum(");
+            let ratio_shape = expression.contains('/')
+                || expression.contains("nullif(")
+                || expression.contains("divide(");
+            let id_stem = id.strip_suffix('s').unwrap_or(&id);
+            let named = expression.contains(&id)
+                || expression.contains(id_stem)
+                || expression.contains(&display_name);
+            match id.as_str() {
+                "orders" | "order_count" | "users" | "user_count" => count_shape,
+                "revenue" | "gmv" => sum_shape && named,
+                "roi" | "roas" => ratio_shape && sum_shape,
+                _ => named,
+            }
+        })
+    })
 }
 
 fn normalized_sql(value: &str) -> String {
@@ -605,8 +1326,15 @@ fn metric_expression_sql(expression: &MetricExpressionIR) -> String {
 
 fn metric_expression_matches(contract: &MetricExpressionIR, selected: &str) -> bool {
     let expected = metric_expression_canonical(&metric_expression_sql(contract));
-    let actual = metric_expression_canonical(selected);
+    let actual = metric_expression_canonical(strip_select_alias(selected));
     expected == actual || unqualified_sql(&expected) == unqualified_sql(&actual)
+}
+
+fn strip_select_alias(selected: &str) -> &str {
+    let lower = selected.to_ascii_lowercase();
+    lower
+        .rfind(" as ")
+        .map_or(selected, |index| &selected[..index])
 }
 
 fn metric_expression_canonical(value: &str) -> String {
@@ -631,6 +1359,89 @@ fn sql_has_filter_clause(sql: &str) -> bool {
     normalized.contains("where") || normalized.contains("having")
 }
 
+fn sql_has_bounded_time_filter(sql: &str, column: &str) -> bool {
+    sql_has_filter_clause(sql) && contains_identifier(sql, column)
+}
+
+fn literal_has_column_comparison(
+    normalized_sql: &str,
+    column: &str,
+    literal: &str,
+    operators: &[&str],
+) -> bool {
+    normalized_sql.match_indices(literal).any(|(index, _)| {
+        let prefix = &normalized_sql[..index];
+        prefix.rfind(column).is_some_and(|column_index| {
+            let comparison = &prefix[column_index..];
+            operators.iter().any(|operator| match *operator {
+                "=" => {
+                    comparison.contains('=')
+                        && !comparison.contains(">=")
+                        && !comparison.contains("<=")
+                        && !comparison.contains("!=")
+                        && !comparison.contains("<>")
+                }
+                "<" => comparison.contains('<') && !comparison.contains("<="),
+                ">" => comparison.contains('>') && !comparison.contains(">="),
+                other => comparison.contains(other),
+            })
+        })
+    })
+}
+
+fn sql_matches_time_semantics(sql: &str, time: &TimeSemantics) -> bool {
+    if !sql_has_bounded_time_filter(sql, &time.column) {
+        return false;
+    }
+    let normalized = unqualified_sql(&normalized_sql(sql));
+    let column = unqualified_sql(&normalized_sql(&time.column));
+    let start = normalized_sql(&time.start_inclusive);
+    let end = normalized_sql(&time.end_exclusive);
+    if column.is_empty() || start.is_empty() || !normalized.contains(&start) {
+        return false;
+    }
+
+    let equality = normalized.contains(&format!("{column}="))
+        || normalized.contains(&format!("date({column})="))
+        || normalized.contains(&format!("cast({column}asdate)="))
+        || literal_has_column_comparison(&normalized, &column, &start, &["="]);
+    if equality {
+        let one_day = chrono::NaiveDate::parse_from_str(&time.start_inclusive, "%Y-%m-%d")
+            .ok()
+            .zip(chrono::NaiveDate::parse_from_str(&time.end_exclusive, "%Y-%m-%d").ok())
+            .is_some_and(|(start, end)| end.signed_duration_since(start).num_days() == 1);
+        return one_day;
+    }
+
+    let inclusive_lower_bound = normalized.contains(&format!("{column}>="))
+        || literal_has_column_comparison(&normalized, &column, &start, &[">="]);
+    let exclusive_upper_bound = (normalized.contains(&format!("{column}<"))
+        && !normalized.contains(&format!("{column}<=")))
+        || literal_has_column_comparison(&normalized, &column, &end, &["<"]);
+    inclusive_lower_bound && exclusive_upper_bound && !end.is_empty() && normalized.contains(&end)
+}
+
+fn sql_matches_timezone_semantics(sql: &str, time: &TimeSemantics) -> bool {
+    let column = time.column.to_ascii_lowercase();
+    if ["date", "day", "dt"]
+        .iter()
+        .any(|suffix| column == *suffix || column.ends_with(&format!("_{suffix}")))
+    {
+        return true;
+    }
+    let timezone = normalized_sql(&time.timezone);
+    if timezone.is_empty() {
+        return false;
+    }
+    let normalized = normalized_sql(sql);
+    normalized.contains(&timezone)
+        && (normalized.contains("attimezone")
+            || normalized.contains("convert_tz(")
+            || normalized.contains("timezone(")
+            || normalized.contains("from_utc_timestamp(")
+            || normalized.contains("date_format("))
+}
+
 fn sql_contains_filter(sql: &str, filter: &SemanticFilter) -> bool {
     let normalized = unqualified_sql(&normalized_sql(sql));
     match filter {
@@ -643,6 +1454,19 @@ fn sql_contains_filter(sql: &str, filter: &SemanticFilter) -> bool {
                 && values
                     .iter()
                     .all(|value| normalized.contains(&normalized_sql(value)))
+        }
+        SemanticFilter::Compare {
+            field,
+            operator,
+            value,
+        } => {
+            let field = unqualified_sql(&normalized_sql(field));
+            let operator = normalized_sql(operator);
+            !field.is_empty()
+                && matches!(operator.as_str(), ">" | ">=" | "<" | "<=" | "!=" | "<>")
+                && normalized.contains(&field)
+                && normalized.contains(&operator)
+                && normalized.contains(&normalized_sql(value))
         }
         SemanticFilter::RawBounded { expression } => {
             normalized.contains(&unqualified_sql(&normalized_sql(expression)))
@@ -706,7 +1530,7 @@ mod tests {
             comparison: None,
             denominator: None,
             ordering: vec![],
-            limit: Some(100),
+            limit: None,
             null_policy: NullPolicy::Ignore,
             data_quality_policy: DataQualityPolicy::BestEffort,
             security_scope: SecurityScopeRef {
@@ -812,6 +1636,221 @@ mod tests {
     }
 
     #[test]
+    fn verifier_requires_a_bounded_filter_for_requested_time_semantics() {
+        let input = ir();
+        let unbounded = SemanticVerifier::default().verify(
+            &input,
+            &["business_date".into(), "COUNT(*) AS orders".into()],
+            &["business_date".into()],
+            &[],
+            "SELECT business_date, COUNT(*) AS orders FROM fact WHERE created_at IS NOT NULL GROUP BY business_date",
+        );
+        assert_eq!(unbounded.time_consistency.status, CheckStatus::Fail);
+        assert_ne!(unbounded.release_decision, QueryReleaseDecision::Release);
+
+        let wrong_window = SemanticVerifier::default().verify(
+            &input,
+            &["business_date".into(), "COUNT(*) AS orders".into()],
+            &["business_date".into()],
+            &[],
+            "SELECT business_date, COUNT(*) AS orders FROM fact WHERE created_at >= DATE '2026-02-01' AND created_at < DATE '2026-02-02' GROUP BY business_date",
+        );
+        assert_eq!(wrong_window.time_consistency.status, CheckStatus::Fail);
+        assert_ne!(wrong_window.release_decision, QueryReleaseDecision::Release);
+
+        let bounded = SemanticVerifier::default().verify(
+            &input,
+            &["business_date".into(), "COUNT(*) AS orders".into()],
+            &["business_date".into()],
+            &[],
+            "SELECT business_date, COUNT(*) AS orders FROM fact WHERE (created_at AT TIME ZONE 'Asia/Shanghai') >= DATE '2026-01-01' AND (created_at AT TIME ZONE 'Asia/Shanghai') < DATE '2026-01-02' GROUP BY business_date",
+        );
+        assert_eq!(bounded.time_consistency.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn verifier_fails_closed_for_unproven_denominator_population_and_policy() {
+        let mut input = ir();
+        input.time = None;
+        input.denominator = Some(DenominatorSpec {
+            expression: "SUM(cost)".into(),
+            population: input.population.clone(),
+        });
+        input.population.exclude_test_users = true;
+        input.security_scope.scope_hash.clear();
+        let result = SemanticVerifier::default().verify(
+            &input,
+            &["business_date".into(), "SUM(revenue) AS revenue".into()],
+            &["business_date".into()],
+            &[],
+            "SELECT business_date, SUM(revenue) AS revenue FROM orders GROUP BY business_date",
+        );
+        assert_eq!(result.denominator_equivalence.status, CheckStatus::Fail);
+        assert_eq!(result.population_equivalence.status, CheckStatus::Fail);
+        assert_eq!(result.policy_compliance.status, CheckStatus::Fail);
+        assert_eq!(result.release_decision, QueryReleaseDecision::Reject);
+    }
+
+    #[test]
+    fn verifier_proves_comparison_null_order_and_limit_from_the_parsed_query() {
+        let mut input = ir();
+        input.time = None;
+        input.objective = AnalyticObjective::Comparison;
+        input.comparison = Some(ComparisonSpec {
+            baseline: "control".into(),
+            treatment: "treatment".into(),
+            method: "difference".into(),
+        });
+        input.ordering = vec![OrderSpec {
+            expression: "delta".into(),
+            descending: true,
+        }];
+        input.limit = Some(20);
+        input.null_policy = NullPolicy::Zero;
+        let result = SemanticVerifier::default().verify(
+            &input,
+            &[
+                "business_date".into(),
+                "COALESCE(SUM(CASE WHEN cohort = 'treatment' THEN revenue ELSE 0 END), 0) - COALESCE(SUM(CASE WHEN cohort = 'control' THEN revenue ELSE 0 END), 0) AS delta".into(),
+            ],
+            &["business_date".into()],
+            &[],
+            "SELECT business_date, COALESCE(SUM(CASE WHEN cohort = 'treatment' THEN revenue ELSE 0 END), 0) - COALESCE(SUM(CASE WHEN cohort = 'control' THEN revenue ELSE 0 END), 0) AS delta FROM orders GROUP BY business_date ORDER BY delta DESC LIMIT 20",
+        );
+        assert_eq!(result.comparison_consistency.status, CheckStatus::Pass);
+        assert_eq!(result.null_semantics.status, CheckStatus::Pass);
+        assert_eq!(result.ordering_consistency.status, CheckStatus::Pass);
+        assert_eq!(result.limit_consistency.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn verifier_never_releases_unchecked_result_invariants() {
+        let mut input = ir();
+        input.time = None;
+        let contract = MetricContract {
+            id: "orders".into(),
+            version: 1,
+            names: vec!["orders".into()],
+            expression: MetricExpressionIR::Aggregate {
+                function: "COUNT".into(),
+                expression: Box::new(MetricExpressionIR::Literal("*".into())),
+                distinct: false,
+            },
+            denominator: None,
+            population: input.population.clone(),
+            default_grain: Grain::Day,
+            allowed_grains: vec![Grain::Day],
+            time_column: "business_date".into(),
+            timezone: "Asia/Shanghai".into(),
+            mandatory_filters: vec![],
+            join_contracts: vec![],
+            invariants: vec![ResultInvariant::NonNegative {
+                field: "orders".into(),
+            }],
+            valid_from: "2026-01-01".into(),
+            valid_until: None,
+            owner: None,
+            evidence_refs: vec![],
+        };
+        let result = SemanticVerifier::default().verify_with_metric_contracts(
+            &input,
+            &["business_date".into(), "COUNT(*) AS orders".into()],
+            &["business_date".into()],
+            &[],
+            &[contract],
+            "SELECT business_date, COUNT(*) AS orders FROM orders GROUP BY business_date",
+        );
+        assert_eq!(result.result_invariants[0].status, CheckStatus::NotChecked);
+        assert_ne!(result.release_decision, QueryReleaseDecision::Release);
+    }
+
+    #[test]
+    fn result_invariants_fail_closed_for_missing_empty_and_invalid_values() {
+        let invariants = vec![
+            ResultInvariant::NonNegative {
+                field: "orders".into(),
+            },
+            ResultInvariant::RatioBounded {
+                field: "roi".into(),
+                lower: 0,
+                upper: 10,
+            },
+            ResultInvariant::SumMatches {
+                total_field: "total".into(),
+                parts_field: "parts".into(),
+            },
+        ];
+        let empty = evaluate_result_invariants(&invariants, &[]);
+        assert!(empty
+            .iter()
+            .all(|observation| observation.status == CheckStatus::NotChecked));
+
+        let valid = evaluate_result_invariants(
+            &invariants,
+            &[serde_json::json!({
+                "orders": 4,
+                "roi": 1.25,
+                "total": 6,
+                "parts": [1, 2, 3]
+            })],
+        );
+        assert!(valid
+            .iter()
+            .all(|observation| observation.status == CheckStatus::Pass));
+
+        let invalid = evaluate_result_invariants(
+            &invariants,
+            &[serde_json::json!({
+                "orders": -1,
+                "roi": 12,
+                "total": 6,
+                "parts": [1, 2]
+            })],
+        );
+        assert!(invalid
+            .iter()
+            .all(|observation| observation.status == CheckStatus::Fail));
+
+        let missing = evaluate_result_invariants(&invariants, &[serde_json::json!({"orders": 1})]);
+        assert_eq!(missing[0].status, CheckStatus::Pass);
+        assert_eq!(missing[1].status, CheckStatus::NotChecked);
+        assert_eq!(missing[2].status, CheckStatus::NotChecked);
+    }
+
+    #[test]
+    fn time_verifier_preserves_half_open_semantics_and_allows_one_day_equality() {
+        let one_day = TimeSemantics {
+            column: "business_date".into(),
+            timezone: "Asia/Shanghai".into(),
+            start_inclusive: "2026-08-15".into(),
+            end_exclusive: "2026-08-16".into(),
+            business_calendar: None,
+            as_of: None,
+        };
+        assert!(sql_matches_time_semantics(
+            "SELECT COUNT(*) FROM orders WHERE business_date = DATE '2026-08-15'",
+            &one_day
+        ));
+        assert!(sql_matches_time_semantics(
+            "SELECT COUNT(*) FROM orders WHERE business_date >= DATE '2026-08-15' AND business_date < DATE '2026-08-16'",
+            &one_day
+        ));
+        assert!(!sql_matches_time_semantics(
+            "SELECT COUNT(*) FROM orders WHERE business_date >= DATE '2026-08-15' AND business_date <= DATE '2026-08-16'",
+            &one_day
+        ));
+
+        let multi_day = TimeSemantics {
+            end_exclusive: "2026-08-22".into(),
+            ..one_day
+        };
+        assert!(!sql_matches_time_semantics(
+            "SELECT COUNT(*) FROM orders WHERE business_date = DATE '2026-08-15'",
+            &multi_day
+        ));
+    }
+
+    #[test]
     fn verifier_rejects_unverified_join_but_does_not_treat_unrelated_contract_as_a_join() {
         let input = ir();
         let unrelated = JoinContract {
@@ -856,6 +1895,24 @@ mod tests {
         assert!((0.0..=1.0).contains(&first.1));
         assert_eq!(calibration_metrics(&[], 10), (0.0, 0.0));
     }
+
+    #[test]
+    fn metric_contract_expression_parser_preserves_certified_semantics() {
+        assert_eq!(
+            parse_metric_expression_ir("COUNT(DISTINCT order_id)").unwrap(),
+            MetricExpressionIR::Aggregate {
+                function: "COUNT".into(),
+                expression: Box::new(MetricExpressionIR::Column("order_id".into())),
+                distinct: true,
+            }
+        );
+        assert!(matches!(
+            parse_metric_expression_ir("SUM(revenue) / NULLIF(SUM(cost), 0)").unwrap(),
+            MetricExpressionIR::Ratio { .. }
+        ));
+        assert!(parse_metric_expression_ir("SUM(revenue); DELETE FROM facts").is_err());
+    }
+
     #[test]
     fn attribution_levels_block_causal_overclaim_without_identification() {
         let descriptive = CausalAnalysisContract {

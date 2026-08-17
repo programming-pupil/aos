@@ -12,7 +12,8 @@ mod types;
 
 pub use compaction::{CompactionCandidate, CompactionError, CompactionValidator};
 pub use context::{
-    ContextBlock, ContextCompiler, ContextError, ContextPacket, ContextSelection, PromptLayer,
+    ContextBlock, ContextCompiler, ContextEnvelope, ContextError, ContextOutputContract,
+    ContextPacket, ContextReference, ContextSelection, ContextTrust, PromptLayer,
 };
 pub use evidence::{
     EvidenceAuthority, EvidenceLedger, EvidenceLedgerError, EvidenceRef, EvidenceSourceType,
@@ -155,6 +156,76 @@ mod tests {
     }
 
     #[test]
+    fn reducer_demotes_model_self_confirmation_for_assertions_and_decisions() {
+        let reducer = SemanticReducer::default();
+        let mut evidence = EvidenceLedger::default();
+        let model_evidence = EvidenceRef {
+            evidence_id: "model-evidence".into(),
+            source_type: EvidenceSourceType::Provider,
+            source_locator: "provider://turn".into(),
+            content_hash: "model-hash".into(),
+            event_seq: Some(1),
+            byte_or_line_range: None,
+            collected_at: Utc::now(),
+            authority: EvidenceAuthority::Model,
+        };
+        evidence.append(model_evidence.clone()).unwrap();
+
+        let mut self_confirmed = assertion("model-assertion", "dark", "model-evidence");
+        self_confirmed.status = AssertionStatus::Confirmed;
+        self_confirmed.source_refs = vec![model_evidence.clone()];
+        let assertion_outcome = reducer
+            .apply(
+                &SemanticSnapshot::default(),
+                ProposedStateDelta::UpsertAssertion(self_confirmed),
+                &evidence,
+            )
+            .unwrap();
+        assert_eq!(
+            assertion_outcome
+                .snapshot
+                .assertions
+                .get("model-assertion")
+                .unwrap()
+                .status,
+            AssertionStatus::Proposed
+        );
+        assert_eq!(assertion_outcome.needs_confirmation, ["model-assertion"]);
+
+        let decision = DecisionRecord {
+            id: "model-decision".into(),
+            scope: AssertionScope::Session("s".into()),
+            question: "Which theme?".into(),
+            decision: "dark".into(),
+            alternatives: Vec::new(),
+            rationale: vec![model_evidence],
+            constraints: Vec::new(),
+            acceptance_criteria: Vec::new(),
+            owner: None,
+            status: DecisionStatus::Accepted,
+            valid_time: None,
+            version: 1,
+        };
+        let decision_outcome = reducer
+            .apply(
+                &SemanticSnapshot::default(),
+                ProposedStateDelta::UpsertDecision(decision),
+                &evidence,
+            )
+            .unwrap();
+        assert_eq!(
+            decision_outcome
+                .snapshot
+                .decisions
+                .get("model-decision")
+                .unwrap()
+                .status,
+            DecisionStatus::Proposed
+        );
+        assert_eq!(decision_outcome.needs_confirmation, ["model-decision"]);
+    }
+
+    #[test]
     fn evidence_requires_source_coverage_and_context_has_manifest() {
         let mut evidence = EvidenceLedger::default();
         evidence
@@ -174,6 +245,7 @@ mod tests {
             .compile(
                 ContextSelection {
                     objective: "answer".into(),
+                    envelope: ContextEnvelope::default(),
                     blocks: vec![ContextBlock::new("e", "evidence", "hello", 2, false, "abc")],
                 },
                 100,
@@ -181,5 +253,86 @@ mod tests {
             .unwrap();
         assert_eq!(packet.manifest.used_tokens, 2);
         assert_eq!(packet.blocks[0].content, "hello");
+    }
+
+    #[test]
+    fn model_context_selection_drops_oldest_recent_blocks_under_budget() {
+        let compiler = ContextCompiler::default();
+        let packet = compiler
+            .compile_for_model(
+                ContextSelection {
+                    objective: "answer".into(),
+                    envelope: ContextEnvelope::default(),
+                    blocks: vec![
+                        ContextBlock {
+                            block_id: "system:0".into(),
+                            source: "stable_system".into(),
+                            content: "system".into(),
+                            tokens: 2,
+                            truncated: false,
+                            source_hash: "s".into(),
+                            policy_version: "v1".into(),
+                            layer: PromptLayer::StableSystem,
+                            selection_reason: "required policy".into(),
+                            trust: ContextTrust::Instruction,
+                        },
+                        ContextBlock {
+                            block_id: "message:0".into(),
+                            source: "recent_interaction".into(),
+                            content: "old".into(),
+                            tokens: 4,
+                            truncated: false,
+                            source_hash: "o".into(),
+                            policy_version: "v1".into(),
+                            layer: PromptLayer::RecentInteraction,
+                            selection_reason: "recent history".into(),
+                            trust: ContextTrust::UntrustedData,
+                        },
+                        ContextBlock {
+                            block_id: "message:1".into(),
+                            source: "recent_interaction".into(),
+                            content: "new".into(),
+                            tokens: 4,
+                            truncated: false,
+                            source_hash: "n".into(),
+                            policy_version: "v1".into(),
+                            layer: PromptLayer::RecentInteraction,
+                            selection_reason: "recent history".into(),
+                            trust: ContextTrust::UntrustedData,
+                        },
+                        ContextBlock {
+                            block_id: "task:current".into(),
+                            source: "current_user_request".into(),
+                            content: "current".into(),
+                            tokens: 3,
+                            truncated: false,
+                            source_hash: "c".into(),
+                            policy_version: "v1".into(),
+                            layer: PromptLayer::TaskPacket,
+                            selection_reason: "latest user objective".into(),
+                            trust: ContextTrust::UntrustedData,
+                        },
+                    ],
+                },
+                9,
+            )
+            .expect("selection should fit the hard budget");
+        assert_eq!(packet.manifest.used_tokens, 9);
+        assert!(packet
+            .blocks
+            .iter()
+            .any(|block| block.block_id == "system:0"));
+        assert!(packet
+            .blocks
+            .iter()
+            .any(|block| block.block_id == "task:current"));
+        assert!(packet
+            .blocks
+            .iter()
+            .any(|block| block.block_id == "message:1"));
+        assert!(!packet
+            .blocks
+            .iter()
+            .any(|block| block.block_id == "message:0"));
     }
 }

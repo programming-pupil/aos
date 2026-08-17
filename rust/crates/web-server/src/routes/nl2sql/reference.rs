@@ -1550,9 +1550,13 @@ async fn append_approved_feedback_references(
         return Ok(());
     }
     let rows = sqlx::query::<sqlx::Sqlite>(
-        "SELECT id, correction_json FROM feedback_learning_events
-         WHERE tenant_id = ? AND scope = ? AND approved = 1
-         ORDER BY created_at DESC LIMIT 20",
+        "SELECT e.id, e.correction_json
+         FROM feedback_learning_events e
+         JOIN feedback_regression_cases r
+           ON r.tenant_id = e.tenant_id AND r.feedback_event_id = e.id
+         WHERE e.tenant_id = ? AND e.scope = ? AND e.approved = 1
+           AND r.status = 'verified'
+         ORDER BY e.created_at DESC LIMIT 20",
     )
     .bind(tenant_id)
     .bind(format!("datasource:{datasource_id}"))
@@ -6394,7 +6398,39 @@ GROUP BY region
         .execute(&db)
         .await
         .unwrap();
+        sqlx::query(
+            "INSERT INTO feedback_regression_cases
+                (id, tenant_id, datasource_id, feedback_event_id, analytic_intent_id,
+                 original_ir_hash, original_sql_hash, corrected_sql_hash,
+                 semantic_diff_json, verification_json, execution_evidence_json,
+                 fixture_json, status, approved_by, approved_at, last_verified_at)
+             VALUES ('case-1', 'tenant-a', 'ds-a', 'f1', 'query-1',
+                     'ir-hash', 'old-hash', 'new-hash', '{}', '{}', NULL, '{}',
+                     'approved', 'owner', CURRENT_TIMESTAMP, NULL)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
         let mut own = Vec::new();
+        append_approved_feedback_references(
+            &db,
+            "tenant-a",
+            "ds-a",
+            "昨天 ROI 哪个 app 最好",
+            &mut own,
+            6,
+        )
+        .await
+        .unwrap();
+        assert!(own.is_empty());
+        sqlx::query(
+            "UPDATE feedback_regression_cases
+             SET status = 'verified', execution_evidence_json = '{}',
+                 last_verified_at = CURRENT_TIMESTAMP WHERE id = 'case-1'",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
         append_approved_feedback_references(
             &db,
             "tenant-a",

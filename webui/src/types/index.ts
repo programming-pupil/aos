@@ -2993,6 +2993,18 @@ export interface MetricItem {
   filterConditions: unknown | null;
   description: string | null;
   granularity: string;
+  timeColumn?: string | null;
+  timezone: string;
+  population: {
+    subject?: string;
+    dedup_key?: string | null;
+    exclude_test_users?: boolean;
+    exclude_internal_users?: boolean;
+    valid_record_rule?: string | null;
+  };
+  allowedGrains: string[];
+  invariants: unknown;
+  joinContractIds: string[];
   createdBy: string | null;
   createdAt: string;
   status?: string | null;
@@ -3009,6 +3021,12 @@ export interface CreateMetricRequest {
   filterConditions?: unknown;
   description?: string;
   granularity?: string;
+  timeColumn?: string;
+  timezone?: string;
+  population?: MetricItem['population'];
+  allowedGrains?: string[];
+  invariants?: unknown;
+  joinContractIds?: string[];
 }
 
 export interface UpdateMetricRequest {
@@ -3018,6 +3036,12 @@ export interface UpdateMetricRequest {
   filterConditions?: unknown;
   description?: string;
   granularity?: string;
+  timeColumn?: string;
+  timezone?: string;
+  population?: MetricItem['population'];
+  allowedGrains?: string[];
+  invariants?: unknown;
+  joinContractIds?: string[];
 }
 
 // ── NL2SQL Join Paths ────────────────────────────────────────────────────────
@@ -3041,6 +3065,11 @@ export interface JoinPathItem {
   pathText?: string;
   sqlJoins?: string;
   notes?: string;
+  cardinality?: '1:1' | '1:N' | 'N:1' | 'N:N';
+  temporalCondition?: string;
+  nullable?: boolean;
+  dedupStrategy?: string;
+  allowedGrains?: string[];
 }
 
 export interface CreateJoinPathRequest {
@@ -3051,6 +3080,11 @@ export interface CreateJoinPathRequest {
   joinType?: string;
   confidence?: number;
   notes?: string;
+  cardinality?: '1:1' | '1:N' | 'N:1' | 'N:N';
+  temporalCondition?: string;
+  nullable?: boolean;
+  dedupStrategy?: string;
+  allowedGrains?: string[];
 }
 
 export interface UpdateJoinPathRequest {
@@ -3062,6 +3096,11 @@ export interface UpdateJoinPathRequest {
   confidence?: number;
   verified?: boolean;
   notes?: string;
+  cardinality?: '1:1' | '1:N' | 'N:1' | 'N:N';
+  temporalCondition?: string;
+  nullable?: boolean;
+  dedupStrategy?: string;
+  allowedGrains?: string[];
 }
 
 export interface ListJoinPathsResponse {

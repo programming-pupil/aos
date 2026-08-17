@@ -85,13 +85,118 @@ pub enum MemoryError {
     MissingEvidence,
     #[error("invalid confidence: {0}")]
     Confidence(String),
+    #[error("invalid temporal memory relation: {0}")]
+    InvalidRelation(String),
 }
 
+/// Stateless production policy kernel. Durable adapters own storage, while
+/// every admission, lexical signal, hybrid score and temporal relation passes
+/// through this type so SQLite and test repositories cannot drift.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemoryEngine;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RetrievalSignals {
+    pub lexical: f64,
+    pub semantic: Option<f64>,
+    pub semantic_min_relevance: f64,
+    pub semantic_weight: f64,
+    pub lexical_weight: f64,
+    pub confidence: f64,
+    pub confidence_weight: f64,
+    pub recency: f64,
+    pub recency_weight: f64,
+    pub pinned: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemporalRelation {
+    Supersedes,
+    ConflictsWith,
+}
+
+/// Reference repository for deterministic unit tests and compatibility
+/// bridges. Production state lives in the tenant-scoped durable adapter.
 #[derive(Debug, Clone, Default)]
-pub struct MemoryEngine {
+pub struct InMemoryMemoryRepository {
     records: BTreeMap<String, MemoryCandidate>,
 }
+
 impl MemoryEngine {
+    /// Shared deterministic admission policy used by durable adapters.  The
+    /// adapter may choose its own repository, but it must pass this gate
+    /// before a candidate can enter production Memory.
+    pub fn admit_text(text: &str) -> Result<(), MemoryError> {
+        validate_memory_text(text)
+    }
+
+    #[must_use]
+    pub fn is_sensitive(text: &str) -> bool {
+        contains_secret(text)
+    }
+
+    /// Canonical lexical component for hybrid retrieval. Keeping tokenization
+    /// here prevents the SQLite adapter and the in-memory engine from silently
+    /// ranking the same candidate differently.
+    #[must_use]
+    pub fn lexical_relevance(query: &str, text: &str) -> f64 {
+        let terms = query
+            .to_lowercase()
+            .split_whitespace()
+            .filter(|term| !term.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        Self::lexical_relevance_terms(&terms, text)
+    }
+
+    #[must_use]
+    pub fn lexical_relevance_terms(terms: &[String], text: &str) -> f64 {
+        if terms.is_empty() {
+            return 0.0;
+        }
+        let haystack = text.to_lowercase();
+        terms
+            .iter()
+            .filter(|term| haystack.contains(term.as_str()) || text.contains(term.as_str()))
+            .count() as f64
+            / terms.len() as f64
+    }
+
+    #[must_use]
+    pub fn retrieval_score(signals: RetrievalSignals) -> f64 {
+        if signals.pinned {
+            return 1.0;
+        }
+        let semantic_relevance = signals
+            .semantic
+            .filter(|score| *score >= signals.semantic_min_relevance)
+            .unwrap_or(0.0);
+        let relevance = match signals.semantic {
+            Some(_) => {
+                semantic_relevance * signals.semantic_weight
+                    + signals.lexical * signals.lexical_weight
+            }
+            None => signals.lexical * (signals.semantic_weight + signals.lexical_weight),
+        };
+        if relevance <= 0.0 {
+            return 0.0;
+        }
+        (relevance
+            + signals.confidence.clamp(0.0, 1.0) * signals.confidence_weight
+            + signals.recency.clamp(0.0, 1.0) * signals.recency_weight)
+            .clamp(0.0, 1.0)
+    }
+
+    pub fn temporal_relation(value: &str) -> Result<TemporalRelation, MemoryError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "supersedes" => Ok(TemporalRelation::Supersedes),
+            "conflicts_with" => Ok(TemporalRelation::ConflictsWith),
+            other => Err(MemoryError::InvalidRelation(other.to_string())),
+        }
+    }
+}
+
+impl InMemoryMemoryRepository {
     pub fn ingest(&mut self, candidate: MemoryCandidate) -> Result<bool, MemoryError> {
         if candidate.source.evidence_id.is_empty() {
             return Err(MemoryError::MissingEvidence);
@@ -219,9 +324,39 @@ impl MemoryEngine {
     }
 }
 fn contains_secret(text: &str) -> bool {
-    Regex::new(r"(?i)(sk-[A-Za-z0-9]{12,}|password\s*=|authorization:\s*bearer)")
+    let lower = text.to_ascii_lowercase();
+    let sensitive_needles = [
+        "api_key",
+        "apikey",
+        "secret",
+        "password",
+        "passwd",
+        "token=",
+        "bearer ",
+        "private key",
+        "access key",
+        "authorization:",
+        "cookie:",
+        "set-cookie:",
+        "sk-",
+    ];
+    if sensitive_needles
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        return true;
+    }
+    if Regex::new(r"(?i)(sk-[A-Za-z0-9]{12,}|password\s*=|authorization:\s*bearer)")
         .expect("static secret regex")
         .is_match(text)
+    {
+        return true;
+    }
+    let digit_count = text
+        .chars()
+        .filter(|character| character.is_ascii_digit())
+        .count();
+    digit_count >= 14 && digit_count * 2 >= text.chars().count()
 }
 
 /// Shared production admission guard for adapters that still persist through
@@ -274,7 +409,7 @@ mod tests {
     }
     #[test]
     fn dual_channels_and_sensitive_filter_are_independent() {
-        let mut engine = MemoryEngine::default();
+        let mut engine = InMemoryMemoryRepository::default();
         let mut continuity = candidate("c", "pending step", 0);
         continuity.channel = MemoryChannel::ContinuityState;
         let mut long_term = candidate("l", "dark", 0);
@@ -297,7 +432,7 @@ mod tests {
     }
     #[test]
     fn search_returns_current_scope_and_conflict_package() {
-        let mut engine = MemoryEngine::default();
+        let mut engine = InMemoryMemoryRepository::default();
         engine.ingest(candidate("old", "dark", 30)).unwrap();
         engine.ingest(candidate("new", "light", 1)).unwrap();
         let scope = AssertionScope::Session("s".into());
@@ -307,5 +442,27 @@ mod tests {
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].current[0].id, "new");
         assert_eq!(conflicts[0].superseded[0].id, "old");
+    }
+
+    #[test]
+    fn production_policy_combines_retrieval_signals_and_validates_relations() {
+        let score = MemoryEngine::retrieval_score(RetrievalSignals {
+            lexical: 0.5,
+            semantic: Some(0.8),
+            semantic_min_relevance: 0.4,
+            semantic_weight: 0.68,
+            lexical_weight: 0.22,
+            confidence: 0.9,
+            confidence_weight: 0.05,
+            recency: 1.0,
+            recency_weight: 0.05,
+            pinned: false,
+        });
+        assert!(score > 0.7 && score < 1.0);
+        assert_eq!(
+            MemoryEngine::temporal_relation("supersedes").unwrap(),
+            TemporalRelation::Supersedes
+        );
+        assert!(MemoryEngine::temporal_relation("overwrites").is_err());
     }
 }

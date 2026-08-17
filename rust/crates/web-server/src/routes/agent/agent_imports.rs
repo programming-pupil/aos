@@ -121,8 +121,8 @@ pub(super) use super::agent_pm_answer_finalize::finalize_pm_answer_text_with_rep
 pub(super) use super::agent_pm_answer_postprocess::{
     apply_hard_alignment_from_tool_results, build_pm_emergency_conclusion_text,
     build_pm_preface_fallback, build_pm_tool_evidence_hits, build_pm_websearch_content_chars_map,
-    pm_is_citable_url_by_content_chars, pm_is_tool_diagnostic_excerpt, push_pm_emergency_url,
-    PmToolEvidenceHit,
+    claim_evidence_semantically_supported, pm_is_citable_url_by_content_chars,
+    pm_is_tool_diagnostic_excerpt, push_pm_emergency_url, PmToolEvidenceHit,
 };
 pub(super) use super::agent_pm_contract::{
     apply_pm_contract_gate, detect_exec_constraints_issue, extract_pm_exec_constraints,

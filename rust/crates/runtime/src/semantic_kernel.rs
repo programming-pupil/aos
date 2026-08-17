@@ -1,10 +1,9 @@
-//! Compatibility bridge used while the semantic kernel is introduced behind
-//! a feature flag.  Existing session JSONL remains authoritative; this bridge
-//! shadow-writes the same message/tool facts into the unified contracts and
-//! can be enabled per tenant without changing old data.
+//! In-memory semantic-kernel fixture used by isolated runtime tests. Production
+//! execution and Memory state are owned by the durable ledger/repository
+//! adapters; this type deliberately does not claim persistence authority.
 
 use agent_protocol::{AgentEventEnvelope, AgentEventV1, EventLedger, MessageItem, MessageRole};
-use memory_engine::{DualChannelExtraction, MemoryEngine};
+use memory_engine::{DualChannelExtraction, InMemoryMemoryRepository};
 use semantic_core::{
     EvidenceLedger, ProposedStateDelta, ReductionOutcome, SemanticAssertion, SemanticReducer,
     SemanticSnapshot,
@@ -16,7 +15,7 @@ pub struct SemanticKernelBridge {
     pub execution: EventLedger,
     pub evidence: EvidenceLedger,
     pub snapshot: SemanticSnapshot,
-    pub memory: MemoryEngine,
+    pub memory: InMemoryMemoryRepository,
     reducer: SemanticReducer,
 }
 
@@ -27,7 +26,7 @@ impl SemanticKernelBridge {
             execution: EventLedger::default(),
             evidence: EvidenceLedger::default(),
             snapshot: SemanticSnapshot::default(),
-            memory: MemoryEngine::default(),
+            memory: InMemoryMemoryRepository::default(),
             reducer: SemanticReducer::default(),
         }
     }

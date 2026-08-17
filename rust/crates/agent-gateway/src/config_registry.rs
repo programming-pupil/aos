@@ -351,6 +351,14 @@ impl TenantConfigRegistry {
         }
     }
 
+    /// Shared durable store used by runtime adapters. Session recovery uses
+    /// this pool to rebuild from the append-only execution ledger; callers do
+    /// not get access to registry internals beyond a cheap pool clone.
+    #[must_use]
+    pub fn database(&self) -> sqlx::SqlitePool {
+        self.db.clone()
+    }
+
     /// Get user quota (max concurrent, token limits).
     pub async fn get_user_quota(
         &self,

@@ -99,6 +99,8 @@ pub(crate) async fn execute_agent_request_with_budget(
             req.shared_context.as_deref(),
             req.max_steps,
             &req.datasource_ids,
+            &conversation_id,
+            &query_id,
         )
         .await
     {

@@ -1495,15 +1495,18 @@ Trace 必须分成两层：最小、append-only 的事件 spine 记录顺序和�
 | CORE-003 | Evidence Ledger 与 source coverage | Runtime/DB | replacement 不得遗漏源事件 |
 | MEM-001 | 双通道 extractor | Memory | 结构化 schema、secret filter、离线 eval |
 | MEM-002 | temporal consolidation | Memory | 新旧事实、冲突和失效 case 通过 |
+| MEM-003 | projection atomicity | Memory | 普通 Memory 的 structured fact 与 searchable projection 同一事务，任一写入失败都不留下半成品 |
 | CMP-001 | 原子 CompactionCheckpoint | Runtime | 边界、smaller-than-source、fail-closed |
 | CTX-001 | Context Compiler + manifest | Runtime | 每个注入块可解释、可重放、有预算 |
 | PM-001 | RequirementState/Event | PM | 跨轮 delta，不从摘要重建当前状态 |
 | PM-002 | next-question policy | PM/Eval | 信息增益盲评优于固定模板 |
 | PM-003 | claim-evidence verifier | PM | URL 存在不等于支持，数值冲突可检出 |
+| PM-004 | Requirement delivery gate | PM | 研究证据回写 state；未就绪 state 只能交付 Requirement Brief，不能被后验质量修复升级为 PRD |
 | SQL-001 | AnalyticIntentIR | NL2SQL | canonical schema 覆盖核心语义字段 |
 | SQL-002 | Metric/Join Contract | NL2SQL/Data | owner/version/valid-time/lineage 完整 |
 | SQL-003 | semantic verifier | NL2SQL | metric/grain/population/time/join 检查 |
 | SQL-004 | calibrated confidence | NL2SQL/Eval | 移除固定 0.8/1.0，报告 ECE/Brier |
+| SQL-005 | immutable schema-bound IR | NL2SQL/Data | 逻辑维度唯一绑定后一次持久化；同 ID 不允许被后续 SQL/repair 覆盖 |
 | EVAL-001 | no-leak Memory benchmark | Eval | 问题不包含答案，评最终回答和证据 |
 | EVAL-002 | PM/NL2SQL blind benchmark | Eval/Domain | 同模型同工具同预算，可复现 |
 | EVAL-003 | Provider replay + fault-injection TCK | Eval/Runtime | request hash、稳定 parent/child script、fault matrix、`assert_consumed` |
@@ -1568,33 +1571,35 @@ AOS 不应以“我也能调用工具、也能写 SQL、也能研究”与 Codex
 
 逐 P0 的触发条件、生产符号、测试符号和状态见
 `docs/AOS_SEMANTIC_KERNEL_CONFORMANCE_MATRIX.zh-CN.md`；CI 由
-`eval/datasets/semantic-kernel-conformance.json` 的 traceability gate 防止文档与源码漂移。
+`eval/datasets/semantic-kernel-conformance.json` 保持规格、生产符号与测试映射一致，并由
+`scripts/check-semantic-kernel-behavior.sh` 逐 case 执行真实行为测试；字符串 traceability
+只能防止引用漂移，不能单独证明功能完成。
 
 | 规格能力 | 当前实现状态 | 代码/测试证据 |
 | --- | --- | --- |
-| Unified Agent Protocol、事件 hash、sequence、幂等、writer fencing | 已接通 | `agent-protocol` 类型与回放测试；SQLite `agent_event_ledger`、`agent_writer_leases`、中段损坏 fail-closed 测试 |
+| Unified Agent Protocol、事件 hash、sequence、幂等、writer fencing | 已接通 | `agent-protocol` 类型与回放测试；SQLite `agent_event_ledger`、`agent_writer_leases`、中段损坏 fail-closed 测试；Gateway 只从脱敏 Ledger envelope 与 hash 绑定的 AES-GCM 恢复 payload 重建实际 Runtime，行为测试证明 turn 消息和后台可见消息都可精确恢复、后台消息不制造 ghost turn、secret 不以明文落 Ledger、替换密文 fail closed 且 JSONL 不参与 |
 | Turn/Tool durable intent、outcome_unknown、取消/异常终结 | 已接通 | `runtime::AgentExecutionKernel` 已挂入 `ConversationRuntime`；SQLite runtime-kernel 测试验证 intent 先于 side effect、重启 synthetic closer |
-| Context Manifest 与敏感投影 | 已接通 | 每次模型迭代在 provider 前由 `semantic-core::ContextCompiler` 生成四层 `ContextPacket`，记录 block/snapshot/hash/预算/截断；结构化保护、hash、PM prompt manifest 测试 |
+| Context Compiler、Manifest 与敏感投影 | 已接通 | 每次模型迭代在 provider 前由 `semantic-core::ContextCompiler` 按 provider context window 选择真实 model-visible request；测试由捕获型 provider 断言旧历史已被裁剪。最终选择再写 block/snapshot/hash/预算 manifest |
 | Tool Capability Router 渐进披露 | 已接通 | 普通 Chat 默认核心工具 + `ToolSearch`；命中候选按 registry/permission 再激活；runtime 工具路由测试 |
 | Artifact/Spill 与精确恢复 | 已接通 | oversized tool output 先持久化完整受保护 payload，再按 text/log/search/table/JSON/binary 类型 reducer 生成 model/client/telemetry 投影；只有显式 `source` projection 可 owner 分页恢复，测试覆盖 UTF-8、行/字节计数、租户隔离和泄漏 |
-| 多维资源预算 | 已接通 | `agent-protocol::BudgetLedger`；SQLite 工具调用、web query、datasource scan 和 artifact bytes 记账；general/final synthesis/domain verifier/user-visible error 阶段隔离，测试证明 general 耗尽后 final 仍能执行并结算 |
+| 多维资源预算 | 已接通 | `agent-protocol::BudgetLedger`；SQLite 工具调用、web query、datasource scan、artifact bytes 和 parent-owned `child_slots` 记账；general/final synthesis/domain verifier/user-visible error 阶段隔离。capability 消费、child slot、lineage 和 spawn event 在一个事务提交，测试证明 general 耗尽后 final 仍能执行、第四个并发 child 被拒绝且无部分状态泄漏、settlement 后 slot 可复用 |
 | Child Thread lineage / settlement / top-down cancel | 已接通（能力协商） | Super Assistant specialist subtask 在执行前写 `child_thread_edges` 和统一 Agent Ledger；完成、失败、取消只结算一次；父任务取消向下传播，tenant lineage 回归测试覆盖。native AOS executor 实际支持 `cancel`，并在重启后恢复 pending cancel；`follow_up`/`steer`/`interrupt`/`resume` 会持久化后按 executor capability 明确拒绝，不伪装成已执行 |
 | Durable capability 与权限只降不升 | 已接通 | Tool intent 在 side effect 前持久化一次性 capability token 并消费，resource scope 仅存 hash；child 使用既有 permission snapshot，`CapabilityScope::intersection` 阻止扩权；权限模式比较使用显式语义，回归测试覆盖 `Prompt` 不能因 enum 顺序而自动满足危险权限 |
 | 通用 Web Approval suspend/resolve/resume | 已接通（Server/Gateway/WebUI） | `DurableDeferPrompter` 在生产 Gateway 路径中写入 durable request 后挂起；SSE 发送脱敏 `approval_paused`，恢复要求租户/用户/session/turn/invocation owner scope、一次性决策、过期检查和当前策略重检；SQLite owner/expiry/单次 dispatch 与重启回归测试通过；WebUI 刷新后从持久化审批列表恢复卡片，并用 reload-safe handlers 继续批准或拒绝，`approvalResume.test.ts` 覆盖实时与刷新两条路径 |
 | Prompt Manifest 与 model/tool lineage | 已接通 | Runtime 每次 provider 调用前持久化 model、active tool set、system prompt hash、message hash 和预算；PM 额外写版本化 `prompt_manifests` |
 | Semantic Assertion/Decision/Evidence/Reducer | 已接通 | `semantic-core` 可重放 reducer；证据缺失、冲突、supersession、context budget 测试 |
-| Memory 双通道与压缩边界 | 已接通 | compaction 生产 hook 使用租户 chat model 做语义抽取，确定性通道仅作 fallback；`memory-engine` 统一 secret admission、continuity/long-term channel 与 source evidence provenance；先写 key info/checkpoint 后替换，exact archive 保留；完整 continuation framing 后的替换内容不小于 source window 时 fail closed，测试覆盖增长门禁；scope cursor 与 `supersedes/conflicts_with` diff 事务已接入 |
-| PM Requirement State / next question | 已接通 | `pm-domain::requirement_state` 增量 delta、确认门禁、信息价值排序；SQLite requirement state/event 持久化和幂等测试 |
-| PM claim-evidence semantic admission | 已接通 | claim 对齐不再只接受 URL：证据 excerpt 必须通过数字、日期/时间单位、金额/百分比/人群单位和方向一致性检查；不一致进入 evidence gap，回归测试覆盖冲突数值/单位 |
-| NL2SQL NL -> IR -> binding -> verifier -> SQL audit | 已接通 | 查询前持久化 `AnalyticIntentIR`；metric contract alias/version binding、join contract loading、语义 verifier release decision 和 audit persistence |
-| NL2SQL feedback learning / calibrated confidence | 已接通 | safe correction 写入 `feedback_learning_events` 和稳定 regression case；仅 approved 且同 tenant/datasource 的 correction 进入检索；feedback 回填 confidence observation，API 报告 ECE/Brier；执行成功后回写 `executionPassed`、行列数和耗时，且按 tenant 隔离回归覆盖 |
+| Memory 双通道与压缩边界 | 已接通 | compaction 生产 hook 使用租户 chat model 做语义抽取，确定性通道仅作低置信 fallback；无状态 `MemoryEngine` 统一所有写入 admission、lexical/hybrid ranking 和 temporal relation，SQLite 只承担持久化；生产适配器等价性测试防止双实现漂移。所有入口先 `prepare`，运行时校验通过后在同一 commit 写 exact encrypted archive、structured facts、retrieval projection、cursor、checkpoint 和 Ledger；任一步失败均 abort，增长门禁 fail closed |
+| PM Requirement State / next question | 已接通 | Planner 输出 problem/stakeholder/job/pain/outcome/constraint/assumption/scope/decision/question/acceptance/evidence/experiment 全字段 `REQUIREMENT_DELTA_V1`，SQLite 按 delta/version 持久化并幂等去重；生产门禁在 retrieve 前处理 core question，研究证据再以 delta 回写，最终交付重新读取 durable state，高影响未验证假设只能形成 Requirement Brief；读写失败均 fail closed |
+| PM claim-evidence semantic admission | 已接通（确定性门禁） | claim 对齐不再只接受 URL：证据 excerpt 必须通过主题 token/entity、否定语义、数字、日期/时间单位、金额/百分比/人群单位和方向一致性检查；无关的无数字 excerpt 也被拒绝。该门禁不冒充通用 NLI 模型，效果 precision 仍待固定集实测 |
+| NL2SQL NL -> IR -> binding -> verifier -> SQL audit | 已接通 | `/query` 与超级助手/归因使用的单数据源、联邦和多步骤 `Nl2SqlAgent` 均在各自 provider/执行阶段前生成 intent proposal，完成 tenant Metric Contract、最终 Schema 唯一维度和时间列绑定，并首次 durable write；同一 JSON 原样注入 SQL generator/planner。生成后只有物理 SQL shape/join contract 作为 verifier 证据，不再从 SQL 反推另一份 intent；执行与 EXPLAIN 阶段的每个 repair 都复用这份 IR、独立且不可变地写 verification 后才允许重试。所有非 `Release`、IR/metric/grain/time/join 漂移及 audit 持久化失败均阻断执行 |
+| NL2SQL feedback learning / calibrated confidence | 已接通 | correction 必须绑定当前用户的真实查询并提供安全只读 SQL；只有 datasource owner/admin 可批准或撤销，当前状态与 append-only 审批审计原子提交。仅 approved 且同 tenant/datasource 的 correction 进入检索；feedback 回填 confidence observation，API 只用同 scope 标注报告 ECE/Brier；执行成功后回写 `executionPassed`、行列数和耗时 |
 | Attribution evidence level / causal guard | 已接通 | 报告输出 `L0_descriptive`/`L1_decomposition`、主因强制 evidence step、服务端加入不可证明因果 caveat，WebUI 展示证据等级 |
 | Provider replay / fault TCK | 已接通（离线） | `eval-harness::replay` canonical request hash、stable script key、`assert_consumed` 和故障帧测试 |
 | No-leak Memory probe | 已接通（机制） | Zero Loss follow-up 不再包含待召回事全文，expected fact 只用于评分；最终效果数值仍必须由固定数据集实测 |
 | 会话删除与 retention 投影 | 已接通 | 即使会话没有 artifact，删除仍撤销 session Memory、relation/citation/summary、archive、Context/Prompt Manifest、checkpoint、snapshot、PM delivery 和 trace；global Memory 与 compliance 记录保留 |
 | 跨竞品质量、准确率、召回率和效果领先 | 待实证 | 必须按第 17 节固定 case、同模型/工具/预算盲评后才可宣布，代码不伪造该结论；本次代码已提供可复现 fixture/指标记录入口 |
 
-本次交付不再把 legacy JSONL、PM stage 表或 NL2SQL 旧 SQL 行当作第二个事实源：它们保留为兼容 projection；新的运行事件、语义 IR、证据等级和最终交付 artifact 是可恢复路径的事实来源。任何 provider/数据库故障都进入结构化降级或 `outcome_unknown`，不得伪造 completed。
+本次交付对新事件不再把 legacy JSONL、PM stage 表或 NL2SQL 旧 SQL 行当作第二个事实源：它们只保留为历史数据兼容 projection；新的运行事件、语义 IR、Requirement State、证据等级和最终交付 artifact 是可恢复路径的事实来源。任何 provider/数据库故障都进入结构化失败、可恢复状态或 `outcome_unknown`，不得伪造 completed。
 
 ---
 
