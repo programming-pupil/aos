@@ -50,7 +50,7 @@ parking_lot = "0.12"
 fs2 = "0.4"
 lettre = { version = "0.11", features = ["smtp-transport", "tokio1", "tracing"] }
 proptest = "1"
-mongodb = "=3.2.5"
+mongodb = "=3.8.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
