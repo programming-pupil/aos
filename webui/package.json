@@ -42,7 +42,7 @@
     "remark-math": "^6.0.0",
     "wouter": "^3.10.0",
     "write-excel-file": "^4.1.1",
-    "zustand": "^5.0.0"
+    "zustand": "^5.0.15"
   },
   "devDependencies": {
     "@types/node": "^25.6.0",
