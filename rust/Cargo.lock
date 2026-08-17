@@ -65,7 +65,7 @@ dependencies = [
  "runtime",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sqlx",
  "thiserror 2.0.20",
  "tokio",
@@ -87,7 +87,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
  "uuid",
 ]
@@ -215,7 +215,7 @@ dependencies = [
  "runtime",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "telemetry",
  "tokio",
  "tracing",
@@ -1532,7 +1532,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
  "tokio",
 ]
@@ -2993,7 +2993,7 @@ dependencies = [
  "semantic-core",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
 ]
 
@@ -3270,7 +3270,7 @@ dependencies = [
  "semantic-core",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sqlparser",
  "sqlx",
  "tokio",
@@ -3758,7 +3758,7 @@ dependencies = [
  "pm-domain",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -4329,7 +4329,7 @@ dependencies = [
  "semantic-core",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "telemetry",
  "tiktoken-rs",
  "tokio",
@@ -4628,7 +4628,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
  "uuid",
 ]
@@ -6251,7 +6251,7 @@ dependencies = [
  "semantic-core",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sqlparser",
  "sqlx",
  "thiserror 2.0.20",

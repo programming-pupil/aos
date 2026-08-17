@@ -13,7 +13,7 @@ local-embedding = ["dep:anyhow", "dep:fastembed", "dep:parking_lot"]
 agent-protocol = { path = "../agent-protocol" }
 semantic-core = { path = "../semantic-core" }
 memory-engine = { path = "../memory-engine" }
-sha2 = "0.10"
+sha2 = "0.11"
 glob = "0.3"
 async-trait = "0.1"
 plugins = { path = "../plugins" }
