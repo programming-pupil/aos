@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 /// Information about an accessible datasource for planning purposes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatasourceSchemaInfo {
+    pub tenant_id: String,
     pub datasource_id: String,
     pub datasource_name: String,
     pub db_type: String,

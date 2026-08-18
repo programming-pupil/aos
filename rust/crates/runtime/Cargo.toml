@@ -25,6 +25,7 @@ tokio.workspace = true
 notify.workspace = true
 reqwest.workspace = true
 bytes.workspace = true
+chrono.workspace = true
 http.workspace = true
 tracing.workspace = true
 walkdir = "2"

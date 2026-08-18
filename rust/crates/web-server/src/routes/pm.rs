@@ -6039,12 +6039,20 @@ fn key_hint(secret: &str) -> Option<String> {
     )
 }
 
-fn decrypt_optional_secret(ciphertext: Option<String>) -> Option<String> {
+fn decrypt_optional_secret(
+    ciphertext: Option<String>,
+    tenant_id: &str,
+    provider_id: &str,
+) -> Option<String> {
     ciphertext.and_then(|raw| {
         if raw.trim().is_empty() {
             None
         } else {
-            agent_gateway::decrypt(&raw).ok()
+            agent_gateway::crypto::decrypt_scoped(
+                &raw,
+                &agent_gateway::crypto::scoped_aad("pm_search.auth_secret", tenant_id, provider_id),
+            )
+            .ok()
         }
     })
 }
@@ -6077,7 +6085,7 @@ fn value_as_string_vec(value: Option<Value>) -> Option<Vec<String>> {
 
 fn provider_select_sql() -> &'static str {
     r#"
-    SELECT id, name, provider_type, enabled, priority, base_url, method, auth_type,
+    SELECT id, tenant_id, name, provider_type, enabled, priority, base_url, method, auth_type,
            auth_secret_ref, auth_secret_ciphertext, key_hint,
            CAST(headers_json AS TEXT) AS headers_json,
            CAST(query_template_json AS TEXT) AS query_template_json,
@@ -6159,6 +6167,8 @@ fn row_to_tool_provider_config(
     row: &sqlx::sqlite::SqliteRow,
     query_max_results: Option<usize>,
 ) -> Result<tools::WebSearchProviderConfig, AppError> {
+    let tenant_id: String = row.get("tenant_id");
+    let provider_id: String = row.get("id");
     let provider_type_raw: String = row.get("provider_type");
     let provider_type = search_provider_type_to_tool_type(&provider_type_raw)
         .ok_or_else(|| AppError::ValidationError("unsupported provider_type".into()))?;
@@ -6167,7 +6177,7 @@ fn row_to_tool_provider_config(
         usize::try_from(raw.max(1)).ok()
     });
     Ok(tools::WebSearchProviderConfig {
-        id: row.get("id"),
+        id: provider_id.clone(),
         name: row.get("name"),
         provider_type,
         enabled: row.get("enabled"),
@@ -6175,7 +6185,11 @@ fn row_to_tool_provider_config(
         base_url: row.get("base_url"),
         method: Some(row.get("method")),
         auth_type: Some(row.get("auth_type")),
-        auth_secret: decrypt_optional_secret(row.get("auth_secret_ciphertext")),
+        auth_secret: decrypt_optional_secret(
+            row.get("auth_secret_ciphertext"),
+            &tenant_id,
+            &provider_id,
+        ),
         headers_json: parse_json_cell(row.get("headers_json")),
         query_template_json: parse_json_cell(row.get("query_template_json")),
         response_mapping_json: parse_json_cell(row.get("response_mapping_json")),
@@ -6263,7 +6277,12 @@ async fn create_search_provider(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(agent_gateway::encrypt)
+        .map(|secret| {
+            agent_gateway::crypto::encrypt_scoped(
+                secret,
+                &agent_gateway::crypto::scoped_aad("pm_search.auth_secret", &claims.tenant_id, &id),
+            )
+        })
         .transpose()
         .map_err(|error| AppError::Internal(format!("encryption failed: {error}")))?;
     let hint = req.auth_secret.as_deref().and_then(key_hint);
@@ -6338,7 +6357,12 @@ async fn update_search_provider(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(agent_gateway::encrypt)
+        .map(|secret| {
+            agent_gateway::crypto::encrypt_scoped(
+                secret,
+                &agent_gateway::crypto::scoped_aad("pm_search.auth_secret", &claims.tenant_id, &id),
+            )
+        })
         .transpose()
         .map_err(|error| AppError::Internal(format!("encryption failed: {error}")))?;
     let hint = req.auth_secret.as_deref().and_then(key_hint);

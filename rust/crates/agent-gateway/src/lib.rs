@@ -58,7 +58,10 @@ pub use events::{
     AgentEvent, CompactionRecord, SessionMetadata, StreamingTurnResult, TokenUsageRecord,
     ToolCallRecord, TurnResult,
 };
-pub use gitlab::{AddProjectRequest, GitlabProject, GitlabProjectManager, UpdateProjectRequest};
+pub use gitlab::{
+    decrypt_token as decrypt_repository_token, encrypt_token as encrypt_repository_token,
+    AddProjectRequest, GitlabProject, GitlabProjectManager, UpdateProjectRequest,
+};
 pub use path_safety::PathValidator;
 pub use runtime_builder::{CompactionHookContext, CompactionHookFactory, RuntimeBuilder};
 pub use session_manager::{
@@ -72,6 +75,15 @@ pub use session_manager::{
 /// workspace reconstruction. Keeping one constant prevents parser/index
 /// changes from silently corrupting reconstructed source text.
 pub const UNIFIED_WORKSPACE_UPLOAD_OVERLAP_CHARS: usize = 180;
+
+pub(crate) fn behavior_trace(case_id: &str) {
+    if std::env::var("AOS_BEHAVIOR_TRACE_CASE").as_deref() == Ok(case_id) {
+        static EMITTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if EMITTED.set(()).is_ok() {
+            eprintln!("AOS_PRODUCTION_TRACE\t{case_id}");
+        }
+    }
+}
 
 use std::path::PathBuf;
 use std::sync::Arc;

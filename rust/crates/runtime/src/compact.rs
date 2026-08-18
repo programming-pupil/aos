@@ -203,13 +203,20 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
     }
 
     let existing_summary = existing_compacted_summary(session);
-    let (compacted_prefix_len, keep_from) =
+    let (archive_start, keep_from) =
         compaction_message_window(session, config).unwrap_or((0, session.messages.len()));
-    let removed = &session.messages[compacted_prefix_len..keep_from];
-    let archived_messages = removed.to_vec();
+    // An existing continuation is a durable replacement artifact. When it is
+    // replaced by a newer summary it must remain in the exact archive so the
+    // persistence layer can record a parent compaction edge. It is excluded
+    // from the new summary input below to avoid recursively expanding text.
+    let summary_start = usize::from(existing_summary.is_some());
+    let summary_messages = &session.messages[summary_start..keep_from];
+    let archived_messages = session.messages[archive_start..keep_from].to_vec();
     let preserved = session.messages[keep_from..].to_vec();
-    let summary =
-        merge_compact_summaries(existing_summary.as_deref(), &summarize_messages(removed));
+    let summary = merge_compact_summaries(
+        existing_summary.as_deref(),
+        &summarize_messages(summary_messages),
+    );
     // Kernel-side pinned protection (Req 4.9): exclude pinned messages from the
     // discardable set by retaining their content verbatim in the final summary,
     // regardless of whether an orchestration layer is present in the call path.
@@ -230,8 +237,8 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
     compacted_session.messages = compacted_messages;
     compacted_session.record_compaction_checkpoint_with_removed_start(
         summary.clone(),
-        compacted_prefix_len,
-        removed.len(),
+        archive_start,
+        archived_messages.len(),
         compacted_session.messages.clone(),
         archived_messages.clone(),
     );
@@ -240,7 +247,7 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         summary,
         formatted_summary,
         compacted_session,
-        removed_message_count: removed.len(),
+        removed_message_count: archived_messages.len(),
         archived_messages,
     }
 }
@@ -283,10 +290,12 @@ pub fn compact_session_with_summary(
         first_message.usage = None;
     }
     if let Some(compaction) = compacted_session.compaction.as_mut() {
-        compaction.summary = summary.clone();
+        compaction.summary.clone_from(&summary);
         compaction.removed_message_count = baseline.removed_message_count;
-        compaction.replacement_messages = compacted_session.messages.clone();
-        compaction.archived_messages = archived_messages.clone();
+        compaction
+            .replacement_messages
+            .clone_from(&compacted_session.messages);
+        compaction.archived_messages.clone_from(&archived_messages);
     } else {
         compacted_session.record_compaction_checkpoint(
             summary.clone(),
@@ -400,7 +409,10 @@ fn compaction_message_window(
         }
         k
     };
-    Some((compacted_prefix_len, keep_from))
+    // The previous continuation is itself being replaced. Keep it in the
+    // exact archive so persistence can bind the parent compaction; only the
+    // summary input remains anchored after that prefix.
+    Some((0, keep_from))
 }
 
 fn summarize_messages(messages: &[ConversationMessage]) -> String {
@@ -1114,6 +1126,15 @@ mod tests {
         assert!(matches!(
             &second.compacted_session.messages[1].blocks[0],
             ContentBlock::Text { text } if text.contains("Please add regression tests for compaction.")
+        ));
+        assert_eq!(
+            second.archived_messages.len(),
+            3,
+            "replacing an existing continuation archives the parent replacement"
+        );
+        assert!(matches!(
+            second.archived_messages[0].role,
+            MessageRole::System
         ));
     }
 

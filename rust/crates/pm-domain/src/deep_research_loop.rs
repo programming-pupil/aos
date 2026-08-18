@@ -568,24 +568,21 @@ impl PmDeepResearchLoop {
         let no_new_external_progress = input.no_new_evidence_repeats >= input.no_new_evidence_limit
             && first_party_is_primary
             && !input.admitted_external_evidence;
-        let action = if !enabled {
-            PmDeepResearchAction::Finalize
-        } else if scores.decision_ready() && input.quality_passed && !diagnostic_leaked {
-            PmDeepResearchAction::Finalize
-        } else if hard_limit_reached {
-            PmDeepResearchAction::Rewrite
-        } else if diagnostic_leaked {
-            PmDeepResearchAction::Rewrite
-        } else if no_new_external_progress {
-            PmDeepResearchAction::Rewrite
-        } else if external_search_exhausted_for_first_party {
-            PmDeepResearchAction::Rewrite
-        } else if external_search_failed_admission
-            && input.attempt < input.max_attempts
-            && !next_queries.is_empty()
+        let action = if !enabled
+            || (scores.decision_ready() && input.quality_passed && !diagnostic_leaked)
         {
-            PmDeepResearchAction::ContinueResearch
-        } else if expert_review_score.should_continue_research && has_external_followup_branch {
+            PmDeepResearchAction::Finalize
+        } else if hard_limit_reached
+            || diagnostic_leaked
+            || no_new_external_progress
+            || external_search_exhausted_for_first_party
+        {
+            PmDeepResearchAction::Rewrite
+        } else if (external_search_failed_admission
+            && input.attempt < input.max_attempts
+            && !next_queries.is_empty())
+            || (expert_review_score.should_continue_research && has_external_followup_branch)
+        {
             PmDeepResearchAction::ContinueResearch
         } else if scores.actionability_score < 0.55 || expert_review_score.should_rewrite {
             if input.external_search_available

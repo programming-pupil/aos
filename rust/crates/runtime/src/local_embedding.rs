@@ -33,8 +33,7 @@ impl Drop for InteractiveWaiterGuard {
 
 pub fn configure_cache_for_data_dir(data_dir: &Path) -> anyhow::Result<()> {
     let cache_dir = std::env::var_os("AOS_LOCAL_EMBEDDING_CACHE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| data_dir.join("models").join("fastembed"));
+        .map_or_else(|| data_dir.join("models").join("fastembed"), PathBuf::from);
     configure_cache_dir(cache_dir)
 }
 
@@ -129,7 +128,8 @@ fn with_model<T>(
 }
 
 pub fn warm() -> anyhow::Result<()> {
-    let vectors = embed(vec!["AOS local embedding readiness check".to_string()])?;
+    let texts = vec!["AOS local embedding readiness check".to_string()];
+    let vectors = embed(&texts)?;
     let dimensions = vectors.first().map_or(0, Vec::len);
     if dimensions != DIMENSIONS {
         anyhow::bail!(
@@ -145,7 +145,7 @@ pub fn shutdown() {
     }
 }
 
-pub fn embed(texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+pub fn embed(texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
     let _interactive_waiter = InteractiveWaiterGuard::new();
     embed_with_priority(texts, false)
 }
@@ -155,11 +155,11 @@ pub fn embed(texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
 /// ONNX inference is serialized because the bundled model is a singleton. A
 /// repository import can enqueue thousands of chunks, so background callers
 /// wait between batches whenever a user-facing query is ready to run.
-pub fn embed_background(texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+pub fn embed_background(texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
     embed_with_priority(texts, true)
 }
 
-fn embed_with_priority(texts: Vec<String>, background: bool) -> anyhow::Result<Vec<Vec<f32>>> {
+fn embed_with_priority(texts: &[String], background: bool) -> anyhow::Result<Vec<Vec<f32>>> {
     let mut vectors = Vec::with_capacity(texts.len());
     for batch in texts.chunks(MAX_INFERENCE_BATCH_SIZE) {
         if background {
@@ -169,7 +169,7 @@ fn embed_with_priority(texts: Vec<String>, background: bool) -> anyhow::Result<V
         }
         let mut batch_vectors = with_model(|model| {
             model
-                .embed(batch.to_vec(), None)
+                .embed(batch, None)
                 .map_err(|error| anyhow::anyhow!("built-in embedding inference failed: {error}"))
         })?;
         vectors.append(&mut batch_vectors);
@@ -190,11 +190,11 @@ mod tests {
             .expect("AOS_TEST_LOCAL_EMBEDDING_CACHE_DIR must point to the bundled model cache");
         configure_cache_dir(cache_dir).expect("configure local embedding cache");
 
-        let vectors = embed(vec![
+        let texts = vec![
             "AOS local embedding readiness check".to_string(),
             "完全不同的业务指标查询".to_string(),
-        ])
-        .expect("run local embedding inference");
+        ];
+        let vectors = embed(&texts).expect("run local embedding inference");
         assert_eq!(vectors.len(), 2);
         assert!(vectors.iter().all(
             |vector| vector.len() == DIMENSIONS && vector.iter().all(|value| value.is_finite())

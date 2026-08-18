@@ -184,6 +184,7 @@ fn budget_map(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
 }
 
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn infer_model_profile(provider: &str, base_url: Option<&str>, model: &str) -> ModelProfile {
     let provider = normalized_provider(provider, base_url, model);
     let model_name = normalized_model(model);

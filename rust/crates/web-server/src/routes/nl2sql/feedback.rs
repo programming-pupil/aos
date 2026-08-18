@@ -312,6 +312,7 @@ async fn load_calibration_metrics(
     tenant_id: &str,
     datasource_id: &str,
 ) -> Result<(usize, f64, f64)> {
+    crate::behavior_trace("SQL-004");
     let observations = sqlx::query_as::<sqlx::Sqlite, (f32, i64)>(
         "SELECT predicted_score, actual_correct
          FROM nl2sql_confidence_observations
@@ -829,13 +830,17 @@ mod tests {
         super::super::semantic_audit::bind_schema_dimensions(
             &mut intent,
             &serde_json::json!([{
-                "table_name": "task_offer",
+                "table_name": "orders",
                 "columns": [
                     {"name": "executor_device_id"},
                     {"name": "order_id"}
                 ]
             }]),
             &[],
+        );
+        let metric_contract = super::super::semantic_audit::bind_test_count_metric_contract(
+            &mut intent,
+            "created_at",
         );
         crate::semantic_kernel_store::persist_nl2sql_intent_ir(
             &pool,
@@ -848,12 +853,12 @@ mod tests {
         .await
         .unwrap();
         let original = "SELECT executor_device_id, COUNT(*) AS order_count \
-                        FROM task_offer GROUP BY executor_device_id";
+                        FROM orders GROUP BY executor_device_id";
         let audit =
             super::super::semantic_audit::compile_canonical_intent_with_contracts_and_joins(
                 &intent,
                 original,
-                &[],
+                std::slice::from_ref(&metric_contract),
                 &[],
             )
             .unwrap();
@@ -875,6 +880,18 @@ mod tests {
         )
         .await
         .unwrap();
+        sqlx::query(
+            "INSERT INTO metric_contracts
+                (id, tenant_id, datasource_id, source_metric_id, version, status,
+                 contract_json, lineage_json, valid_from, valid_until)
+             VALUES (?, 'tenant', 'ds', NULL, 1, 'active', ?, '{}',
+                     '2026-01-01', NULL)",
+        )
+        .bind(&metric_contract.id)
+        .bind(serde_json::to_string(&metric_contract).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
         let material = compile_feedback_regression_material(
             &pool,
             "tenant",
@@ -882,7 +899,7 @@ mod tests {
             "query",
             "按设备统计订单数",
             original,
-            "SELECT COUNT(*) AS order_count FROM task_offer",
+            "SELECT COUNT(*) AS order_count FROM orders",
         )
         .await;
         assert!(material.is_err());

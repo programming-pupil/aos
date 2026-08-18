@@ -225,6 +225,7 @@ pub async fn run_real_parity(
     dataset: &ParityDataset,
     config: &ParityRunConfig,
 ) -> Result<ParityRunSummary, String> {
+    crate::behavior_trace("EVAL-002");
     let cases = expand_parity_cases(dataset)?;
     let run_id = format!(
         "{}-{}",

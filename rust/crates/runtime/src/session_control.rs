@@ -184,7 +184,7 @@ impl SessionStore {
         // and project-local .claw/sessions/ so `/resume latest` finds sessions
         // from other workspaces.
         if let Some(latest) = self
-            .scan_global_sessions()?
+            .scan_global_sessions()
             .into_iter()
             .find(|s| s.id != exclude && s.message_count > 0)
         {
@@ -193,7 +193,7 @@ impl SessionStore {
         // Distinguish between "no sessions at all" and "sessions exist but all
         // are empty" so the user gets a clear signal about what to do.
         let has_any_session = self.list_sessions()?.iter().any(|s| s.id != exclude)
-            || self.scan_global_sessions()?.iter().any(|s| s.id != exclude);
+            || self.scan_global_sessions().iter().any(|s| s.id != exclude);
         if has_any_session {
             return Err(SessionControlError::Format(format_all_sessions_empty(
                 &self.sessions_root,
@@ -275,7 +275,7 @@ impl SessionStore {
     /// sessions, without enforcing the current-workspace validation. Used as a
     /// fallback by `latest_session_excluding` so `/resume latest` can find
     /// sessions created in other workspaces.
-    fn scan_global_sessions(&self) -> Result<Vec<ManagedSessionSummary>, SessionControlError> {
+    fn scan_global_sessions(&self) -> Vec<ManagedSessionSummary> {
         let mut sessions = Vec::new();
 
         // Scan global root: <config_home>/sessions/<fingerprint>/
@@ -304,7 +304,7 @@ impl SessionStore {
         }
 
         sort_managed_sessions(&mut sessions);
-        Ok(sessions)
+        sessions
     }
 
     pub fn fork_session(

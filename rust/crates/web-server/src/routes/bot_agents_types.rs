@@ -6,6 +6,61 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BotChannelSecretKind {
+    InboundSecret,
+    OutboundToken,
+    SigningSecret,
+    OutboundSigningSecret,
+}
+
+impl BotChannelSecretKind {
+    #[must_use]
+    pub const fn store_id(self) -> &'static str {
+        match self {
+            Self::InboundSecret => "bot_agent_channels.inbound_secret",
+            Self::OutboundToken => "bot_agent_channels.outbound_token",
+            Self::SigningSecret => "bot_agent_channels.signing_secret",
+            Self::OutboundSigningSecret => "bot_agent_channels.outbound_signing_secret",
+        }
+    }
+}
+
+pub fn encrypt_bot_channel_secret(
+    value: Option<String>,
+    tenant_id: &str,
+    channel_id: &str,
+    kind: BotChannelSecretKind,
+) -> Result<Option<String>, agent_gateway::crypto::CryptoError> {
+    clean_opt(value)
+        .map(|plaintext| {
+            let aad = agent_gateway::crypto::scoped_aad(kind.store_id(), tenant_id, channel_id);
+            agent_gateway::crypto::encrypt_scoped(&plaintext, &aad)
+        })
+        .transpose()
+}
+
+pub fn decrypt_bot_channel_secret(
+    value: Option<String>,
+    tenant_id: &str,
+    channel_id: &str,
+    kind: BotChannelSecretKind,
+) -> Result<Option<String>, agent_gateway::crypto::CryptoError> {
+    value
+        .filter(|stored| !stored.is_empty())
+        .map(|stored| {
+            if !stored.starts_with("aosenc:") {
+                // Legacy Bot channel credentials were stored as plaintext.
+                // Reads remain lossless while the registry worker migrates
+                // them in place to the scoped envelope.
+                return Ok(stored);
+            }
+            let aad = agent_gateway::crypto::scoped_aad(kind.store_id(), tenant_id, channel_id);
+            agent_gateway::crypto::decrypt_scoped(&stored, &aad)
+        })
+        .transpose()
+}
+
 #[derive(Debug, Serialize)]
 pub struct BotAgentInfo {
     pub id: String,
@@ -421,9 +476,53 @@ pub fn default_capability_bindings() -> Vec<CapabilityBindingInput> {
 #[cfg(test)]
 mod tests {
     use super::{
-        capability_binding_parts, default_capability_bindings, first_capability_key,
+        capability_binding_parts, decrypt_bot_channel_secret, default_capability_bindings,
+        encrypt_bot_channel_secret, first_capability_key, BotChannelSecretKind,
         CapabilityBindingInput,
     };
+
+    #[test]
+    fn bot_channel_secrets_are_scoped_and_legacy_plaintext_remains_readable_for_migration() {
+        let ciphertext = encrypt_bot_channel_secret(
+            Some("bot-secret-value".into()),
+            "tenant-a",
+            "channel-a",
+            BotChannelSecretKind::OutboundToken,
+        )
+        .unwrap()
+        .expect("encrypted secret");
+        assert!(ciphertext.starts_with("aosenc:v2:"));
+        assert!(!ciphertext.contains("bot-secret-value"));
+        assert_eq!(
+            decrypt_bot_channel_secret(
+                Some(ciphertext.clone()),
+                "tenant-a",
+                "channel-a",
+                BotChannelSecretKind::OutboundToken,
+            )
+            .unwrap()
+            .as_deref(),
+            Some("bot-secret-value")
+        );
+        assert!(decrypt_bot_channel_secret(
+            Some(ciphertext),
+            "tenant-b",
+            "channel-a",
+            BotChannelSecretKind::OutboundToken,
+        )
+        .is_err());
+        assert_eq!(
+            decrypt_bot_channel_secret(
+                Some("legacy-plaintext-token".into()),
+                "tenant-a",
+                "channel-a",
+                BotChannelSecretKind::OutboundToken,
+            )
+            .unwrap()
+            .as_deref(),
+            Some("legacy-plaintext-token")
+        );
+    }
 
     #[test]
     fn default_bot_uses_super_assistant_router() {

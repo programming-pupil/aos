@@ -32,69 +32,65 @@ pub enum LifecycleError {
 }
 
 impl ToolLifecycle {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             state: ToolLifecycleState::Proposed,
         }
     }
+    #[must_use]
     pub fn state(&self) -> ToolLifecycleState {
         self.state
     }
     pub fn transition(&mut self, next: ToolLifecycleState) -> Result<(), LifecycleError> {
-        let valid = match (self.state, next) {
+        let valid = matches!(
+            (self.state, next),
             (
                 ToolLifecycleState::Proposed,
                 ToolLifecycleState::AwaitingAuthorization
-                | ToolLifecycleState::Authorized
-                | ToolLifecycleState::Cancelled
-                | ToolLifecycleState::Expired,
-            ) => true,
-            (
+                    | ToolLifecycleState::Authorized
+                    | ToolLifecycleState::Cancelled
+                    | ToolLifecycleState::Expired,
+            ) | (
                 ToolLifecycleState::AwaitingAuthorization,
                 ToolLifecycleState::Authorized
-                | ToolLifecycleState::Cancelled
-                | ToolLifecycleState::Expired,
-            ) => true,
-            (
+                    | ToolLifecycleState::Cancelled
+                    | ToolLifecycleState::Expired,
+            ) | (
                 ToolLifecycleState::Authorized,
                 ToolLifecycleState::Started
-                | ToolLifecycleState::Cancelled
-                | ToolLifecycleState::Expired,
-            ) => true,
-            (
+                    | ToolLifecycleState::Cancelled
+                    | ToolLifecycleState::Expired,
+            ) | (
                 ToolLifecycleState::Started,
                 ToolLifecycleState::Streaming
-                | ToolLifecycleState::Completed
-                | ToolLifecycleState::Failed
-                | ToolLifecycleState::Cancelled
-                | ToolLifecycleState::OutcomeUnknown
-                | ToolLifecycleState::Suspended,
-            ) => true,
-            (
+                    | ToolLifecycleState::Completed
+                    | ToolLifecycleState::Failed
+                    | ToolLifecycleState::Cancelled
+                    | ToolLifecycleState::OutcomeUnknown
+                    | ToolLifecycleState::Suspended,
+            ) | (
                 ToolLifecycleState::Streaming,
                 ToolLifecycleState::Completed
-                | ToolLifecycleState::Failed
-                | ToolLifecycleState::Cancelled
-                | ToolLifecycleState::OutcomeUnknown
-                | ToolLifecycleState::Suspended,
-            ) => true,
-            (
+                    | ToolLifecycleState::Failed
+                    | ToolLifecycleState::Cancelled
+                    | ToolLifecycleState::OutcomeUnknown
+                    | ToolLifecycleState::Suspended,
+            ) | (
                 ToolLifecycleState::Suspended,
                 ToolLifecycleState::Resumed
-                | ToolLifecycleState::Cancelled
-                | ToolLifecycleState::Expired
-                | ToolLifecycleState::OutcomeUnknown,
-            ) => true,
-            (
+                    | ToolLifecycleState::Cancelled
+                    | ToolLifecycleState::Expired
+                    | ToolLifecycleState::OutcomeUnknown,
+            ) | (
                 ToolLifecycleState::Resumed,
                 ToolLifecycleState::Streaming
-                | ToolLifecycleState::Completed
-                | ToolLifecycleState::Failed
-                | ToolLifecycleState::Cancelled
-                | ToolLifecycleState::OutcomeUnknown,
-            ) => true,
-            _ => false,
-        };
+                    | ToolLifecycleState::Completed
+                    | ToolLifecycleState::Failed
+                    | ToolLifecycleState::Cancelled
+                    | ToolLifecycleState::OutcomeUnknown,
+            )
+        );
         if !valid {
             return Err(LifecycleError::Invalid {
                 from: self.state,

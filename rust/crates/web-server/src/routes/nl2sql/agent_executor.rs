@@ -267,7 +267,13 @@ impl FederatedTrinoSource {
         if !matches!(schema.db_type.as_str(), "presto" | "trino") {
             return None;
         }
-        let config_val = decrypt_config(&schema.config, data_dir).ok()?;
+        let config_val = decrypt_config(
+            &schema.config,
+            data_dir,
+            &schema.tenant_id,
+            &schema.datasource_id,
+        )
+        .ok()?;
         let cfg: AgentTrinoConfig = serde_json::from_value(config_val).ok()?;
         let normalized_host = nl2sql_domain::datasource_config::normalize_host_input(&cfg.host);
         let port = normalized_host.port.unwrap_or(cfg.port);
@@ -2106,7 +2112,10 @@ impl Nl2SqlAgent {
         let max_attempts = federated_trino_explain_repair_attempts();
         let mut context = SelfCorrectContext::default();
         for attempt in 0..=max_attempts {
-            match self.explain_trino_sql(claims, config_json, sql).await {
+            match self
+                .explain_trino_sql(claims, datasource_id, config_json, sql)
+                .await
+            {
                 Ok(()) => {
                     clear_trino_explain_suppression(datasource_id).await;
                     return Ok(());
@@ -2207,6 +2216,7 @@ impl Nl2SqlAgent {
             match self
                 .execute_trino_with_timeout(
                     claims,
+                    datasource_id,
                     sql,
                     config_json,
                     self.max_rows_per_step,
@@ -2372,8 +2382,9 @@ impl Nl2SqlAgent {
                     }
                     next_retry_reason = Some("sql_repair:model".to_string());
                     if federated_trino_explain_after_execution_repair() {
-                        if let Err(explain_err) =
-                            self.explain_trino_sql(claims, config_json, sql).await
+                        if let Err(explain_err) = self
+                            .explain_trino_sql(claims, datasource_id, config_json, sql)
+                            .await
                         {
                             tracing::warn!(
                                 error = %explain_err,
@@ -2389,12 +2400,14 @@ impl Nl2SqlAgent {
     async fn explain_trino_sql(
         &self,
         claims: &Claims,
+        datasource_id: &str,
         config_json: &serde_json::Value,
         sql: &str,
     ) -> Result<(), String> {
         let explain_sql = format!("EXPLAIN {}", strip_trailing_semicolon(sql));
         self.execute_trino_with_timeout(
             claims,
+            datasource_id,
             &explain_sql,
             config_json,
             5,
@@ -3367,6 +3380,7 @@ impl Nl2SqlAgent {
             let schema_info = schema_info.unwrap_or_else(super::empty_schema_info);
             let parsed = extract_schema_tables_and_fks(&schema_info);
             schemas.push(DatasourceSchemaInfo {
+                tenant_id: tenant_id.to_string(),
                 datasource_id: ds_id.clone(),
                 datasource_name: ds_name,
                 db_type,
@@ -4063,7 +4077,7 @@ impl Nl2SqlAgent {
         config_json: &serde_json::Value,
         sql: &str,
         max_rows: usize,
-        _datasource_id: &str,
+        datasource_id: &str,
     ) -> anyhow::Result<(Vec<String>, Vec<serde_json::Value>)> {
         let _network_permit = if matches!(db_type, "presto" | "trino") {
             None
@@ -4075,12 +4089,29 @@ impl Nl2SqlAgent {
             )
         };
         match db_type {
-            "mysql" | "tidb" => self.execute_mysql(sql, config_json, max_rows).await,
-            "clickhouse" => self.execute_clickhouse(sql, config_json, max_rows).await,
-            "presto" | "trino" => self.execute_trino(claims, sql, config_json, max_rows).await,
-            "postgres" => self.execute_postgres(sql, config_json, max_rows).await,
+            "mysql" | "tidb" => {
+                self.execute_mysql(claims, datasource_id, sql, config_json, max_rows)
+                    .await
+            }
+            "clickhouse" => {
+                self.execute_clickhouse(claims, datasource_id, sql, config_json, max_rows)
+                    .await
+            }
+            "presto" | "trino" => {
+                self.execute_trino(claims, datasource_id, sql, config_json, max_rows)
+                    .await
+            }
+            "postgres" => {
+                self.execute_postgres(claims, datasource_id, sql, config_json, max_rows)
+                    .await
+            }
             "mongodb" => {
-                let config_val = decrypt_config(config_json, &self.state.data_dir)?;
+                let config_val = decrypt_config(
+                    config_json,
+                    &self.state.data_dir,
+                    &claims.tenant_id,
+                    datasource_id,
+                )?;
                 let config: nl2sql_domain::datasource_config::MongoConfig =
                     serde_json::from_value(config_val)?;
                 let result = super::mongodb_query::execute(
@@ -4099,6 +4130,8 @@ impl Nl2SqlAgent {
 
     async fn execute_mysql(
         &self,
+        claims: &Claims,
+        datasource_id: &str,
         sql: &str,
         config_json: &serde_json::Value,
         max_rows: usize,
@@ -4111,7 +4144,12 @@ impl Nl2SqlAgent {
             username: String,
             password: String,
         }
-        let config_val = decrypt_config(config_json, &self.state.data_dir)?;
+        let config_val = decrypt_config(
+            config_json,
+            &self.state.data_dir,
+            &claims.tenant_id,
+            datasource_id,
+        )?;
         let cfg: SqlConfig = serde_json::from_value(config_val)?;
         let url = crate::routes::data_sources::build_mysql_url_parts(
             &cfg.username,
@@ -4165,6 +4203,8 @@ impl Nl2SqlAgent {
 
     async fn execute_clickhouse(
         &self,
+        claims: &Claims,
+        datasource_id: &str,
         sql: &str,
         config_json: &serde_json::Value,
         max_rows: usize,
@@ -4177,7 +4217,12 @@ impl Nl2SqlAgent {
             username: String,
             password: String,
         }
-        let config_val = decrypt_config(config_json, &self.state.data_dir)?;
+        let config_val = decrypt_config(
+            config_json,
+            &self.state.data_dir,
+            &claims.tenant_id,
+            datasource_id,
+        )?;
         let cfg: ClickHouseConfig = serde_json::from_value(config_val)?;
 
         let addr = format!("http://{}:{}", cfg.host, cfg.port);
@@ -4240,12 +4285,14 @@ impl Nl2SqlAgent {
     async fn execute_trino(
         &self,
         claims: &Claims,
+        datasource_id: &str,
         sql: &str,
         config_json: &serde_json::Value,
         max_rows: usize,
     ) -> anyhow::Result<(Vec<String>, Vec<serde_json::Value>)> {
         self.execute_trino_with_timeout(
             claims,
+            datasource_id,
             sql,
             config_json,
             max_rows,
@@ -4257,6 +4304,7 @@ impl Nl2SqlAgent {
     async fn execute_trino_with_timeout(
         &self,
         claims: &Claims,
+        datasource_id: &str,
         sql: &str,
         config_json: &serde_json::Value,
         max_rows: usize,
@@ -4279,7 +4327,12 @@ impl Nl2SqlAgent {
             #[serde(default)]
             basic_auth: Option<bool>,
         }
-        let config_val = decrypt_config(config_json, &self.state.data_dir)?;
+        let config_val = decrypt_config(
+            config_json,
+            &self.state.data_dir,
+            &claims.tenant_id,
+            datasource_id,
+        )?;
         let cfg: TrinoConfig = serde_json::from_value(config_val)?;
 
         let normalized_host = nl2sql_domain::datasource_config::normalize_host_input(&cfg.host);
@@ -4356,6 +4409,8 @@ impl Nl2SqlAgent {
 
     async fn execute_postgres(
         &self,
+        claims: &Claims,
+        datasource_id: &str,
         sql: &str,
         config_json: &serde_json::Value,
         max_rows: usize,
@@ -4368,7 +4423,12 @@ impl Nl2SqlAgent {
             username: String,
             password: String,
         }
-        let config_val = decrypt_config(config_json, &self.state.data_dir)?;
+        let config_val = decrypt_config(
+            config_json,
+            &self.state.data_dir,
+            &claims.tenant_id,
+            datasource_id,
+        )?;
         let cfg: PgConfig = serde_json::from_value(config_val)?;
         let url = crate::routes::data_sources::build_postgres_url_parts(
             &cfg.username,
@@ -4597,33 +4657,35 @@ mod tests {
         super::super::semantic_audit::bind_schema_dimensions(
             &mut intent,
             &serde_json::json!([{
-                "table_name": "task_offer",
+                "table_name": "orders",
                 "columns": [{"name": "executor_device_id"}, {"name": "order_id"}]
             }]),
             &[],
+        );
+        let metric_contract = super::super::semantic_audit::bind_test_count_metric_contract(
+            &mut intent,
+            "created_at",
         );
         let guard = AgentSemanticGuard {
             conversation_id: "conversation".into(),
             intent_id: "intent".into(),
             datasource_id: "datasource".into(),
             intent,
-            metric_contracts: vec![],
+            metric_contracts: vec![metric_contract],
             join_contracts: vec![],
         };
         let matching = audit_agent_semantic_candidate(
             &guard,
-            "SELECT executor_device_id, COUNT(*) AS order_count FROM task_offer GROUP BY executor_device_id",
+            "SELECT executor_device_id, COUNT(*) AS order_count FROM orders GROUP BY executor_device_id",
         )
         .expect("matching SQL audit");
         assert_eq!(
             matching.verification.release_decision,
             nl2sql_core::semantic_ir::QueryReleaseDecision::Release
         );
-        let drifting = audit_agent_semantic_candidate(
-            &guard,
-            "SELECT COUNT(*) AS order_count FROM task_offer",
-        )
-        .expect("drifting SQL audit");
+        let drifting =
+            audit_agent_semantic_candidate(&guard, "SELECT COUNT(*) AS order_count FROM orders")
+                .expect("drifting SQL audit");
         assert_ne!(
             drifting.verification.release_decision,
             nl2sql_core::semantic_ir::QueryReleaseDecision::Release
@@ -5037,6 +5099,8 @@ mod tests {
         let config = crate::routes::data_sources::decrypt_config(
             &encrypted,
             std::path::Path::new(&data_dir),
+            &tenant_id,
+            &datasource_id,
         )
         .expect("decrypt Trino datasource config");
 

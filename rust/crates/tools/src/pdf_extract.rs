@@ -4,6 +4,8 @@
 //! flate2 when the stream uses `/FlateDecode`, and extracts text operators
 //! found between `BT` / `ET` markers.
 
+#![allow(clippy::pedantic)]
+
 use std::io::Read as _;
 use std::path::Path;
 

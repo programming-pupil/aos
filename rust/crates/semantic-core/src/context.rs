@@ -281,6 +281,7 @@ impl ContextCompiler {
         packet.manifest.snapshot_version = Some(snapshot.version);
         Ok(packet)
     }
+    #[must_use]
     pub fn hash(packet: &ContextPacket) -> String {
         let bytes = serde_json::to_vec(packet).expect("context is serializable");
         hex::encode(Sha256::digest(bytes))

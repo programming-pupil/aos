@@ -310,11 +310,11 @@ impl PmTurnRoute {
         })
     }
 
-    pub fn is_pm_deep_strategy(self: &Self) -> bool {
+    pub fn is_pm_deep_strategy(&self) -> bool {
         matches!(self.engine, PmRouteEngine::AosDeepResearch)
     }
 
-    pub fn is_lightweight_lookup(self: &Self) -> bool {
+    pub fn is_lightweight_lookup(&self) -> bool {
         matches!(self.turn_class, PmTurnClass::LiveLookup)
             || (matches!(self.answer_contract, PmAnswerContract::SourceGroundedAnswer)
                 && !self.is_pm_deep_strategy())

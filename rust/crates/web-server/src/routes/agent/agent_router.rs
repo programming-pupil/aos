@@ -55,6 +55,10 @@ pub fn routes(state: AppState) -> Router<AppState> {
             routing_get(list_session_approvals),
         )
         .route(
+            "/sessions/{session_id}/interactions",
+            routing_get(list_session_interactions),
+        )
+        .route(
             "/sessions/{session_id}/context-status",
             routing_get(get_session_context_status),
         )

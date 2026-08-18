@@ -934,6 +934,9 @@ impl McpServerManager {
             .retain(|_, route| route.server_name != server_name);
     }
 
+    // Keep the typed manager error by value here so callers retain structured
+    // server context without an allocation on every route lookup.
+    #[allow(clippy::result_large_err)]
     fn server_mut(
         &mut self,
         server_name: &str,
@@ -951,6 +954,7 @@ impl McpServerManager {
         JsonRpcId::Number(id)
     }
 
+    #[allow(clippy::result_large_err)]
     fn tool_call_timeout_ms(&self, server_name: &str) -> Result<u64, McpServerManagerError> {
         let server =
             self.servers
@@ -968,6 +972,7 @@ impl McpServerManager {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     fn server_process_exited(&mut self, server_name: &str) -> Result<bool, McpServerManagerError> {
         let server = self.server_mut(server_name)?;
         match server.process.as_mut() {

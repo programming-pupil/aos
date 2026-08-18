@@ -384,10 +384,7 @@ pub fn full_outer_join(
         let key_str = join_key_str(on, right_row)?;
         let has_null = key_str.contains("__null__");
 
-        if has_null {
-            let merged = fill_null_columns(&output_columns, right_row, Some(&left.columns));
-            output_rows.push(serde_json::Value::Object(merged));
-        } else if !right_matched_keys.contains(&key) {
+        if has_null || !right_matched_keys.contains(&key) {
             let merged = fill_null_columns(&output_columns, right_row, Some(&left.columns));
             output_rows.push(serde_json::Value::Object(merged));
         }

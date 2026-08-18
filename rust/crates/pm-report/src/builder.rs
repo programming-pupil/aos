@@ -249,7 +249,7 @@ fn pm_sanitize_url_list(items: Vec<String>, max_items: usize) -> Vec<String> {
 fn pm_humanize_metric_key(raw: &str) -> String {
     let mut out = String::new();
     for part in raw
-        .split(|ch: char| ch == '_' || ch == '-' || ch == ' ' || ch == '.')
+        .split(['_', '-', ' ', '.'])
         .filter(|part| !part.trim().is_empty())
     {
         if !out.is_empty() {
@@ -436,7 +436,7 @@ fn pm_parse_numeric_token(raw: &str) -> Option<(f64, String, String)> {
         numeric.truncate(numeric.len().saturating_sub(3));
     }
 
-    numeric = numeric.replace(',', "").replace('_', "").trim().to_string();
+    numeric = numeric.replace([',', '_'], "").trim().to_string();
     if numeric.is_empty() {
         return None;
     }
@@ -576,11 +576,7 @@ fn pm_extract_metrics_from_quant(
         };
         for (raw_key, raw_value) in metrics_obj {
             let key = pm_detect_metric_key(raw_key).unwrap_or_else(|| {
-                let normalized = raw_key
-                    .trim()
-                    .to_ascii_lowercase()
-                    .replace(' ', "_")
-                    .replace('-', "_");
+                let normalized = raw_key.trim().to_ascii_lowercase().replace([' ', '-'], "_");
                 if normalized.is_empty() {
                     "metric".to_string()
                 } else {
@@ -673,13 +669,8 @@ fn pm_extract_timeseries_from_quant(
             if items.len() < 2 {
                 continue;
             }
-            let key = pm_detect_metric_key(raw_key).unwrap_or_else(|| {
-                raw_key
-                    .trim()
-                    .to_ascii_lowercase()
-                    .replace(' ', "_")
-                    .replace('-', "_")
-            });
+            let key = pm_detect_metric_key(raw_key)
+                .unwrap_or_else(|| raw_key.trim().to_ascii_lowercase().replace([' ', '-'], "_"));
             let cjk_mode = contains_cjk(raw_key);
             let label = pm_metric_label_for_key(&key, cjk_mode);
             let mut points = Vec::<serde_json::Value>::new();
@@ -854,6 +845,7 @@ fn pm_build_metric_model(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pm_compute_report_strategy(
     question_type: &str,
     metric_count: usize,

@@ -288,12 +288,12 @@ pub fn model_capabilities(
             || override_value.max_output_tokens.is_some()
         {
             let built_in = model_token_limit(model);
-            let fallback_context = built_in
-                .map(|limit| limit.context_window_tokens)
-                .unwrap_or(CONSERVATIVE_CONTEXT_WINDOW_TOKENS);
-            let fallback_output = built_in
-                .map(|limit| limit.max_output_tokens)
-                .unwrap_or(CONSERVATIVE_MAX_OUTPUT_TOKENS);
+            let fallback_context = built_in.map_or(CONSERVATIVE_CONTEXT_WINDOW_TOKENS, |limit| {
+                limit.context_window_tokens
+            });
+            let fallback_output = built_in.map_or(CONSERVATIVE_MAX_OUTPUT_TOKENS, |limit| {
+                limit.max_output_tokens
+            });
             return ModelCapabilities {
                 context_window_tokens: override_value
                     .context_window_tokens
@@ -366,11 +366,7 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 65_536,
             context_window_tokens: 1_048_576,
         }),
-        "qwen-max" => Some(ModelTokenLimit {
-            max_output_tokens: 8_192,
-            context_window_tokens: 131_072,
-        }),
-        "qwen-plus" => Some(ModelTokenLimit {
+        "qwen-max" | "qwen-plus" => Some(ModelTokenLimit {
             max_output_tokens: 8_192,
             context_window_tokens: 131_072,
         }),

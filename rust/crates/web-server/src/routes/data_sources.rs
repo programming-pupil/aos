@@ -433,39 +433,46 @@ pub fn get_encryption_key(
     Ok(key)
 }
 
-fn encrypt_config(
+pub(crate) fn encrypt_config(
     config: &serde_json::Value,
-    data_dir: &std::path::Path,
+    _data_dir: &std::path::Path,
+    tenant_id: &str,
+    datasource_id: &str,
 ) -> std::result::Result<serde_json::Value, CryptoError> {
-    let key = get_encryption_key(data_dir)?;
-    let cipher =
-        Aes256Gcm::new_from_slice(&key).map_err(|e| CryptoError::Encrypt(e.to_string()))?;
-    let nonce_bytes = generate_nonce();
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let plaintext = config.to_string();
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_bytes())
-        .map_err(|e| CryptoError::Encrypt(e.to_string()))?;
-
-    let mut combined = nonce_bytes.to_vec();
-    combined.extend(ciphertext);
-
+    let ciphertext = agent_gateway::crypto::encrypt_scoped(
+        &config.to_string(),
+        &agent_gateway::crypto::scoped_aad("datasource.config", tenant_id, datasource_id),
+    )
+    .map_err(|error| CryptoError::Encrypt(error.to_string()))?;
     Ok(serde_json::json!({
         "_encrypted": true,
-        "nonce": BASE64.encode(nonce_bytes),
-        "data": BASE64.encode(combined),
+        "codec": "aos-envelope-v2",
+        "data": ciphertext,
     }))
 }
 
 pub fn decrypt_config(
     encrypted: &serde_json::Value,
     data_dir: &std::path::Path,
+    tenant_id: &str,
+    datasource_id: &str,
 ) -> std::result::Result<serde_json::Value, CryptoError> {
     // Non-encrypted config (freshly imported / legacy rows) passes through
     // unchanged so callers don't need to special-case it.
     if encrypted.get("_encrypted").and_then(|v| v.as_bool()) != Some(true) {
         return Ok(encrypted.clone());
+    }
+
+    if encrypted.get("codec").and_then(|value| value.as_str()) == Some("aos-envelope-v2") {
+        let ciphertext = encrypted["data"]
+            .as_str()
+            .ok_or_else(|| CryptoError::Malformed("missing `data` field".into()))?;
+        let plaintext = agent_gateway::crypto::decrypt_scoped(
+            ciphertext,
+            &agent_gateway::crypto::scoped_aad("datasource.config", tenant_id, datasource_id),
+        )
+        .map_err(|error| CryptoError::Decrypt(error.to_string()))?;
+        return serde_json::from_str(&plaintext).map_err(CryptoError::from);
     }
 
     let combined_b64 = encrypted["data"]
@@ -525,11 +532,12 @@ fn row_to_info(
 ) -> DataSourceInfo {
     let config_json: serde_json::Value = row.get("config");
     let id: String = row.get("id");
+    let tenant_id: String = row.get("tenant_id");
     // Decrypt first so we have the plaintext config keys (host, port, etc.).
     // A corrupt row is logged but not allowed to abort the whole listing:
     // the preview is substituted with an explicit marker so operators can
     // spot the broken datasource in the UI and re-key / re-save it.
-    let decrypted = match decrypt_config(&config_json, data_dir) {
+    let decrypted = match decrypt_config(&config_json, data_dir, &tenant_id, &id) {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(
@@ -548,7 +556,7 @@ fn row_to_info(
     };
     DataSourceInfo {
         id,
-        tenant_id: row.get("tenant_id"),
+        tenant_id,
         user_id: row.get("user_id"),
         name: row.get("name"),
         description: row.get("description"),
@@ -732,8 +740,13 @@ async fn create(
         )));
     }
 
-    let encrypted_config = serde_json::to_value(encrypt_config(&req.config, &state.data_dir)?)
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let encrypted_config = serde_json::to_value(encrypt_config(
+        &req.config,
+        &state.data_dir,
+        &claims.tenant_id,
+        &id,
+    )?)
+    .map_err(|e| AppError::Internal(e.to_string()))?;
 
     let sensitive_columns_json = req
         .sensitive_columns
@@ -958,7 +971,7 @@ async fn update(
         .bind(&id)
         .fetch_one(&state.db)
         .await?;
-        let decrypted = decrypt_config(&config_row.0, &state.data_dir)?;
+        let decrypted = decrypt_config(&config_row.0, &state.data_dir, &claims.tenant_id, &id)?;
         let mut merged = decrypted.as_object().cloned().unwrap_or_default();
         if let Some(new_cfg) = cfg.as_object() {
             // Merge policy (explicit-null-is-delete, mirroring JSON Merge
@@ -976,7 +989,12 @@ async fn update(
                 }
             }
         }
-        let encrypted = encrypt_config(&serde_json::json!(merged), &state.data_dir)?;
+        let encrypted = encrypt_config(
+            &serde_json::json!(merged),
+            &state.data_dir,
+            &claims.tenant_id,
+            &id,
+        )?;
         // Check for duplicate config (same host+port+database for SQL types).
         let sql_types = ["mysql", "tidb", "postgres", "clickhouse"];
         let db_type_row: Option<(String,)> =
@@ -1422,7 +1440,7 @@ async fn test_connection(
         return Err(AppError::Forbidden);
     }
 
-    let config = decrypt_config(&config_json, &state.data_dir)?;
+    let config = decrypt_config(&config_json, &state.data_dir, &tenant_id, &id)?;
     let response =
         probe_connection(&db_type, &config, Some((&claims.tenant_id, &claims.sub))).await?;
     if response.success {
@@ -1841,7 +1859,7 @@ async fn discover_schema(
         }
     };
 
-    let decrypted = decrypt_config(&config_json, &state.data_dir)?;
+    let decrypted = decrypt_config(&config_json, &state.data_dir, &claims.tenant_id, &id)?;
     let discovery_started_at = std::time::Instant::now();
     let outcome = match db_type.as_str() {
         "mysql" | "tidb" => {
@@ -2125,7 +2143,7 @@ async fn discover_table_schema(
         }
     };
 
-    let decrypted = decrypt_config(&config_json, &state.data_dir)?;
+    let decrypted = decrypt_config(&config_json, &state.data_dir, &claims.tenant_id, &id)?;
 
     let _trino_permit = if matches!(db_type.as_str(), "presto" | "trino") {
         Some(
@@ -3206,7 +3224,7 @@ async fn import_sql_schema(
         return Err(AppError::Forbidden);
     }
 
-    let decrypted_config = decrypt_config(&config_json, &state.data_dir).ok();
+    let decrypted_config = decrypt_config(&config_json, &state.data_dir, &ds_tenant, &id).ok();
     let imported_tables = parse_sql_schema_tables(&req.sql);
     if imported_tables.is_empty() {
         return Err(AppError::ValidationError(
@@ -4404,7 +4422,8 @@ async fn export_all(
             .and_then(|v| serde_json::from_value(v).ok());
         let enabled: bool = row.get("enabled");
 
-        let config = decrypt_config(&config_json, &state.data_dir).map_err(CryptoError::from)?;
+        let config = decrypt_config(&config_json, &state.data_dir, tenant_id, &ds_id)
+            .map_err(CryptoError::from)?;
 
         let table_semantics = load_table_semantics(&state.db, &ds_id).await?;
         let datasource_semantics = load_datasource_semantics(&state.db, &ds_id).await?;
@@ -4644,7 +4663,7 @@ async fn import_single_datasource(
         return ImportOutcome::Skipped(format!("data source '{}' already exists", ds.name));
     }
 
-    let encrypted = match encrypt_config(&ds.config, &state.data_dir) {
+    let encrypted = match encrypt_config(&ds.config, &state.data_dir, tenant_id, &existing_id) {
         Ok(v) => v,
         Err(e) => return ImportOutcome::Failed(e.to_string()),
     };
@@ -4696,7 +4715,7 @@ async fn create_datasource(
     ds: &ExportedDataSource,
 ) -> Result<String> {
     let id = uuid::Uuid::new_v4().to_string();
-    let encrypted = encrypt_config(&ds.config, &state.data_dir)?;
+    let encrypted = encrypt_config(&ds.config, &state.data_dir, tenant_id, &id)?;
     let sc_json: Option<String> = ds
         .sensitive_columns
         .as_ref()
@@ -4885,8 +4904,8 @@ async fn check_duplicate_config(
     .await
     .unwrap_or_default();
 
-    for (_, name, config_json) in rows {
-        if let Ok(decrypted) = decrypt_config(&config_json, data_dir) {
+    for (datasource_id, name, config_json) in rows {
+        if let Ok(decrypted) = decrypt_config(&config_json, data_dir, tenant_id, &datasource_id) {
             if let Ok(cfg) = serde_json::from_value::<SqlConfig>(decrypted) {
                 if cfg.host == host && cfg.port == port && cfg.database == database {
                     return Some(name);
@@ -4895,15 +4914,6 @@ async fn check_duplicate_config(
         }
     }
     None
-}
-
-fn generate_nonce() -> [u8; 12] {
-    let uuid = uuid::Uuid::new_v4();
-    let mut bytes = uuid.as_bytes().to_vec();
-    bytes.truncate(12);
-    let mut nonce = [0u8; 12];
-    nonce.copy_from_slice(&bytes);
-    nonce
 }
 
 #[cfg(test)]

@@ -378,8 +378,8 @@ mod tests {
         let (custom, source) = pricing_with_provenance("deepseek-v4-pro", Some(1.25), Some(2.5));
         let custom = custom.expect("complete custom pricing is usable");
         assert_eq!(source, PricingSource::Custom);
-        assert_eq!(custom.input_cost_per_million, 1.25);
-        assert_eq!(custom.output_cost_per_million, 2.5);
+        assert!((custom.input_cost_per_million - 1.25).abs() < f64::EPSILON);
+        assert!((custom.output_cost_per_million - 2.5).abs() < f64::EPSILON);
     }
 
     #[test]

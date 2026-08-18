@@ -120,8 +120,15 @@ fn rebuild_session_from_ledger_rows(
         let recovery_payload = recovery_ciphertext
             .as_deref()
             .map(|ciphertext| {
-                crate::crypto::decrypt(ciphertext)
-                    .map_err(|error| format!("cannot decrypt runtime recovery payload: {error}"))
+                crate::crypto::decrypt_scoped(
+                    ciphertext,
+                    &crate::crypto::scoped_aad(
+                        "ledger.raw_payload",
+                        tenant_id,
+                        &typed_envelope.event_id,
+                    ),
+                )
+                .map_err(|error| format!("cannot decrypt runtime recovery payload: {error}"))
             })
             .transpose()?
             .map(|value| {
@@ -282,6 +289,7 @@ async fn load_durable_ledger_session(
     tenant_id: &str,
     user_id: &str,
 ) -> Result<Option<runtime::Session>> {
+    crate::behavior_trace("PROTO-002");
     let rows = sqlx::query(
         "SELECT sequence, event_type, payload_json, payload_hash, raw_payload_ciphertext
          FROM agent_event_ledger

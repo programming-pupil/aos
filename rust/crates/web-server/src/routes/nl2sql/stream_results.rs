@@ -132,7 +132,12 @@ pub async fn execute_stream(
     let hard_limit = params.limit.unwrap_or(10_000).min(100_000);
 
     // Build MySQL pool.
-    let config_val = match decrypt_config(&config_json, &state.data_dir) {
+    let config_val = match decrypt_config(
+        &config_json,
+        &state.data_dir,
+        &claims.tenant_id,
+        &params.data_source_id,
+    ) {
         Ok(v) => v,
         Err(e) => {
             let ev = make_event(&StreamEvent::Error {

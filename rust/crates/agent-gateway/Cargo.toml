@@ -9,6 +9,7 @@ publish.workspace = true
 # Core runtime (we ONLY call public interfaces, never touch internals)
 runtime = { path = "../runtime", features = ["local-embedding"] }
 agent-protocol = { path = "../agent-protocol" }
+memory-engine = { path = "../memory-engine" }
 api = { path = "../api" }
 tools = { path = "../tools" }
 plugins = { path = "../plugins" }

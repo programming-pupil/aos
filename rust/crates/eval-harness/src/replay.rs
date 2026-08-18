@@ -20,11 +20,39 @@ pub struct ProviderRequestFixture {
 pub enum ProviderFrame {
     FirstChunkError(String),
     Chunk(String),
+    Partial(String),
+    Malformed(String),
     Disconnect,
     Hang,
     Timeout,
+    Cancelled,
+    LateResult(String),
     Duplicate(String),
+    Terminal {
+        status: ReplayTerminalStatus,
+        payload: Option<String>,
+    },
     Done,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ReplayTerminalStatus {
+    Completed,
+    Failed,
+    TimedOut,
+    Cancelled,
+    UnknownOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ReplayTranscript {
+    pub chunks: Vec<String>,
+    pub malformed_frames: Vec<String>,
+    pub partial: bool,
+    pub disconnected: bool,
+    pub hung: bool,
+    pub late_results: Vec<String>,
+    pub duplicate_terminal_count: usize,
+    pub terminal: Option<(ReplayTerminalStatus, Option<String>)>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FaultPoint {
@@ -54,6 +82,8 @@ pub enum ReplayError {
     UnsafeFixture,
     #[error("replay fixture still has {0} unconsumed fault point(s)")]
     UnconsumedFaults(usize),
+    #[error("provider replay ended without a terminal outcome")]
+    MissingTerminal,
 }
 
 #[derive(Debug, Clone)]
@@ -63,29 +93,38 @@ pub struct ProviderReplay {
     consumed_tools: BTreeMap<String, u32>,
     remaining_faults: Vec<FaultPoint>,
 }
+
+pub fn provider_replay(
+    fixture: ProviderRequestFixture,
+    canonical_request: &serde_json::Value,
+) -> Result<ProviderReplay, ReplayError> {
+    crate::behavior_trace("EVAL-003");
+    let actual = canonical_hash(canonical_request);
+    if actual != fixture.canonical_request_hash {
+        return Err(ReplayError::RequestHashMismatch {
+            expected: fixture.canonical_request_hash,
+            actual,
+        });
+    }
+    let remaining_faults = fixture
+        .fault_script
+        .as_ref()
+        .map(|script| script.points.clone())
+        .unwrap_or_default();
+    Ok(ProviderReplay {
+        fixture,
+        cursor: 0,
+        consumed_tools: BTreeMap::new(),
+        remaining_faults,
+    })
+}
+
 impl ProviderReplay {
     pub fn new(
         fixture: ProviderRequestFixture,
         canonical_request: &serde_json::Value,
     ) -> Result<Self, ReplayError> {
-        let actual = canonical_hash(canonical_request);
-        if actual != fixture.canonical_request_hash {
-            return Err(ReplayError::RequestHashMismatch {
-                expected: fixture.canonical_request_hash,
-                actual,
-            });
-        }
-        let remaining_faults = fixture
-            .fault_script
-            .as_ref()
-            .map(|script| script.points.clone())
-            .unwrap_or_default();
-        Ok(Self {
-            fixture,
-            cursor: 0,
-            consumed_tools: BTreeMap::new(),
-            remaining_faults,
-        })
+        provider_replay(fixture, canonical_request)
     }
     pub fn next(&mut self) -> Option<ProviderFrame> {
         let frame = self.fixture.frames.get(self.cursor).cloned();
@@ -93,6 +132,67 @@ impl ProviderReplay {
             self.cursor += 1;
         }
         frame
+    }
+
+    /// Consume the complete provider script using the same first-terminal-wins
+    /// rule as the runtime. Frames after a terminal remain auditable but can
+    /// never overwrite the committed outcome.
+    pub fn drive_to_terminal(&mut self) -> Result<ReplayTranscript, ReplayError> {
+        let mut transcript = ReplayTranscript::default();
+        while let Some(frame) = self.next() {
+            match frame {
+                ProviderFrame::FirstChunkError(error) => {
+                    set_first_terminal(&mut transcript, ReplayTerminalStatus::Failed, Some(error));
+                    self.consume_fault(FaultPoint::FirstChunk);
+                }
+                ProviderFrame::Chunk(chunk) => {
+                    if transcript.terminal.is_none() {
+                        transcript.chunks.push(chunk);
+                    } else {
+                        transcript.late_results.push(chunk);
+                    }
+                }
+                ProviderFrame::Partial(chunk) => {
+                    transcript.partial = true;
+                    if transcript.terminal.is_none() {
+                        transcript.chunks.push(chunk);
+                    } else {
+                        transcript.late_results.push(chunk);
+                    }
+                    self.consume_fault(FaultPoint::PartialStream);
+                }
+                ProviderFrame::Malformed(raw) => transcript.malformed_frames.push(raw),
+                ProviderFrame::Disconnect => {
+                    transcript.disconnected = true;
+                    set_first_terminal(&mut transcript, ReplayTerminalStatus::UnknownOutcome, None);
+                }
+                ProviderFrame::Hang => {
+                    transcript.hung = true;
+                    self.consume_fault(FaultPoint::Timeout);
+                }
+                ProviderFrame::Timeout => {
+                    self.consume_fault(FaultPoint::Timeout);
+                    set_first_terminal(&mut transcript, ReplayTerminalStatus::TimedOut, None);
+                }
+                ProviderFrame::Cancelled => {
+                    self.consume_fault(FaultPoint::Cancel);
+                    set_first_terminal(&mut transcript, ReplayTerminalStatus::Cancelled, None);
+                }
+                ProviderFrame::LateResult(value) | ProviderFrame::Duplicate(value) => {
+                    transcript.late_results.push(value);
+                }
+                ProviderFrame::Terminal { status, payload } => {
+                    set_first_terminal(&mut transcript, status, payload);
+                }
+                ProviderFrame::Done => {
+                    set_first_terminal(&mut transcript, ReplayTerminalStatus::Completed, None);
+                }
+            }
+        }
+        if transcript.terminal.is_none() {
+            return Err(ReplayError::MissingTerminal);
+        }
+        Ok(transcript)
     }
     pub fn record_tool_call(&mut self, name: impl Into<String>) -> Result<(), ReplayError> {
         let name = name.into();
@@ -135,6 +235,18 @@ impl ProviderReplay {
             return Err(ReplayError::UnconsumedFaults(self.remaining_faults.len()));
         }
         Ok(())
+    }
+}
+
+fn set_first_terminal(
+    transcript: &mut ReplayTranscript,
+    status: ReplayTerminalStatus,
+    payload: Option<String>,
+) {
+    if transcript.terminal.is_some() {
+        transcript.duplicate_terminal_count = transcript.duplicate_terminal_count.saturating_add(1);
+    } else {
+        transcript.terminal = Some((status, payload));
     }
 }
 pub fn canonical_hash(value: &serde_json::Value) -> String {
@@ -225,6 +337,90 @@ mod tests {
             Err(ReplayError::UnconsumedFaults(1))
         ));
         assert!(replay.consume_fault(FaultPoint::Cancel));
+        assert!(replay.assert_consumed().is_ok());
+    }
+
+    #[test]
+    fn provider_fault_matrix_is_deterministic_and_first_terminal_wins() {
+        let request = serde_json::json!({"model":"fixture","turn":"fault-matrix"});
+        let fixture = ProviderRequestFixture {
+            script_key: "faults/matrix".into(),
+            canonical_request_hash: canonical_hash(&request),
+            frames: vec![
+                ProviderFrame::Malformed("not-json".into()),
+                ProviderFrame::Partial("partial".into()),
+                ProviderFrame::Timeout,
+                ProviderFrame::LateResult("too-late".into()),
+                ProviderFrame::Terminal {
+                    status: ReplayTerminalStatus::Completed,
+                    payload: Some("must-not-win".into()),
+                },
+            ],
+            expected_tool_calls: vec![],
+            fault_script: Some(FaultScript {
+                seed: 11,
+                points: vec![FaultPoint::PartialStream, FaultPoint::Timeout],
+            }),
+        };
+        let mut replay = ProviderReplay::new(fixture, &request).unwrap();
+        let transcript = replay.drive_to_terminal().unwrap();
+        assert_eq!(
+            transcript.terminal,
+            Some((ReplayTerminalStatus::TimedOut, None))
+        );
+        assert_eq!(transcript.malformed_frames, vec!["not-json"]);
+        assert_eq!(transcript.late_results, vec!["too-late"]);
+        assert_eq!(transcript.duplicate_terminal_count, 1);
+        assert!(replay.assert_consumed().is_ok());
+    }
+
+    #[test]
+    fn hang_without_terminal_is_rejected_even_when_all_frames_are_consumed() {
+        let request = serde_json::json!({"model":"fixture"});
+        let fixture = ProviderRequestFixture {
+            script_key: "faults/hang".into(),
+            canonical_request_hash: canonical_hash(&request),
+            frames: vec![ProviderFrame::Hang],
+            expected_tool_calls: vec![],
+            fault_script: Some(FaultScript {
+                seed: 13,
+                points: vec![FaultPoint::Timeout],
+            }),
+        };
+        let mut replay = ProviderReplay::new(fixture, &request).unwrap();
+        assert_eq!(
+            replay.drive_to_terminal(),
+            Err(ReplayError::MissingTerminal)
+        );
+        assert!(replay.assert_consumed().is_ok());
+    }
+
+    #[test]
+    fn cancellation_is_terminal_and_late_completion_cannot_overwrite_it() {
+        let request = serde_json::json!({"model":"fixture"});
+        let fixture = ProviderRequestFixture {
+            script_key: "faults/cancel".into(),
+            canonical_request_hash: canonical_hash(&request),
+            frames: vec![
+                ProviderFrame::Cancelled,
+                ProviderFrame::Terminal {
+                    status: ReplayTerminalStatus::Completed,
+                    payload: Some("late".into()),
+                },
+            ],
+            expected_tool_calls: vec![],
+            fault_script: Some(FaultScript {
+                seed: 17,
+                points: vec![FaultPoint::Cancel],
+            }),
+        };
+        let mut replay = ProviderReplay::new(fixture, &request).unwrap();
+        let transcript = replay.drive_to_terminal().unwrap();
+        assert_eq!(
+            transcript.terminal,
+            Some((ReplayTerminalStatus::Cancelled, None))
+        );
+        assert_eq!(transcript.duplicate_terminal_count, 1);
         assert!(replay.assert_consumed().is_ok());
     }
 }

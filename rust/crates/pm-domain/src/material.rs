@@ -41,9 +41,7 @@ pub fn infer_image_size_by_orientation(prompt: &str) -> &'static str {
         .to_ascii_lowercase()
         .replace('：', ":")
         .replace('／', "/")
-        .replace('＊', "x")
-        .replace('×', "x")
-        .replace('*', "x");
+        .replace(['＊', '×', '*'], "x");
 
     if contains_any(
         &normalized,

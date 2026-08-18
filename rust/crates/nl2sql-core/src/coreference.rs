@@ -105,7 +105,7 @@ pub fn resolve(question: &str, prev: Option<&PrevContext>) -> ResolvedQuestion {
 
     // Pattern 1: Time references — inherit time range from previous query
     if is_time_reference(q) {
-        if let Some(ref prev_ctx) = prev {
+        if let Some(prev_ctx) = prev {
             if let Some(range) = prev_ctx.time_range {
                 resolved.time_context = Some(TimeContext {
                     raw_text: q.to_string(),
@@ -123,7 +123,7 @@ pub fn resolve(question: &str, prev: Option<&PrevContext>) -> ResolvedQuestion {
 
     // Pattern 4: Simple subject pronouns — "这个", "那", "它"
     if is_pronoun_only(q) {
-        if let Some(ref prev_ctx) = prev {
+        if let Some(prev_ctx) = prev {
             // Replace "这个"/"那" with the previous question's subject
             resolved.resolved_text = substitute_pronoun(q, prev_ctx);
         }

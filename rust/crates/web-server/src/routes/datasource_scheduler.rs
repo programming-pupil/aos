@@ -260,8 +260,8 @@ async fn refresh_single(
     };
 
     // Decrypt config to get connection details.
-    let config_val =
-        decrypt_config(config_json, data_dir).map_err(|e| format!("decrypt config failed: {e}"))?;
+    let config_val = decrypt_config(config_json, data_dir, tenant_id, ds_id)
+        .map_err(|e| format!("decrypt config failed: {e}"))?;
 
     let _trino_permit = if matches!(db_type, "presto" | "trino") {
         Some(

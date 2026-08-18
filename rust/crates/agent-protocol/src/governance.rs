@@ -19,6 +19,7 @@ pub struct CapabilityScope {
 impl CapabilityScope {
     /// Bind a server-selected executor before delegation. A child-supplied
     /// executor is never adopted by generic scope intersection.
+    #[must_use]
     pub fn bind_executor(&self, executor: &str) -> Option<Self> {
         if executor.trim().is_empty() || self.executor.is_some() {
             return None;
@@ -30,6 +31,7 @@ impl CapabilityScope {
 
     /// Bind a server-generated child id at capability issuance time. Generic
     /// intersection is not allowed to adopt an id supplied by the child.
+    #[must_use]
     pub fn bind_child_thread(&self, child_thread: &str) -> Option<Self> {
         if child_thread.trim().is_empty() || self.child_thread.is_some() {
             return None;
@@ -39,6 +41,7 @@ impl CapabilityScope {
         Some(bound)
     }
 
+    #[must_use]
     pub fn intersection(&self, child: &CapabilityScope) -> Option<Self> {
         if self.tenant_id != child.tenant_id
             || self.user_id != child.user_id
@@ -71,7 +74,6 @@ impl CapabilityScope {
             executor: match (&self.executor, &child.executor) {
                 (Some(a), Some(b)) if a == b => Some(a.clone()),
                 (a, None) => a.clone(),
-                (None, Some(_)) => return None,
                 _ => return None,
             },
             child_thread: match (&self.child_thread, &child.child_thread) {
@@ -100,6 +102,7 @@ pub enum CapabilityError {
     ScopeExpansion,
 }
 impl CapabilityToken {
+    #[must_use]
     pub fn new(scope: CapabilityScope, expires_at: DateTime<Utc>, uses: u32) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
@@ -121,12 +124,12 @@ impl CapabilityToken {
     }
     pub fn derive_child(
         &mut self,
-        child_scope: CapabilityScope,
+        child_scope: &CapabilityScope,
         now: DateTime<Utc>,
     ) -> Result<Self, CapabilityError> {
         let scope = self
             .scope
-            .intersection(&child_scope)
+            .intersection(child_scope)
             .ok_or(CapabilityError::ScopeExpansion)?;
         let child_uses = self.remaining_uses.min(1);
         self.consume(now)?;
@@ -162,11 +165,13 @@ pub struct ProjectedPayload {
 }
 pub struct SensitiveProjector;
 impl SensitiveProjector {
+    #[must_use]
     pub fn project(
         text: &str,
         kind: ProjectionKind,
         policy: &SensitiveProjectionPolicy,
     ) -> ProjectedPayload {
+        crate::behavior_trace("SEC-002");
         let source_hash = hex::encode(Sha256::digest(text.as_bytes()));
         if matches!(kind, ProjectionKind::RawEncrypted) {
             return ProjectedPayload {
@@ -327,7 +332,7 @@ mod tests {
         let mut broader = scope();
         broader.resources.insert("repo:b".into());
         let mut fresh = CapabilityToken::new(scope(), now + chrono::Duration::minutes(5), 1);
-        let child = fresh.derive_child(broader, now).unwrap();
+        let child = fresh.derive_child(&broader, now).unwrap();
         assert!(!child.scope.resources.contains("repo:b"));
         assert_eq!(
             fresh.remaining_uses, 0,
@@ -341,11 +346,11 @@ mod tests {
         let mut cross_session = scope();
         cross_session.session_id = Some("other".into());
         assert_eq!(
-            parent.derive_child(cross_session, now),
+            parent.derive_child(&cross_session, now),
             Err(CapabilityError::ScopeExpansion)
         );
         assert_eq!(parent.remaining_uses, 2);
-        let child = parent.derive_child(scope(), now).unwrap();
+        let child = parent.derive_child(&scope(), now).unwrap();
         assert_eq!(child.remaining_uses, 1);
         assert_eq!(parent.remaining_uses, 1);
     }

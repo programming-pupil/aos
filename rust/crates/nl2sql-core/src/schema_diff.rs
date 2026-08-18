@@ -122,7 +122,7 @@ pub fn extract_schema_tables(schema: &Value) -> Vec<Value> {
         Value::Array(a) => Some(a),
         _ => None,
     };
-    arr.map(|a| a.iter().cloned().collect()).unwrap_or_default()
+    arr.map_or_else(Vec::new, |a| a.to_vec())
 }
 
 fn normalise(v: &Value) -> BTreeMap<String, NormTable> {

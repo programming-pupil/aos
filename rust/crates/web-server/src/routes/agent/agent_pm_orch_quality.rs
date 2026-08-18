@@ -1813,6 +1813,7 @@ fn enforce_requirement_state_delivery_gate(
     quality: &mut PmAnswerQualityDto,
     state: &pm_domain::requirement_state::RequirementState,
 ) {
+    crate::behavior_trace("PM-004");
     use pm_domain::requirement_state::{planning_gate, RequirementPlanningGate};
 
     let gate = planning_gate(state);

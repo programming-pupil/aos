@@ -13,6 +13,7 @@ use thiserror::Error;
 
 const DATASET_RELATIVE_PATH: &str = "../../../eval/datasets/semantic-kernel-conformance.json";
 const MATRIX_RELATIVE_PATH: &str = "../../../docs/AOS_SEMANTIC_KERNEL_CONFORMANCE_MATRIX.zh-CN.md";
+const EXPECTED_P0_CASES: usize = 40;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -143,9 +144,9 @@ fn assert_reference_exists(reference: &str) -> Result<(), ConformanceError> {
 pub fn assert_semantic_kernel_traceability_dataset(
 ) -> Result<Vec<ConformanceCase>, ConformanceError> {
     let cases = load_semantic_kernel_conformance_dataset()?;
-    if cases.len() != 31 {
+    if cases.len() != EXPECTED_P0_CASES {
         return Err(ConformanceError::Invalid(format!(
-            "expected 31 P0 cases, found {}",
+            "expected {EXPECTED_P0_CASES} P0 cases, found {}",
             cases.len()
         )));
     }
@@ -194,19 +195,22 @@ pub fn semantic_kernel_behavior_commands() -> Result<Vec<BehaviorCommand>, Confo
 
 #[cfg(test)]
 mod tests {
-    use super::{assert_semantic_kernel_traceability_dataset, semantic_kernel_behavior_commands};
+    use super::{
+        assert_semantic_kernel_traceability_dataset, semantic_kernel_behavior_commands,
+        EXPECTED_P0_CASES,
+    };
 
     #[test]
     fn every_p0_case_has_live_traceability_references() {
         let cases = assert_semantic_kernel_traceability_dataset().expect("conformance dataset");
-        assert_eq!(cases.len(), 31);
+        assert_eq!(cases.len(), EXPECTED_P0_CASES);
         assert!(cases.iter().all(|case| case.expected.len() > 12));
     }
 
     #[test]
     fn every_p0_case_produces_an_executable_behavior_command() {
         let commands = semantic_kernel_behavior_commands().expect("behavior commands");
-        assert_eq!(commands.len(), 31);
+        assert_eq!(commands.len(), EXPECTED_P0_CASES);
         assert!(commands
             .iter()
             .all(|command| !command.package.is_empty() && !command.test_filter.is_empty()));

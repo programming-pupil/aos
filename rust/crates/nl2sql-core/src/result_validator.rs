@@ -259,7 +259,7 @@ impl ResultValidator {
                     ));
                 }
 
-                let has_zero = numeric_values.iter().any(|v| *v == 0.0);
+                let has_zero = numeric_values.contains(&0.0);
                 if has_zero && (col.contains("price") || col.contains("amount")) {
                     suggestions.push(format!(
                         "列 '{col}' 包含零值，请确认是否存在免费赠送或测试数据。"

@@ -28,6 +28,7 @@ pub enum ToolDecision {
 #[derive(Debug, Clone, Default)]
 pub struct ToolCapabilityRouter;
 impl ToolCapabilityRouter {
+    #[must_use]
     pub fn route(
         &self,
         candidates: &[ToolCandidate],
@@ -142,10 +143,12 @@ impl PromptRegistry {
         });
         self.variants.push(variant);
     }
+    #[must_use]
     pub fn resolve(&self, prompt_id: &str, model: &str) -> Option<PromptVariant> {
         self.resolve_for_request(prompt_id, model, model)
     }
 
+    #[must_use]
     pub fn resolve_for_request(
         &self,
         prompt_id: &str,
@@ -169,6 +172,7 @@ impl PromptRegistry {
             })
             .cloned()
     }
+    #[must_use]
     pub fn manifest(
         variant: &PromptVariant,
         tool_schema_hash: &str,

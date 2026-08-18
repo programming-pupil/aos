@@ -58,6 +58,7 @@ dependencies = [
  "futures-util",
  "glob",
  "hex",
+ "memory-engine",
  "plugins",
  "proptest",
  "regex",
@@ -2986,6 +2987,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 name = "memory-engine"
 version = "0.1.2"
 dependencies = [
+ "async-trait",
  "chrono",
  "hex",
  "proptest",
@@ -2994,7 +2996,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sqlx",
  "thiserror 2.0.20",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -4315,6 +4320,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "chrono",
  "fastembed",
  "glob",
  "hex",

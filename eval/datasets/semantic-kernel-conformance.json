@@ -2,36 +2,325 @@
   "schemaVersion": "semantic-kernel-conformance-v1",
   "spec": "docs/AOS_SEMANTIC_KERNEL_CONFORMANCE_MATRIX.zh-CN.md",
   "cases": [
-    {"id":"PROTO-001","section":"5.2","production":"rust/crates/agent-protocol/src/lib.rs::AgentEventEnvelope","test":"rust/crates/agent-protocol/src/lib.rs::envelope_hash_is_deterministic_and_verifiable","trigger":"提交带 payload hash 的事件并重算 hash","expected":"hash 可重算且不一致被拒绝"},
-    {"id":"PROTO-002","section":"5.2","production":"rust/crates/agent-gateway/src/session_manager.rs::load_durable_ledger_session","test":"rust/crates/agent-gateway/src/session_manager.rs::durable_ledger_loader_recovers_exact_encrypted_runtime_without_jsonl","trigger":"只写入脱敏 Ledger envelope 与绑定其 hash 的加密恢复 payload（包含 turn 内消息和后台可见消息），不创建 JSONL，然后执行恢复、密文替换和密文删除攻击","expected":"Runtime 精确恢复 user/assistant/background message 和唯一真实 turn，后台消息不制造 ghost turn；Ledger 明文不含 secret，替换或删除恢复密文均 fail closed，JSONL 不参与"},
-    {"id":"PROTO-003","section":"5.8","production":"rust/crates/web-server/src/semantic_kernel_store.rs::append_event_in_transaction","test":"rust/crates/web-server/src/semantic_kernel_store.rs::stale_writer_torn_tail_and_middle_corruption_fail_closed","trigger":"过期 writer、torn tail、中段 hash 损坏","expected":"旧 writer 拒绝，只有未提交尾部可修复，中段损坏 quarantine 并 fail closed"},
-    {"id":"TOOL-001","section":"5.3","production":"rust/crates/runtime/src/conversation.rs::resolve_executor_tool_contract","test":"rust/crates/web-server/src/semantic_kernel_store.rs::production_tool_contract_fails_closed_and_audits_valid_lifecycle","trigger":"生产 executor 依次提供缺失 contract、高风险无幂等 contract、有效 contract 和未声明 deferred outcome","expected":"无效 contract 在 dispatch 前失败并关闭 durable turn；有效 contract 的 hash/version 随 intent 持久化且 intent/start/outcome 有序；未声明 deferred 记为 failed 而非 suspended"},
-    {"id":"TOOL-002","section":"5.6","production":"rust/crates/runtime/src/conversation.rs::activate_tools_from_search_result","test":"rust/crates/agent-gateway/src/runtime_builder.rs::tool_search_activates_only_authorized_tools_for_one_turn","trigger":"普通 Chat 搜索延迟工具后激活，再阻断/结束 turn","expected":"只激活授权命中工具，阻断后不可调用，turn 结束恢复原工具集"},
-    {"id":"ART-001","section":"5.6","production":"rust/crates/web-server/src/semantic_kernel_store.rs::RuntimeExecutionKernel","test":"rust/crates/web-server/src/semantic_kernel_store.rs::runtime_artifact_plane_persists_and_recovers_every_typed_payload","trigger":"文本、日志、搜索、表格、JSON、二进制六类超大工具结果进入生产 execution kernel","expected":"每类完整受保护 payload 均持久化并按 owner 分页恢复，model preview 类型、字节计数和截断状态准确"},
-    {"id":"BUDGET-001","section":"5.7","production":"rust/crates/web-server/src/semantic_kernel_store.rs::ensure_protected_model_budgets","test":"rust/crates/web-server/src/semantic_kernel_store.rs::resource_budget_protects_final_and_conserves_concurrent_child_slots","trigger":"耗尽 general 池后执行 final synthesis；并发 spawn 超过父级 child_slots 后结算、重试和再次 spawn","expected":"general 不得挪用保护池，final 仍可执行；capability/slot/lineage 原子提交，父级最多三个并发 child，settlement 释放且重复事件不超卖"},
-    {"id":"CHILD-001","section":"5.4","production":"rust/crates/web-server/src/routes/super_assistant_parent.rs::recover_pending_child_controls_for_session","test":"rust/crates/web-server/src/semantic_kernel_store.rs::child_control_is_durable_redacted_and_settled_exactly_once","trigger":"父取消、重启恢复、重复/晚到控制请求","expected":"lineage/settlement 只结算一次；native executor 支持 cancel，其他动作按 capability 明确拒绝"},
-    {"id":"SEC-001","section":"5.8","production":"rust/crates/web-server/src/semantic_kernel_store.rs::record_child_spawn","test":"rust/crates/web-server/src/semantic_kernel_store.rs::production_child_spawn_consumes_narrow_one_time_capability","trigger":"生产 specialist child spawn 派生 capability，并尝试跨 owner/tenant、扩大 action/resource、重复 spawn/settlement","expected":"生产路径只持久化父权限交集且立即单次消费；跨 scope 拒绝，重复操作幂等且首次 settlement 不被覆盖"},
-    {"id":"SEC-002","section":"5.8","production":"rust/crates/runtime/src/data_protection.rs::protect_sensitive_json","test":"rust/crates/agent-protocol/src/governance.rs::projections_keep_source_hash_without_leaking_secret","trigger":"secret/PII 进入 provider、client、telemetry projection","expected":"各投影独立裁决，source hash 保留，明文 secret 不出现在无权投影"},
-    {"id":"PROMPT-001","section":"9.3","production":"rust/crates/runtime/src/conversation.rs::prompt_variant","test":"rust/crates/web-server/src/semantic_kernel_store.rs::production_prompt_registry_variant_controls_provider_and_manifest","trigger":"同一 prompt 注册通用 evaluated、模型特定 evaluated 和更新但未评测的模型特定 variant，再执行真实 Runtime provider turn","expected":"只有已评测的最高优先模型 variant 控制实际 system/domain sections；完整 model/tool/schema/cache/eval/rollback lineage 在 dispatch 前持久化"},
-    {"id":"CORE-001","section":"6.1","production":"rust/crates/semantic-core/src/lib.rs::Assertion","test":"rust/crates/semantic-core/src/lib.rs::evidence_requires_source_coverage_and_context_has_manifest","trigger":"创建 assertion/decision/evidence/snapshot","expected":"结构化记录有 schema、来源和 snapshot 引用，不依赖 LLM 才能校验"},
-    {"id":"CORE-002","section":"6.4","production":"rust/crates/semantic-core/src/lib.rs::SemanticReducer","test":"rust/crates/semantic-core/src/lib.rs::reducer_is_idempotent_and_preserves_old_versions","trigger":"重复、乱序、冲突和 supersession 事件重放","expected":"幂等合并、版本保留、冲突不静默覆盖"},
-    {"id":"CORE-003","section":"6.3","production":"rust/crates/web-server/src/semantic_kernel_store.rs::commit_compaction_transaction","test":"rust/crates/web-server/src/semantic_kernel_store.rs::compaction_checkpoint_is_durable_and_structurally_redacted","trigger":"checkpoint/replacement 覆盖源事件后 reload","expected":"source coverage/hash 完整，敏感字段按策略保护"},
-    {"id":"MEM-001","section":"7.1-7.2","production":"rust/crates/web-server/src/routes/super_assistant.rs::RuntimeCompactionHook","test":"rust/crates/web-server/src/routes/super_assistant.rs::production_compaction_extracts_both_memory_channels_and_rejects_secrets","trigger":"真实生产压缩 Hook 对被归档窗口执行抽取、secret admission、双通道持久化与 cursor/checkpoint 提交","expected":"continuity/long-term 两类结构化候选都持久化且带证据，secret 不落库，cursor 和 checkpoint 只在生产链路推进"},
-    {"id":"MEM-002","section":"7.3-7.4","production":"rust/crates/web-server/src/routes/memory_continuity.rs::consolidate_memory_internal","test":"rust/crates/web-server/src/routes/memory_continuity.rs::conflict_and_supersession_control_current_memory_retrieval","trigger":"矛盾事实和 supersession 通过生产 SQLite consolidation 后立即检索当前 scope","expected":"conflict 双方保持当前且关系可追溯；superseded 事实失效并不再进入当前检索"},
-    {"id":"MEM-003","section":"7.2","production":"rust/crates/web-server/src/routes/memory_continuity.rs::create_memory_item_internal","test":"rust/crates/web-server/src/routes/memory_continuity.rs::structured_fact_failure_rolls_back_searchable_memory_projection","trigger":"在普通 Memory upsert 的 structured fact 写入点注入失败","expected":"searchable projection 与 structured fact 同一事务回滚，不留下可检索半成品"},
-    {"id":"CMP-001","section":"8.1-8.2","production":"rust/crates/runtime/src/conversation.rs::compact","test":"rust/crates/runtime/src/conversation.rs::auto_compaction_rejects_a_framed_replacement_that_grows_context","trigger":"压缩 replacement 大于 source window 或边界损坏","expected":"fail closed，原文 archive 保留，不能以更长摘要替换"},
-    {"id":"CTX-001","section":"9.1","production":"rust/crates/web-server/src/semantic_kernel_store.rs::load_context_supplement","test":"rust/crates/web-server/src/semantic_kernel_store.rs::production_context_compiler_injects_scoped_semantic_memory_and_evidence","trigger":"真实 RuntimeExecutionKernel 从 SQLite 加载 snapshot、混合检索 Memory 和 session Evidence，同时存在超预算旧历史及其他用户/会话数据","expected":"provider 实际收到经过预算选择的 governed data message 和最新请求，旧历史被裁剪且跨 scope 不泄漏；脱敏 manifest 与加密 exact packet/hash/snapshot 可精确核对"},
-    {"id":"PM-001","section":"10.1-10.2","production":"rust/crates/web-server/src/semantic_kernel_store.rs::persist_pm_requirement_state_delta","test":"rust/crates/web-server/src/semantic_kernel_store.rs::requirement_state_full_delta_is_incremental_idempotent_and_reused_as_data","trigger":"Planner 完整 Requirement Delta 两次跨轮写入、更新假设/决策/实验，并重复投递同一 event","expected":"全部状态字段经真实 SQLite round-trip，重复 event 幂等；事件历史保留旧值，物化 state upsert 新状态并驱动 ReadyForDelivery"},
-    {"id":"PM-002","section":"10.3","production":"rust/crates/pm-domain/src/requirement_state.rs::next_question","test":"rust/crates/pm-domain/src/requirement_state.rs::next_question_uses_information_value_not_fixed_order","trigger":"多个缺口拥有不同信息价值","expected":"下一问按信息增益排序，而非固定模板"},
-    {"id":"PM-003","section":"10.4-10.5","production":"rust/crates/web-server/src/routes/agent/agent_pm_answer_postprocess.rs::claim_evidence_semantically_supported","test":"rust/crates/web-server/src/routes/agent/agent_pm_answer_postprocess.rs::claim_evidence_requires_numeric_unit_and_directional_support","trigger":"URL 存在但 excerpt 数值/单位/方向冲突","expected":"证据不 admission，生成 evidence gap，不把 URL 当作支持"},
-    {"id":"PM-004","section":"10.2-10.5","production":"rust/crates/web-server/src/routes/agent/agent_pm_orch_quality.rs::enforce_requirement_state_delivery_gate","test":"rust/crates/web-server/src/routes/agent/agent_pm_orch_quality.rs::durable_requirement_state_controls_final_delivery_status","trigger":"相同草稿分别加载 ready state 与含未验证高影响假设的 durable state","expected":"ready state 保持正式交付；未就绪 state 强制降为 Requirement Brief 并显示准确缺口，不能被质量修复重新标记为 deliverable"},
-    {"id":"SQL-001","section":"11.1","production":"rust/crates/web-server/src/routes/nl2sql/mod.rs::append_canonical_semantic_intent","test":"rust/crates/web-server/src/routes/nl2sql/mod.rs::nl2sql_production_flow_uses_canonical_ir_before_and_after_generation","trigger":"自然语言先编译 IR，注入 SQL generator，再用同一 IR 审计生成 SQL","expected":"canonical IR 同时控制生成前 prompt 与生成后 verifier，禁止从 SQL 重猜 intent"},
-    {"id":"SQL-002","section":"11.2-11.3","production":"rust/crates/web-server/src/semantic_kernel_store.rs::sync_metric_contract_in_tx","test":"rust/crates/web-server/src/semantic_kernel_store.rs::production_metric_and_join_contracts_control_semantic_release","trigger":"发布 datasource-scoped Metric Contract，并尝试认证缺少去重策略的 N:N Join；随后修正 cardinality、降级 metric/join 状态并跨 datasource 读取","expected":"只有当前 datasource 的发布版本控制语义 release；错误 metric 被拒绝，N:N fanout fail closed，未发布/未验证版本立即退出生产绑定且 lineage 保留"},
-    {"id":"SQL-003","section":"11.5","production":"rust/crates/web-server/src/routes/nl2sql/queries.rs::verify_repair_against_canonical_intent","test":"rust/crates/web-server/src/routes/nl2sql/queries.rs::execution_repair_is_reverified_against_the_durable_canonical_intent","trigger":"执行阶段分别产生保持原粒度和丢失原粒度的修复 SQL，并读取首次持久化的 canonical IR 重新验证","expected":"保持范围的修复记录 Release 后可重试；指标、粒度、时间或 Join 漂移的修复先记录非 Release 再 fail closed"},
-    {"id":"SQL-004","section":"11.6-11.7","production":"rust/crates/web-server/src/routes/nl2sql/feedback.rs::load_calibration_metrics","test":"rust/crates/web-server/src/routes/nl2sql/feedback.rs::feedback_learning_and_calibration_are_scoped_and_owner_approved","trigger":"owner 批准并撤销 correction，同时混入跨 tenant/datasource 的置信度标注","expected":"批准状态与 append-only 审批审计原子提交；只有同 scope 标注进入 ECE/Brier，未批准 correction 不能成为 exemplar"},
-    {"id":"SQL-005","section":"11.1-11.4","production":"rust/crates/web-server/src/routes/nl2sql/semantic_audit.rs::bind_schema_dimensions","test":"rust/crates/web-server/src/semantic_kernel_store.rs::canonical_analytic_intent_is_immutable_after_first_durable_write","trigger":"逻辑维度绑定真实 schema 后持久化 canonical IR，再通过 IR 写入接口和后置 semantic-audit 接口分别尝试相同/漂移内容","expected":"唯一物理列进入 IR；相同内容幂等，任何后置接口都无法覆盖首次 durable canonical IR"},
-    {"id":"EVAL-001","section":"16.2","production":"rust/crates/web-server/src/routes/super_assistant.rs::measure_zero_loss_for_compaction","test":"rust/crates/web-server/src/routes/super_assistant.rs::full_recall_after_real_compaction_passes_and_reconciles","trigger":"不把目标事实全文放进 follow-up probe，压缩后回取","expected":"按隐藏答案评分，验证 recall/false-memory 而非关键词泄题"},
-    {"id":"EVAL-002","section":"16.3-16.5","production":"rust/crates/eval-harness/src/parity.rs::run_real_parity","test":"rust/crates/eval-harness/src/parity.rs::real_parity_runner_persists_traces_and_pending_blind_review","trigger":"用 recorded provider outcomes 完整执行 180-case runner，再由外部门禁使用同模型/工具/预算执行 live adapter","expected":"双方 raw trace、盲评 pair/key 和 pending status 持久化；测试与 runner 都不得制造正确率，领先结论保持待盲评"},
-    {"id":"EVAL-003","section":"16.6","production":"rust/crates/eval-harness/src/replay.rs::ProviderReplay","test":"rust/crates/eval-harness/src/replay.rs::declared_faults_must_be_consumed","trigger":"provider partial stream/hang/late result/crash fixture","expected":"request hash、fault、tool side effect 和 terminal projection 可确定性重放，fixture 必须完整消费"}
+    {
+      "id": "PROTO-001",
+      "section": "5.2",
+      "production": "rust/crates/agent-protocol/src/protocol.rs::AgentEventEnvelope::new",
+      "test": "rust/crates/agent-protocol/src/lib.rs::envelope_hash_is_deterministic_and_verifiable",
+      "trigger": "提交带 payload hash 的事件并重算 hash",
+      "expected": "hash 可重算且不一致被拒绝"
+    },
+    {
+      "id": "PROTO-002",
+      "section": "5.2",
+      "production": "rust/crates/agent-gateway/src/session_manager.rs::load_durable_ledger_session",
+      "test": "rust/crates/agent-gateway/src/session_manager.rs::durable_ledger_loader_recovers_exact_encrypted_runtime_without_jsonl",
+      "trigger": "只写入脱敏 Ledger envelope 与绑定其 hash 的加密恢复 payload（包含 turn 内消息和后台可见消息），不创建 JSONL，然后执行恢复、密文替换和密文删除攻击",
+      "expected": "Runtime 精确恢复 user/assistant/background message 和唯一真实 turn，后台消息不制造 ghost turn；Ledger 明文不含 secret，替换或删除恢复密文均 fail closed，JSONL 不参与"
+    },
+    {
+      "id": "PROTO-003",
+      "section": "5.8",
+      "production": "rust/crates/web-server/src/semantic_kernel_store.rs::append_event_in_transaction",
+      "test": "rust/crates/web-server/src/semantic_kernel_store.rs::stale_writer_torn_tail_and_middle_corruption_fail_closed",
+      "trigger": "过期 writer、torn tail、中段 hash 损坏",
+      "expected": "旧 writer 拒绝，只有未提交尾部可修复，中段损坏 quarantine 并 fail closed"
+    },
+    {
+      "id": "TOOL-001",
+      "section": "5.3",
+      "production": "rust/crates/runtime/src/conversation.rs::resolve_executor_tool_contract",
+      "test": "rust/crates/web-server/src/semantic_kernel_store.rs::production_tool_contract_fails_closed_and_audits_valid_lifecycle",
+      "trigger": "生产 executor 依次提供缺失 contract、高风险无幂等 contract、有效 contract 和未声明 deferred outcome",
+      "expected": "无效 contract 在 dispatch 前失败并关闭 durable turn；有效 contract 的 hash/version 随 intent 持久化且 intent/start/outcome 有序；未声明 deferred 记为 failed 而非 suspended"
+    },
+    {
+      "id": "TOOL-002",
+      "section": "5.6",
+      "production": "rust/crates/agent-gateway/src/runtime_builder.rs::activate_tool_candidates",
+      "test": "rust/crates/agent-gateway/src/runtime_builder.rs::tool_search_activates_only_authorized_tools_for_one_turn",
+      "trigger": "普通 Chat 搜索延迟工具后激活，再阻断/结束 turn",
+      "expected": "只激活授权命中工具，阻断后不可调用，turn 结束恢复原工具集"
+    },
+    {
+      "id": "ART-001",
+      "section": "5.6",
+      "production": "rust/crates/web-server/src/semantic_kernel_store.rs::RuntimeExecutionKernel::new",
+      "test": "rust/crates/web-server/src/semantic_kernel_store.rs::runtime_artifact_plane_persists_and_recovers_every_typed_payload",
+      "trigger": "文本、日志、搜索、表格、JSON、二进制六类超大工具结果进入生产 execution kernel",
+      "expected": "每类完整受保护 payload 均持久化并按 owner 分页恢复，model preview 类型、字节计数和截断状态准确"
+    },
+    {
+      "id": "BUDGET-001",
+      "section": "5.7",
+      "production": "rust/crates/web-server/src/semantic_kernel_store.rs::ensure_protected_model_budgets",
+      "test": "rust/crates/web-server/src/semantic_kernel_store.rs::resource_budget_protects_final_and_conserves_concurrent_child_slots",
+      "trigger": "耗尽 general 池后执行 final synthesis；并发 spawn 超过父级 child_slots 后结算、重试和再次 spawn",
+      "expected": "general 不得挪用保护池，final 仍可执行；capability/slot/lineage 原子提交，父级最多三个并发 child，settlement 释放且重复事件不超卖"
+    },
+    {
+      "id": "CHILD-001",
+      "section": "5.4",
+      "production": "rust/crates/web-server/src/semantic_kernel_store.rs::record_child_control",
+      "test": "rust/crates/web-server/src/semantic_kernel_store.rs::child_control_is_durable_redacted_and_settled_exactly_once",
+      "trigger": "父取消、重启恢复、重复/晚到控制请求",
+      "expected": "lineage/settlement 只结算一次；native executor 支持 cancel，其他动作按 capability 明确拒绝"
+    },
+    {
+      "id": "SEC-001",
+      "section": "5.8",
+      "production": "rust/crates/web-server/src/semantic_kernel_store.rs::record_child_spawn_in_transaction",
+      "test": "rust/crates/web-server/src/semantic_kernel_store.rs::production_child_spawn_consumes_narrow_one_time_capability",
+      "trigger": "生产 specialist child spawn 派生 capability，并尝试跨 owner/tenant、扩大 action/resource、重复 spawn/settlement",
+      "expected": "生产路径只持久化父权限交集且立即单次消费；跨 scope 拒绝，重复操作幂等且首次 settlement 不被覆盖"
+    },
+    {
+      "id": "SEC-002",
+      "section": "5.8",
+      "production": "rust/crates/agent-protocol/src/governance.rs::SensitiveProjector::project",
+      "test": "rust/crates/agent-protocol/src/governance.rs::projections_keep_source_hash_without_leaking_secret",
+      "trigger": "secret/PII 进入 provider、client、telemetry projection",
+      "expected": "各投影独立裁决，source hash 保留，明文 secret 不出现在无权投影"
+    },
+    {
+      "id": "PROMPT-001",
+      "section": "9.3",
+      "production": "rust/crates/runtime/src/conversation.rs::ConversationRuntime::run_turn",
+      "test": "rust/crates/web-server/src/semantic_kernel_store.rs::production_prompt_registry_variant_controls_provider_and_manifest",
+      "trigger": "同一 prompt 注册通用 evaluated、模型特定 evaluated 和更新但未评测的模型特定 variant，再执行真实 Runtime provider turn",
+      "expected": "只有已评测的最高优先模型 variant 控制实际 system/domain sections；完整 model/tool/schema/cache/eval/rollback lineage 在 dispatch 前持久化"
+    },
+    {
+      "id": "PROMPT-002",
+      "section": "9.2",
+      "production": "rust/crates/agent-gateway/src/runtime_builder.rs::begin_attempt",
+      "test": "rust/crates/agent-gateway/src/runtime_builder.rs::provider_attempt_lineage_is_durable_before_dispatch_and_orders_retries",
+      "trigger": "同一 turn 发生 retry/fallback/provider attempt，并尝试复用上一 attempt 的 manifest",
+      "expected": "每个 attempt 的 prompt/context/tool/wire hash、provider、模型、父 attempt 和 retry reason 独立持久化；lineage 不可覆盖且 dispatch 前不匹配即拒绝"
+    },
+    {
+      "id": "CORE-001",
+      "section": "6.1",
+      "production": "rust/crates/semantic-core/src/evidence.rs::EvidenceLedger::validate_source_coverage",
+      "test": "rust/crates/semantic-core/src/lib.rs::evidence_requires_source_coverage_and_context_has_manifest",
+      "trigger": "创建 assertion/decision/evidence/snapshot",
+      "expected": "结构化记录有 schema、来源和 snapshot 引用，不依赖 LLM 才能校验"
+    },
+    {
+      "id": "CORE-002",
+      "section": "6.4",
+      "production": "rust/crates/semantic-core/src/reducer.rs::SemanticReducer::apply",
+      "test": "rust/crates/semantic-core/src/lib.rs::reducer_is_idempotent_and_preserves_old_versions",
+      "trigger": "重复、乱序、冲突和 supersession 事件重放",
+      "expected": "幂等合并、版本保留、冲突不静默覆盖"
+    },
+    {
+      "id": "CORE-003",
+      "section": "6.3",
+      "production": "rust/crates/web-server/src/semantic_kernel_store.rs::commit_compaction_transaction",
+      "test": "rust/crates/web-server/src/semantic_kernel_store.rs::compaction_checkpoint_is_durable_and_structurally_redacted",
+      "trigger": "checkpoint/replacement 覆盖源事件后 reload",
+      "expected": "source coverage/hash 完整，敏感字段按策略保护"
+    },
+    {
+      "id": "MEM-001",
+      "section": "7.1-7.2",
+      "production": "rust/crates/web-server/src/routes/super_assistant.rs::RuntimeCompactionHook::prepare_compaction",
+      "test": "rust/crates/web-server/src/routes/super_assistant.rs::production_compaction_extracts_both_memory_channels_and_rejects_secrets",
+      "trigger": "真实生产压缩 Hook 对被归档窗口执行抽取、secret admission、双通道持久化与 cursor/checkpoint 提交",
+      "expected": "continuity/long-term 两类结构化候选都持久化且带证据，secret 不落库，cursor 和 checkpoint 只在生产链路推进"
+    },
+    {
+      "id": "MEM-002",
+      "section": "7.3-7.4",
+      "production": "rust/crates/web-server/src/semantic_memory_worker.rs::run_memory_maintenance_once",
+      "test": "rust/crates/web-server/src/semantic_memory_worker.rs::high_impact_conflict_creates_restart_durable_question",
+      "trigger": "矛盾高影响事实由唯一生产 consolidation worker 处理后重启",
+      "expected": "冲突不会自动选边；durable question 跨重启存在，fencing cursor 只前进一次"
+    },
+    {
+      "id": "MEM-003",
+      "section": "7.2",
+      "production": "rust/crates/web-server/src/routes/memory_continuity.rs::create_memory_item_internal",
+      "test": "rust/crates/web-server/src/routes/memory_continuity.rs::structured_fact_failure_rolls_back_searchable_memory_projection",
+      "trigger": "在普通 Memory upsert 的 structured fact 写入点注入失败",
+      "expected": "searchable projection 与 structured fact 同一事务回滚，不留下可检索半成品"
+    },
+    {
+      "id": "MEM-004",
+      "section": "7.1-7.9",
+      "production": "rust/crates/memory-engine/src/repository.rs::upsert_in_transaction",
+      "test": "rust/crates/web-server/src/routes/memory_continuity.rs::structured_fact_failure_rolls_back_searchable_memory_projection",
+      "trigger": "普通 Memory 写入经过公开事务 Repository 门面并在 structured fact/projection 边界注入失败",
+      "expected": "应用层无法调用 SQLite 私有 helper；事务门面保持 canonical fact、projection 和事件原子提交或完整回滚"
+    },
+    {
+      "id": "TCK-001",
+      "section": "15.1",
+      "production": "rust/crates/memory-engine/src/lib.rs::exercise_repository_contract",
+      "test": "rust/crates/memory-engine/src/lib.rs::repository_contract_is_enforced_by_the_reference_adapter",
+      "trigger": "同一公开 MemoryRepository contract 依次执行 candidate、quarantine、confirmation、forget、projection rebuild 和 scope negative case",
+      "expected": "参考 adapter 和内存 adapter 共享同一 contract；状态、scope、生命周期和 projection hash 结果一致"
+    },
+    {
+      "id": "CMP-001",
+      "section": "8.1-8.2",
+      "production": "rust/crates/runtime/src/conversation.rs::compact_transactionally",
+      "test": "rust/crates/runtime/src/conversation.rs::auto_compaction_rejects_a_framed_replacement_that_grows_context",
+      "trigger": "压缩 replacement 大于 source window 或边界损坏",
+      "expected": "fail closed，原文 archive 保留，不能以更长摘要替换"
+    },
+    {
+      "id": "CMP-002",
+      "section": "8.2-8.3",
+      "production": "rust/crates/web-server/src/semantic_kernel_store.rs::validate_compaction_sources_in_transaction",
+      "test": "rust/crates/web-server/src/semantic_kernel_store.rs::three_nested_compactions_keep_exact_non_overlapping_sources_and_reject_cycles",
+      "trigger": "连续三次 compaction 形成 parent DAG，再注入祖先环和错误 source boundary",
+      "expected": "每次只绑定 exact archive window，parent provenance 可递归展开；重叠、缺失父节点和 cycle 均 fail closed"
+    },
+    {
+      "id": "INTERACTION-001",
+      "section": "6.1-6.4",
+      "production": "rust/crates/web-server/src/semantic_kernel_store.rs::request_interaction",
+      "test": "rust/crates/web-server/src/semantic_kernel_store.rs::interaction_create_fault_rolls_back_turn_event_projection_and_outbox",
+      "trigger": "生产 interaction create 在 durable row、turn suspension、event 和 outbox 之间注入失败",
+      "expected": "create/suspend/event/outbox 作为一个事务提交；失败后无半成品，重复 idempotency 不重复 dispatch"
+    },
+    {
+      "id": "CHECKPOINT-001",
+      "section": "10.1-10.3",
+      "production": "rust/crates/web-server/src/semantic_kernel_store.rs::finish_turn_with_checkpoint",
+      "test": "rust/crates/web-server/src/semantic_kernel_store.rs::terminal_checkpoint_rejects_status_drift_cross_scope_and_duplicate_commit",
+      "trigger": "terminal/checkpoint 提交尝试 status drift、cross scope 和 duplicate commit",
+      "expected": "唯一提交 API 拒绝 scope/status 漂移和重复 terminal，并保持 turn、checkpoint、ledger 一致"
+    },
+    {
+      "id": "CTX-001",
+      "section": "9.1",
+      "production": "rust/crates/web-server/src/semantic_kernel_store.rs::load_context_supplement",
+      "test": "rust/crates/web-server/src/semantic_kernel_store.rs::production_context_compiler_injects_scoped_semantic_memory_and_evidence",
+      "trigger": "真实 RuntimeExecutionKernel 从 SQLite 加载 snapshot、混合检索 Memory 和 session Evidence，同时存在超预算旧历史及其他用户/会话数据",
+      "expected": "provider 实际收到经过预算选择的 governed data message 和最新请求，旧历史被裁剪且跨 scope 不泄漏；脱敏 manifest 与加密 exact packet/hash/snapshot 可精确核对"
+    },
+    {
+      "id": "PM-001",
+      "section": "10.1-10.2",
+      "production": "rust/crates/web-server/src/semantic_kernel_store.rs::persist_pm_requirement_state_delta",
+      "test": "rust/crates/web-server/src/semantic_kernel_store.rs::requirement_state_full_delta_is_incremental_idempotent_and_reused_as_data",
+      "trigger": "Planner 完整 Requirement Delta 两次跨轮写入、更新假设/决策/实验，并重复投递同一 event",
+      "expected": "全部状态字段经真实 SQLite round-trip，重复 event 幂等；事件历史保留旧值，物化 state upsert 新状态并驱动 ReadyForDelivery"
+    },
+    {
+      "id": "PM-002",
+      "section": "12.3",
+      "production": "rust/crates/web-server/src/semantic_kernel_store.rs::load_pm_question_calibration_profile",
+      "test": "rust/crates/web-server/src/semantic_kernel_store.rs::production_pm_question_selection_uses_mature_observed_outcomes",
+      "trigger": "生产 PM 路径读取二十条已回答且改变决策的同领域历史，再处理模型自报低 prior 和高 posterior 的新问题",
+      "expected": "历史决策变化率、剩余不确定性和实际回答耗时校准下一问；模型自报概率不能覆盖成熟观测值，校准结果持久化并控制提问 gate"
+    },
+    {
+      "id": "PM-003",
+      "section": "10.4-10.5",
+      "production": "rust/crates/web-server/src/routes/agent/agent_pm_answer_postprocess.rs::claim_evidence_semantically_supported",
+      "test": "rust/crates/web-server/src/routes/agent/agent_pm_answer_postprocess.rs::claim_evidence_requires_numeric_unit_and_directional_support",
+      "trigger": "URL 存在但 excerpt 数值/单位/方向冲突",
+      "expected": "证据不 admission，生成 evidence gap，不把 URL 当作支持"
+    },
+    {
+      "id": "PM-004",
+      "section": "10.2-10.5",
+      "production": "rust/crates/web-server/src/routes/agent/agent_pm_orch_quality.rs::enforce_requirement_state_delivery_gate",
+      "test": "rust/crates/web-server/src/routes/agent/agent_pm_orch_quality.rs::durable_requirement_state_controls_final_delivery_status",
+      "trigger": "相同草稿分别加载 ready state 与含未验证高影响假设的 durable state",
+      "expected": "ready state 保持正式交付；未就绪 state 强制降为 Requirement Brief 并显示准确缺口，不能被质量修复重新标记为 deliverable"
+    },
+    {
+      "id": "PM-005",
+      "section": "12.2",
+      "production": "rust/crates/web-server/src/routes/agent/agent_pm_persist.rs::persist_pm_evidence_graph",
+      "test": "rust/crates/web-server/src/routes/agent/agent_pm_persist.rs::production_pm_evidence_admission_requires_real_and_semantically_matching_tool_hits",
+      "trigger": "依次提交无工具证据、语义不匹配的真实工具证据、单一语义匹配工具证据和两个独立语义匹配来源",
+      "expected": "模型自报 URL 不落为证据；不匹配来源保持 proposed；单一 Tool 不确认高影响断言；只有独立双源满足 authority policy 后才 confirmed"
+    },
+    {
+      "id": "SQL-001",
+      "section": "11.1",
+      "production": "rust/crates/web-server/src/routes/nl2sql/mod.rs::append_canonical_semantic_intent",
+      "test": "rust/crates/web-server/src/routes/nl2sql/mod.rs::nl2sql_production_flow_uses_canonical_ir_before_and_after_generation",
+      "trigger": "自然语言先编译 IR，注入 SQL generator，再用同一 IR 审计生成 SQL",
+      "expected": "canonical IR 同时控制生成前 prompt 与生成后 verifier，禁止从 SQL 重猜 intent"
+    },
+    {
+      "id": "SQL-002",
+      "section": "11.2-11.3",
+      "production": "rust/crates/web-server/src/semantic_kernel_store.rs::sync_metric_contract_in_tx",
+      "test": "rust/crates/web-server/src/semantic_kernel_store.rs::production_metric_and_join_contracts_control_semantic_release",
+      "trigger": "发布 datasource-scoped Metric Contract，并尝试认证缺少去重策略的 N:N Join；随后修正 cardinality、降级 metric/join 状态并跨 datasource 读取",
+      "expected": "只有当前 datasource 的发布版本控制语义 release；错误 metric 被拒绝，N:N fanout fail closed，未发布/未验证版本立即退出生产绑定且 lineage 保留"
+    },
+    {
+      "id": "SQL-003",
+      "section": "11.5",
+      "production": "rust/crates/web-server/src/routes/nl2sql/queries.rs::verify_repair_against_canonical_intent",
+      "test": "rust/crates/web-server/src/routes/nl2sql/queries.rs::execution_repair_is_reverified_against_the_durable_canonical_intent",
+      "trigger": "执行阶段分别产生保持原粒度和丢失原粒度的修复 SQL，并读取首次持久化的 canonical IR 重新验证",
+      "expected": "保持范围的修复记录 Release 后可重试；指标、粒度、时间或 Join 漂移的修复先记录非 Release 再 fail closed"
+    },
+    {
+      "id": "SQL-004",
+      "section": "11.6-11.7",
+      "production": "rust/crates/web-server/src/routes/nl2sql/feedback.rs::load_calibration_metrics",
+      "test": "rust/crates/web-server/src/routes/nl2sql/feedback.rs::feedback_learning_and_calibration_are_scoped_and_owner_approved",
+      "trigger": "owner 批准并撤销 correction，同时混入跨 tenant/datasource 的置信度标注",
+      "expected": "批准状态与 append-only 审批审计原子提交；只有同 scope 标注进入 ECE/Brier，未批准 correction 不能成为 exemplar"
+    },
+    {
+      "id": "SQL-005",
+      "section": "11.1-11.4",
+      "production": "rust/crates/web-server/src/routes/nl2sql/semantic_audit.rs::bind_schema_dimensions",
+      "test": "rust/crates/web-server/src/semantic_kernel_store.rs::canonical_analytic_intent_is_immutable_after_first_durable_write",
+      "trigger": "逻辑维度绑定真实 schema 后持久化 canonical IR，再通过 IR 写入接口和后置 semantic-audit 接口分别尝试相同/漂移内容",
+      "expected": "唯一物理列进入 IR；相同内容幂等，任何后置接口都无法覆盖首次 durable canonical IR"
+    },
+    {
+      "id": "EVAL-001",
+      "section": "16.2",
+      "production": "rust/crates/web-server/src/routes/super_assistant.rs::measure_zero_loss_from_replay",
+      "test": "rust/crates/web-server/src/routes/super_assistant.rs::full_recall_after_real_compaction_passes_and_reconciles",
+      "trigger": "不把目标事实全文放进 follow-up probe，压缩后回取",
+      "expected": "按隐藏答案评分，验证 recall/false-memory 而非关键词泄题"
+    },
+    {
+      "id": "EVAL-002",
+      "section": "16.3-16.5",
+      "production": "rust/crates/eval-harness/src/parity.rs::run_real_parity",
+      "test": "rust/crates/eval-harness/src/parity.rs::real_parity_runner_persists_traces_and_pending_blind_review",
+      "trigger": "用 recorded provider outcomes 完整执行 180-case runner，再由外部门禁使用同模型/工具/预算执行 live adapter",
+      "expected": "双方 raw trace、盲评 pair/key 和 pending status 持久化；测试与 runner 都不得制造正确率，领先结论保持待盲评"
+    },
+    {
+      "id": "EVAL-003",
+      "section": "16.6",
+      "production": "rust/crates/eval-harness/src/replay.rs::provider_replay",
+      "test": "rust/crates/eval-harness/src/replay.rs::declared_faults_must_be_consumed",
+      "trigger": "provider partial stream/hang/late result/crash fixture",
+      "expected": "request hash、fault、tool side effect 和 terminal projection 可确定性重放，fixture 必须完整消费"
+    },
+    {
+      "id": "FAULT-001",
+      "section": "15.3-15.4",
+      "production": "rust/crates/web-server/src/lib.rs::run_semantic_kernel_process_tck",
+      "test": "rust/crates/web-server/tests/semantic_kernel_process_faults.rs::process_faults_survive_kill_restart",
+      "trigger": "真实 web-server 子进程在 migration、turn/checkpoint、interaction、tool/artifact、compaction、Memory Repository 和 Memory consolidation 事务边界 abort，随后以相同 SQLite 数据目录重启",
+      "expected": "所有 before/after commit 边界恢复为唯一 canonical 状态；未知工具结果不重试，未提交状态不可见，已提交状态不重复，Memory batch/projection/cursor 保持原子一致"
+    },
+    {
+      "id": "KEY-001",
+      "section": "14.1-14.3",
+      "production": "rust/crates/web-server/src/semantic_kernel_store.rs::issue_key_retirement_certificate",
+      "test": "rust/crates/web-server/tests/semantic_kernel_process_faults.rs::key_rotation_and_retirement_survive_process_restart",
+      "trigger": "真实 web-server 子进程在 rotation commit 前 abort 并重启；随后验证备份未确认、未知 key、active key、未版本化密文、旧 key 引用和错误 AAD 等负向场景",
+      "expected": "只有 registry 全覆盖、旧 key 引用为零、抽样 scoped decrypt 成功且备份策略已确认时才签发退役证书"
+    }
   ]
 }

@@ -952,18 +952,22 @@ pub(crate) async fn discover_knowledge_schema_tables(
         return serde_json::json!([]);
     }
 
-    let config =
-        match crate::routes::data_sources::decrypt_config(encrypted_config, &state.data_dir) {
-            Ok(config) => config,
-            Err(error) => {
-                tracing::warn!(
-                    datasource_id,
-                    error = %error,
-                    "on-demand SQL knowledge schema hydration could not decrypt datasource config"
-                );
-                return serde_json::json!([]);
-            }
-        };
+    let config = match crate::routes::data_sources::decrypt_config(
+        encrypted_config,
+        &state.data_dir,
+        &claims.tenant_id,
+        datasource_id,
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(
+                datasource_id,
+                error = %error,
+                "on-demand SQL knowledge schema hydration could not decrypt datasource config"
+            );
+            return serde_json::json!([]);
+        }
+    };
     let discovery = crate::nl2sql::schema_discovery::SchemaDiscovery::new();
     let db_type = db_type.to_string();
     let _trino_permit = if matches!(db_type.as_str(), "presto" | "trino") {
@@ -3048,6 +3052,7 @@ async fn send_generation_request_with_sql_tools(
 }
 
 fn append_canonical_semantic_intent(system_prompt: &mut String, semantic_intent_json: &str) {
+    crate::behavior_trace("SQL-001");
     debug_assert!(!semantic_intent_json.trim().is_empty());
     system_prompt.push_str(
         "\n\nCanonical analytic intent (authoritative semantic input; do not ignore or silently broaden it):\n",
@@ -4030,8 +4035,13 @@ async fn explain_trino_or_presto_sql(
             .await
             .map_err(|e| format!("load datasource config failed: {e}"))?
             .ok_or_else(|| "data source not found".to_string())?;
-    let config_val = crate::routes::data_sources::decrypt_config(&config_json, &state.data_dir)
-        .map_err(|e| format!("decrypt datasource config failed: {e}"))?;
+    let config_val = crate::routes::data_sources::decrypt_config(
+        &config_json,
+        &state.data_dir,
+        &claims.tenant_id,
+        data_source_id,
+    )
+    .map_err(|e| format!("decrypt datasource config failed: {e}"))?;
     let cfg: TrinoConfig = serde_json::from_value(config_val)
         .map_err(|e| format!("invalid trino/presto config: {e}"))?;
     let normalized_host = nl2sql_domain::datasource_config::normalize_host_input(&cfg.host);
@@ -8643,6 +8653,48 @@ mod tests {
     #[tokio::test]
     async fn nl2sql_production_flow_uses_canonical_ir_before_and_after_generation() {
         let db = crate::test_sqlite_pool().await;
+        let metric_contract = nl2sql_core::semantic_ir::MetricContract {
+            id: "orders".into(),
+            version: 1,
+            names: vec!["orders".into(), "订单数".into()],
+            expression: nl2sql_core::semantic_ir::MetricExpressionIR::Aggregate {
+                function: "COUNT".into(),
+                expression: Box::new(nl2sql_core::semantic_ir::MetricExpressionIR::Literal(
+                    "*".into(),
+                )),
+                distinct: false,
+            },
+            denominator: None,
+            population: nl2sql_core::semantic_ir::PopulationDefinition {
+                subject: "order".into(),
+                dedup_key: None,
+                exclude_test_users: false,
+                exclude_internal_users: false,
+                valid_record_rule: None,
+            },
+            default_grain: nl2sql_core::semantic_ir::Grain::Day,
+            allowed_grains: vec![nl2sql_core::semantic_ir::Grain::Day],
+            time_column: "stat_date".into(),
+            timezone: "Asia/Shanghai".into(),
+            mandatory_filters: vec![],
+            join_contracts: vec![],
+            invariants: vec![],
+            valid_from: "2026-01-01".into(),
+            valid_until: None,
+            owner: Some("analytics".into()),
+            evidence_refs: vec!["contract://orders/v1".into()],
+        };
+        sqlx::query(
+            "INSERT INTO metric_contracts
+                (id, tenant_id, datasource_id, source_metric_id, version, status,
+                 contract_json, lineage_json, valid_from, valid_until)
+             VALUES ('orders', 'tenant', 'datasource', NULL, 1, 'active', ?,
+                     '{}', '2026-01-01', NULL)",
+        )
+        .bind(serde_json::to_string(&metric_contract).unwrap())
+        .execute(&db)
+        .await
+        .unwrap();
         let understanding = crate::nl2sql::query_understanding::QueryUnderstandingResult {
             rewritten_question: "按日期统计已支付订单数，范围为 2026-08-01 到 2026-08-08".into(),
             intent: crate::nl2sql::query_understanding::Intent::Trend,
@@ -8696,6 +8748,13 @@ mod tests {
         .expect("durable canonical intent");
         assert_eq!(canonical, durable.intent);
         assert_eq!(canonical.dimensions[0].column, "stat_date");
+        assert_eq!(
+            canonical
+                .time
+                .as_ref()
+                .map(|time| time.end_exclusive.as_str()),
+            Some("2026-08-09")
+        );
 
         let canonical_json = durable.intent_json().unwrap();
         let mut prompt = "base generator contract".to_string();
@@ -8704,7 +8763,7 @@ mod tests {
 
         let audit = semantic_audit::compile_canonical_intent_with_contracts_and_joins(
             &canonical,
-            "SELECT stat_date, COUNT(*) AS order_count FROM orders WHERE stat_date >= '2026-08-01' AND stat_date < '2026-08-08' AND status = 'paid' GROUP BY stat_date",
+            "SELECT stat_date, COUNT(*) AS order_count FROM orders WHERE stat_date >= '2026-08-01' AND stat_date < '2026-08-09' AND status = 'paid' GROUP BY stat_date",
             &durable.metric_contracts,
             &durable.join_contracts,
         )

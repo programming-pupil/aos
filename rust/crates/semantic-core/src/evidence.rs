@@ -64,13 +64,16 @@ impl EvidenceLedger {
         self.entries.insert(evidence.evidence_id.clone(), evidence);
         Ok(())
     }
+    #[must_use]
     pub fn get(&self, id: &str) -> Option<&EvidenceRef> {
         self.entries.get(id)
     }
+    #[must_use]
     pub fn contains(&self, id: &str) -> bool {
         self.entries.contains_key(id)
     }
     pub fn validate_source_coverage(&self, source_seqs: &[u64]) -> Result<(), EvidenceLedgerError> {
+        crate::behavior_trace("CORE-001");
         for seq in source_seqs {
             if !self.entries.values().any(|e| e.event_seq == Some(*seq)) {
                 return Err(EvidenceLedgerError::MissingSourceEvent(*seq));

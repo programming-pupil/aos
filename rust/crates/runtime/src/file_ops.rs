@@ -12,10 +12,10 @@ use walkdir::{DirEntry, WalkDir};
 
 /// Maximum file size that can be read (10 MB).
 const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
-/// Default line window returned by read_file when the caller does not specify a
+/// Default line window returned by `read_file` when the caller does not specify a
 /// limit. Large files can still be read by requesting subsequent offsets.
 const DEFAULT_READ_LINE_LIMIT: usize = 1_200;
-/// Hard cap for a single read_file response to avoid feeding multi-megabyte
+/// Hard cap for a single `read_file` response to avoid feeding multi-megabyte
 /// files back into the model in one tool result.
 const MAX_READ_LINE_LIMIT: usize = 4_000;
 
@@ -228,14 +228,16 @@ pub fn read_file(
     let end_index = start_index.saturating_add(requested_limit).min(lines.len());
     let mut selected = lines[start_index..end_index].join("\n");
     if end_index < lines.len() {
-        selected.push_str(&format!(
+        use std::fmt::Write;
+        let _ = write!(
+            selected,
             "\n\n[read_file truncated: showing lines {}-{} of {}. Continue with offset={} limit={} to read more.]",
             start_index.saturating_add(1),
             end_index,
             lines.len(),
             end_index,
             requested_limit
-        ));
+        );
     }
 
     Ok(ReadFileOutput {

@@ -8,6 +8,7 @@
 mod budget;
 mod capabilities;
 mod governance;
+mod interactions;
 mod ledger;
 mod lifecycle;
 mod protocol;
@@ -23,9 +24,25 @@ pub use governance::{
     ArtifactObject, ArtifactPlane, CapabilityScope, CapabilityToken, ProjectedPayload,
     ProjectionKind, SensitiveProjectionPolicy, SensitiveProjector,
 };
+pub use interactions::{
+    DurableInteraction, InteractionError, InteractionKind, InteractionResponse, InteractionScope,
+    InteractionState,
+};
 pub use ledger::{AppendReceipt, CorruptionKind, EventLedger, LedgerError, LedgerRecord};
 pub use lifecycle::{LifecycleError, ToolLifecycle, ToolLifecycleState};
 pub use protocol::*;
+
+/// Emit a gated marker used by the conformance gate to prove that a test
+/// exercised the production contract.  It is inert unless the gate sets the
+/// matching case id, so normal runtime logs never contain test-only noise.
+pub(crate) fn behavior_trace(case_id: &str) {
+    if std::env::var("AOS_BEHAVIOR_TRACE_CASE").as_deref() == Ok(case_id) {
+        static EMITTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if EMITTED.set(()).is_ok() {
+            eprintln!("AOS_PRODUCTION_TRACE\t{case_id}");
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -66,14 +83,14 @@ mod tests {
         let mut ledger = EventLedger::default();
         let first = ledger.acquire_writer("thread-1", "worker-a").unwrap();
         let stale = ledger.acquire_writer("thread-1", "worker-b").unwrap();
-        assert!(ledger.append(first, message(1)).is_err());
-        let receipt = ledger.append(stale.clone(), message(1)).unwrap();
+        assert!(ledger.append(&first, message(1)).is_err());
+        let receipt = ledger.append(&stale, message(1)).unwrap();
         assert_eq!(receipt.sequence, 1);
         let mut duplicate = message(2);
         duplicate.idempotency_key = Some("same".into());
         duplicate.payload_hash = duplicate.compute_payload_hash().unwrap();
-        ledger.append(stale.clone(), duplicate.clone()).unwrap();
-        let duplicate_receipt = ledger.append(stale, duplicate).unwrap();
+        ledger.append(&stale, duplicate.clone()).unwrap();
+        let duplicate_receipt = ledger.append(&stale, duplicate).unwrap();
         assert!(duplicate_receipt.deduplicated);
     }
 
@@ -117,6 +134,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn protected_final_and_verifier_budget_cannot_be_spent_by_general_work() {
         let mut ledger = BudgetLedger::new([
             (BudgetDimension::TokenInput, 100),
@@ -231,8 +249,8 @@ mod tests {
     fn tail_repair_is_fail_closed_for_middle_corruption() {
         let mut ledger = EventLedger::default();
         let writer = ledger.acquire_writer("t", "w").unwrap();
-        ledger.append(writer.clone(), message(1)).unwrap();
-        ledger.append(writer.clone(), message(2)).unwrap();
+        ledger.append(&writer, message(1)).unwrap();
+        ledger.append(&writer, message(2)).unwrap();
         ledger
             .corrupt_for_test("t", 1, CorruptionKind::PayloadHash)
             .unwrap();
@@ -246,10 +264,10 @@ mod tests {
     fn uncommitted_torn_tail_is_discarded_but_committed_corruption_is_not() {
         let mut ledger = EventLedger::default();
         let writer = ledger.acquire_writer("tail", "w").unwrap();
-        ledger.append(writer.clone(), message(1)).unwrap();
+        ledger.append(&writer, message(1)).unwrap();
         let mut tail = message(2);
         tail.payload_hash = "partial".into();
-        ledger.append_uncommitted_for_test(writer, tail).unwrap();
+        ledger.append_uncommitted_for_test(&writer, tail).unwrap();
         assert_eq!(ledger.repair("tail").unwrap(), 1);
         assert_eq!(ledger.records("tail").unwrap().len(), 1);
     }

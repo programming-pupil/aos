@@ -262,6 +262,34 @@ pub(super) async fn list_session_approvals(
     }
 }
 
+/// GET `/api/v1/agent/sessions/{session_id}/interactions` - list the
+/// authenticated owner's pending durable interactions.
+pub(super) async fn list_session_interactions(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    let Some(handle) = get_agent_manager(&state).get_session(&session_id).await else {
+        return AppError::NotFound(format!("session {session_id} not found")).into_response();
+    };
+    if handle.user_id != claims.sub || handle.tenant_id != claims.tenant_id {
+        return AppError::Forbidden.into_response();
+    }
+    match crate::semantic_kernel_store::list_runtime_interactions(
+        &state.db,
+        &claims.tenant_id,
+        &claims.sub,
+        &session_id,
+    )
+    .await
+    {
+        Ok(interactions) => {
+            Json(serde_json::json!({ "interactions": interactions })).into_response()
+        }
+        Err(error) => AppError::Internal(error.to_string()).into_response(),
+    }
+}
+
 /// POST `/api/v1/agent/sessions/{session_id}/turn` — run a turn (non-streaming)
 pub(super) async fn run_turn(
     State(state): State<AppState>,

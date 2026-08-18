@@ -42,12 +42,16 @@ pub enum TypedValue {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CalibratedScore(u16);
 impl CalibratedScore {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn new(value: f32) -> Result<Self, ScoreError> {
         if !(0.0..=1.0).contains(&value) || !value.is_finite() {
             return Err(ScoreError::OutOfRange);
         }
+        // The range and finiteness checks above prove this conversion is in
+        // the inclusive u16 interval 0..=10_000.
         Ok(Self((value * 10_000.0).round() as u16))
     }
+    #[must_use]
     pub fn value(self) -> f32 {
         f32::from(self.0) / 10_000.0
     }
@@ -158,6 +162,7 @@ pub enum ProposedStateDelta {
     Noop { source_event_ids: Vec<String> },
 }
 impl ProposedStateDelta {
+    #[must_use]
     pub fn upsert(assertion: SemanticAssertion) -> Self {
         Self::UpsertAssertion(assertion)
     }

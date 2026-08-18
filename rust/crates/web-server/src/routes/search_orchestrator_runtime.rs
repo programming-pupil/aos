@@ -1482,7 +1482,8 @@ async fn load_configured_search_providers(
     .await?;
     let mut providers = Vec::new();
     for row in rows {
-        let Some(tool_config) = search_provider_row_to_tool_config(&row, Some(DEFAULT_MAX_RESULTS))
+        let Some(tool_config) =
+            search_provider_row_to_tool_config(&row, tenant_id, Some(DEFAULT_MAX_RESULTS))
         else {
             continue;
         };
@@ -1503,6 +1504,7 @@ async fn load_configured_search_providers(
 
 fn search_provider_row_to_tool_config(
     row: &sqlx::sqlite::SqliteRow,
+    tenant_id: &str,
     query_max_results: Option<usize>,
 ) -> Option<tools::WebSearchProviderConfig> {
     let provider_type_raw: String = row.get("provider_type");
@@ -1543,7 +1545,16 @@ fn search_provider_row_to_tool_config(
                 if ciphertext.trim().is_empty() {
                     None
                 } else {
-                    agent_gateway::crypto::decrypt(&ciphertext).ok()
+                    let provider_id: String = row.get("id");
+                    agent_gateway::crypto::decrypt_scoped(
+                        &ciphertext,
+                        &agent_gateway::crypto::scoped_aad(
+                            "pm_search.auth_secret",
+                            tenant_id,
+                            &provider_id,
+                        ),
+                    )
+                    .ok()
                 }
             }),
         headers_json: parse_json(row.get("headers_json")),

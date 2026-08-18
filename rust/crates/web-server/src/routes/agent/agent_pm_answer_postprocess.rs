@@ -578,6 +578,7 @@ fn score_claim_to_tool_hit(claim: &str, hit: &PmToolEvidenceHit) -> f64 {
 /// intentionally conservative: numeric/date/unit mismatches become a gap and
 /// are left for the model or a later source to repair.
 pub(super) fn claim_evidence_semantically_supported(claim: &str, excerpt: &str) -> bool {
+    crate::behavior_trace("PM-003");
     let claim_lower = claim.to_ascii_lowercase();
     let evidence_lower = excerpt.to_ascii_lowercase();
     let number_pattern =

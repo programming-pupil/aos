@@ -117,6 +117,7 @@ struct SensitivePattern {
     pii: bool,
 }
 
+#[allow(clippy::too_many_lines)]
 fn patterns() -> &'static [SensitivePattern] {
     static PATTERNS: OnceLock<Vec<SensitivePattern>> = OnceLock::new();
     PATTERNS.get_or_init(|| {
@@ -190,7 +191,7 @@ fn patterns() -> &'static [SensitivePattern] {
             SensitivePattern {
                 category: SensitiveDataCategory::CredentialAssignment,
                 regex: Regex::new(
-                    r#"(?i)\b(api[_-]?key|apikey|password|passwd|token|client[_-]?secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|secret[_-]?key)\b(=)([^\s,;}]+)"#,
+                    r"(?i)\b(api[_-]?key|apikey|password|passwd|token|client[_-]?secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|secret[_-]?key)\b(=)([^\s,;}]+)",
                 )
                 .expect("valid compact credential assignment regex"),
                 replacement: "$1$2[REDACTED]",
@@ -199,7 +200,7 @@ fn patterns() -> &'static [SensitivePattern] {
             SensitivePattern {
                 category: SensitiveDataCategory::CredentialAssignment,
                 regex: Regex::new(
-                    r#"(?i)\b(api[_-]?key|apikey|password|passwd|token|client[_-]?secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|secret[_-]?key)\b(\s*:\s*)([^\s,;}]+)"#,
+                    r"(?i)\b(api[_-]?key|apikey|password|passwd|token|client[_-]?secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|secret[_-]?key)\b(\s*:\s*)([^\s,;}]+)",
                 )
                 .expect("valid unquoted credential field regex"),
                 replacement: "$1$2[REDACTED]",
@@ -265,10 +266,12 @@ pub fn inspect_sensitive_text(text: &str, mode: DataProtectionMode) -> DataProte
 }
 
 #[must_use]
+#[allow(clippy::items_after_statements)]
 pub fn protect_sensitive_json(
     value: &Value,
     mode: DataProtectionMode,
 ) -> (Value, DataProtectionReport) {
+    crate::behavior_trace("SEC-002");
     fn protect(
         value: &Value,
         mode: DataProtectionMode,
@@ -316,7 +319,7 @@ pub fn protect_sensitive_json(
 fn sensitive_json_field_name(key: &str) -> bool {
     let normalized = key
         .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .collect::<String>()
         .to_ascii_lowercase();
     matches!(

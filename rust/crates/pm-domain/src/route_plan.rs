@@ -71,6 +71,7 @@ pub fn build_pm_source_routes(
     mcp_servers: &[String],
     skills: &[String],
 ) -> Vec<serde_json::Value> {
+    #[allow(clippy::too_many_arguments)]
     fn push_pm_source_route(
         routes: &mut Vec<serde_json::Value>,
         route_id: &str,

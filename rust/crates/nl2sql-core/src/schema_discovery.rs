@@ -1211,7 +1211,7 @@ fn try_infer_fk_from_col_name(
     // Pattern 2: `id_{table}` → references `{table}.id`
     // e.g. `id_user` → `users.id`
     if col_lower.starts_with("id_") {
-        let target = &col_lower[3..];
+        let target = col_lower.strip_prefix("id_").unwrap_or_default();
         if target.is_empty() {
             return None;
         }
@@ -1656,6 +1656,7 @@ fn trino_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn discover_unqualified_trino_table(
     host: &str,
     port: u16,
@@ -1740,6 +1741,7 @@ async fn discover_unqualified_trino_table(
     })))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_trino_client(
     host: &str,
     port: u16,
@@ -2129,6 +2131,7 @@ async fn list_trino_tables_for_schema(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn discover_trino(
     host: &str,
     port: u16,
@@ -2146,6 +2149,7 @@ pub async fn discover_trino(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn discover_trino_multi(
     host: &str,
     port: u16,
@@ -2312,6 +2316,7 @@ pub async fn discover_trino_multi(
 }
 
 /// Discover the schema of a single Trino table.
+#[allow(clippy::too_many_arguments)]
 pub async fn discover_trino_table(
     host: &str,
     port: u16,

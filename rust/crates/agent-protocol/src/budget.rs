@@ -94,6 +94,7 @@ impl BudgetLedger {
             reservations: BTreeMap::new(),
         }
     }
+    #[must_use]
     pub fn state(&self, dimension: BudgetDimension) -> BudgetState {
         self.accounts.get(&dimension).copied().unwrap_or_default()
     }

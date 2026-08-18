@@ -59,11 +59,7 @@ pub fn normalize_task_graph_priority(raw: Option<&str>) -> String {
 }
 
 pub fn normalize_pm_required_evidence_type(raw: Option<&str>) -> Option<String> {
-    let normalized = raw?
-        .trim()
-        .replace('-', "_")
-        .replace(' ', "_")
-        .to_ascii_lowercase();
+    let normalized = raw?.trim().replace(['-', ' '], "_").to_ascii_lowercase();
     let normalized = match normalized.as_str() {
         "external" | "web" | "public" | "public_web" | "source" | "source_backed" | "market"
         | "benchmark" | "case" | "competitive" | "competitor" => "external",

@@ -229,7 +229,7 @@ pub(super) use super::agent_pm_task_runtime::{
 pub(super) use super::agent_router::get_agent_manager;
 pub(super) use super::agent_session_api::{
     branch_session, cancel_session_turn, create_session, delete_session, get_commands, get_session,
-    get_session_state, list_sessions, rename_session, run_turn, toggle_bookmark_session,
-    toggle_pin_session,
+    get_session_state, list_session_interactions, list_sessions, rename_session, run_turn,
+    toggle_bookmark_session, toggle_pin_session,
 };
 pub(super) use super::agent_stream_session::stream_session;

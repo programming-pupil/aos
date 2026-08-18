@@ -31,6 +31,15 @@ pub mod runner;
 pub mod scenario;
 pub mod scenarios;
 
+pub(crate) fn behavior_trace(case_id: &str) {
+    if std::env::var("AOS_BEHAVIOR_TRACE_CASE").as_deref() == Ok(case_id) {
+        static EMITTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if EMITTED.set(()).is_ok() {
+            eprintln!("AOS_PRODUCTION_TRACE\t{case_id}");
+        }
+    }
+}
+
 pub use dataset::{default_eval_config, eval_config_from_dataset_str, DatasetError};
 pub use positioning::{DISCLAIMER, DISCLAIMER_MARKER, POSITIONING, POSITIONING_MARKER};
 pub use report::{CaseFailure, EvalReport, ScenarioScore};

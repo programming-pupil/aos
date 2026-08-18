@@ -275,12 +275,8 @@ impl QueryUnderstanding {
                     (today.year(), today.month() - 1)
                 };
                 let last_start = NaiveDate::from_ymd_opt(ly, lm as u32, 1).unwrap_or(this_start);
-                let last_end = last_start + chrono::Duration::days(32);
-                let last_end = NaiveDate::from_ymd_opt(ly, lm as u32, 28)
-                    .unwrap_or(last_end)
-                    .checked_add_months(chrono::Months::new(1))
-                    .and_then(|d| d.pred_opt())
-                    .unwrap_or(last_end);
+                let elapsed_days = (today - this_start).num_days();
+                let last_end = last_start + chrono::Duration::days(elapsed_days);
                 vec![
                     (this_start.to_string(), today.to_string()),
                     (last_start.to_string(), last_end.to_string()),
@@ -290,11 +286,12 @@ impl QueryUnderstanding {
                 let this_start = NaiveDate::from_ymd_opt(today.year(), 1, 1).unwrap_or(today);
                 let last_start =
                     NaiveDate::from_ymd_opt(today.year() - 1, 1, 1).unwrap_or(this_start);
+                let elapsed_days = (today - this_start).num_days();
                 vec![
                     (this_start.to_string(), today.to_string()),
                     (
                         last_start.to_string(),
-                        today.pred_opt().unwrap_or(today).to_string(),
+                        (last_start + chrono::Duration::days(elapsed_days)).to_string(),
                     ),
                 ]
             }

@@ -7,8 +7,9 @@
 //! so live progress and history are projections of one durable stream.
 
 use agent_protocol::{
-    AgentEventEnvelope, AgentEventV1, ApprovalEvent, ChildSettlement, ChildThreadEvent,
-    DomainEvent, EventActor,
+    AgentEventEnvelope, AgentEventV1, ChildSettlement, ChildThreadEvent, DomainEvent,
+    DurableInteraction, EventActor, InteractionKind, InteractionResponse, InteractionScope,
+    InteractionState,
 };
 use chrono::{Duration, Utc};
 use nl2sql_core::semantic_ir::{
@@ -20,6 +21,19 @@ use sha2::Digest;
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
+
+/// Named process fault points used by the black-box persistence TCK. They are
+/// compiled out of release builds and require an explicit internal TCK flag,
+/// so an accidental environment variable cannot terminate a production node.
+pub(crate) fn process_fault_point(name: &str) {
+    #[cfg(debug_assertions)]
+    if std::env::var("AOS_INTERNAL_PROCESS_TCK").as_deref() == Ok("1")
+        && std::env::var("AOS_PROCESS_FAULT_POINT").as_deref() == Ok(name)
+    {
+        eprintln!("AOS_PROCESS_FAULT\t{name}\tpid={}", std::process::id());
+        std::process::abort();
+    }
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum SemanticStoreError {
@@ -88,6 +102,146 @@ pub(crate) struct RuntimeApprovalView {
     pub expired: bool,
 }
 
+fn parse_interaction_kind(value: &str) -> Result<InteractionKind, runtime::RuntimeError> {
+    match value {
+        "approval" => Ok(InteractionKind::Approval),
+        "user_question" => Ok(InteractionKind::UserQuestion),
+        "credential_request" => Ok(InteractionKind::CredentialRequest),
+        "external_authorization" => Ok(InteractionKind::ExternalAuthorization),
+        _ => Err(runtime::RuntimeError::new(format!(
+            "unknown durable interaction kind `{value}`"
+        ))),
+    }
+}
+
+fn parse_interaction_state(value: &str) -> Result<InteractionState, runtime::RuntimeError> {
+    match value {
+        "pending" => Ok(InteractionState::Pending),
+        "responded" => Ok(InteractionState::Responded),
+        "granted" => Ok(InteractionState::Granted),
+        "rejected" => Ok(InteractionState::Rejected),
+        "expired" => Ok(InteractionState::Expired),
+        "cancelled" => Ok(InteractionState::Cancelled),
+        "consumed" => Ok(InteractionState::Consumed),
+        _ => Err(runtime::RuntimeError::new(format!(
+            "unknown durable interaction state `{value}`"
+        ))),
+    }
+}
+
+fn durable_interaction_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<DurableInteraction, runtime::RuntimeError> {
+    let json = |column: &str| -> Result<serde_json::Value, runtime::RuntimeError> {
+        let raw = row
+            .try_get::<String, _>(column)
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        serde_json::from_str(&raw).map_err(|error| runtime::RuntimeError::new(error.to_string()))
+    };
+    let optional_json = |column: &str| -> Result<Option<serde_json::Value>, runtime::RuntimeError> {
+        row.try_get::<Option<String>, _>(column)
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?
+            .map(|raw| {
+                serde_json::from_str(&raw)
+                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))
+            })
+            .transpose()
+    };
+    let allowed_responder_ids =
+        serde_json::from_value::<Vec<String>>(json("allowed_responder_ids_json")?)
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+    let expires_at = row
+        .try_get::<Option<String>, _>("expires_at")
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?
+        .map(|value| {
+            chrono::DateTime::parse_from_rfc3339(&value)
+                .map(|value| value.with_timezone(&Utc))
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))
+        })
+        .transpose()?;
+    Ok(DurableInteraction {
+        interaction_id: row
+            .try_get("id")
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?,
+        kind: parse_interaction_kind(
+            &row.try_get::<String, _>("kind")
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?,
+        )?,
+        state: parse_interaction_state(
+            &row.try_get::<String, _>("state")
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?,
+        )?,
+        scope: InteractionScope {
+            tenant_id: row
+                .try_get("tenant_id")
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?,
+            user_id: row
+                .try_get("user_id")
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?,
+            session_id: row
+                .try_get("session_id")
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?,
+            turn_id: row
+                .try_get("turn_id")
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?,
+            invocation_id: row
+                .try_get("invocation_id")
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?,
+        },
+        owner_user_id: row
+            .try_get("owner_user_id")
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?,
+        allowed_responder_ids,
+        capability_requirement: row
+            .try_get("capability_requirement")
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?,
+        request_schema_hash: row
+            .try_get("request_schema_hash")
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?,
+        choice_schema_hash: row
+            .try_get("choice_schema_hash")
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?,
+        display_projection: json("display_projection_json")?,
+        response_projection: optional_json("response_projection_json")?,
+        encrypted_secret_ref: row
+            .try_get("encrypted_secret_ref")
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?,
+        idempotency_key: row
+            .try_get("idempotency_key")
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?,
+        expected_turn_revision: u64::try_from(
+            row.try_get::<i64, _>("expected_turn_revision")
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?,
+        )
+        .map_err(|_| runtime::RuntimeError::new("negative interaction turn revision"))?,
+        expires_at,
+        created_event_id: row
+            .try_get("created_event_id")
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?,
+        response_event_id: row
+            .try_get("response_event_id")
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?,
+        consumed_event_id: row
+            .try_get("consumed_event_id")
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?,
+    })
+}
+
+async fn load_durable_interaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    tenant_id: &str,
+    interaction_id: &str,
+) -> Result<DurableInteraction, runtime::RuntimeError> {
+    let row =
+        sqlx::query::<Sqlite>("SELECT * FROM durable_interactions WHERE tenant_id = ? AND id = ?")
+            .bind(tenant_id)
+            .bind(interaction_id)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+    durable_interaction_from_row(&row)
+}
+
 pub(crate) async fn list_runtime_approvals(
     db: &SqlitePool,
     tenant_id: &str,
@@ -108,12 +262,18 @@ pub(crate) async fn list_runtime_approvals(
             String,
         ),
     >(
-        "SELECT id, turn_id, invocation_id, tool_name, current_mode, required_mode,
-                reason, status, expires_at
-         FROM approval_requests
-         WHERE tenant_id = ? AND user_id = ? AND session_id = ?
-           AND executor_scope = 'native' AND status = 'pending'
-         ORDER BY rowid ASC",
+        "SELECT interaction.id, interaction.turn_id, interaction.invocation_id,
+                projection.tool_name, projection.current_mode, projection.required_mode,
+                projection.reason, interaction.state, interaction.expires_at
+         FROM durable_interactions AS interaction
+         INNER JOIN approval_requests AS projection
+           ON projection.id = interaction.id
+          AND projection.tenant_id = interaction.tenant_id
+         WHERE interaction.tenant_id = ? AND interaction.user_id = ?
+           AND interaction.session_id = ? AND interaction.kind = 'approval'
+           AND interaction.state = 'pending'
+           AND projection.executor_scope = 'native'
+         ORDER BY interaction.created_at ASC, interaction.id ASC",
     )
     .bind(tenant_id)
     .bind(user_id)
@@ -149,6 +309,102 @@ pub(crate) async fn list_runtime_approvals(
             },
         )
         .collect())
+}
+
+pub(crate) async fn list_runtime_interactions(
+    db: &SqlitePool,
+    tenant_id: &str,
+    user_id: &str,
+    session_id: &str,
+) -> Result<Vec<DurableInteraction>, SemanticStoreError> {
+    let rows = sqlx::query::<Sqlite>(
+        "SELECT * FROM durable_interactions
+         WHERE tenant_id = ? AND user_id = ? AND session_id = ?
+           AND state = 'pending'
+         ORDER BY created_at ASC, id ASC",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_all(db)
+    .await?;
+    rows.iter()
+        .map(durable_interaction_from_row)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))
+}
+
+pub(crate) async fn respond_to_runtime_user_question(
+    db: &SqlitePool,
+    tenant_id: &str,
+    owner_user_id: &str,
+    responder_user_id: &str,
+    session_id: &str,
+    interaction_id: &str,
+    answer: &str,
+    idempotency_key: &str,
+) -> Result<runtime::DeferredToolResult, SemanticStoreError> {
+    let interaction = sqlx::query::<Sqlite>(
+        "SELECT * FROM durable_interactions
+         WHERE tenant_id = ? AND user_id = ? AND session_id = ? AND id = ?",
+    )
+    .bind(tenant_id)
+    .bind(owner_user_id)
+    .bind(session_id)
+    .bind(interaction_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or_else(|| SemanticStoreError::InvalidEvent("interaction not found".into()))?;
+    let interaction = durable_interaction_from_row(&interaction)
+        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+    if interaction.kind != InteractionKind::UserQuestion {
+        return Err(SemanticStoreError::InvalidEvent(
+            "only user-question interactions can be answered through this command".into(),
+        ));
+    }
+    let answer = answer.trim();
+    if answer.is_empty() {
+        return Err(SemanticStoreError::InvalidEvent(
+            "interaction answer cannot be empty".into(),
+        ));
+    }
+    let kernel = RuntimeExecutionKernel::new(db.clone(), tenant_id, owner_user_id, session_id);
+    let resolution = runtime::RuntimeInteractionResolution {
+        interaction_id: interaction_id.to_string(),
+        turn_id: interaction.scope.turn_id.clone(),
+        responder_user_id: responder_user_id.to_string(),
+        state: InteractionState::Responded,
+        response_projection: Some(serde_json::json!({"answer": answer})),
+        encrypted_secret_ref: None,
+        idempotency_key: idempotency_key.to_string(),
+    };
+    runtime::AgentExecutionKernel::respond_interaction(&kernel, &resolution)
+        .await
+        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+    let consumed = runtime::AgentExecutionKernel::consume_interaction(
+        &kernel,
+        interaction_id,
+        &interaction.scope.turn_id,
+        idempotency_key,
+    )
+    .await
+    .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+    let protected_answer = consumed
+        .response_projection
+        .as_ref()
+        .and_then(|value| value.get("answer"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(answer)
+        .to_string();
+    Ok(runtime::DeferredToolResult {
+        tool_use_id: interaction.scope.invocation_id,
+        output: serde_json::json!({
+            "interactionId": interaction_id,
+            "answer": protected_answer,
+        })
+        .to_string(),
+        is_error: false,
+    })
 }
 
 pub(crate) async fn get_runtime_approval(
@@ -269,6 +525,7 @@ pub(crate) async fn sync_metric_contract_in_tx(
     datasource_id: &str,
     metric_id: i64,
 ) -> Result<MetricContract, SemanticStoreError> {
+    crate::behavior_trace("SQL-002");
     let row = sqlx::query::<Sqlite>(
         "SELECT metric_name, metric_aliases, expression, filter_conditions,
                 granularity, version, status, owner_id, created_by, time_column,
@@ -887,6 +1144,7 @@ pub(crate) async fn record_child_spawn_in_transaction(
     spawn_item_id: &str,
     detached: bool,
 ) -> Result<(), SemanticStoreError> {
+    crate::behavior_trace("SEC-001");
     let parent = sqlx::query_as::<Sqlite, (String, String)>(
         "SELECT tenant_id, owner_user_id FROM agent_threads WHERE id = ?",
     )
@@ -1259,6 +1517,7 @@ pub(crate) async fn record_child_control(
     action: &str,
     detail: Option<&str>,
 ) -> Result<String, SemanticStoreError> {
+    crate::behavior_trace("CHILD-001");
     let action = action.trim().to_ascii_lowercase();
     if !matches!(
         action.as_str(),
@@ -1528,6 +1787,7 @@ impl RuntimeExecutionKernel {
         user_id: impl Into<String>,
         session_id: impl Into<String>,
     ) -> Self {
+        crate::behavior_trace("ART-001");
         Self {
             db,
             tenant_id: tenant_id.into(),
@@ -1581,159 +1841,120 @@ impl RuntimeExecutionKernel {
         payload: serde_json::Value,
         idempotency_key: String,
     ) -> Result<u64, SemanticStoreError> {
-        let recovery_payload_raw = payload.to_string();
-        let recovery_payload_hash =
-            hex::encode(sha2::Sha256::digest(recovery_payload_raw.as_bytes()));
-        let recovery_payload_ciphertext = agent_gateway::crypto::encrypt(&recovery_payload_raw)
-            .map_err(|error| {
-                SemanticStoreError::InvalidEvent(format!(
-                    "cannot encrypt runtime recovery payload: {error}"
-                ))
-            })?;
-        ensure_runtime_thread_row(tx, &self.tenant_id, &self.user_id, &self.session_id).await?;
-        if let Some(turn_id) = turn_id {
-            ensure_runtime_turn(tx, &self.tenant_id, &self.session_id, turn_id).await?;
-        }
-        let writer =
-            acquire_writer(tx, &self.tenant_id, &self.session_id, "runtime-kernel").await?;
-        let existing = sqlx::query_scalar::<Sqlite, i64>(
+        append_runtime_domain_event_in_transaction(
+            tx,
+            &self.tenant_id,
+            &self.user_id,
+            &self.session_id,
+            turn_id,
+            item_id,
+            kind,
+            payload,
+            idempotency_key,
+        )
+        .await
+    }
+}
+
+async fn append_runtime_domain_event_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    tenant_id: &str,
+    user_id: &str,
+    session_id: &str,
+    turn_id: Option<&str>,
+    item_id: &str,
+    kind: &str,
+    payload: serde_json::Value,
+    idempotency_key: String,
+) -> Result<u64, SemanticStoreError> {
+    let recovery_payload_raw = payload.to_string();
+    let recovery_payload_hash = hex::encode(sha2::Sha256::digest(recovery_payload_raw.as_bytes()));
+    ensure_runtime_thread_row(tx, tenant_id, user_id, session_id).await?;
+    if let Some(turn_id) = turn_id {
+        ensure_runtime_turn(tx, tenant_id, session_id, turn_id).await?;
+    }
+    let writer = acquire_writer(tx, tenant_id, session_id, "runtime-kernel").await?;
+    let existing = sqlx::query_scalar::<Sqlite, i64>(
             "SELECT sequence FROM agent_event_ledger WHERE tenant_id = ? AND thread_id = ? AND idempotency_key = ?",
         )
-        .bind(&self.tenant_id)
-        .bind(&self.session_id)
+        .bind(tenant_id)
+        .bind(session_id)
         .bind(&idempotency_key)
         .fetch_optional(&mut **tx)
         .await?;
-        if let Some(sequence) = existing {
-            return u64::try_from(sequence)
-                .map_err(|_| SemanticStoreError::InvalidEvent("negative sequence".into()));
-        }
-        let next = sqlx::query_scalar::<Sqlite, i64>(
+    if let Some(sequence) = existing {
+        return u64::try_from(sequence)
+            .map_err(|_| SemanticStoreError::InvalidEvent("negative sequence".into()));
+    }
+    let next = sqlx::query_scalar::<Sqlite, i64>(
             "SELECT COALESCE(MAX(sequence), 0) + 1 FROM agent_event_ledger WHERE tenant_id = ? AND thread_id = ?",
         )
-        .bind(&self.tenant_id)
-        .bind(&self.session_id)
+        .bind(tenant_id)
+        .bind(session_id)
         .fetch_one(&mut **tx)
         .await?;
-        let sequence = u64::try_from(next)
-            .map_err(|_| SemanticStoreError::InvalidEvent("ledger sequence overflow".into()))?;
-        let mut protected_payload =
-            runtime::protect_sensitive_json(&payload, runtime::configured_data_protection_mode()).0;
-        protected_payload
-            .as_object_mut()
-            .ok_or_else(|| {
-                SemanticStoreError::InvalidEvent(
-                    "runtime domain payload must be a JSON object".to_string(),
-                )
-            })?
-            .insert(
-                "_recoveryPayloadHash".to_string(),
-                serde_json::Value::String(recovery_payload_hash),
-            );
-        protected_payload
-            .as_object_mut()
-            .expect("validated as object above")
-            .insert(
-                "_requiredForRecovery".to_string(),
-                serde_json::Value::Bool(true),
-            );
-        let mut event = AgentEventEnvelope::new(
-            &self.session_id,
-            turn_id,
-            None,
-            item_id,
-            AgentEventV1::Domain(DomainEvent {
-                domain: "runtime".into(),
-                kind: kind.into(),
-                payload: protected_payload,
-            }),
-            sequence,
+    let sequence = u64::try_from(next)
+        .map_err(|_| SemanticStoreError::InvalidEvent("ledger sequence overflow".into()))?;
+    let mut protected_payload =
+        runtime::protect_sensitive_json(&payload, runtime::configured_data_protection_mode()).0;
+    protected_payload
+        .as_object_mut()
+        .ok_or_else(|| {
+            SemanticStoreError::InvalidEvent(
+                "runtime domain payload must be a JSON object".to_string(),
+            )
+        })?
+        .insert(
+            "_recoveryPayloadHash".to_string(),
+            serde_json::Value::String(recovery_payload_hash),
         );
-        event.actor = EventActor::Worker {
-            id: "runtime-kernel".into(),
-        };
-        event.idempotency_key = Some(idempotency_key);
-        event.payload_hash = event
-            .compute_payload_hash()
-            .map_err(|e| SemanticStoreError::InvalidEvent(e.to_string()))?;
-        append_event_in_transaction(tx, &writer, &event).await?;
-        sqlx::query::<Sqlite>(
-            "UPDATE agent_event_ledger SET raw_payload_ciphertext = ?
+    protected_payload
+        .as_object_mut()
+        .expect("validated as object above")
+        .insert(
+            "_requiredForRecovery".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    let mut event = AgentEventEnvelope::new(
+        session_id,
+        turn_id,
+        None,
+        item_id,
+        AgentEventV1::Domain(DomainEvent {
+            domain: "runtime".into(),
+            kind: kind.into(),
+            payload: protected_payload,
+        }),
+        sequence,
+    );
+    event.actor = EventActor::Worker {
+        id: "runtime-kernel".into(),
+    };
+    event.idempotency_key = Some(idempotency_key);
+    event.payload_hash = event
+        .compute_payload_hash()
+        .map_err(|e| SemanticStoreError::InvalidEvent(e.to_string()))?;
+    let recovery_payload_ciphertext = agent_gateway::crypto::encrypt_scoped(
+        &recovery_payload_raw,
+        &agent_gateway::crypto::scoped_aad("ledger.raw_payload", tenant_id, &event.event_id),
+    )
+    .map_err(|error| {
+        SemanticStoreError::InvalidEvent(format!(
+            "cannot encrypt runtime recovery payload: {error}"
+        ))
+    })?;
+    append_event_in_transaction(tx, &writer, &event).await?;
+    sqlx::query::<Sqlite>(
+        "UPDATE agent_event_ledger SET raw_payload_ciphertext = ?
              WHERE event_id = ? AND tenant_id = ? AND thread_id = ?",
-        )
-        .bind(recovery_payload_ciphertext)
-        .bind(&event.event_id)
-        .bind(&self.tenant_id)
-        .bind(&self.session_id)
-        .execute(&mut **tx)
-        .await?;
-        Ok(sequence)
-    }
-
-    async fn append_approval_in_transaction(
-        &self,
-        tx: &mut Transaction<'_, Sqlite>,
-        turn_id: &str,
-        invocation_id: &str,
-        tool_name: &str,
-        scope_hash: &str,
-        status: &str,
-        expires_at: Option<chrono::DateTime<Utc>>,
-    ) -> Result<(), SemanticStoreError> {
-        let idempotency_key = format!("approval:{invocation_id}:{status}");
-        if sqlx::query_scalar::<Sqlite, i64>(
-            "SELECT COUNT(*) FROM agent_event_ledger
-             WHERE tenant_id = ? AND thread_id = ? AND idempotency_key = ?",
-        )
-        .bind(&self.tenant_id)
-        .bind(&self.session_id)
-        .bind(&idempotency_key)
-        .fetch_one(&mut **tx)
-        .await?
-            > 0
-        {
-            return Ok(());
-        }
-        let writer =
-            acquire_writer(tx, &self.tenant_id, &self.session_id, "runtime-approval").await?;
-        let next = sqlx::query_scalar::<Sqlite, i64>(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM agent_event_ledger
-             WHERE tenant_id = ? AND thread_id = ?",
-        )
-        .bind(&self.tenant_id)
-        .bind(&self.session_id)
-        .fetch_one(&mut **tx)
-        .await?;
-        let sequence = u64::try_from(next)
-            .map_err(|_| SemanticStoreError::InvalidEvent("ledger sequence overflow".into()))?;
-        let request_id = tenant_scoped_record_id(
-            "approval",
-            &self.tenant_id,
-            &format!("{}:{turn_id}:{invocation_id}", self.session_id),
-        );
-        let mut event = AgentEventEnvelope::new(
-            &self.session_id,
-            Some(turn_id),
-            None,
-            format!("approval:{invocation_id}"),
-            AgentEventV1::Approval(ApprovalEvent {
-                request_id,
-                tool_name: tool_name.to_string(),
-                scope_hash: scope_hash.to_string(),
-                status: status.to_string(),
-                expires_at,
-            }),
-            sequence,
-        );
-        event.actor = EventActor::Worker {
-            id: "runtime-approval".into(),
-        };
-        event.idempotency_key = Some(idempotency_key);
-        event.payload_hash = event
-            .compute_payload_hash()
-            .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
-        append_event_in_transaction(tx, &writer, &event).await
-    }
+    )
+    .bind(recovery_payload_ciphertext)
+    .bind(&event.event_id)
+    .bind(tenant_id)
+    .bind(session_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(sequence)
 }
 
 async fn ensure_runtime_thread(
@@ -2068,12 +2289,40 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         .await
         .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
         for turn_id in open_turns {
-            self.finish_turn(
-                &turn_id,
-                runtime::RuntimeTurnTerminalStatus::Failed,
-                Some("process restart recovered an open turn; external outcomes are unknown"),
+            let mut tx = self
+                .db
+                .begin()
+                .await
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            acquire_sqlite_write_lock(&mut tx)
+                .await
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            sqlx::query::<Sqlite>(
+                "UPDATE agent_turns SET status = 'recovery_required'
+                 WHERE tenant_id = ? AND thread_id = ? AND id = ?
+                   AND status = 'running' AND ended_at IS NULL",
             )
-            .await?;
+            .bind(&self.tenant_id)
+            .bind(&self.session_id)
+            .bind(&turn_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            self.append_domain_event_in_transaction(
+                &mut tx,
+                Some(&turn_id),
+                &format!("turn-recovery-required:{turn_id}"),
+                "turn_recovery_required",
+                serde_json::json!({
+                    "reason":"process_restart_without_atomic_terminal_checkpoint"
+                }),
+                format!("turn-recovery-required:{turn_id}"),
+            )
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
         }
         for row in open_tools {
             let invocation_id = row
@@ -2178,10 +2427,27 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         .map_err(|e| runtime::RuntimeError::new(e.to_string()))
     }
 
+    async fn current_turn_revision(&self, turn_id: &str) -> Result<u64, runtime::RuntimeError> {
+        let revision = sqlx::query_scalar::<Sqlite, i64>(
+            "SELECT revision FROM agent_turns
+             WHERE tenant_id = ? AND thread_id = ? AND id = ? AND status = 'running'",
+        )
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(turn_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?
+        .ok_or_else(|| runtime::RuntimeError::new("canonical running turn was not found"))?;
+        u64::try_from(revision)
+            .map_err(|_| runtime::RuntimeError::new("canonical turn revision is negative"))
+    }
+
     async fn load_context_supplement(
         &self,
         input: runtime::RuntimeContextSupplementRequest,
     ) -> Result<runtime::RuntimeContextSupplement, runtime::RuntimeError> {
+        crate::behavior_trace("CTX-001");
         let mut tx = self
             .db
             .begin()
@@ -2320,7 +2586,7 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
     async fn record_context_manifest(
         &self,
         input: runtime::RuntimeContextManifestInput,
-    ) -> Result<(), runtime::RuntimeError> {
+    ) -> Result<runtime::RuntimeManifestLineage, runtime::RuntimeError> {
         let system_prompt_hash = sha256_json(&serde_json::json!(&input.system_sections));
         let mut context_packet = input.context_packet;
         let packet_token_sum = context_packet
@@ -2341,6 +2607,13 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             &self.tenant_id,
             &format!("{}:{}", input.turn_id, input.iteration),
         );
+        let prompt_row_id = input.prompt_manifest.as_ref().map(|_| {
+            tenant_scoped_record_id(
+                "runtime-prompt",
+                &self.tenant_id,
+                &format!("{}:{}", input.turn_id, input.iteration),
+            )
+        });
         let model_reservation_id = format!("model:{}:{}", input.turn_id, input.iteration);
         let mut tx = self
             .db
@@ -2394,12 +2667,15 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         });
         let raw_manifest = raw_manifest_value.to_string();
         let raw_manifest_hash = sha256_bytes(raw_manifest.as_bytes());
-        let raw_manifest_ciphertext =
-            agent_gateway::crypto::encrypt(&raw_manifest).map_err(|error| {
-                runtime::RuntimeError::new(format!(
-                    "cannot encrypt exact model-visible context manifest: {error}"
-                ))
-            })?;
+        let raw_manifest_ciphertext = agent_gateway::crypto::encrypt_scoped(
+            &raw_manifest,
+            &agent_gateway::crypto::scoped_aad("context_manifest.raw", &self.tenant_id, &id),
+        )
+        .map_err(|error| {
+            runtime::RuntimeError::new(format!(
+                "cannot encrypt exact model-visible context manifest: {error}"
+            ))
+        })?;
         let manifest = runtime::protect_sensitive_json(
             &raw_manifest_value,
             runtime::configured_data_protection_mode(),
@@ -2501,13 +2777,7 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                  manifest_hash, manifest_json, model_version,
                  raw_manifest_hash, raw_manifest_ciphertext, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-             ON CONFLICT(id) DO UPDATE SET
-                snapshot_version = excluded.snapshot_version,
-                manifest_json = excluded.manifest_json,
-                manifest_hash = excluded.manifest_hash,
-                model_version = excluded.model_version,
-                raw_manifest_hash = excluded.raw_manifest_hash,
-                raw_manifest_ciphertext = excluded.raw_manifest_ciphertext",
+             ON CONFLICT(id) DO NOTHING",
         )
         .bind(&id)
         .bind(&self.tenant_id)
@@ -2526,12 +2796,26 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         .execute(&mut *tx)
         .await
         .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+        let stored_context_hash = sqlx::query_scalar::<Sqlite, String>(
+            "SELECT raw_manifest_hash FROM context_packet_manifests
+             WHERE id = ? AND tenant_id = ? AND thread_id = ? AND turn_id = ?",
+        )
+        .bind(&id)
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(&input.turn_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        if stored_context_hash != raw_manifest_hash {
+            return Err(runtime::RuntimeError::new(
+                "immutable context manifest ID was reused with different bytes",
+            ));
+        }
         if let Some(prompt) = input.prompt_manifest.as_ref() {
-            let prompt_id = tenant_scoped_record_id(
-                "runtime-prompt",
-                &self.tenant_id,
-                &format!("{}:{}", input.turn_id, input.iteration),
-            );
+            let prompt_id = prompt_row_id
+                .as_ref()
+                .expect("prompt row id exists with a prompt manifest");
             sqlx::query::<Sqlite>(
                 "INSERT INTO prompt_manifests
                     (id, tenant_id, thread_id, turn_id, run_id, prompt_id, version,
@@ -2539,19 +2823,7 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                      tool_schema_hash, context_manifest_id, input_budget, output_budget,
                      trust_policy_version, eval_suite, manifest_json, created_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                 ON CONFLICT(id) DO UPDATE SET
-                    version = excluded.version,
-                    variant = excluded.variant,
-                    model = excluded.model,
-                    stable_prefix_hash = excluded.stable_prefix_hash,
-                    task_packet_hash = excluded.task_packet_hash,
-                    tool_schema_hash = excluded.tool_schema_hash,
-                    context_manifest_id = excluded.context_manifest_id,
-                    input_budget = excluded.input_budget,
-                    output_budget = excluded.output_budget,
-                    trust_policy_version = excluded.trust_policy_version,
-                    eval_suite = excluded.eval_suite,
-                    manifest_json = excluded.manifest_json",
+                 ON CONFLICT(id) DO NOTHING",
             )
             .bind(prompt_id)
             .bind(&self.tenant_id)
@@ -2584,6 +2856,27 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             .execute(&mut *tx)
             .await
             .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            let stored = sqlx::query_as::<Sqlite, (String, String, String)>(
+                "SELECT context_manifest_id, tool_schema_hash, manifest_json
+                 FROM prompt_manifests WHERE id = ? AND tenant_id = ? AND thread_id = ?",
+            )
+            .bind(prompt_id)
+            .bind(&self.tenant_id)
+            .bind(&self.session_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            let expected_prompt_hash =
+                sha256_bytes(serde_json::to_string(prompt).unwrap_or_default().as_bytes());
+            let stored_prompt_hash = sha256_bytes(stored.2.as_bytes());
+            if stored.0 != id
+                || stored.1 != prompt.tool_schema_hash
+                || stored_prompt_hash != expected_prompt_hash
+            {
+                return Err(runtime::RuntimeError::new(
+                    "immutable prompt manifest ID was reused with different lineage",
+                ));
+            }
         }
         self.append_domain_event_in_transaction(
             &mut tx,
@@ -2604,7 +2897,15 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
         tx.commit()
             .await
-            .map_err(|e| runtime::RuntimeError::new(e.to_string()))
+            .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+        Ok(runtime::RuntimeManifestLineage {
+            context_manifest_id: id,
+            prompt_manifest_id: prompt_row_id,
+            context_manifest_hash: raw_manifest_hash,
+            prompt_manifest_hash: input.prompt_manifest.as_ref().map(|prompt| {
+                sha256_bytes(serde_json::to_string(prompt).unwrap_or_default().as_bytes())
+            }),
+        })
     }
 
     async fn record_assistant_message(
@@ -2856,7 +3157,8 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
         tx.commit()
             .await
-            .map_err(|e| runtime::RuntimeError::new(e.to_string()))
+            .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+        Ok(())
     }
 
     async fn start_tool(
@@ -2963,11 +3265,20 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             runtime::configured_data_protection_mode(),
         )
         .0;
+        let checkpoint_ciphertext = agent_gateway::crypto::encrypt_scoped(
+            &session_json.to_string(),
+            &agent_gateway::crypto::scoped_aad(
+                "checkpoint.session",
+                &self.tenant_id,
+                &checkpoint_id,
+            ),
+        )
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
         sqlx::query::<Sqlite>(
             "INSERT INTO execution_checkpoints
                 (id, tenant_id, thread_id, sequence, state_hash, checkpoint_json,
-                 durable, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+                 checkpoint_ciphertext, durable, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
              ON CONFLICT(id) DO NOTHING",
         )
         .bind(&checkpoint_id)
@@ -2976,6 +3287,7 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         .bind(i64::try_from(sequence).unwrap_or(i64::MAX))
         .bind(&state_hash)
         .bind(projection.to_string())
+        .bind(checkpoint_ciphertext)
         .execute(&mut *transaction)
         .await
         .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
@@ -3004,6 +3316,20 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         );
         let input_hash = sha256_bytes(request.input.as_bytes());
         let expires_at = Utc::now() + Duration::minutes(15);
+        let interaction_idempotency_key = format!("approval:{}", request.invocation_id);
+        let choice_schema_hash = sha256_json(&serde_json::json!({
+            "choices":["approved","denied","cancelled"]
+        }));
+        let display_projection = runtime::protect_sensitive_json(
+            &serde_json::json!({
+                "toolName":request.tool_name,
+                "currentMode":request.request.current_mode.as_str(),
+                "requiredMode":request.request.required_mode.as_str(),
+                "reason":request.request.reason,
+            }),
+            runtime::configured_data_protection_mode(),
+        )
+        .0;
         let intent = runtime::RuntimeToolIntent::new_with_contract(
             &request.turn_id,
             &request.invocation_id,
@@ -3031,6 +3357,80 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         )
         .await
         .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+        let expected_turn_revision = sqlx::query_scalar::<Sqlite, i64>(
+            "SELECT revision FROM agent_turns
+             WHERE tenant_id = ? AND thread_id = ? AND id = ? AND status = 'running'",
+        )
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(&request.turn_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let inserted = sqlx::query::<Sqlite>(
+            "INSERT INTO durable_interactions
+                (id, tenant_id, user_id, session_id, turn_id, invocation_id,
+                 kind, state, owner_user_id, allowed_responder_ids_json,
+                 capability_requirement, request_schema_hash, choice_schema_hash,
+                 display_projection_json, idempotency_key, expected_turn_revision,
+                 expires_at)
+             SELECT ?, ?, ?, ?, ?, ?, 'approval', 'pending', ?, '[]', ?, ?, ?, ?, ?, ?, ?
+             WHERE ? IS NOT NULL
+             ON CONFLICT(tenant_id, session_id, idempotency_key) DO NOTHING",
+        )
+        .bind(&request_id)
+        .bind(&self.tenant_id)
+        .bind(&self.user_id)
+        .bind(&self.session_id)
+        .bind(&request.turn_id)
+        .bind(&request.invocation_id)
+        .bind(&self.user_id)
+        .bind(&request.contract.required_capability)
+        .bind(&input_hash)
+        .bind(&choice_schema_hash)
+        .bind(display_projection.to_string())
+        .bind(&interaction_idempotency_key)
+        .bind(expected_turn_revision.unwrap_or(-1))
+        .bind(expires_at.to_rfc3339())
+        .bind(expected_turn_revision)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        if inserted.rows_affected() == 0 {
+            let existing = load_durable_interaction(&mut tx, &self.tenant_id, &request_id).await?;
+            if existing.kind != InteractionKind::Approval
+                || existing.scope.user_id != self.user_id
+                || existing.scope.session_id != self.session_id
+                || existing.scope.turn_id != request.turn_id
+                || existing.scope.invocation_id != request.invocation_id
+                || existing.request_schema_hash != input_hash
+            {
+                return Err(runtime::RuntimeError::new(
+                    "approval idempotency key was reused across scopes",
+                ));
+            }
+            tx.commit()
+                .await
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            return Ok(());
+        }
+        let suspended = sqlx::query::<Sqlite>(
+            "UPDATE agent_turns SET status = 'suspended', revision = revision + 1
+             WHERE tenant_id = ? AND thread_id = ? AND id = ?
+               AND status = 'running' AND revision = ?",
+        )
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(&request.turn_id)
+        .bind(expected_turn_revision.unwrap_or(-1))
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        if suspended.rows_affected() != 1 {
+            return Err(runtime::RuntimeError::new(
+                "approval lost the expected canonical turn revision",
+            ));
+        }
         sqlx::query::<Sqlite>("INSERT INTO approval_requests (id, tenant_id, thread_id, tool_name, scope_hash, status, expires_at, max_uses, user_id, session_id, turn_id, invocation_id, input_hash, current_mode, required_mode, reason, executor_scope) VALUES (?, ?, ?, ?, ?, 'pending', ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, 'native') ON CONFLICT(id) DO NOTHING")
             .bind(&request_id).bind(&self.tenant_id).bind(&self.session_id).bind(&request.tool_name).bind(&input_hash).bind(expires_at.to_rfc3339()).bind(&self.user_id).bind(&self.session_id).bind(&request.turn_id).bind(&request.invocation_id).bind(&input_hash).bind(request.request.current_mode.as_str()).bind(request.request.required_mode.as_str()).bind(request.request.reason.as_deref()).execute(&mut *tx).await.map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
         let stored = sqlx::query_as::<Sqlite, (String, String, String, String, String, String)>("SELECT tenant_id, user_id, session_id, turn_id, invocation_id, input_hash FROM approval_requests WHERE id = ?")
@@ -3051,20 +3451,67 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         }
         sqlx::query::<Sqlite>("INSERT INTO tool_invocations (id, tenant_id, thread_id, turn_id, tool_name, lifecycle_state, idempotency_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'awaiting_authorization', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT(id) DO NOTHING")
             .bind(&invocation_row_id).bind(&self.tenant_id).bind(&self.session_id).bind(&request.turn_id).bind(&request.tool_name).bind(&intent.idempotency_key).execute(&mut *tx).await.map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
-        self.append_approval_in_transaction(
+        let event_key = format!("interaction-created:{request_id}");
+        self.append_domain_event_in_transaction(
             &mut tx,
-            &request.turn_id,
-            &request.invocation_id,
-            &request.tool_name,
-            &input_hash,
-            "pending",
-            Some(expires_at),
+            Some(&request.turn_id),
+            &request_id,
+            "interaction_requested",
+            serde_json::json!({
+                "interactionId":request_id,
+                "kind":"approval",
+                "state":"pending",
+                "invocationId":request.invocation_id,
+                "expectedTurnRevision":expected_turn_revision,
+                "expiresAt":expires_at,
+            }),
+            event_key.clone(),
         )
         .await
         .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+        let event_id = sqlx::query_scalar::<Sqlite, String>(
+            "SELECT event_id FROM agent_event_ledger
+             WHERE tenant_id = ? AND thread_id = ? AND idempotency_key = ?",
+        )
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(&event_key)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        sqlx::query::<Sqlite>(
+            "UPDATE durable_interactions SET created_event_id = ?
+             WHERE id = ? AND tenant_id = ?",
+        )
+        .bind(event_id)
+        .bind(&request_id)
+        .bind(&self.tenant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        sqlx::query::<Sqlite>(
+            "INSERT INTO durable_interaction_outbox
+                (id, tenant_id, interaction_id, intent, idempotency_key)
+             VALUES (?, ?, ?, 'display', ?)
+             ON CONFLICT(tenant_id, idempotency_key) DO NOTHING",
+        )
+        .bind(tenant_scoped_record_id(
+            "interaction-outbox",
+            &self.tenant_id,
+            &event_key,
+        ))
+        .bind(&self.tenant_id)
+        .bind(&request_id)
+        .bind(event_key)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        process_fault_point("interaction.before_commit");
         tx.commit()
             .await
-            .map_err(|e| runtime::RuntimeError::new(e.to_string()))
+            .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+        process_fault_point("interaction.after_commit");
+        Ok(())
     }
 
     async fn resolve_approval(
@@ -3079,58 +3526,584 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                 self.session_id, resolution.turn_id, resolution.invocation_id
             ),
         );
-        let requested_status = match resolution.decision {
-            runtime::RuntimeApprovalDecision::Approved => "approved",
-            runtime::RuntimeApprovalDecision::Denied => "denied",
-            runtime::RuntimeApprovalDecision::Expired => "expired",
-            runtime::RuntimeApprovalDecision::Cancelled => "cancelled",
+        let requested_state = match resolution.decision {
+            runtime::RuntimeApprovalDecision::Approved => InteractionState::Granted,
+            runtime::RuntimeApprovalDecision::Denied => InteractionState::Rejected,
+            runtime::RuntimeApprovalDecision::Expired => InteractionState::Expired,
+            runtime::RuntimeApprovalDecision::Cancelled => InteractionState::Cancelled,
         };
+        let response_key = format!(
+            "approval-response:{}:{}",
+            resolution.invocation_id,
+            requested_state.as_str()
+        );
+        let answered = self
+            .respond_interaction(&runtime::RuntimeInteractionResolution {
+                interaction_id: request_id.clone(),
+                turn_id: resolution.turn_id.clone(),
+                responder_user_id: self.user_id.clone(),
+                state: requested_state,
+                response_projection: Some(serde_json::json!({
+                    "decision":requested_state.as_str(),
+                    "reason":resolution.reason,
+                })),
+                encrypted_secret_ref: None,
+                idempotency_key: response_key.clone(),
+            })
+            .await?;
+        let effective_state = answered
+            .response_projection
+            .as_ref()
+            .and_then(|value| value.get("decision").or_else(|| value.get("terminalState")))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| answered.state.as_str());
+        let effective = match effective_state {
+            "granted" => runtime::RuntimeApprovalDecision::Approved,
+            "rejected" => runtime::RuntimeApprovalDecision::Denied,
+            "cancelled" => runtime::RuntimeApprovalDecision::Cancelled,
+            "expired" => runtime::RuntimeApprovalDecision::Expired,
+            _ => resolution.decision,
+        };
+        if answered.state != InteractionState::Consumed {
+            self.consume_interaction(&request_id, &resolution.turn_id, &response_key)
+                .await?;
+        }
+        Ok(effective)
+    }
+
+    async fn request_interaction(
+        &self,
+        request: &runtime::RuntimeInteractionRequest,
+    ) -> Result<DurableInteraction, runtime::RuntimeError> {
+        crate::behavior_trace("INTERACTION-001");
+        if request.owner_user_id != self.user_id || request.interaction_id.trim().is_empty() {
+            return Err(runtime::RuntimeError::new(
+                "durable interaction owner or identifier does not match the execution scope",
+            ));
+        }
+        let display_projection = runtime::protect_sensitive_json(
+            &request.display_projection,
+            runtime::configured_data_protection_mode(),
+        )
+        .0;
+        let allowed_responders = serde_json::to_string(&request.allowed_responder_ids)
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
         let mut tx = self
             .db
             .begin()
             .await
-            .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
         acquire_sqlite_write_lock(&mut tx)
             .await
-            .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
-        let row = sqlx::query_as::<Sqlite, (String, String, String, String)>("SELECT tool_name, scope_hash, status, expires_at FROM approval_requests WHERE id = ? AND tenant_id = ? AND user_id = ? AND session_id = ? AND turn_id = ? AND invocation_id = ? AND executor_scope = 'native'")
-            .bind(&request_id).bind(&self.tenant_id).bind(&self.user_id).bind(&self.session_id).bind(&resolution.turn_id).bind(&resolution.invocation_id).fetch_optional(&mut *tx).await.map_err(|e| runtime::RuntimeError::new(e.to_string()))?
-            .ok_or_else(|| runtime::RuntimeError::new("approval request was not found in this authenticated scope"))?;
-        if row.2 != "pending" {
-            return Err(runtime::RuntimeError::new(
-                "approval request is no longer pending",
-            ));
-        }
-        let expired = chrono::DateTime::parse_from_rfc3339(&row.3)
-            .map(|value| value.with_timezone(&Utc) <= Utc::now())
-            .unwrap_or(true);
-        let final_status = if expired { "expired" } else { requested_status };
-        let changed = sqlx::query::<Sqlite>("UPDATE approval_requests SET status = ?, resolved_at = CURRENT_TIMESTAMP, resolution_reason = ? WHERE id = ? AND tenant_id = ? AND user_id = ? AND status = 'pending'")
-            .bind(final_status).bind(resolution.reason.as_deref()).bind(&request_id).bind(&self.tenant_id).bind(&self.user_id).execute(&mut *tx).await.map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
-        if changed.rows_affected() != 1 {
-            return Err(runtime::RuntimeError::new(
-                "approval resolution raced with another worker",
-            ));
-        }
-        self.append_approval_in_transaction(
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        ensure_runtime_thread(
             &mut tx,
-            &resolution.turn_id,
-            &resolution.invocation_id,
-            &row.0,
-            &row.1,
-            final_status,
-            None,
+            &self.tenant_id,
+            &self.user_id,
+            &self.session_id,
+            &request.turn_id,
         )
         .await
-        .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let inserted = sqlx::query::<Sqlite>(
+            "INSERT INTO durable_interactions
+                (id, tenant_id, user_id, session_id, turn_id, invocation_id,
+                 kind, state, owner_user_id, allowed_responder_ids_json,
+                 capability_requirement, request_schema_hash, choice_schema_hash,
+                 display_projection_json, idempotency_key, expected_turn_revision,
+                 expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(tenant_id, session_id, idempotency_key) DO NOTHING",
+        )
+        .bind(&request.interaction_id)
+        .bind(&self.tenant_id)
+        .bind(&self.user_id)
+        .bind(&self.session_id)
+        .bind(&request.turn_id)
+        .bind(&request.invocation_id)
+        .bind(request.kind.as_str())
+        .bind(&request.owner_user_id)
+        .bind(&allowed_responders)
+        .bind(&request.capability_requirement)
+        .bind(&request.request_schema_hash)
+        .bind(&request.choice_schema_hash)
+        .bind(display_projection.to_string())
+        .bind(&request.idempotency_key)
+        .bind(i64::try_from(request.expected_turn_revision).unwrap_or(i64::MAX))
+        .bind(request.expires_at.map(|value| value.to_rfc3339()))
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        if inserted.rows_affected() == 0 {
+            let existing_id = sqlx::query_scalar::<Sqlite, String>(
+                "SELECT id FROM durable_interactions
+                 WHERE tenant_id = ? AND session_id = ? AND idempotency_key = ?",
+            )
+            .bind(&self.tenant_id)
+            .bind(&self.session_id)
+            .bind(&request.idempotency_key)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            let existing = load_durable_interaction(&mut tx, &self.tenant_id, &existing_id).await?;
+            if existing.scope.session_id != self.session_id
+                || existing.scope.turn_id != request.turn_id
+                || existing.scope.invocation_id != request.invocation_id
+                || existing.request_schema_hash != request.request_schema_hash
+                || existing.interaction_id != request.interaction_id
+            {
+                return Err(runtime::RuntimeError::new(
+                    "durable interaction idempotency key was reused for another request",
+                ));
+            }
+            tx.commit()
+                .await
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            return Ok(existing);
+        }
+        let suspended = sqlx::query::<Sqlite>(
+            "UPDATE agent_turns SET status = 'suspended', revision = revision + 1
+             WHERE tenant_id = ? AND thread_id = ? AND id = ?
+               AND status = 'running' AND revision = ?",
+        )
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(&request.turn_id)
+        .bind(i64::try_from(request.expected_turn_revision).unwrap_or(i64::MAX))
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        if suspended.rows_affected() != 1 {
+            return Err(runtime::RuntimeError::new(
+                "durable interaction lost the expected turn revision",
+            ));
+        }
+        let event_key = format!("interaction-created:{}", request.interaction_id);
+        self.append_domain_event_in_transaction(
+            &mut tx,
+            Some(&request.turn_id),
+            &request.interaction_id,
+            "interaction_requested",
+            serde_json::json!({
+                "interactionId":request.interaction_id,
+                "kind":request.kind.as_str(),
+                "state":"pending",
+                "invocationId":request.invocation_id,
+                "expectedTurnRevision":request.expected_turn_revision,
+                "expiresAt":request.expires_at,
+            }),
+            event_key.clone(),
+        )
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let event_id = sqlx::query_scalar::<Sqlite, String>(
+            "SELECT event_id FROM agent_event_ledger
+             WHERE tenant_id = ? AND thread_id = ? AND idempotency_key = ?",
+        )
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(&event_key)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        sqlx::query::<Sqlite>(
+            "UPDATE durable_interactions SET created_event_id = ? WHERE id = ? AND tenant_id = ?",
+        )
+        .bind(&event_id)
+        .bind(&request.interaction_id)
+        .bind(&self.tenant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        sqlx::query::<Sqlite>(
+            "INSERT INTO durable_interaction_outbox
+                (id, tenant_id, interaction_id, intent, idempotency_key)
+             VALUES (?, ?, ?, 'display', ?)",
+        )
+        .bind(tenant_scoped_record_id(
+            "interaction-outbox",
+            &self.tenant_id,
+            &event_key,
+        ))
+        .bind(&self.tenant_id)
+        .bind(&request.interaction_id)
+        .bind(&event_key)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let created =
+            load_durable_interaction(&mut tx, &self.tenant_id, &request.interaction_id).await?;
+        process_fault_point("interaction.before_commit");
         tx.commit()
             .await
-            .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
-        Ok(if expired {
-            runtime::RuntimeApprovalDecision::Expired
-        } else {
-            resolution.decision
-        })
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        process_fault_point("interaction.after_commit");
+        Ok(created)
+    }
+
+    async fn respond_interaction(
+        &self,
+        resolution: &runtime::RuntimeInteractionResolution,
+    ) -> Result<DurableInteraction, runtime::RuntimeError> {
+        let response_hash = sha256_json(&serde_json::json!({
+            "state":resolution.state,
+            "response":resolution.response_projection,
+            "secretRef":resolution.encrypted_secret_ref,
+            "responder":resolution.responder_user_id,
+        }));
+        if resolution
+            .encrypted_secret_ref
+            .as_deref()
+            .is_some_and(|reference| {
+                !reference.starts_with("secret://") && !reference.starts_with("vault://")
+            })
+        {
+            return Err(runtime::RuntimeError::new(
+                "credential response must contain an opaque secret:// or vault:// reference",
+            ));
+        }
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        acquire_sqlite_write_lock(&mut tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let mut interaction =
+            load_durable_interaction(&mut tx, &self.tenant_id, &resolution.interaction_id).await?;
+        if interaction.scope.session_id != self.session_id
+            || interaction.scope.turn_id != resolution.turn_id
+            || interaction.scope.user_id != self.user_id
+        {
+            return Err(runtime::RuntimeError::new(
+                "interaction response crossed its durable scope",
+            ));
+        }
+        if interaction.state != InteractionState::Pending {
+            let stored_hash = sqlx::query_scalar::<Sqlite, Option<String>>(
+                "SELECT response_hash FROM durable_interactions WHERE tenant_id = ? AND id = ?",
+            )
+            .bind(&self.tenant_id)
+            .bind(&resolution.interaction_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            if stored_hash.as_deref() == Some(response_hash.as_str()) {
+                tx.commit()
+                    .await
+                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+                return Ok(interaction);
+            }
+            return Err(runtime::RuntimeError::new(
+                "interaction was already answered with a different response",
+            ));
+        }
+        if let Some(requirement) = interaction.capability_requirement.as_deref() {
+            let capability_count = sqlx::query_scalar::<Sqlite, i64>(
+                "SELECT COUNT(*) FROM capability_tokens
+                 WHERE tenant_id = ? AND user_id = ?
+                   AND (session_id = ? OR session_id IS NULL)
+                   AND action_scope = ? AND remaining_uses > 0
+                   AND revoked_at IS NULL AND julianday(expires_at) > julianday('now')",
+            )
+            .bind(&self.tenant_id)
+            .bind(&resolution.responder_user_id)
+            .bind(&self.session_id)
+            .bind(requirement)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            if capability_count == 0 {
+                return Err(runtime::RuntimeError::new(
+                    "interaction responder no longer has the required capability",
+                ));
+            }
+        }
+        let response_event_key = format!(
+            "interaction-response:{}:{}",
+            resolution.interaction_id, resolution.idempotency_key
+        );
+        let response_projection = resolution.response_projection.as_ref().map(|projection| {
+            runtime::protect_sensitive_json(projection, runtime::configured_data_protection_mode())
+                .0
+        });
+        interaction
+            .respond(
+                InteractionResponse {
+                    responder_user_id: resolution.responder_user_id.clone(),
+                    state: resolution.state,
+                    response_projection,
+                    encrypted_secret_ref: resolution.encrypted_secret_ref.clone(),
+                    response_event_id: response_event_key.clone(),
+                },
+                Utc::now(),
+            )
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        if interaction.state == InteractionState::Expired {
+            interaction.response_projection = Some(serde_json::json!({
+                "terminalState":"expired"
+            }));
+            interaction.encrypted_secret_ref = None;
+        }
+        let changed = sqlx::query::<Sqlite>(
+            "UPDATE durable_interactions
+             SET state = ?, response_projection_json = ?, encrypted_secret_ref = ?,
+                 responder_user_id = ?, response_event_id = ?, response_hash = ?,
+                 responded_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE tenant_id = ? AND id = ? AND state = 'pending'",
+        )
+        .bind(interaction.state.as_str())
+        .bind(
+            interaction
+                .response_projection
+                .as_ref()
+                .map(serde_json::Value::to_string),
+        )
+        .bind(&interaction.encrypted_secret_ref)
+        .bind(&resolution.responder_user_id)
+        .bind(&response_event_key)
+        .bind(&response_hash)
+        .bind(&self.tenant_id)
+        .bind(&resolution.interaction_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        if changed.rows_affected() != 1 {
+            return Err(runtime::RuntimeError::new(
+                "interaction response raced with another responder",
+            ));
+        }
+        if interaction.kind == InteractionKind::Approval {
+            let projection_status = match interaction.state {
+                InteractionState::Granted => "approved",
+                InteractionState::Rejected => "denied",
+                InteractionState::Expired => "expired",
+                InteractionState::Cancelled => "cancelled",
+                InteractionState::Responded => "responded",
+                InteractionState::Pending | InteractionState::Consumed => {
+                    return Err(runtime::RuntimeError::new(
+                        "approval response reached an invalid interaction state",
+                    ));
+                }
+            };
+            let projected = sqlx::query::<Sqlite>(
+                "UPDATE approval_requests
+                 SET status = ?, resolved_at = CURRENT_TIMESTAMP, resolution_reason = ?
+                 WHERE id = ? AND tenant_id = ? AND user_id = ? AND status = 'pending'",
+            )
+            .bind(projection_status)
+            .bind(
+                interaction
+                    .response_projection
+                    .as_ref()
+                    .and_then(|value| value.get("reason"))
+                    .and_then(serde_json::Value::as_str),
+            )
+            .bind(&resolution.interaction_id)
+            .bind(&self.tenant_id)
+            .bind(&self.user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            if projected.rows_affected() != 1 {
+                return Err(runtime::RuntimeError::new(
+                    "approval compatibility projection is missing or stale",
+                ));
+            }
+        }
+        self.append_domain_event_in_transaction(
+            &mut tx,
+            Some(&resolution.turn_id),
+            &resolution.interaction_id,
+            "interaction_responded",
+            serde_json::json!({
+                "interactionId":resolution.interaction_id,
+                "state":interaction.state.as_str(),
+                "responseHash":response_hash,
+                "secretReferencePresent":interaction.encrypted_secret_ref.is_some(),
+            }),
+            response_event_key,
+        )
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        if interaction.state.can_resume() {
+            let outbox_key = format!("interaction-resume:{}", resolution.interaction_id);
+            sqlx::query::<Sqlite>(
+                "INSERT INTO durable_interaction_outbox
+                    (id, tenant_id, interaction_id, intent, idempotency_key)
+                 VALUES (?, ?, ?, 'resume', ?)
+                 ON CONFLICT(tenant_id, idempotency_key) DO NOTHING",
+            )
+            .bind(tenant_scoped_record_id(
+                "interaction-outbox",
+                &self.tenant_id,
+                &outbox_key,
+            ))
+            .bind(&self.tenant_id)
+            .bind(&resolution.interaction_id)
+            .bind(&outbox_key)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        }
+        let answered =
+            load_durable_interaction(&mut tx, &self.tenant_id, &resolution.interaction_id).await?;
+        tx.commit()
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        Ok(answered)
+    }
+
+    async fn consume_interaction(
+        &self,
+        interaction_id: &str,
+        turn_id: &str,
+        idempotency_key: &str,
+    ) -> Result<DurableInteraction, runtime::RuntimeError> {
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        acquire_sqlite_write_lock(&mut tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let mut interaction =
+            load_durable_interaction(&mut tx, &self.tenant_id, interaction_id).await?;
+        if interaction.scope.session_id != self.session_id || interaction.scope.turn_id != turn_id {
+            return Err(runtime::RuntimeError::new(
+                "interaction consume crossed its durable scope",
+            ));
+        }
+        let consume_event_key = format!("interaction-consumed:{interaction_id}:{idempotency_key}");
+        if interaction.state == InteractionState::Consumed {
+            if interaction.consumed_event_id.as_deref() == Some(consume_event_key.as_str()) {
+                tx.commit()
+                    .await
+                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+                return Ok(interaction);
+            }
+            return Err(runtime::RuntimeError::new(
+                "interaction resume was already consumed",
+            ));
+        }
+        interaction
+            .consume(consume_event_key.clone())
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        if let Some(requirement) = interaction.capability_requirement.as_deref() {
+            let responder_user_id = sqlx::query_scalar::<Sqlite, String>(
+                "SELECT responder_user_id FROM durable_interactions
+                 WHERE tenant_id = ? AND id = ?",
+            )
+            .bind(&self.tenant_id)
+            .bind(interaction_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            let consumed_capability = sqlx::query::<Sqlite>(
+                "UPDATE capability_tokens SET remaining_uses = remaining_uses - 1
+                 WHERE id = (
+                   SELECT id FROM capability_tokens
+                   WHERE tenant_id = ? AND user_id = ?
+                     AND (session_id = ? OR session_id IS NULL)
+                     AND action_scope = ? AND remaining_uses > 0
+                     AND revoked_at IS NULL
+                     AND julianday(expires_at) > julianday('now')
+                   ORDER BY expires_at ASC, id ASC LIMIT 1
+                 ) AND tenant_id = ? AND remaining_uses > 0",
+            )
+            .bind(&self.tenant_id)
+            .bind(&responder_user_id)
+            .bind(&self.session_id)
+            .bind(requirement)
+            .bind(&self.tenant_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            if consumed_capability.rows_affected() != 1 {
+                return Err(runtime::RuntimeError::new(
+                    "interaction capability was revoked or consumed before resume",
+                ));
+            }
+        }
+        let claim_owner = format!("interaction-resumer:{idempotency_key}");
+        let claimed = sqlx::query::<Sqlite>(
+            "UPDATE durable_interaction_outbox
+             SET state = 'claimed', lease_owner = ?,
+                 lease_expires_at = datetime('now', '+5 minutes')
+             WHERE tenant_id = ? AND interaction_id = ? AND intent = 'resume'
+               AND (state = 'pending' OR (state = 'claimed' AND lease_owner = ?))",
+        )
+        .bind(&claim_owner)
+        .bind(&self.tenant_id)
+        .bind(interaction_id)
+        .bind(&claim_owner)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        if claimed.rows_affected() != 1 {
+            return Err(runtime::RuntimeError::new(
+                "interaction resume intent is missing or already claimed",
+            ));
+        }
+        let resumed = sqlx::query::<Sqlite>(
+            "UPDATE agent_turns SET status = 'running', revision = revision + 1
+             WHERE tenant_id = ? AND thread_id = ? AND id = ? AND status = 'suspended'",
+        )
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(turn_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        if resumed.rows_affected() != 1 {
+            return Err(runtime::RuntimeError::new(
+                "suspended turn could not be resumed exactly once",
+            ));
+        }
+        let changed = sqlx::query::<Sqlite>(
+            "UPDATE durable_interactions SET state = 'consumed', consumed_event_id = ?,
+                    consumed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+             WHERE tenant_id = ? AND id = ?
+               AND state IN ('responded','granted','rejected','expired','cancelled')",
+        )
+        .bind(&consume_event_key)
+        .bind(&self.tenant_id)
+        .bind(interaction_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        if changed.rows_affected() != 1 {
+            return Err(runtime::RuntimeError::new(
+                "interaction consume raced with another dispatcher",
+            ));
+        }
+        self.append_domain_event_in_transaction(
+            &mut tx,
+            Some(turn_id),
+            interaction_id,
+            "interaction_consumed",
+            serde_json::json!({"interactionId":interaction_id,"state":"consumed"}),
+            consume_event_key,
+        )
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        sqlx::query::<Sqlite>(
+            "UPDATE durable_interaction_outbox SET state = 'settled', settled_at = CURRENT_TIMESTAMP
+             WHERE tenant_id = ? AND interaction_id = ? AND intent = 'resume' AND state IN ('pending','claimed')",
+        )
+        .bind(&self.tenant_id)
+        .bind(interaction_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let consumed = load_durable_interaction(&mut tx, &self.tenant_id, interaction_id).await?;
+        tx.commit()
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        Ok(consumed)
     }
 
     async fn finish_tool(
@@ -3170,8 +4143,13 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                 &self.tenant_id,
                 &format!("{}:{}", self.session_id, outcome.invocation_id),
             );
+            let artifact_ciphertext = agent_gateway::crypto::encrypt_scoped(
+                &protected.value,
+                &agent_gateway::crypto::scoped_aad("artifact.payload", &self.tenant_id, &id),
+            )
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
             sqlx::query::<Sqlite>("INSERT INTO artifact_objects (id, tenant_id, owner_scope, content_hash, media_type, byte_size, locator, retention_policy, expires_at, deleted_at, payload_blob) VALUES (?, ?, ?, ?, ?, ?, ?, 'session', NULL, NULL, ?) ON CONFLICT(id) DO UPDATE SET content_hash = excluded.content_hash, media_type = excluded.media_type, byte_size = excluded.byte_size, payload_blob = excluded.payload_blob, deleted_at = NULL")
-                .bind(&id).bind(&self.tenant_id).bind(&self.session_id).bind(&content_hash).bind(model_preview.kind.media_type()).bind(i64::try_from(protected.value.len()).unwrap_or(i64::MAX)).bind(format!("artifact://{id}")).bind(protected.value.as_bytes()).execute(&mut *tx).await.map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+                .bind(&id).bind(&self.tenant_id).bind(&self.session_id).bind(&content_hash).bind(model_preview.kind.media_type()).bind(i64::try_from(protected.value.len()).unwrap_or(i64::MAX)).bind(format!("artifact://{id}")).bind(artifact_ciphertext.as_bytes()).execute(&mut *tx).await.map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
             let projections = [
                 (
                     "source",
@@ -3310,9 +4288,11 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         )
         .await
         .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        process_fault_point("tool_artifact.before_commit");
         tx.commit()
             .await
             .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+        process_fault_point("tool_artifact.after_commit");
         Ok(runtime::RuntimeToolProjection {
             model_output,
             artifact_id,
@@ -3321,12 +4301,30 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         })
     }
 
-    async fn finish_turn(
+    async fn finish_turn_with_checkpoint(
         &self,
         turn_id: &str,
         status: runtime::RuntimeTurnTerminalStatus,
         detail: Option<&str>,
+        session: &runtime::Session,
     ) -> Result<(), runtime::RuntimeError> {
+        crate::behavior_trace("CHECKPOINT-001");
+        let expected_session_status = match status {
+            runtime::RuntimeTurnTerminalStatus::Completed => runtime::SessionTurnStatus::Completed,
+            runtime::RuntimeTurnTerminalStatus::Failed => runtime::SessionTurnStatus::Failed,
+            runtime::RuntimeTurnTerminalStatus::Cancelled => runtime::SessionTurnStatus::Cancelled,
+            runtime::RuntimeTurnTerminalStatus::Suspended => runtime::SessionTurnStatus::Suspended,
+        };
+        if session.session_id != self.session_id
+            || session.tenant_id.as_deref() != Some(self.tenant_id.as_str())
+            || session.user_id.as_deref() != Some(self.user_id.as_str())
+            || session.turns.last().map(|turn| turn.turn_id.as_str()) != Some(turn_id)
+            || session.turns.last().map(|turn| turn.status) != Some(expected_session_status)
+        {
+            return Err(runtime::RuntimeError::new(
+                "terminal checkpoint scope or status does not match its execution kernel and turn",
+            ));
+        }
         let status_text = match status {
             runtime::RuntimeTurnTerminalStatus::Completed => "completed",
             runtime::RuntimeTurnTerminalStatus::Failed => "failed",
@@ -3341,6 +4339,23 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         acquire_sqlite_write_lock(&mut tx)
             .await
             .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let current_turn = sqlx::query_as::<Sqlite, (String, i64)>(
+            "SELECT status, revision FROM agent_turns
+             WHERE tenant_id = ? AND thread_id = ? AND id = ?",
+        )
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(turn_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?
+        .ok_or_else(|| runtime::RuntimeError::new("canonical turn was not found in this scope"))?;
+        if !matches!(current_turn.0.as_str(), "running" | "suspended") {
+            return Err(runtime::RuntimeError::new(format!(
+                "canonical turn is already terminal (status={})",
+                current_turn.0.as_str()
+            )));
+        }
         if !matches!(status, runtime::RuntimeTurnTerminalStatus::Suspended) {
             let reservation_prefix = format!("model:{turn_id}:%");
             let rows = sqlx::query::<Sqlite>(
@@ -3463,8 +4478,16 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             .await
             .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
         }
-        sqlx::query::<Sqlite>("UPDATE agent_turns SET status = ?, ended_at = CASE WHEN ? <> 'suspended' THEN CURRENT_TIMESTAMP ELSE ended_at END, terminal_outcome = CASE WHEN ? <> 'suspended' THEN ? ELSE terminal_outcome END WHERE tenant_id = ? AND id = ?")
-            .bind(status_text).bind(status_text).bind(status_text).bind(status_text).bind(&self.tenant_id).bind(turn_id).execute(&mut *tx).await.map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+        let updated = sqlx::query::<Sqlite>("UPDATE agent_turns SET status = ?, ended_at = CASE WHEN ? <> 'suspended' THEN CURRENT_TIMESTAMP ELSE ended_at END, terminal_outcome = CASE WHEN ? <> 'suspended' THEN ? ELSE terminal_outcome END, revision = revision + 1 WHERE tenant_id = ? AND thread_id = ? AND id = ? AND revision = ? AND status = ?")
+            .bind(status_text).bind(status_text).bind(status_text).bind(status_text)
+            .bind(&self.tenant_id).bind(&self.session_id).bind(turn_id)
+            .bind(current_turn.1).bind(&current_turn.0)
+            .execute(&mut *tx).await.map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+        if updated.rows_affected() != 1 {
+            return Err(runtime::RuntimeError::new(
+                "canonical turn revision changed before terminal checkpoint commit",
+            ));
+        }
         self.append_domain_event_in_transaction(
             &mut tx,
             Some(turn_id),
@@ -3475,10 +4498,261 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         )
         .await
         .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let session_json = session
+            .to_recovery_json()
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let state_hash = sha256_json(&session_json);
+        let checkpoint_id = tenant_scoped_record_id(
+            "runtime-checkpoint",
+            &self.tenant_id,
+            &format!("{}:{state_hash}", self.session_id),
+        );
+        let checkpoint_sequence = self
+            .append_domain_event_in_transaction(
+                &mut tx,
+                Some(turn_id),
+                &checkpoint_id,
+                "session_checkpoint",
+                serde_json::json!({
+                    "schemaVersion":"runtime-session-checkpoint-v2",
+                    "reason":"turn_terminal",
+                    "terminalTurnId":turn_id,
+                    "terminalStatus":status_text,
+                    "stateHash":state_hash,
+                    "session":session_json,
+                }),
+                format!("session-checkpoint:{state_hash}"),
+            )
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let projection = runtime::protect_sensitive_json(
+            &session_json,
+            runtime::configured_data_protection_mode(),
+        )
+        .0;
+        let checkpoint_ciphertext = agent_gateway::crypto::encrypt_scoped(
+            &session_json.to_string(),
+            &agent_gateway::crypto::scoped_aad(
+                "checkpoint.session",
+                &self.tenant_id,
+                &checkpoint_id,
+            ),
+        )
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        sqlx::query::<Sqlite>(
+            "INSERT INTO execution_checkpoints
+                (id, tenant_id, thread_id, sequence, state_hash, checkpoint_json,
+                 checkpoint_ciphertext, durable, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(&checkpoint_id)
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(i64::try_from(checkpoint_sequence).unwrap_or(i64::MAX))
+        .bind(&state_hash)
+        .bind(projection.to_string())
+        .bind(checkpoint_ciphertext)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        if !matches!(status, runtime::RuntimeTurnTerminalStatus::Suspended) {
+            let source_sequence_start = sqlx::query_scalar::<Sqlite, i64>(
+                "SELECT COALESCE(MIN(sequence), ?) FROM agent_event_ledger
+                 WHERE tenant_id = ? AND thread_id = ? AND turn_id = ?",
+            )
+            .bind(i64::try_from(checkpoint_sequence).unwrap_or(i64::MAX))
+            .bind(&self.tenant_id)
+            .bind(&self.session_id)
+            .bind(turn_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            let source_sequence_end = i64::try_from(checkpoint_sequence).unwrap_or(i64::MAX);
+            let source_window_hash =
+                crate::semantic_memory_worker::compute_ledger_window_hash_in_transaction(
+                    &mut tx,
+                    &self.tenant_id,
+                    &self.session_id,
+                    source_sequence_start,
+                    source_sequence_end,
+                )
+                .await
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            sqlx::query::<Sqlite>(
+                "INSERT INTO memory_extraction_outbox
+                    (id, tenant_id, user_id, session_id, turn_id,
+                     source_sequence_start, source_sequence_end, source_window_hash,
+                     status, available_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP)
+                 ON CONFLICT(tenant_id, session_id, turn_id, source_window_hash) DO NOTHING",
+            )
+            .bind(tenant_scoped_record_id(
+                "memory-extraction",
+                &self.tenant_id,
+                &format!("{}:{turn_id}:{source_window_hash}", self.session_id),
+            ))
+            .bind(&self.tenant_id)
+            .bind(&self.user_id)
+            .bind(&self.session_id)
+            .bind(turn_id)
+            .bind(source_sequence_start)
+            .bind(source_sequence_end)
+            .bind(source_window_hash)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        }
+        process_fault_point("turn_checkpoint.before_commit");
         tx.commit()
             .await
-            .map_err(|error| runtime::RuntimeError::new(error.to_string()))
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        process_fault_point("turn_checkpoint.after_commit");
+        Ok(())
     }
+}
+
+pub(crate) async fn create_memory_conflict_question_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    tenant_id: &str,
+    user_id: &str,
+    session_id: Option<&str>,
+    current_fact_id: &str,
+    candidate_fact_id: &str,
+    correlation_id: &str,
+) -> Result<(), SemanticStoreError> {
+    let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) else {
+        return Err(SemanticStoreError::InvalidEvent(
+            "a conflicting Memory fact has no durable session scope".into(),
+        ));
+    };
+    let turn = sqlx::query_as::<Sqlite, (String, i64)>(
+        "SELECT id, revision FROM agent_turns
+         WHERE tenant_id = ? AND thread_id = ?
+         ORDER BY started_at DESC, id DESC LIMIT 1",
+    )
+    .bind(tenant_id)
+    .bind(session_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| {
+        SemanticStoreError::InvalidEvent(
+            "a conflicting Memory fact has no canonical originating turn".into(),
+        )
+    })?;
+    let conflict_key = format!("{current_fact_id}:{candidate_fact_id}");
+    let interaction_id = tenant_scoped_record_id("memory-conflict", tenant_id, &conflict_key);
+    let invocation_id =
+        tenant_scoped_record_id("memory-conflict-invocation", tenant_id, &conflict_key);
+    let idempotency_key = format!("memory-conflict:{conflict_key}");
+    let request_schema_hash = sha256_json(&serde_json::json!({
+        "schemaVersion":"memory-conflict-question-v1",
+        "currentFactId":current_fact_id,
+        "candidateFactId":candidate_fact_id,
+    }));
+    let display = serde_json::json!({
+        "question":"Two governed memories conflict. Choose which fact should remain active.",
+        "currentFactId":current_fact_id,
+        "candidateFactId":candidate_fact_id,
+        "correlationId":correlation_id,
+    });
+    let inserted = sqlx::query::<Sqlite>(
+        "INSERT INTO durable_interactions
+            (id, tenant_id, user_id, session_id, turn_id, invocation_id,
+             kind, state, owner_user_id, allowed_responder_ids_json,
+             capability_requirement, request_schema_hash, choice_schema_hash,
+             display_projection_json, idempotency_key, expected_turn_revision)
+         VALUES (?, ?, ?, ?, ?, ?, 'user_question', 'pending', ?, ?,
+                 'memory.resolve', ?, ?, ?, ?, ?)
+         ON CONFLICT(tenant_id, session_id, idempotency_key) DO NOTHING",
+    )
+    .bind(&interaction_id)
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(session_id)
+    .bind(&turn.0)
+    .bind(&invocation_id)
+    .bind(user_id)
+    .bind(serde_json::json!([user_id]).to_string())
+    .bind(&request_schema_hash)
+    .bind(sha256_json(
+        &serde_json::json!({"choices":["current","candidate"]}),
+    ))
+    .bind(display.to_string())
+    .bind(&idempotency_key)
+    .bind(turn.1)
+    .execute(&mut **tx)
+    .await?;
+    if inserted.rows_affected() == 0 {
+        let stored = sqlx::query_as::<Sqlite, (String, String, String)>(
+            "SELECT tenant_id, owner_user_id, request_schema_hash
+             FROM durable_interactions WHERE id = ?",
+        )
+        .bind(&interaction_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if stored.0 != tenant_id || stored.1 != user_id || stored.2 != request_schema_hash {
+            return Err(SemanticStoreError::InvalidEvent(
+                "Memory conflict interaction id was reused across scopes".into(),
+            ));
+        }
+        return Ok(());
+    }
+    let event_key = format!("interaction-created:{interaction_id}");
+    append_runtime_domain_event_in_transaction(
+        tx,
+        tenant_id,
+        user_id,
+        session_id,
+        Some(&turn.0),
+        &interaction_id,
+        "interaction_requested",
+        serde_json::json!({
+            "interactionId":interaction_id,
+            "kind":"user_question",
+            "state":"pending",
+            "reason":"memory_conflict",
+            "currentFactId":current_fact_id,
+            "candidateFactId":candidate_fact_id,
+        }),
+        event_key.clone(),
+    )
+    .await?;
+    let created_event_id = sqlx::query_scalar::<Sqlite, String>(
+        "SELECT event_id FROM agent_event_ledger
+         WHERE tenant_id = ? AND thread_id = ? AND idempotency_key = ?",
+    )
+    .bind(tenant_id)
+    .bind(session_id)
+    .bind(&event_key)
+    .fetch_one(&mut **tx)
+    .await?;
+    sqlx::query::<Sqlite>(
+        "UPDATE durable_interactions SET created_event_id = ?
+         WHERE id = ? AND tenant_id = ?",
+    )
+    .bind(created_event_id)
+    .bind(&interaction_id)
+    .bind(tenant_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query::<Sqlite>(
+        "INSERT INTO durable_interaction_outbox
+            (id, tenant_id, interaction_id, intent, idempotency_key)
+         VALUES (?, ?, ?, 'display', ?)
+         ON CONFLICT(tenant_id, idempotency_key) DO NOTHING",
+    )
+    .bind(tenant_scoped_record_id(
+        "memory-conflict-outbox",
+        tenant_id,
+        &interaction_id,
+    ))
+    .bind(tenant_id)
+    .bind(interaction_id)
+    .bind(event_key)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 fn sha256_bytes(value: &[u8]) -> String {
@@ -3531,6 +4805,7 @@ async fn ensure_protected_model_budgets(
     owner_scope: &str,
     turn_id: &str,
 ) -> Result<(), runtime::RuntimeError> {
+    crate::behavior_trace("BUDGET-001");
     for stage in [
         runtime::RuntimeModelBudgetStage::FinalSynthesis,
         runtime::RuntimeModelBudgetStage::DomainVerifier,
@@ -3972,7 +5247,7 @@ pub(crate) async fn read_artifact_projection(
         SemanticStoreError::InvalidEvent("artifact projection payload is missing".into())
     })?;
     if projection_kind == "source" {
-        let payload = row
+        let stored_payload = row
             .try_get::<Option<Vec<u8>>, _>(2)
             .ok()
             .flatten()
@@ -3980,6 +5255,15 @@ pub(crate) async fn read_artifact_projection(
             .ok_or_else(|| {
                 SemanticStoreError::InvalidEvent("artifact source payload is missing".into())
             })?;
+        let payload = if stored_payload.starts_with("aosenc:") {
+            agent_gateway::crypto::decrypt_scoped(
+                &stored_payload,
+                &agent_gateway::crypto::scoped_aad("artifact.payload", tenant_id, artifact_id),
+            )
+            .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?
+        } else {
+            stored_payload
+        };
         let bounded: String = payload.chars().skip(start).take(max_chars.max(1)).collect();
         let returned_chars = bounded.chars().count();
         return Ok(Some(serde_json::json!({
@@ -4167,14 +5451,13 @@ pub(crate) async fn delete_session_artifacts(
     .bind(owner_scope)
     .execute(&mut *tx)
     .await?;
-    sqlx::query::<Sqlite>(
-        "DELETE FROM agent_memory_items
-         WHERE tenant_id = ? AND session_id = ?",
+    memory_engine::SqliteMemoryTransaction::erase_session_in_transaction(
+        &mut tx,
+        tenant_id,
+        owner_scope,
     )
-    .bind(tenant_id)
-    .bind(owner_scope)
-    .execute(&mut *tx)
-    .await?;
+    .await
+    .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
     sqlx::query::<Sqlite>(
         "WITH RECURSIVE descendants(id) AS (
              SELECT id FROM capability_tokens
@@ -4194,14 +5477,6 @@ pub(crate) async fn delete_session_artifacts(
     .bind(owner_scope)
     .bind(tenant_id)
     .bind(tenant_id)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query::<Sqlite>(
-        "DELETE FROM structured_memory_facts
-         WHERE tenant_id = ? AND session_id = ?",
-    )
-    .bind(tenant_id)
-    .bind(owner_scope)
     .execute(&mut *tx)
     .await?;
     sqlx::query::<Sqlite>(
@@ -4296,7 +5571,7 @@ pub(crate) async fn delete_session_artifacts(
     Ok(u64::try_from(artifact_ids.len()).unwrap_or(u64::MAX))
 }
 
-async fn acquire_sqlite_write_lock(
+pub(crate) async fn acquire_sqlite_write_lock(
     transaction: &mut Transaction<'_, Sqlite>,
 ) -> Result<(), SemanticStoreError> {
     // A write to the single setup row upgrades SQLite to a RESERVED lock before
@@ -4552,6 +5827,7 @@ async fn append_event_in_transaction(
     writer: &WriterLease,
     event: &AgentEventEnvelope,
 ) -> Result<(), SemanticStoreError> {
+    crate::behavior_trace("PROTO-003");
     event
         .verify_hash()
         .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
@@ -4640,17 +5916,78 @@ async fn append_event_in_transaction(
     Ok(())
 }
 
-/// Return the actual committed ledger positions available at a compaction
-/// boundary.  Runtime compaction must never synthesize `1..N` positions from a
-/// message count: those positions are only meaningful when they exist in the
-/// authoritative ledger.
-pub(crate) async fn ledger_sequences_for_thread(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactionSourceCoverage {
+    pub event_sequences: Vec<u64>,
+    pub message_event_ids: Vec<String>,
+    pub parent_compaction_ids: Vec<String>,
+}
+
+fn json_contains_value(haystack: &serde_json::Value, needle: &serde_json::Value) -> bool {
+    if haystack == needle {
+        return true;
+    }
+    match haystack {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| json_contains_value(value, needle)),
+        serde_json::Value::Object(values) => values
+            .values()
+            .any(|value| json_contains_value(value, needle)),
+        _ => false,
+    }
+}
+
+fn event_payload_matches_message(
+    payload: &serde_json::Value,
+    message: &runtime::ConversationMessage,
+) -> bool {
+    let expected = serde_json::to_value(message).ok();
+    if expected
+        .as_ref()
+        .is_some_and(|expected| json_contains_value(payload, expected))
+        || payload.pointer("/message/message") == expected.as_ref()
+        || payload.get("message") == expected.as_ref()
+    {
+        return true;
+    }
+    let [runtime::ContentBlock::Text { text }] = message.blocks.as_slice() else {
+        if let [runtime::ContentBlock::ToolResult {
+            tool_use_id,
+            tool_name,
+            output,
+            ..
+        }] = message.blocks.as_slice()
+        {
+            return payload
+                .get("invocationId")
+                .and_then(serde_json::Value::as_str)
+                == Some(tool_use_id)
+                && payload.get("toolName").and_then(serde_json::Value::as_str) == Some(tool_name)
+                && payload.get("output").and_then(serde_json::Value::as_str) == Some(output);
+        }
+        return false;
+    };
+    message.role == runtime::MessageRole::User
+        && payload.get("userInput").and_then(serde_json::Value::as_str) == Some(text)
+}
+
+/// Resolve the exact committed Ledger window represented by the messages that
+/// this compaction removes. Nested replacement messages bind to their parent
+/// manifest instead of re-declaring the parent's original source events.
+pub(crate) async fn ledger_coverage_for_archive(
     db: &SqlitePool,
     tenant_id: &str,
     thread_id: &str,
-) -> Result<Vec<u64>, SemanticStoreError> {
-    let rows = sqlx::query_scalar::<Sqlite, i64>(
-        "SELECT sequence FROM agent_event_ledger
+    archived_messages: &[runtime::ConversationMessage],
+) -> Result<CompactionSourceCoverage, SemanticStoreError> {
+    if archived_messages.is_empty() {
+        return Err(SemanticStoreError::InvalidEvent(
+            "cannot prove an empty compaction archive".into(),
+        ));
+    }
+    let rows = sqlx::query::<Sqlite>(
+        "SELECT sequence, event_id, raw_payload_ciphertext FROM agent_event_ledger
          WHERE tenant_id = ? AND thread_id = ? AND durable = 1
          ORDER BY sequence ASC",
     )
@@ -4658,12 +5995,125 @@ pub(crate) async fn ledger_sequences_for_thread(
     .bind(thread_id)
     .fetch_all(db)
     .await?;
-    rows.into_iter()
-        .map(|value| {
-            u64::try_from(value)
-                .map_err(|_| SemanticStoreError::InvalidEvent("negative ledger sequence".into()))
-        })
-        .collect()
+    let mut events = Vec::with_capacity(rows.len());
+    for row in rows {
+        let sequence = u64::try_from(row.try_get::<i64, _>("sequence")?)
+            .map_err(|_| SemanticStoreError::InvalidEvent("negative ledger sequence".into()))?;
+        let event_id = row.try_get::<String, _>("event_id")?;
+        let payload = row
+            .try_get::<Option<String>, _>("raw_payload_ciphertext")?
+            .map(|ciphertext| {
+                agent_gateway::crypto::decrypt_scoped(
+                    &ciphertext,
+                    &agent_gateway::crypto::scoped_aad("ledger.raw_payload", tenant_id, &event_id),
+                )
+                .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))
+                .and_then(|raw| {
+                    serde_json::from_str::<serde_json::Value>(&raw)
+                        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))
+                })
+            })
+            .transpose()?;
+        events.push((sequence, event_id, payload));
+    }
+    let parent_rows = sqlx::query::<Sqlite>(
+        "SELECT id, source_sequence_start, source_sequence_end, ledger_sequence,
+                replacement_ciphertext
+         FROM compaction_transactions
+         WHERE tenant_id = ? AND thread_id = ? AND status = 'committed'
+           AND replacement_ciphertext IS NOT NULL AND ledger_sequence IS NOT NULL
+         ORDER BY committed_at ASC",
+    )
+    .bind(tenant_id)
+    .bind(thread_id)
+    .fetch_all(db)
+    .await?;
+    let mut parents = Vec::new();
+    for row in parent_rows {
+        let id = row.try_get::<String, _>("id")?;
+        let start = u64::try_from(row.try_get::<i64, _>("source_sequence_start")?)
+            .map_err(|_| SemanticStoreError::InvalidEvent("negative parent source start".into()))?;
+        let end = u64::try_from(row.try_get::<i64, _>("source_sequence_end")?)
+            .map_err(|_| SemanticStoreError::InvalidEvent("negative parent source end".into()))?;
+        let sequence = u64::try_from(row.try_get::<i64, _>("ledger_sequence")?).map_err(|_| {
+            SemanticStoreError::InvalidEvent("negative parent ledger sequence".into())
+        })?;
+        let ciphertext = row.try_get::<String, _>("replacement_ciphertext")?;
+        let raw = agent_gateway::crypto::decrypt_scoped(
+            &ciphertext,
+            &agent_gateway::crypto::scoped_aad("compaction.replacement", tenant_id, &id),
+        )
+        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+        let replacement = serde_json::from_str::<serde_json::Value>(&raw)
+            .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+        let session = runtime::Session::from_recovery_json(&replacement)
+            .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+        parents.push((id, start, end, sequence, session.messages));
+    }
+
+    let mut direct_matches = Vec::<usize>::new();
+    let mut parent_matches = Vec::<(String, u64)>::new();
+    let mut message_event_ids = Vec::with_capacity(archived_messages.len());
+    for message in archived_messages {
+        // A compacted continuation is a derived artifact. Prefer its parent
+        // manifest over a later checkpoint that happens to contain the same
+        // text, otherwise nested provenance silently flattens into a thread-
+        // wide event reference.
+        if message.role == runtime::MessageRole::System {
+            if let Some((parent_id, _, _, parent_sequence, _)) = parents
+                .iter()
+                .find(|(_, _, _, _, messages)| messages.first().is_some_and(|item| item == message))
+            {
+                parent_matches.push((parent_id.clone(), *parent_sequence));
+                message_event_ids.push(format!("compaction:{parent_id}"));
+                continue;
+            }
+        }
+        if let Some((index, (_, event_id, _))) =
+            events.iter().enumerate().find(|(_, (_, _, payload))| {
+                payload
+                    .as_ref()
+                    .is_some_and(|payload| event_payload_matches_message(payload, message))
+            })
+        {
+            direct_matches.push(index);
+            message_event_ids.push(event_id.clone());
+            continue;
+        }
+        let Some((parent_id, _, _, parent_sequence, _)) = parents
+            .iter()
+            .find(|(_, _, _, _, messages)| messages.iter().any(|candidate| candidate == message))
+        else {
+            return Err(SemanticStoreError::InvalidEvent(
+                "compaction archive contains a message with no exact Ledger or parent-manifest source"
+                    .into(),
+            ));
+        };
+        parent_matches.push((parent_id.clone(), *parent_sequence));
+        message_event_ids.push(format!("compaction:{parent_id}"));
+    }
+    let mut parent_compaction_ids = parent_matches
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    parent_compaction_ids.sort();
+    parent_compaction_ids.dedup();
+    let mut event_sequences = direct_matches
+        .iter()
+        .map(|index| events[*index].0)
+        .collect::<Vec<_>>();
+    event_sequences.sort_unstable();
+    event_sequences.dedup();
+    if event_sequences.is_empty() && parent_compaction_ids.is_empty() {
+        return Err(SemanticStoreError::InvalidEvent(
+            "compaction exact source window has no durable coverage".into(),
+        ));
+    }
+    Ok(CompactionSourceCoverage {
+        event_sequences,
+        message_event_ids,
+        parent_compaction_ids,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4684,6 +6134,196 @@ pub(crate) struct CompactionMemoryCandidate {
     pub sensitivity: String,
     pub pinned: bool,
     pub source_cursor: String,
+    pub evidence_message_id: String,
+    pub evidence_start: usize,
+    pub evidence_end: usize,
+}
+
+fn compaction_message_evidence_text(message: &runtime::ConversationMessage) -> String {
+    message
+        .blocks
+        .iter()
+        .map(|block| match block {
+            runtime::ContentBlock::Text { text } => text.as_str(),
+            runtime::ContentBlock::ToolUse { input, .. } => input.as_str(),
+            runtime::ContentBlock::ToolResult { output, .. } => output.as_str(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn validate_compaction_sources_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    tenant_id: &str,
+    thread_id: &str,
+    archived_messages: &[runtime::ConversationMessage],
+    source_event_sequences: &[u64],
+    source_message_ids: &[String],
+    parent_compaction_ids: &[String],
+) -> Result<(), SemanticStoreError> {
+    crate::behavior_trace("CMP-002");
+    if archived_messages.len() != source_message_ids.len() {
+        return Err(SemanticStoreError::InvalidEvent(
+            "each archived message must have one exact source locator".into(),
+        ));
+    }
+    let mut ordered_sequences = source_event_sequences.to_vec();
+    ordered_sequences.sort_unstable();
+    ordered_sequences.dedup();
+    if ordered_sequences != source_event_sequences {
+        return Err(SemanticStoreError::InvalidEvent(
+            "direct compaction source sequences must be sorted and unique".into(),
+        ));
+    }
+    let parent_set = parent_compaction_ids
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if parent_set.len() != parent_compaction_ids.len() {
+        return Err(SemanticStoreError::InvalidEvent(
+            "parent compaction ids must be unique".into(),
+        ));
+    }
+
+    let parent_rows = sqlx::query::<Sqlite>(
+        "SELECT id, parent_compaction_ids_json, replacement_ciphertext
+         FROM compaction_transactions
+         WHERE tenant_id = ? AND thread_id = ? AND status = 'committed'",
+    )
+    .bind(tenant_id)
+    .bind(thread_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let mut parents = std::collections::BTreeMap::<String, (Vec<String>, String)>::new();
+    for row in parent_rows {
+        let id = row.try_get::<String, _>("id")?;
+        let ancestors = serde_json::from_str::<Vec<String>>(
+            &row.try_get::<String, _>("parent_compaction_ids_json")?,
+        )
+        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+        let ciphertext = row.try_get::<String, _>("replacement_ciphertext")?;
+        parents.insert(id, (ancestors, ciphertext));
+    }
+
+    // Validate the complete nested parent graph, not just the immediate rows.
+    // The explicit enter/exit stack is a non-recursive DFS with cycle fencing.
+    let mut visited = std::collections::BTreeSet::new();
+    let mut active = std::collections::BTreeSet::new();
+    let mut stack = parent_compaction_ids
+        .iter()
+        .rev()
+        .map(|id| (id.clone(), false))
+        .collect::<Vec<_>>();
+    while let Some((id, leaving)) = stack.pop() {
+        if leaving {
+            active.remove(&id);
+            visited.insert(id);
+            continue;
+        }
+        if visited.contains(&id) {
+            continue;
+        }
+        let Some((ancestor_ids, _)) = parents.get(&id) else {
+            return Err(SemanticStoreError::InvalidEvent(format!(
+                "missing committed parent compaction {id}"
+            )));
+        };
+        if !active.insert(id.clone()) {
+            return Err(SemanticStoreError::InvalidEvent(
+                "compaction parent graph contains a cycle".into(),
+            ));
+        }
+        stack.push((id.clone(), true));
+        for ancestor_id in ancestor_ids.iter().rev() {
+            if active.contains(ancestor_id) {
+                return Err(SemanticStoreError::InvalidEvent(
+                    "compaction parent graph contains a cycle".into(),
+                ));
+            }
+            stack.push((ancestor_id.clone(), false));
+        }
+    }
+
+    let mut actual_sequences = std::collections::BTreeSet::new();
+    let mut observed_parents = std::collections::BTreeSet::new();
+    for (message, source_id) in archived_messages.iter().zip(source_message_ids) {
+        if let Some(parent_id) = source_id.strip_prefix("compaction:") {
+            if !parent_set.contains(parent_id) {
+                return Err(SemanticStoreError::InvalidEvent(
+                    "archive references an undeclared parent compaction".into(),
+                ));
+            }
+            let (_, ciphertext) = parents.get(parent_id).ok_or_else(|| {
+                SemanticStoreError::InvalidEvent("parent compaction is unavailable".into())
+            })?;
+            let raw = agent_gateway::crypto::decrypt_scoped(
+                ciphertext,
+                &agent_gateway::crypto::scoped_aad("compaction.replacement", tenant_id, parent_id),
+            )
+            .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+            let value = serde_json::from_str::<serde_json::Value>(&raw)
+                .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+            let parent_session = runtime::Session::from_recovery_json(&value)
+                .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+            if parent_session.messages.first() != Some(message) {
+                return Err(SemanticStoreError::InvalidEvent(
+                    "nested compaction message does not equal its parent replacement".into(),
+                ));
+            }
+            observed_parents.insert(parent_id.to_string());
+            continue;
+        }
+        let row = sqlx::query::<Sqlite>(
+            "SELECT sequence, raw_payload_ciphertext FROM agent_event_ledger
+             WHERE tenant_id = ? AND thread_id = ? AND event_id = ? AND durable = 1",
+        )
+        .bind(tenant_id)
+        .bind(thread_id)
+        .bind(source_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| {
+            SemanticStoreError::InvalidEvent("archive source event is missing".into())
+        })?;
+        let sequence = u64::try_from(row.try_get::<i64, _>("sequence")?)
+            .map_err(|_| SemanticStoreError::InvalidEvent("negative source sequence".into()))?;
+        let ciphertext = row
+            .try_get::<Option<String>, _>("raw_payload_ciphertext")?
+            .ok_or_else(|| {
+                SemanticStoreError::InvalidEvent(
+                    "archive source event has no exact protected payload".into(),
+                )
+            })?;
+        let raw = agent_gateway::crypto::decrypt_scoped(
+            &ciphertext,
+            &agent_gateway::crypto::scoped_aad("ledger.raw_payload", tenant_id, source_id),
+        )
+        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+        let payload = serde_json::from_str::<serde_json::Value>(&raw)
+            .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+        if !event_payload_matches_message(&payload, message) {
+            return Err(SemanticStoreError::InvalidEvent(
+                "archive message no longer matches its exact source event".into(),
+            ));
+        }
+        actual_sequences.insert(sequence);
+    }
+    if actual_sequences.into_iter().collect::<Vec<_>>() != source_event_sequences {
+        return Err(SemanticStoreError::InvalidEvent(
+            "archive direct source sequence set changed".into(),
+        ));
+    }
+    if observed_parents != parent_set {
+        return Err(SemanticStoreError::InvalidEvent(
+            "declared parent compactions do not exactly match archive locators".into(),
+        ));
+    }
+    if source_event_sequences.is_empty() && parent_compaction_ids.is_empty() {
+        return Err(SemanticStoreError::InvalidEvent(
+            "compaction archive has no canonical source".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Persist only a reversible prepared compaction record. No Memory, cursor,
@@ -4696,20 +6336,30 @@ pub(crate) async fn prepare_compaction_transaction(
     thread_id: &str,
     trigger: &str,
     source_event_sequences: &[u64],
+    source_message_ids: &[String],
+    parent_compaction_ids: &[String],
     archived_messages: &[runtime::ConversationMessage],
     candidates: &[CompactionMemoryCandidate],
+    replacement_summary: &str,
 ) -> Result<String, SemanticStoreError> {
-    let Some(source_sequence_start) = source_event_sequences.first().copied() else {
+    if source_event_sequences.is_empty() && parent_compaction_ids.is_empty() {
         return Err(SemanticStoreError::InvalidEvent(
             "cannot prepare compaction without durable source coverage".into(),
         ));
-    };
-    let source_sequence_end = source_event_sequences.last().copied().ok_or_else(|| {
-        SemanticStoreError::InvalidEvent("compaction source coverage is empty".into())
-    })?;
+    }
+    if replacement_summary.trim().is_empty() {
+        return Err(SemanticStoreError::InvalidEvent(
+            "cannot prepare an empty compaction replacement".into(),
+        ));
+    }
+    let source_sequence_start = source_event_sequences.first().copied().unwrap_or(0);
+    let source_sequence_end = source_event_sequences.last().copied().unwrap_or(0);
+    let prepared_replacement_hash = sha256_bytes(replacement_summary.as_bytes());
     let archive = serde_json::json!({
         "schemaVersion": "exact-compaction-archive-v1",
         "sourceEventSeqs": source_event_sequences,
+        "sourceMessageIds": source_message_ids,
+        "parentCompactionIds": parent_compaction_ids,
         "messages": archived_messages,
     });
     let archive_raw = archive.to_string();
@@ -4717,29 +6367,112 @@ pub(crate) async fn prepare_compaction_transaction(
     let source_hash = sha256_json(&serde_json::json!({
         "threadId": thread_id,
         "sourceEventSeqs": source_event_sequences,
+        "sourceMessageIds": source_message_ids,
+        "parentCompactionIds": parent_compaction_ids,
         "sourceArchiveHash": source_archive_hash,
+        "preparedReplacementHash": prepared_replacement_hash,
     }));
     let transaction_id = tenant_scoped_record_id(
         "compaction-transaction",
         tenant_id,
         &format!("{thread_id}:{source_hash}"),
     );
-    let source_archive_ciphertext =
-        agent_gateway::crypto::encrypt(&archive_raw).map_err(|error| {
-            SemanticStoreError::InvalidEvent(format!(
-                "cannot encrypt exact compaction archive: {error}"
-            ))
-        })?;
+    let source_archive_ciphertext = agent_gateway::crypto::encrypt_scoped(
+        &archive_raw,
+        &agent_gateway::crypto::scoped_aad("compaction.source_archive", tenant_id, &transaction_id),
+    )
+    .map_err(|error| {
+        SemanticStoreError::InvalidEvent(format!(
+            "cannot encrypt exact compaction archive: {error}"
+        ))
+    })?;
     let candidates_raw = serde_json::to_string(candidates)
         .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
-    let memory_candidates_ciphertext =
-        agent_gateway::crypto::encrypt(&candidates_raw).map_err(|error| {
-            SemanticStoreError::InvalidEvent(format!(
-                "cannot encrypt compaction memory candidates: {error}"
-            ))
-        })?;
+    let memory_candidates_ciphertext = agent_gateway::crypto::encrypt_scoped(
+        &candidates_raw,
+        &agent_gateway::crypto::scoped_aad("compaction.candidates", tenant_id, &transaction_id),
+    )
+    .map_err(|error| {
+        SemanticStoreError::InvalidEvent(format!(
+            "cannot encrypt compaction memory candidates: {error}"
+        ))
+    })?;
     let mut transaction = db.begin().await?;
     acquire_sqlite_write_lock(&mut transaction).await?;
+    validate_compaction_sources_in_transaction(
+        &mut transaction,
+        tenant_id,
+        thread_id,
+        archived_messages,
+        source_event_sequences,
+        source_message_ids,
+        parent_compaction_ids,
+    )
+    .await?;
+    for candidate in candidates {
+        let Some(message_index) = source_message_ids
+            .iter()
+            .position(|source_id| source_id == &candidate.evidence_message_id)
+        else {
+            return Err(SemanticStoreError::InvalidEvent(
+                "memory candidate cites a source outside the compaction archive".into(),
+            ));
+        };
+        let evidence = compaction_message_evidence_text(&archived_messages[message_index]);
+        if candidate.evidence_start > candidate.evidence_end
+            || evidence.get(candidate.evidence_start..candidate.evidence_end)
+                != Some(candidate.text.as_str())
+        {
+            return Err(SemanticStoreError::InvalidEvent(
+                "memory candidate evidence span is not exact".into(),
+            ));
+        }
+    }
+    let expected_ledger_tail_sequence = sqlx::query_scalar::<Sqlite, i64>(
+        "SELECT COALESCE(MAX(sequence), 0) FROM agent_event_ledger
+         WHERE tenant_id = ? AND thread_id = ?",
+    )
+    .bind(tenant_id)
+    .bind(thread_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let expected_turn = sqlx::query_as::<Sqlite, (String, i64)>(
+        "SELECT id, revision FROM agent_turns
+         WHERE tenant_id = ? AND thread_id = ?
+         ORDER BY started_at DESC, id DESC LIMIT 1",
+    )
+    .bind(tenant_id)
+    .bind(thread_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let (baseline_manifest_id, baseline_turn_id) =
+        sqlx::query_as::<Sqlite, (String, Option<String>)>(
+            "SELECT id, turn_id FROM context_packet_manifests
+         WHERE tenant_id = ? AND thread_id = ? AND raw_manifest_hash IS NOT NULL
+           AND raw_manifest_ciphertext IS NOT NULL
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(thread_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| {
+            SemanticStoreError::InvalidEvent(
+                "compaction requires an exact context baseline manifest".into(),
+            )
+        })?;
+    if expected_turn
+        .as_ref()
+        .is_some_and(|(turn_id, _)| baseline_turn_id.as_deref() != Some(turn_id))
+    {
+        return Err(SemanticStoreError::InvalidEvent(
+            "context baseline does not belong to the current turn".into(),
+        ));
+    }
+    let source_token_count = archived_messages
+        .iter()
+        .map(runtime::estimate_message_tokens)
+        .sum::<usize>();
     let existing = sqlx::query_as::<Sqlite, (String, String)>(
         "SELECT status, source_archive_hash FROM compaction_transactions
          WHERE id = ? AND tenant_id = ? AND thread_id = ?",
@@ -4764,13 +6497,36 @@ pub(crate) async fn prepare_compaction_transaction(
             sqlx::query::<Sqlite>(
                 "UPDATE compaction_transactions
                  SET status = 'prepared', trigger = ?, source_archive_ciphertext = ?,
+                     source_message_ids_json = ?, parent_compaction_ids_json = ?,
                      memory_candidates_ciphertext = ?, abort_reason = NULL,
-                     aborted_at = NULL, prepared_at = CURRENT_TIMESTAMP
+                     aborted_at = NULL, prepared_at = CURRENT_TIMESTAMP,
+                     source_event_sequences_json = ?, source_token_count = ?,
+                     expected_ledger_tail_sequence = ?, expected_turn_id = ?,
+                     expected_turn_revision = ?, baseline_manifest_id = ?,
+                     prepared_replacement_hash = ?
                  WHERE id = ? AND tenant_id = ? AND thread_id = ?",
             )
             .bind(trigger)
             .bind(source_archive_ciphertext)
+            .bind(
+                serde_json::to_string(source_message_ids)
+                    .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?,
+            )
+            .bind(
+                serde_json::to_string(parent_compaction_ids)
+                    .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?,
+            )
             .bind(memory_candidates_ciphertext)
+            .bind(
+                serde_json::to_string(source_event_sequences)
+                    .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?,
+            )
+            .bind(i64::try_from(source_token_count).unwrap_or(i64::MAX))
+            .bind(expected_ledger_tail_sequence)
+            .bind(expected_turn.as_ref().map(|(id, _)| id))
+            .bind(expected_turn.as_ref().map(|(_, revision)| *revision))
+            .bind(&baseline_manifest_id)
+            .bind(&prepared_replacement_hash)
             .bind(&transaction_id)
             .bind(tenant_id)
             .bind(thread_id)
@@ -4783,8 +6539,12 @@ pub(crate) async fn prepare_compaction_transaction(
                     (id, tenant_id, user_id, thread_id, trigger, status,
                      source_sequence_start, source_sequence_end, source_hash,
                      source_archive_hash, source_archive_ciphertext,
-                     memory_candidates_ciphertext, prepared_at)
-                 VALUES (?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                     source_message_ids_json, parent_compaction_ids_json,
+                     memory_candidates_ciphertext, source_event_sequences_json,
+                     source_token_count, expected_ledger_tail_sequence,
+                     expected_turn_id, expected_turn_revision, baseline_manifest_id,
+                     prepared_replacement_hash, prepared_at)
+                 VALUES (?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
             )
             .bind(&transaction_id)
             .bind(tenant_id)
@@ -4796,12 +6556,29 @@ pub(crate) async fn prepare_compaction_transaction(
             .bind(source_hash)
             .bind(source_archive_hash)
             .bind(source_archive_ciphertext)
+            .bind(
+                serde_json::to_string(source_message_ids)
+                    .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?,
+            )
+            .bind(
+                serde_json::to_string(parent_compaction_ids)
+                    .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?,
+            )
             .bind(memory_candidates_ciphertext)
+            .bind(serde_json::to_string(source_event_sequences).map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?)
+            .bind(i64::try_from(source_token_count).unwrap_or(i64::MAX))
+            .bind(expected_ledger_tail_sequence)
+            .bind(expected_turn.as_ref().map(|(id, _)| id))
+            .bind(expected_turn.as_ref().map(|(_, revision)| *revision))
+            .bind(&baseline_manifest_id)
+            .bind(&prepared_replacement_hash)
             .execute(&mut *transaction)
             .await?;
         }
     }
+    process_fault_point("compaction.prepare.before_commit");
     transaction.commit().await?;
+    process_fault_point("compaction.prepare.after_commit");
     Ok(transaction_id)
 }
 
@@ -4850,6 +6627,7 @@ pub(crate) async fn commit_compaction_transaction(
     trigger: &str,
     result: &runtime::CompactionResult,
 ) -> Result<(), SemanticStoreError> {
+    crate::behavior_trace("CORE-003");
     if result.compacted_session.session_id != thread_id
         || result.compacted_session.tenant_id.as_deref() != Some(tenant_id)
         || result.compacted_session.user_id.as_deref() != Some(user_id)
@@ -4858,9 +6636,15 @@ pub(crate) async fn commit_compaction_transaction(
             "compaction replacement scope does not match prepared transaction".into(),
         ));
     }
-    let row = sqlx::query_as::<Sqlite, (String, String, String, String)>(
+    let mut transaction = db.begin().await?;
+    acquire_sqlite_write_lock(&mut transaction).await?;
+    let row = sqlx::query::<Sqlite>(
         "SELECT status, source_archive_hash, source_archive_ciphertext,
-                memory_candidates_ciphertext
+                memory_candidates_ciphertext, source_event_sequences_json,
+                source_message_ids_json, parent_compaction_ids_json,
+                source_token_count, expected_ledger_tail_sequence,
+                expected_turn_id, expected_turn_revision, baseline_manifest_id,
+                prepared_replacement_hash
          FROM compaction_transactions
          WHERE id = ? AND tenant_id = ? AND user_id = ? AND thread_id = ?",
     )
@@ -4868,18 +6652,24 @@ pub(crate) async fn commit_compaction_transaction(
     .bind(tenant_id)
     .bind(user_id)
     .bind(thread_id)
-    .fetch_one(db)
+    .fetch_one(&mut *transaction)
     .await?;
-    if row.0 != "prepared" {
+    let status = row.try_get::<String, _>("status")?;
+    if status != "prepared" {
         return Err(SemanticStoreError::InvalidEvent(format!(
             "compaction transaction is not prepared: {}",
-            row.0
+            status
         )));
     }
-    let archive_raw = agent_gateway::crypto::decrypt(&row.2).map_err(|error| {
+    let source_archive_hash = row.try_get::<String, _>("source_archive_hash")?;
+    let archive_raw = agent_gateway::crypto::decrypt_scoped(
+        &row.try_get::<String, _>("source_archive_ciphertext")?,
+        &agent_gateway::crypto::scoped_aad("compaction.source_archive", tenant_id, transaction_id),
+    )
+    .map_err(|error| {
         SemanticStoreError::InvalidEvent(format!("cannot decrypt compaction archive: {error}"))
     })?;
-    if sha256_bytes(archive_raw.as_bytes()) != row.1 {
+    if sha256_bytes(archive_raw.as_bytes()) != source_archive_hash {
         return Err(SemanticStoreError::InvalidEvent(
             "compaction archive hash mismatch".into(),
         ));
@@ -4896,35 +6686,171 @@ pub(crate) async fn commit_compaction_transaction(
             "validated compaction source differs from prepared exact archive".into(),
         ));
     }
-    let source_event_sequences: Vec<u64> = serde_json::from_value(
+    let archive_source_event_sequences: Vec<u64> = serde_json::from_value(
         archive
             .get("sourceEventSeqs")
             .cloned()
             .ok_or_else(|| SemanticStoreError::InvalidEvent("source coverage missing".into()))?,
     )
     .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
-    let candidates_raw = agent_gateway::crypto::decrypt(&row.3).map_err(|error| {
+    let source_event_sequences =
+        serde_json::from_str::<Vec<u64>>(&row.try_get::<String, _>("source_event_sequences_json")?)
+            .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+    if source_event_sequences != archive_source_event_sequences {
+        return Err(SemanticStoreError::InvalidEvent(
+            "prepared source sequence projection does not match exact archive".into(),
+        ));
+    }
+    let source_message_ids =
+        serde_json::from_str::<Vec<String>>(&row.try_get::<String, _>("source_message_ids_json")?)
+            .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+    let parent_compaction_ids = serde_json::from_str::<Vec<String>>(
+        &row.try_get::<String, _>("parent_compaction_ids_json")?,
+    )
+    .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+    validate_compaction_sources_in_transaction(
+        &mut transaction,
+        tenant_id,
+        thread_id,
+        &archived_messages,
+        &source_event_sequences,
+        &source_message_ids,
+        &parent_compaction_ids,
+    )
+    .await?;
+    let expected_ledger_tail_sequence = row.try_get::<i64, _>("expected_ledger_tail_sequence")?;
+    let current_ledger_tail_sequence = sqlx::query_scalar::<Sqlite, i64>(
+        "SELECT COALESCE(MAX(sequence), 0) FROM agent_event_ledger
+         WHERE tenant_id = ? AND thread_id = ?",
+    )
+    .bind(tenant_id)
+    .bind(thread_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if current_ledger_tail_sequence != expected_ledger_tail_sequence {
+        return Err(SemanticStoreError::InvalidEvent(
+            "compaction stream revision changed after prepare".into(),
+        ));
+    }
+    let expected_turn_id = row.try_get::<Option<String>, _>("expected_turn_id")?;
+    let expected_turn_revision = row.try_get::<Option<i64>, _>("expected_turn_revision")?;
+    if let Some(expected_turn_id) = expected_turn_id.as_deref() {
+        let current_revision = sqlx::query_scalar::<Sqlite, i64>(
+            "SELECT revision FROM agent_turns
+             WHERE id = ? AND tenant_id = ? AND thread_id = ?",
+        )
+        .bind(expected_turn_id)
+        .bind(tenant_id)
+        .bind(thread_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if current_revision != expected_turn_revision {
+            return Err(SemanticStoreError::InvalidEvent(
+                "compaction turn revision changed after prepare".into(),
+            ));
+        }
+    }
+    let baseline_manifest_id = row
+        .try_get::<Option<String>, _>("baseline_manifest_id")?
+        .ok_or_else(|| {
+            SemanticStoreError::InvalidEvent("compaction baseline manifest is missing".into())
+        })?;
+    let baseline_turn_id = sqlx::query_scalar::<Sqlite, Option<String>>(
+        "SELECT turn_id FROM context_packet_manifests
+         WHERE id = ? AND tenant_id = ? AND thread_id = ?
+           AND raw_manifest_hash IS NOT NULL AND raw_manifest_ciphertext IS NOT NULL",
+    )
+    .bind(&baseline_manifest_id)
+    .bind(tenant_id)
+    .bind(thread_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or_else(|| {
+        SemanticStoreError::InvalidEvent("compaction baseline manifest is unavailable".into())
+    })?;
+    if expected_turn_id.is_some() && baseline_turn_id != expected_turn_id {
+        return Err(SemanticStoreError::InvalidEvent(
+            "compaction baseline manifest turn changed".into(),
+        ));
+    }
+    let candidates_raw = agent_gateway::crypto::decrypt_scoped(
+        &row.try_get::<String, _>("memory_candidates_ciphertext")?,
+        &agent_gateway::crypto::scoped_aad("compaction.candidates", tenant_id, transaction_id),
+    )
+    .map_err(|error| {
         SemanticStoreError::InvalidEvent(format!(
             "cannot decrypt compaction memory candidates: {error}"
         ))
     })?;
     let candidates: Vec<CompactionMemoryCandidate> = serde_json::from_str(&candidates_raw)
         .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+    for candidate in &candidates {
+        let Some(message_index) = source_message_ids
+            .iter()
+            .position(|source_id| source_id == &candidate.evidence_message_id)
+        else {
+            return Err(SemanticStoreError::InvalidEvent(
+                "memory candidate evidence left the source window".into(),
+            ));
+        };
+        let evidence = compaction_message_evidence_text(&archived_messages[message_index]);
+        if candidate.evidence_start > candidate.evidence_end
+            || evidence.get(candidate.evidence_start..candidate.evidence_end)
+                != Some(candidate.text.as_str())
+        {
+            return Err(SemanticStoreError::InvalidEvent(
+                "memory candidate evidence proof is unsupported".into(),
+            ));
+        }
+    }
+    let prepared_replacement_hash = row
+        .try_get::<Option<String>, _>("prepared_replacement_hash")?
+        .ok_or_else(|| {
+            SemanticStoreError::InvalidEvent("prepared replacement proof is missing".into())
+        })?;
+    if sha256_bytes(result.summary.as_bytes()) != prepared_replacement_hash {
+        return Err(SemanticStoreError::InvalidEvent(
+            "replacement differs from the deterministically prepared summary".into(),
+        ));
+    }
+    let source_token_count = archived_messages
+        .iter()
+        .map(runtime::estimate_message_tokens)
+        .sum::<usize>();
+    if row.try_get::<Option<i64>, _>("source_token_count")?
+        != Some(i64::try_from(source_token_count).unwrap_or(i64::MAX))
+    {
+        return Err(SemanticStoreError::InvalidEvent(
+            "prepared source token count changed".into(),
+        ));
+    }
+    let replacement_token_count = result
+        .compacted_session
+        .messages
+        .first()
+        .map(runtime::estimate_message_tokens)
+        .unwrap_or_default();
+    if source_token_count == 0
+        || replacement_token_count.saturating_mul(100) > source_token_count.saturating_mul(60)
+    {
+        return Err(SemanticStoreError::InvalidEvent(format!(
+            "compaction replacement exceeds the 60% proof budget ({replacement_token_count}/{source_token_count})"
+        )));
+    }
     let replacement = result
         .compacted_session
         .to_recovery_json()
         .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
     let replacement_raw = replacement.to_string();
     let replacement_hash = sha256_bytes(replacement_raw.as_bytes());
-    let replacement_ciphertext =
-        agent_gateway::crypto::encrypt(&replacement_raw).map_err(|error| {
-            SemanticStoreError::InvalidEvent(format!(
-                "cannot encrypt compaction replacement: {error}"
-            ))
-        })?;
+    let replacement_ciphertext = agent_gateway::crypto::encrypt_scoped(
+        &replacement_raw,
+        &agent_gateway::crypto::scoped_aad("compaction.replacement", tenant_id, transaction_id),
+    )
+    .map_err(|error| {
+        SemanticStoreError::InvalidEvent(format!("cannot encrypt compaction replacement: {error}"))
+    })?;
 
-    let mut transaction = db.begin().await?;
-    acquire_sqlite_write_lock(&mut transaction).await?;
     let still_prepared = sqlx::query_scalar::<Sqlite, String>(
         "SELECT status FROM compaction_transactions
          WHERE id = ? AND tenant_id = ? AND thread_id = ?",
@@ -4942,97 +6868,17 @@ pub(crate) async fn commit_compaction_transaction(
 
     let mut latest_cursor = None::<String>;
     for candidate in &candidates {
-        memory_engine::MemoryEngine::admit_text(&candidate.text)
-            .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
-        let subject_json = candidate.subject.to_string();
-        let value_json = candidate.value.to_string();
         let projection_id = tenant_scoped_record_id(
             "memory-projection",
             tenant_id,
             &format!("{user_id}:{}", candidate.id),
         );
-        let conflict_group = tenant_scoped_record_id(
-            "memory-conflict",
-            tenant_id,
-            &format!("{user_id}:{subject_json}:{}", candidate.predicate),
-        );
-        sqlx::query::<Sqlite>(
-            "INSERT INTO structured_memory_facts
-                (id, tenant_id, user_id, scope, app, session_id, channel, kind,
-                 subject_json, predicate, value_json, text, evidence_id,
-                 evidence_hash, observed_at, valid_until, confidence,
-                 sensitivity, current, conflict_group, projection_memory_id,
-                 candidate_json, created_at, updated_at)
-             VALUES (?, ?, ?, 'session', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                     1, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-             ON CONFLICT(id) DO NOTHING",
-        )
-        .bind(&candidate.id)
-        .bind(tenant_id)
-        .bind(user_id)
-        .bind(app)
-        .bind(thread_id)
-        .bind(&candidate.channel)
-        .bind(&candidate.kind)
-        .bind(&subject_json)
-        .bind(&candidate.predicate)
-        .bind(&value_json)
-        .bind(&candidate.text)
-        .bind(&candidate.evidence_id)
-        .bind(&candidate.evidence_hash)
-        .bind(&candidate.observed_at)
-        .bind(&candidate.valid_until)
-        .bind(candidate.confidence.clamp(0.0, 1.0))
-        .bind(&candidate.sensitivity)
-        .bind(&conflict_group)
-        .bind(&projection_id)
-        .bind(serde_json::to_string(candidate).unwrap_or_else(|_| "{}".into()))
-        .execute(&mut *transaction)
-        .await?;
-        let superseded_projection_ids = sqlx::query_scalar::<Sqlite, String>(
-            "SELECT projection_memory_id FROM structured_memory_facts
-             WHERE tenant_id = ? AND user_id = ? AND scope = 'session'
-               AND app = ? AND session_id = ? AND subject_json = ?
-               AND predicate = ? AND current = 1 AND id <> ?
-               AND projection_memory_id IS NOT NULL",
-        )
-        .bind(tenant_id)
-        .bind(user_id)
-        .bind(app)
-        .bind(thread_id)
-        .bind(&subject_json)
-        .bind(&candidate.predicate)
-        .bind(&candidate.id)
-        .fetch_all(&mut *transaction)
-        .await?;
-        sqlx::query::<Sqlite>(
-            "UPDATE structured_memory_facts
-             SET current = 0, superseded_by = ?, updated_at = CURRENT_TIMESTAMP
-             WHERE tenant_id = ? AND user_id = ? AND scope = 'session'
-               AND app = ? AND session_id = ? AND subject_json = ?
-               AND predicate = ? AND current = 1 AND id <> ?",
-        )
-        .bind(&candidate.id)
-        .bind(tenant_id)
-        .bind(user_id)
-        .bind(app)
-        .bind(thread_id)
-        .bind(&subject_json)
-        .bind(&candidate.predicate)
-        .bind(&candidate.id)
-        .execute(&mut *transaction)
-        .await?;
-        for old_projection_id in superseded_projection_ids {
-            sqlx::query::<Sqlite>(
-                "UPDATE agent_memory_items SET enabled = 0, updated_at = CURRENT_TIMESTAMP
-                 WHERE tenant_id = ? AND user_id = ? AND id = ?",
-            )
-            .bind(tenant_id)
-            .bind(user_id)
-            .bind(old_projection_id)
-            .execute(&mut *transaction)
-            .await?;
-        }
+        let pollution_lineage = memory_engine::pollution_lineage_for_text(&candidate.text);
+        let lifecycle = if pollution_lineage.is_empty() {
+            memory_engine::FactLifecycle::Candidate
+        } else {
+            memory_engine::FactLifecycle::Quarantined
+        };
         let metadata = serde_json::json!({
             "structuredMemoryFactId": candidate.id,
             "semanticChannel": candidate.channel,
@@ -5040,33 +6886,48 @@ pub(crate) async fn commit_compaction_transaction(
             "evidenceHash": candidate.evidence_hash,
             "pinned": candidate.pinned,
         });
-        sqlx::query::<Sqlite>(
-            "INSERT INTO agent_memory_items
-                (id, tenant_id, user_id, scope, app, session_id, session_key,
-                 memory_type, content, content_hash, source_type, confidence,
-                 pinned, enabled, metadata_json, created_at, updated_at)
-             VALUES (?, ?, ?, 'session', ?, ?, ?, ?, ?, ?, 'compaction', ?, ?, 1,
-                     json(?), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-             ON CONFLICT(id) DO UPDATE SET
-                content = excluded.content, content_hash = excluded.content_hash,
-                confidence = excluded.confidence, pinned = excluded.pinned,
-                enabled = 1, metadata_json = excluded.metadata_json,
-                updated_at = CURRENT_TIMESTAMP",
+        memory_engine::SqliteMemoryTransaction::upsert_in_transaction(
+            &mut transaction,
+            &memory_engine::MemoryFactDraft {
+                fact_id: candidate.id.clone(),
+                projection_id,
+                tenant_id: tenant_id.to_string(),
+                user_id: user_id.to_string(),
+                scope: "session".into(),
+                app: app.to_string(),
+                session_id: Some(thread_id.to_string()),
+                channel: candidate.channel.clone(),
+                kind: candidate.kind.clone(),
+                subject: candidate.subject.clone(),
+                predicate: candidate.predicate.clone(),
+                value: candidate.value.clone(),
+                text: candidate.text.clone(),
+                evidence_id: candidate.evidence_id.clone(),
+                evidence_hash: candidate.evidence_hash.clone(),
+                valid_from: Some(candidate.observed_at.clone()),
+                valid_until: candidate.valid_until.clone(),
+                confidence: candidate.confidence,
+                sensitivity: candidate.sensitivity.clone(),
+                lifecycle,
+                authority: vec!["model".into()],
+                source_event_ids: source_event_sequences
+                    .iter()
+                    .map(|sequence| format!("ledger:{sequence}"))
+                    .collect(),
+                pollution_lineage,
+                memory_type: compaction_memory_type(&candidate.kind).into(),
+                source_type: "compaction".into(),
+                pinned: candidate.pinned,
+                metadata,
+                stale_at: None,
+                verified_at: None,
+                embedding_model: None,
+                embedding_dimensions: None,
+                embedding_json: None,
+            },
         )
-        .bind(&projection_id)
-        .bind(tenant_id)
-        .bind(user_id)
-        .bind(app)
-        .bind(thread_id)
-        .bind(thread_id)
-        .bind(compaction_memory_type(&candidate.kind))
-        .bind(&candidate.text)
-        .bind(sha256_bytes(candidate.text.as_bytes()))
-        .bind(candidate.confidence.clamp(0.0, 1.0))
-        .bind(i64::from(candidate.pinned))
-        .bind(metadata.to_string())
-        .execute(&mut *transaction)
-        .await?;
+        .await
+        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
         latest_cursor = Some(candidate.source_cursor.clone());
     }
     if let Some(cursor) = latest_cursor.as_deref() {
@@ -5086,6 +6947,35 @@ pub(crate) async fn commit_compaction_transaction(
         .execute(&mut *transaction)
         .await?;
     }
+
+    let replacement_artifact_id =
+        tenant_scoped_record_id("compaction-replacement-artifact", tenant_id, transaction_id);
+    let replacement_artifact_ciphertext = agent_gateway::crypto::encrypt_scoped(
+        &replacement_raw,
+        &agent_gateway::crypto::scoped_aad("artifact.payload", tenant_id, &replacement_artifact_id),
+    )
+    .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+    sqlx::query::<Sqlite>(
+        "INSERT INTO artifact_objects
+            (id, tenant_id, owner_scope, content_hash, media_type, byte_size,
+             locator, retention_policy, expires_at, deleted_at, payload_blob)
+         VALUES (?, ?, ?, ?, 'application/vnd.aos.compaction-replacement+json', ?, ?,
+                 'session', NULL, NULL, ?)
+         ON CONFLICT(id) DO UPDATE SET
+             content_hash = excluded.content_hash,
+             byte_size = excluded.byte_size,
+             payload_blob = excluded.payload_blob,
+             deleted_at = NULL",
+    )
+    .bind(&replacement_artifact_id)
+    .bind(tenant_id)
+    .bind(thread_id)
+    .bind(&replacement_hash)
+    .bind(i64::try_from(replacement_raw.len()).unwrap_or(i64::MAX))
+    .bind(format!("artifact://{replacement_artifact_id}"))
+    .bind(replacement_artifact_ciphertext.as_bytes())
+    .execute(&mut *transaction)
+    .await?;
 
     let checkpoint_id = tenant_scoped_record_id(
         "runtime-checkpoint",
@@ -5123,11 +7013,16 @@ pub(crate) async fn commit_compaction_transaction(
         runtime::configured_data_protection_mode(),
     )
     .0;
+    let checkpoint_ciphertext = agent_gateway::crypto::encrypt_scoped(
+        &replacement_raw,
+        &agent_gateway::crypto::scoped_aad("checkpoint.session", tenant_id, &checkpoint_id),
+    )
+    .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
     sqlx::query::<Sqlite>(
         "INSERT INTO execution_checkpoints
             (id, tenant_id, thread_id, sequence, state_hash, checkpoint_json,
-             durable, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+             checkpoint_ciphertext, durable, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
          ON CONFLICT(id) DO NOTHING",
     )
     .bind(&checkpoint_id)
@@ -5136,6 +7031,7 @@ pub(crate) async fn commit_compaction_transaction(
     .bind(i64::try_from(sequence).unwrap_or(i64::MAX))
     .bind(&replacement_hash)
     .bind(checkpoint_projection.to_string())
+    .bind(checkpoint_ciphertext)
     .execute(&mut *transaction)
     .await?;
     let source_event_seqs_json = serde_json::to_string(&source_event_sequences)
@@ -5156,10 +7052,37 @@ pub(crate) async fn commit_compaction_transaction(
     .bind(&replacement_hash)
     .execute(&mut *transaction)
     .await?;
+    let proof_result = serde_json::json!({
+        "schemaVersion": "compaction-proof-v1",
+        "status": "supported",
+        "obligations": {
+            "exactArchiveHash": "pass",
+            "sourceWindowRevalidated": "pass",
+            "streamRevisionStable": "pass",
+            "turnRevisionStable": "pass",
+            "baselineManifestBound": "pass",
+            "parentDagAcyclic": "pass",
+            "candidateEvidenceSpans": "pass",
+            "replacementDeterministic": "pass",
+            "replacementTokenRatio": "pass"
+        },
+        "sourceArchiveHash": source_archive_hash,
+        "baselineManifestId": baseline_manifest_id,
+        "sourceMessageIds": source_message_ids,
+        "sourceEventSequences": source_event_sequences,
+        "parentCompactionIds": parent_compaction_ids,
+        "extractedFactIds": candidates.iter().map(|candidate| candidate.id.as_str()).collect::<Vec<_>>(),
+        "sourceTokens": source_token_count,
+        "replacementTokens": replacement_token_count,
+        "replacementHash": replacement_hash,
+        "replacementArtifactId": replacement_artifact_id,
+    });
     let changed = sqlx::query::<Sqlite>(
         "UPDATE compaction_transactions
          SET status = 'committed', replacement_hash = ?, replacement_ciphertext = ?,
              consolidation_cursor = ?, checkpoint_id = ?, ledger_sequence = ?,
+             replacement_token_count = ?, proof_result_json = ?,
+             replacement_artifact_id = ?,
              committed_at = CURRENT_TIMESTAMP
          WHERE id = ? AND tenant_id = ? AND thread_id = ? AND status = 'prepared'",
     )
@@ -5168,6 +7091,9 @@ pub(crate) async fn commit_compaction_transaction(
     .bind(latest_cursor)
     .bind(checkpoint_id)
     .bind(i64::try_from(sequence).unwrap_or(i64::MAX))
+    .bind(i64::try_from(replacement_token_count).unwrap_or(i64::MAX))
+    .bind(proof_result.to_string())
+    .bind(&replacement_artifact_id)
     .bind(transaction_id)
     .bind(tenant_id)
     .bind(thread_id)
@@ -5178,7 +7104,9 @@ pub(crate) async fn commit_compaction_transaction(
             "prepared compaction was concurrently consumed".into(),
         ));
     }
+    process_fault_point("compaction.commit.before_commit");
     transaction.commit().await?;
+    process_fault_point("compaction.commit.after_commit");
     Ok(())
 }
 
@@ -5309,6 +7237,11 @@ pub(crate) async fn persist_pm_final_delivery(
     let artifact_id = format!("pm-final-{task_id}");
     let protected_projection = serde_json::to_string(&artifact)
         .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+    let artifact_ciphertext = agent_gateway::crypto::encrypt_scoped(
+        &protected_projection,
+        &agent_gateway::crypto::scoped_aad("artifact.payload", tenant_id, &artifact_id),
+    )
+    .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
     sqlx::query::<Sqlite>(
         "INSERT INTO artifact_objects
             (id, tenant_id, owner_scope, content_hash, media_type, byte_size,
@@ -5328,7 +7261,7 @@ pub(crate) async fn persist_pm_final_delivery(
     .bind(&artifact.content_hash)
     .bind(i64::try_from(protected_projection.len()).unwrap_or(i64::MAX))
     .bind(format!("sqlite://pm_final_delivery_artifacts/{task_id}"))
-    .bind(protected_projection.as_bytes())
+    .bind(artifact_ciphertext.as_bytes())
     .execute(db)
     .await?;
     let model_preview =
@@ -5445,7 +7378,7 @@ pub(crate) fn sha256_json(value: &serde_json::Value) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-fn tenant_scoped_record_id(prefix: &str, tenant_id: &str, logical_id: &str) -> String {
+pub(crate) fn tenant_scoped_record_id(prefix: &str, tenant_id: &str, logical_id: &str) -> String {
     let scoped = format!("{tenant_id}\0{logical_id}");
     format!("{prefix}:{}", sha256_bytes(scoped.as_bytes()))
 }
@@ -6212,6 +8145,76 @@ fn json_probability_basis_points(value: Option<&serde_json::Value>, default: u16
     scaled.round().clamp(0.0, 10_000.0) as u16
 }
 
+fn pm_question_domain_bucket(
+    target: &pm_domain::requirement_state::QuestionDecisionTarget,
+) -> &'static str {
+    use pm_domain::requirement_state::QuestionDecisionTarget;
+    match target {
+        QuestionDecisionTarget::ProblemFrame => "problem_frame",
+        QuestionDecisionTarget::Stakeholder => "stakeholder",
+        QuestionDecisionTarget::OutcomeMetric => "outcome_metric",
+        QuestionDecisionTarget::Population => "population",
+        QuestionDecisionTarget::Scope => "scope",
+        QuestionDecisionTarget::Constraint => "constraint",
+        QuestionDecisionTarget::Solution => "solution",
+        QuestionDecisionTarget::Deliverable => "deliverable",
+    }
+}
+
+async fn load_pm_question_calibration_profile(
+    transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: &str,
+    domain_bucket: &str,
+) -> Result<pm_domain::requirement_state::QuestionCalibrationProfile, SemanticStoreError> {
+    crate::behavior_trace("PM-002");
+    let rows = sqlx::query_as::<Sqlite, (i64, f64, Option<f64>, Option<i64>)>(
+        "SELECT decision_changed, calibrated_prior, calibrated_posterior,
+                user_effort_ms
+         FROM pm_question_outcomes
+         WHERE tenant_id = ? AND domain_bucket = ? AND answered = 1
+         ORDER BY created_at, id",
+    )
+    .bind(tenant_id)
+    .bind(domain_bucket)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let sample_count = rows.len();
+    let decision_change_rate = (!rows.is_empty())
+        .then(|| rows.iter().map(|row| row.0 as f64).sum::<f64>() / rows.len() as f64);
+    let remaining = rows
+        .iter()
+        .filter_map(|row| {
+            (row.1 > 0.0)
+                .then_some(row.2.map(|posterior| posterior / row.1))
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    let remaining_ratio =
+        (!remaining.is_empty()).then(|| remaining.iter().sum::<f64>() / remaining.len() as f64);
+    let mut efforts = rows.iter().filter_map(|row| row.3).collect::<Vec<_>>();
+    efforts.sort_unstable();
+    let median_effort_ms = match efforts.len() {
+        0 => 30_000,
+        len if len % 2 == 1 => efforts[len / 2],
+        len => efforts[len / 2 - 1]
+            .saturating_add(efforts[len / 2])
+            .saturating_div(2),
+    };
+    Ok(pm_domain::requirement_state::QuestionCalibrationProfile {
+        domain_bucket: domain_bucket.to_string(),
+        sample_count: u32::try_from(sample_count).unwrap_or(u32::MAX),
+        decision_change_rate_basis_points: u16::try_from(
+            (decision_change_rate.unwrap_or_default().clamp(0.0, 1.0) * 10_000.0).round() as u64,
+        )
+        .unwrap_or(10_000),
+        remaining_uncertainty_ratio_basis_points: u16::try_from(
+            (remaining_ratio.unwrap_or(0.65).clamp(0.0, 1.0) * 10_000.0).round() as u64,
+        )
+        .unwrap_or(6_500),
+        median_user_effort_ms: u32::try_from(median_effort_ms.max(0)).unwrap_or(u32::MAX),
+    })
+}
+
 pub(crate) async fn persist_pm_requirement_state_delta(
     db: &SqlitePool,
     tenant_id: &str,
@@ -6220,6 +8223,7 @@ pub(crate) async fn persist_pm_requirement_state_delta(
     user_message: &str,
     plan: &serde_json::Value,
 ) -> Result<pm_domain::requirement_state::RequirementState, SemanticStoreError> {
+    crate::behavior_trace("PM-001");
     use pm_domain::requirement_state::{
         apply_delta, AcceptanceCriterion, Assumption, AssumptionStatus, AssumptionType,
         ClaimEvidenceLink, DecisionRef, EvidenceSupport, JobToBeDone, OpenQuestion, Outcome, Pain,
@@ -6617,94 +8621,136 @@ pub(crate) async fn persist_pm_requirement_state_delta(
             else {
                 continue;
             };
-            delta.add_questions.push(
-                OpenQuestion {
-                    id: item
-                        .get("id")
-                        .and_then(serde_json::Value::as_str)
-                        .filter(|value| !value.trim().is_empty())
-                        .unwrap_or("planner-core-question")
-                        .to_string(),
-                    question: question.to_string(),
-                    impact: item
-                        .get("impact")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("high")
-                        .to_string(),
-                    answerability: item
-                        .get("answerability")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("medium")
-                        .to_string(),
-                    user_effort: item
-                        .get("userEffort")
-                        .and_then(serde_json::Value::as_u64)
-                        .and_then(|value| u8::try_from(value).ok())
-                        .unwrap_or(1)
-                        .max(1),
-                    decision_target: match item
-                        .get("decisionTarget")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("scope")
-                    {
-                        "problem_frame" => QuestionDecisionTarget::ProblemFrame,
-                        "stakeholder" => QuestionDecisionTarget::Stakeholder,
-                        "outcome_metric" | "metric" => QuestionDecisionTarget::OutcomeMetric,
-                        "population" => QuestionDecisionTarget::Population,
-                        "constraint" => QuestionDecisionTarget::Constraint,
-                        "solution" => QuestionDecisionTarget::Solution,
-                        "deliverable" => QuestionDecisionTarget::Deliverable,
-                        _ => QuestionDecisionTarget::Scope,
-                    },
-                    prior_uncertainty_basis_points: json_probability_basis_points(
-                        item.get("priorUncertainty"),
-                        0,
-                    ),
-                    answer_branches: item
-                        .get("answerBranches")
-                        .and_then(serde_json::Value::as_array)
-                        .map(|branches| {
-                            branches
-                                .iter()
-                                .filter_map(|branch| {
-                                    let id = branch
-                                        .get("id")
-                                        .and_then(serde_json::Value::as_str)?
-                                        .trim();
-                                    let answer = branch
-                                        .get("answer")
-                                        .and_then(serde_json::Value::as_str)?
-                                        .trim();
-                                    let decision_effect = branch
-                                        .get("decisionEffect")
-                                        .and_then(serde_json::Value::as_str)?
-                                        .trim();
-                                    (!id.is_empty()
-                                        && !answer.is_empty()
-                                        && !decision_effect.is_empty())
-                                    .then(|| QuestionAnswerBranch {
-                                        id: id.to_string(),
-                                        answer: answer.to_string(),
-                                        probability_basis_points: json_probability_basis_points(
-                                            branch.get("probability"),
-                                            0,
+            let mut open_question = OpenQuestion {
+                id: item
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("planner-core-question")
+                    .to_string(),
+                question: question.to_string(),
+                impact: item
+                    .get("impact")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("high")
+                    .to_string(),
+                answerability: item
+                    .get("answerability")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("medium")
+                    .to_string(),
+                user_effort: item
+                    .get("userEffort")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| u8::try_from(value).ok())
+                    .unwrap_or(1)
+                    .max(1),
+                decision_target: match item
+                    .get("decisionTarget")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("scope")
+                {
+                    "problem_frame" => QuestionDecisionTarget::ProblemFrame,
+                    "stakeholder" => QuestionDecisionTarget::Stakeholder,
+                    "outcome_metric" | "metric" => QuestionDecisionTarget::OutcomeMetric,
+                    "population" => QuestionDecisionTarget::Population,
+                    "constraint" => QuestionDecisionTarget::Constraint,
+                    "solution" => QuestionDecisionTarget::Solution,
+                    "deliverable" => QuestionDecisionTarget::Deliverable,
+                    _ => QuestionDecisionTarget::Scope,
+                },
+                prior_uncertainty_basis_points: json_probability_basis_points(
+                    item.get("priorUncertainty"),
+                    0,
+                ),
+                answer_branches: item
+                    .get("answerBranches")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|branches| {
+                        branches
+                            .iter()
+                            .filter_map(|branch| {
+                                let id =
+                                    branch.get("id").and_then(serde_json::Value::as_str)?.trim();
+                                let answer = branch
+                                    .get("answer")
+                                    .and_then(serde_json::Value::as_str)?
+                                    .trim();
+                                let decision_effect = branch
+                                    .get("decisionEffect")
+                                    .and_then(serde_json::Value::as_str)?
+                                    .trim();
+                                (!id.is_empty()
+                                    && !answer.is_empty()
+                                    && !decision_effect.is_empty())
+                                .then(|| QuestionAnswerBranch {
+                                    id: id.to_string(),
+                                    answer: answer.to_string(),
+                                    probability_basis_points: json_probability_basis_points(
+                                        branch.get("probability"),
+                                        0,
+                                    ),
+                                    posterior_uncertainty_basis_points:
+                                        json_probability_basis_points(
+                                            branch.get("posteriorUncertainty"),
+                                            10_000,
                                         ),
-                                        posterior_uncertainty_basis_points:
-                                            json_probability_basis_points(
-                                                branch.get("posteriorUncertainty"),
-                                                10_000,
-                                            ),
-                                        decision_effect: decision_effect.to_string(),
-                                    })
+                                    decision_effect: decision_effect.to_string(),
                                 })
-                                .collect()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                expected_posterior_uncertainty_basis_points: 0,
+                expected_information_gain_basis_points: 0,
+            };
+            let domain_bucket = pm_question_domain_bucket(&open_question.decision_target);
+            let profile =
+                load_pm_question_calibration_profile(&mut transaction, tenant_id, domain_bucket)
+                    .await?;
+            open_question = open_question.with_calibrated_information_value(&profile);
+            let raw_prior = json_probability_basis_points(item.get("priorUncertainty"), 0);
+            let raw_posterior = item
+                .get("answerBranches")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|branches| {
+                    let values = branches
+                        .iter()
+                        .map(|branch| {
+                            json_probability_basis_points(
+                                branch.get("posteriorUncertainty"),
+                                10_000,
+                            )
                         })
-                        .unwrap_or_default(),
-                    expected_posterior_uncertainty_basis_points: 0,
-                    expected_information_gain_basis_points: 0,
-                }
-                .with_recomputed_information_value(),
-            );
+                        .collect::<Vec<_>>();
+                    (!values.is_empty()).then(|| {
+                        values.iter().map(|value| u64::from(*value)).sum::<u64>()
+                            / values.len() as u64
+                    })
+                });
+            sqlx::query::<Sqlite>(
+                "INSERT INTO pm_question_outcomes
+                    (id, tenant_id, run_id, question_id, domain_bucket,
+                     raw_prior, calibrated_prior, raw_posterior, calibrated_posterior)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(tenant_id, run_id, question_id) DO NOTHING",
+            )
+            .bind(tenant_scoped_record_id(
+                "pm-question-outcome",
+                tenant_id,
+                &format!("{run_id}:{}", open_question.id),
+            ))
+            .bind(tenant_id)
+            .bind(run_id)
+            .bind(&open_question.id)
+            .bind(domain_bucket)
+            .bind(f64::from(raw_prior) / 10_000.0)
+            .bind(f64::from(open_question.prior_uncertainty_basis_points) / 10_000.0)
+            .bind(raw_posterior.map(|value| value as f64 / 10_000.0))
+            .bind(f64::from(open_question.expected_posterior_uncertainty_basis_points) / 10_000.0)
+            .execute(&mut *transaction)
+            .await?;
+            delta.add_questions.push(open_question);
         }
     }
     delta.resolve_question_ids = proposed
@@ -6935,6 +8981,30 @@ pub(crate) async fn persist_pm_requirement_state_delta(
     }
     let next = apply_delta(&current, delta.clone(), &[])
         .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+    for resolution in &delta.add_question_resolutions {
+        sqlx::query::<Sqlite>(
+            "UPDATE pm_question_outcomes
+             SET answered = 1, decision_changed = ?,
+                 risk_reduced = ?, calibrated_posterior = ?,
+                 user_effort_ms = MAX(
+                   0,
+                   CAST((julianday(CURRENT_TIMESTAMP) - julianday(created_at))
+                        * 86400000 AS INTEGER)
+                 )
+             WHERE id = (
+                 SELECT id FROM pm_question_outcomes
+                 WHERE tenant_id = ? AND question_id = ? AND answered = 0
+                 ORDER BY created_at DESC, id DESC LIMIT 1
+             )",
+        )
+        .bind(i64::from(resolution.decision_changed))
+        .bind(f64::from(resolution.observed_convergence_basis_points) / 10_000.0)
+        .bind(f64::from(resolution.observed_posterior_uncertainty_basis_points) / 10_000.0)
+        .bind(tenant_id)
+        .bind(&resolution.question_id)
+        .execute(&mut *transaction)
+        .await?;
+    }
     let reducer_source = if is_input_event {
         serde_json::json!({"userMessage": user_message})
     } else {
@@ -7066,75 +9136,634 @@ pub(crate) async fn repair_ledger_thread(
     Ok(valid)
 }
 
-/// Re-encrypt a bounded batch of durable ciphertexts with the active key. The
-/// old key remains readable through `ENCRYPTION_KEY_RING` until every batch is
-/// committed; compare-and-swap updates avoid overwriting concurrent writes.
-pub(crate) async fn rotate_encrypted_payload_batch(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CiphertextRewriter {
+    Envelope,
+    BotSecret,
+    Artifact,
+    DataSource,
+    RepositoryToken,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CiphertextStoreDescriptor {
+    store_id: &'static str,
+    table: &'static str,
+    row_id_column: &'static str,
+    tenant_column: &'static str,
+    ciphertext_column: &'static str,
+    rewriter: CiphertextRewriter,
+    retention_policy: &'static str,
+}
+
+const CIPHERTEXT_STORES: &[CiphertextStoreDescriptor] = &[
+    ciphertext_store(
+        "api_keys.encrypted_key",
+        "api_keys",
+        "id",
+        "tenant_id",
+        "encrypted_key",
+    ),
+    bot_secret_store(
+        "bot_agent_channels.inbound_secret",
+        "bot_agent_channels",
+        "id",
+        "tenant_id",
+        "inbound_secret",
+    ),
+    bot_secret_store(
+        "bot_agent_channels.outbound_token",
+        "bot_agent_channels",
+        "id",
+        "tenant_id",
+        "outbound_token",
+    ),
+    bot_secret_store(
+        "bot_agent_channels.signing_secret",
+        "bot_agent_channels",
+        "id",
+        "tenant_id",
+        "signing_secret",
+    ),
+    bot_secret_store(
+        "bot_agent_channels.outbound_signing_secret",
+        "bot_agent_channels",
+        "id",
+        "tenant_id",
+        "outbound_signing_secret",
+    ),
+    ciphertext_store(
+        "ledger.raw_payload",
+        "agent_event_ledger",
+        "event_id",
+        "tenant_id",
+        "raw_payload_ciphertext",
+    ),
+    ciphertext_store(
+        "context_manifest.raw",
+        "context_packet_manifests",
+        "id",
+        "tenant_id",
+        "raw_manifest_ciphertext",
+    ),
+    ciphertext_store(
+        "provider_attempt.tool_schema",
+        "provider_request_attempts",
+        "id",
+        "tenant_id",
+        "tool_schema_ciphertext",
+    ),
+    ciphertext_store(
+        "tool_manifest.schema",
+        "tool_manifests",
+        "id",
+        "tenant_id",
+        "schema_ciphertext",
+    ),
+    ciphertext_store(
+        "provider_attempt.stream",
+        "provider_attempt_artifacts",
+        "id",
+        "tenant_id",
+        "payload_ciphertext",
+    ),
+    ciphertext_store(
+        "compaction.source_archive",
+        "compaction_transactions",
+        "id",
+        "tenant_id",
+        "source_archive_ciphertext",
+    ),
+    ciphertext_store(
+        "compaction.replacement",
+        "compaction_transactions",
+        "id",
+        "tenant_id",
+        "replacement_ciphertext",
+    ),
+    ciphertext_store(
+        "compaction.candidates",
+        "compaction_transactions",
+        "id",
+        "tenant_id",
+        "memory_candidates_ciphertext",
+    ),
+    ciphertext_store(
+        "checkpoint.session",
+        "execution_checkpoints",
+        "id",
+        "tenant_id",
+        "checkpoint_ciphertext",
+    ),
+    CiphertextStoreDescriptor {
+        store_id: "artifact.payload",
+        table: "artifact_objects",
+        row_id_column: "id",
+        tenant_column: "tenant_id",
+        ciphertext_column: "payload_blob",
+        rewriter: CiphertextRewriter::Artifact,
+        retention_policy: "artifact_row",
+    },
+    ciphertext_store(
+        "pm_search.auth_secret",
+        "pm_search_provider_configs",
+        "id",
+        "tenant_id",
+        "auth_secret_ciphertext",
+    ),
+    CiphertextStoreDescriptor {
+        store_id: "datasource.config",
+        table: "data_sources",
+        row_id_column: "id",
+        tenant_column: "tenant_id",
+        ciphertext_column: "config",
+        rewriter: CiphertextRewriter::DataSource,
+        retention_policy: "datasource_row",
+    },
+    CiphertextStoreDescriptor {
+        store_id: "repository.token",
+        table: "gitlab_projects",
+        row_id_column: "id",
+        tenant_column: "tenant_id",
+        ciphertext_column: "gitlab_token",
+        rewriter: CiphertextRewriter::RepositoryToken,
+        retention_policy: "repository_row",
+    },
+];
+
+const fn ciphertext_store(
+    store_id: &'static str,
+    table: &'static str,
+    row_id_column: &'static str,
+    tenant_column: &'static str,
+    ciphertext_column: &'static str,
+) -> CiphertextStoreDescriptor {
+    CiphertextStoreDescriptor {
+        store_id,
+        table,
+        row_id_column,
+        tenant_column,
+        ciphertext_column,
+        rewriter: CiphertextRewriter::Envelope,
+        retention_policy: "row_lifecycle",
+    }
+}
+
+const fn bot_secret_store(
+    store_id: &'static str,
+    table: &'static str,
+    row_id_column: &'static str,
+    tenant_column: &'static str,
+    ciphertext_column: &'static str,
+) -> CiphertextStoreDescriptor {
+    CiphertextStoreDescriptor {
+        store_id,
+        table,
+        row_id_column,
+        tenant_column,
+        ciphertext_column,
+        rewriter: CiphertextRewriter::BotSecret,
+        retention_policy: "bot_channel_lifecycle",
+    }
+}
+
+async fn register_ciphertext_stores(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<(), SemanticStoreError> {
+    for descriptor in CIPHERTEXT_STORES {
+        sqlx::query::<Sqlite>(
+            "INSERT INTO ciphertext_store_registry
+                (store_id, key_namespace, codec_version, scanner_id, rewriter_id,
+                 retention_policy)
+             VALUES (?, 'aos.semantic-kernel', 2, ?, ?, ?)
+             ON CONFLICT(store_id) DO UPDATE SET
+                 key_namespace = excluded.key_namespace,
+                 codec_version = excluded.codec_version,
+                 scanner_id = excluded.scanner_id,
+                 rewriter_id = excluded.rewriter_id,
+                 retention_policy = excluded.retention_policy",
+        )
+        .bind(descriptor.store_id)
+        .bind(format!(
+            "sqlite:{}:{}:{}",
+            descriptor.table, descriptor.row_id_column, descriptor.ciphertext_column
+        ))
+        .bind(match descriptor.rewriter {
+            CiphertextRewriter::Envelope => "aos-envelope-v2",
+            CiphertextRewriter::BotSecret => "bot-secret-envelope-v2",
+            CiphertextRewriter::Artifact => "artifact-envelope-v2",
+            CiphertextRewriter::DataSource => "datasource-envelope-v2",
+            CiphertextRewriter::RepositoryToken => "repository-token-envelope-v2",
+        })
+        .bind(descriptor.retention_policy)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    Ok(())
+}
+
+fn registered_ciphertext_key_id(
+    descriptor: &CiphertextStoreDescriptor,
+    stored: &str,
+) -> Option<String> {
+    let envelope = match descriptor.rewriter {
+        CiphertextRewriter::DataSource => serde_json::from_str::<serde_json::Value>(stored)
+            .ok()?
+            .get("data")?
+            .as_str()
+            .filter(|value| value.starts_with("aosenc:"))
+            .map(ToOwned::to_owned),
+        _ => stored.starts_with("aosenc:").then(|| stored.to_string()),
+    }?;
+    agent_gateway::crypto::ciphertext_key_id(&envelope).map(ToOwned::to_owned)
+}
+
+fn verify_registered_ciphertext(
+    descriptor: &CiphertextStoreDescriptor,
+    stored: &str,
+    data_dir: &std::path::Path,
+    tenant_id: &str,
+    row_identity: &str,
+) -> Result<(), SemanticStoreError> {
+    let aad = agent_gateway::crypto::scoped_aad(descriptor.store_id, tenant_id, row_identity);
+    match descriptor.rewriter {
+        CiphertextRewriter::Envelope
+        | CiphertextRewriter::BotSecret
+        | CiphertextRewriter::Artifact => {
+            agent_gateway::crypto::decrypt_scoped(stored, &aad).map_err(|error| {
+                SemanticStoreError::InvalidEvent(format!(
+                    "registered ciphertext {} row {} failed scoped decrypt: {error}",
+                    descriptor.store_id, row_identity
+                ))
+            })?;
+        }
+        CiphertextRewriter::DataSource => {
+            let config = serde_json::from_str::<serde_json::Value>(stored).map_err(|error| {
+                SemanticStoreError::InvalidEvent(format!(
+                    "datasource ciphertext envelope is malformed: {error}"
+                ))
+            })?;
+            crate::routes::data_sources::decrypt_config(&config, data_dir, tenant_id, row_identity)
+                .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+        }
+        CiphertextRewriter::RepositoryToken => {
+            let plaintext =
+                agent_gateway::decrypt_repository_token(stored, tenant_id, row_identity);
+            if plaintext.is_empty() {
+                return Err(SemanticStoreError::InvalidEvent(format!(
+                    "repository token {row_identity} failed scoped decrypt"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn rotate_encrypted_payload_batch_with_data_dir(
     db: &SqlitePool,
+    data_dir: &std::path::Path,
     batch_size: i64,
 ) -> Result<usize, SemanticStoreError> {
     let active_key_id = agent_gateway::crypto::active_key_id()
         .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
-    let active_pattern = format!("aosenc:v1:{active_key_id}:%");
+    let cursor_key = format!("all-to-{active_key_id}");
     let mut transaction = db.begin().await?;
     acquire_sqlite_write_lock(&mut transaction).await?;
+    register_ciphertext_stores(&mut transaction).await?;
     let mut rotated = 0_usize;
-    for (table, column) in [
-        ("api_keys", "encrypted_key"),
-        ("bot_channels", "auth_secret_ciphertext"),
-        ("agent_event_ledger", "raw_payload_ciphertext"),
-        ("context_packet_manifests", "raw_manifest_ciphertext"),
-    ] {
-        let column_exists = sqlx::query_scalar::<Sqlite, i64>(
-            "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
+    for descriptor in CIPHERTEXT_STORES {
+        let table_exists = sqlx::query_scalar::<Sqlite, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
         )
-        .bind(table)
-        .bind(column)
+        .bind(descriptor.table)
         .fetch_one(&mut *transaction)
         .await?
             > 0;
-        if !column_exists {
-            tracing::debug!(table, column, "skipping unavailable ciphertext store");
-            continue;
+        let column_exists = sqlx::query_scalar::<Sqlite, i64>(
+            "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
+        )
+        .bind(descriptor.table)
+        .bind(descriptor.ciphertext_column)
+        .fetch_one(&mut *transaction)
+        .await?
+            > 0;
+        if !table_exists || !column_exists {
+            return Err(SemanticStoreError::InvalidEvent(format!(
+                "registered ciphertext store {} is unavailable",
+                descriptor.store_id
+            )));
         }
+        let cursor = sqlx::query_scalar::<Sqlite, Option<String>>(
+            "SELECT cursor FROM ciphertext_rotation_cursors
+             WHERE store_id = ? AND retiring_key_id = ?",
+        )
+        .bind(descriptor.store_id)
+        .bind(&cursor_key)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .flatten()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
         let select = format!(
-            "SELECT rowid, {column} FROM {table}
-             WHERE {column} IS NOT NULL AND {column} <> '' AND {column} NOT LIKE ?
-             LIMIT ?"
+            "SELECT rowid, CAST({row_id} AS TEXT) AS row_identity,
+                    CAST({tenant} AS TEXT) AS tenant_identity,
+                    CAST({ciphertext} AS TEXT) AS ciphertext
+             FROM {table}
+             WHERE rowid > ? AND {ciphertext} IS NOT NULL
+               AND CAST({ciphertext} AS TEXT) <> ''
+             ORDER BY rowid LIMIT ?",
+            row_id = descriptor.row_id_column,
+            tenant = descriptor.tenant_column,
+            ciphertext = descriptor.ciphertext_column,
+            table = descriptor.table,
         );
         let rows = sqlx::query::<Sqlite>(&select)
-            .bind(&active_pattern)
+            .bind(cursor)
             .bind(batch_size.max(1))
             .fetch_all(&mut *transaction)
             .await?;
+        let scanned_count = i64::try_from(rows.len()).unwrap_or(i64::MAX);
+        let mut last_rowid = cursor;
         for row in rows {
-            let row_id = row.try_get::<i64, _>(0)?;
-            let old = row.try_get::<String, _>(1)?;
-            let replacement = agent_gateway::crypto::reencrypt(&old)
-                .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
-            if replacement == old {
-                continue;
+            let rowid = row.try_get::<i64, _>("rowid")?;
+            let row_identity = row.try_get::<String, _>("row_identity")?;
+            let tenant_id = row.try_get::<String, _>("tenant_identity")?;
+            let old = row.try_get::<String, _>("ciphertext")?;
+            let aad =
+                agent_gateway::crypto::scoped_aad(descriptor.store_id, &tenant_id, &row_identity);
+            let replacement = match descriptor.rewriter {
+                CiphertextRewriter::Envelope => agent_gateway::crypto::reencrypt_scoped(&old, &aad)
+                    .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?,
+                CiphertextRewriter::BotSecret => {
+                    if old.starts_with("aosenc:") {
+                        agent_gateway::crypto::reencrypt_scoped(&old, &aad)
+                            .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?
+                    } else {
+                        agent_gateway::crypto::encrypt_scoped(&old, &aad)
+                            .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?
+                    }
+                }
+                CiphertextRewriter::Artifact => {
+                    if old.starts_with("aosenc:") {
+                        agent_gateway::crypto::reencrypt_scoped(&old, &aad)
+                            .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?
+                    } else {
+                        agent_gateway::crypto::encrypt_scoped(&old, &aad)
+                            .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?
+                    }
+                }
+                CiphertextRewriter::DataSource => {
+                    let config =
+                        serde_json::from_str::<serde_json::Value>(&old).map_err(|error| {
+                            SemanticStoreError::InvalidEvent(format!(
+                                "datasource ciphertext envelope is malformed: {error}"
+                            ))
+                        })?;
+                    let plaintext = crate::routes::data_sources::decrypt_config(
+                        &config,
+                        data_dir,
+                        &tenant_id,
+                        &row_identity,
+                    )
+                    .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+                    crate::routes::data_sources::encrypt_config(
+                        &plaintext,
+                        data_dir,
+                        &tenant_id,
+                        &row_identity,
+                    )
+                    .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?
+                    .to_string()
+                }
+                CiphertextRewriter::RepositoryToken => {
+                    let plaintext =
+                        agent_gateway::decrypt_repository_token(&old, &tenant_id, &row_identity);
+                    if plaintext.is_empty() {
+                        return Err(SemanticStoreError::InvalidEvent(format!(
+                            "repository token {} cannot be decrypted",
+                            row_identity
+                        )));
+                    }
+                    agent_gateway::encrypt_repository_token(&plaintext, &tenant_id, &row_identity)
+                }
+            };
+            if replacement != old {
+                let update = format!(
+                    "UPDATE {table} SET {column} = ?
+                     WHERE rowid = ? AND CAST({column} AS TEXT) = ?",
+                    table = descriptor.table,
+                    column = descriptor.ciphertext_column,
+                );
+                let updated = sqlx::query::<Sqlite>(&update)
+                    .bind(replacement)
+                    .bind(rowid)
+                    .bind(old)
+                    .execute(&mut *transaction)
+                    .await?;
+                if updated.rows_affected() != 1 {
+                    return Err(SemanticStoreError::InvalidEvent(format!(
+                        "ciphertext CAS lost for {} row {}",
+                        descriptor.store_id, row_identity
+                    )));
+                }
+                rotated = rotated.saturating_add(1);
             }
-            let update =
-                format!("UPDATE {table} SET {column} = ? WHERE rowid = ? AND {column} = ?");
-            let result = sqlx::query::<Sqlite>(&update)
-                .bind(replacement)
-                .bind(row_id)
-                .bind(old)
-                .execute(&mut *transaction)
-                .await?;
-            rotated = rotated.saturating_add(result.rows_affected() as usize);
+            last_rowid = rowid;
         }
+        let reference_pattern = format!("%aosenc:v2:{active_key_id}:%");
+        let reference_sql = format!(
+            "SELECT COUNT(*) FROM {table}
+             WHERE {column} IS NOT NULL AND CAST({column} AS TEXT) <> ''
+               AND CAST({column} AS TEXT) NOT LIKE ?",
+            table = descriptor.table,
+            column = descriptor.ciphertext_column,
+        );
+        let reference_count = sqlx::query_scalar::<Sqlite, i64>(&reference_sql)
+            .bind(reference_pattern)
+            .fetch_one(&mut *transaction)
+            .await?;
+        if scanned_count < batch_size.max(1) && reference_count > 0 {
+            // We reached the end while stale/non-active ciphertext still
+            // exists. Restart at row zero so an earlier-row concurrent write
+            // cannot permanently escape all subsequent scans.
+            last_rowid = 0;
+        }
+        sqlx::query::<Sqlite>(
+            "INSERT INTO ciphertext_rotation_cursors
+                (store_id, retiring_key_id, cursor, reference_count,
+                 sampled_decrypt_ok, last_error)
+             VALUES (?, ?, ?, ?, 1, NULL)
+             ON CONFLICT(store_id, retiring_key_id) DO UPDATE SET
+                 cursor = excluded.cursor,
+                 reference_count = excluded.reference_count,
+                 sampled_decrypt_ok = excluded.sampled_decrypt_ok,
+                 last_error = NULL,
+                 updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(descriptor.store_id)
+        .bind(&cursor_key)
+        .bind(last_rowid.to_string())
+        .bind(reference_count)
+        .execute(&mut *transaction)
+        .await?;
     }
+    process_fault_point("rotation.before_commit");
     transaction.commit().await?;
+    process_fault_point("rotation.after_commit");
     Ok(rotated)
 }
 
-pub(crate) fn start_encryption_key_rotation_worker(db: SqlitePool) {
+#[cfg(test)]
+pub(crate) async fn rotate_encrypted_payload_batch(
+    db: &SqlitePool,
+    batch_size: i64,
+) -> Result<usize, SemanticStoreError> {
+    rotate_encrypted_payload_batch_with_data_dir(db, std::path::Path::new("."), batch_size).await
+}
+
+pub(crate) async fn issue_key_retirement_certificate(
+    db: &SqlitePool,
+    data_dir: &std::path::Path,
+    key_id: &str,
+    backup_policy_confirmed: bool,
+) -> Result<String, SemanticStoreError> {
+    crate::behavior_trace("KEY-001");
+    if !backup_policy_confirmed {
+        return Err(SemanticStoreError::InvalidEvent(
+            "key retirement requires an explicit backup-policy confirmation".into(),
+        ));
+    }
+    let mut transaction = db.begin().await?;
+    acquire_sqlite_write_lock(&mut transaction).await?;
+    register_ciphertext_stores(&mut transaction).await?;
+    let active_key_id = agent_gateway::crypto::active_key_id()
+        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+    let configured_key_ids = agent_gateway::crypto::configured_key_ids()
+        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+    if !configured_key_ids
+        .iter()
+        .any(|configured| configured == key_id)
+    {
+        return Err(SemanticStoreError::InvalidEvent(format!(
+            "key {key_id} is not present in the configured key ring"
+        )));
+    }
+    if active_key_id == key_id {
+        return Err(SemanticStoreError::InvalidEvent(
+            "the active encryption key cannot be retired".into(),
+        ));
+    }
+    let mut zero_reference_stores = 0_i64;
+    let mut sampled_decrypt_ok = true;
+    for descriptor in CIPHERTEXT_STORES {
+        let sql = format!(
+            "SELECT CAST({row_id} AS TEXT) AS row_identity,
+                    CAST({tenant} AS TEXT) AS tenant_identity,
+                    CAST({column} AS TEXT) AS ciphertext
+             FROM {table}
+             WHERE {column} IS NOT NULL AND CAST({column} AS TEXT) <> ''
+             ORDER BY rowid",
+            table = descriptor.table,
+            row_id = descriptor.row_id_column,
+            tenant = descriptor.tenant_column,
+            column = descriptor.ciphertext_column,
+        );
+        let rows = sqlx::query::<Sqlite>(&sql)
+            .fetch_all(&mut *transaction)
+            .await?;
+        let mut references = 0_i64;
+        let mut unknown_or_unversioned = 0_i64;
+        for (index, row) in rows.iter().enumerate() {
+            let row_identity = row.try_get::<String, _>("row_identity")?;
+            let tenant_id = row.try_get::<String, _>("tenant_identity")?;
+            let stored = row.try_get::<String, _>("ciphertext")?;
+            let Some(ciphertext_key_id) = registered_ciphertext_key_id(descriptor, &stored) else {
+                unknown_or_unversioned += 1;
+                continue;
+            };
+            if ciphertext_key_id == key_id {
+                references += 1;
+            }
+            if index < 3
+                && verify_registered_ciphertext(
+                    descriptor,
+                    &stored,
+                    data_dir,
+                    &tenant_id,
+                    &row_identity,
+                )
+                .is_err()
+            {
+                sampled_decrypt_ok = false;
+            }
+        }
+        if unknown_or_unversioned > 0 {
+            return Err(SemanticStoreError::InvalidEvent(format!(
+                "registered store {} still has {unknown_or_unversioned} unknown or unversioned ciphertext rows",
+                descriptor.store_id
+            )));
+        }
+        if !sampled_decrypt_ok {
+            return Err(SemanticStoreError::InvalidEvent(format!(
+                "registered store {} failed sampled scoped decrypt",
+                descriptor.store_id
+            )));
+        }
+        if references == 0 {
+            zero_reference_stores += 1;
+        }
+    }
+    let registered_store_count = i64::try_from(CIPHERTEXT_STORES.len()).unwrap_or(i64::MAX);
+    if zero_reference_stores != registered_store_count {
+        return Err(SemanticStoreError::InvalidEvent(format!(
+            "key {key_id} still has ciphertext references"
+        )));
+    }
+    let registry_rows = sqlx::query_as::<Sqlite, (String, String, i64, String, String, String)>(
+        "SELECT store_id, key_namespace, codec_version, scanner_id, rewriter_id,
+                retention_policy
+         FROM ciphertext_store_registry ORDER BY store_id",
+    )
+    .fetch_all(&mut *transaction)
+    .await?;
+    if registry_rows.len() != CIPHERTEXT_STORES.len() {
+        return Err(SemanticStoreError::InvalidEvent(
+            "ciphertext registry snapshot does not cover every production store".into(),
+        ));
+    }
+    let snapshot_hash = sha256_json(
+        &serde_json::to_value(&registry_rows)
+            .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?,
+    );
+    sqlx::query::<Sqlite>(
+        "INSERT INTO key_retirement_certificates
+            (key_id, registry_snapshot_hash, registered_store_count,
+             zero_reference_store_count, sampled_decrypt_ok, backup_policy_confirmed)
+         VALUES (?, ?, ?, ?, ?, 1)
+         ON CONFLICT(key_id) DO UPDATE SET
+             registry_snapshot_hash = excluded.registry_snapshot_hash,
+             registered_store_count = excluded.registered_store_count,
+             zero_reference_store_count = excluded.zero_reference_store_count,
+             sampled_decrypt_ok = excluded.sampled_decrypt_ok,
+             backup_policy_confirmed = 1,
+             issued_at = CURRENT_TIMESTAMP",
+    )
+    .bind(key_id)
+    .bind(&snapshot_hash)
+    .bind(registered_store_count)
+    .bind(zero_reference_stores)
+    .bind(sampled_decrypt_ok)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(snapshot_hash)
+}
+
+pub(crate) fn start_encryption_key_rotation_worker(db: SqlitePool, data_dir: std::path::PathBuf) {
     tokio::spawn(async move {
         loop {
-            match rotate_encrypted_payload_batch(&db, 200).await {
-                Ok(0) => break,
+            match rotate_encrypted_payload_batch_with_data_dir(&db, &data_dir, 200).await {
+                Ok(0) => tokio::time::sleep(std::time::Duration::from_secs(60)).await,
                 Ok(rotated) => {
                     tracing::info!(rotated, "rotated durable ciphertext batch");
                     tokio::task::yield_now().await;
@@ -7145,6 +9774,37 @@ pub(crate) fn start_encryption_key_rotation_worker(db: SqlitePool) {
                         "durable ciphertext rotation stopped; keep retired keys configured and retry"
                     );
                     break;
+                }
+            }
+            if let Ok(key_id) = std::env::var("AOS_RETIRE_ENCRYPTION_KEY_ID") {
+                let backup_confirmed = matches!(
+                    std::env::var("AOS_RETIRE_BACKUP_CONFIRMED").as_deref(),
+                    Ok("1" | "true" | "TRUE" | "yes" | "YES")
+                );
+                match issue_key_retirement_certificate(
+                    &db,
+                    &data_dir,
+                    key_id.trim(),
+                    backup_confirmed,
+                )
+                .await
+                {
+                    Ok(snapshot_hash) => {
+                        tracing::info!(
+                            key_id = %key_id,
+                            registry_snapshot_hash = %snapshot_hash,
+                            "encryption key retirement certificate issued; remove the old key only after recording this certificate"
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            key_id = %key_id,
+                            error = %error,
+                            "encryption key retirement refused; keep the old key configured and retry after remediation"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    }
                 }
             }
         }
@@ -7164,6 +9824,42 @@ mod tests {
         crate::test_sqlite_pool().await
     }
 
+    // Keep legacy fixture call sites compact while forcing every test through
+    // the production atomic terminal/checkpoint command. There is no
+    // production `finish_turn` compatibility method.
+    impl RuntimeExecutionKernel {
+        async fn finish_turn(
+            &self,
+            turn_id: &str,
+            status: runtime::RuntimeTurnTerminalStatus,
+            detail: Option<&str>,
+        ) -> Result<(), runtime::RuntimeError> {
+            let mut session =
+                scoped_runtime_session(&self.session_id, &self.tenant_id, &self.user_id);
+            let session_status = match status {
+                runtime::RuntimeTurnTerminalStatus::Completed => {
+                    runtime::SessionTurnStatus::Completed
+                }
+                runtime::RuntimeTurnTerminalStatus::Failed => runtime::SessionTurnStatus::Failed,
+                runtime::RuntimeTurnTerminalStatus::Cancelled => {
+                    runtime::SessionTurnStatus::Cancelled
+                }
+                runtime::RuntimeTurnTerminalStatus::Suspended => {
+                    runtime::SessionTurnStatus::Suspended
+                }
+            };
+            session.restore_turn(
+                turn_id,
+                String::new(),
+                session.messages.len(),
+                None,
+                session_status,
+            );
+            self.finish_turn_with_checkpoint(turn_id, status, detail, &session)
+                .await
+        }
+    }
+
     async fn seed_agent_thread(db: &SqlitePool, tenant_id: &str, user_id: &str, thread_id: &str) {
         sqlx::query(
             "INSERT INTO agent_threads
@@ -7176,6 +9872,178 @@ mod tests {
         .execute(db)
         .await
         .unwrap();
+    }
+
+    async fn seed_compaction_test_source(
+        db: &SqlitePool,
+        tenant_id: &str,
+        user_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        messages: &[runtime::ConversationMessage],
+    ) -> (Vec<u64>, Vec<String>) {
+        seed_agent_thread(db, tenant_id, user_id, thread_id).await;
+        sqlx::query(
+            "INSERT INTO agent_turns
+                (id, tenant_id, thread_id, status, started_at, revision)
+             VALUES (?, ?, ?, 'running', CURRENT_TIMESTAMP, 0)",
+        )
+        .bind(turn_id)
+        .bind(tenant_id)
+        .bind(thread_id)
+        .execute(db)
+        .await
+        .unwrap();
+        let mut sequences = Vec::new();
+        let mut event_ids = Vec::new();
+        for (index, message) in messages.iter().enumerate() {
+            let sequence = u64::try_from(index + 1).unwrap();
+            let event_id = format!("message-event-{index}");
+            let raw = serde_json::json!({"message": message}).to_string();
+            let raw_hash = sha256_bytes(raw.as_bytes());
+            let ciphertext = agent_gateway::crypto::encrypt(&raw).unwrap();
+            sqlx::query(
+                "INSERT INTO agent_event_ledger
+                    (event_id, tenant_id, thread_id, turn_id, sequence, batch_id,
+                     schema_version, event_type, payload_json, payload_hash,
+                     durable, occurred_at, raw_payload_ciphertext)
+                 VALUES (?, ?, ?, ?, ?, ?, 1, 'conversation.message', '{}', ?, 1,
+                         CURRENT_TIMESTAMP, ?)",
+            )
+            .bind(&event_id)
+            .bind(tenant_id)
+            .bind(thread_id)
+            .bind(turn_id)
+            .bind(i64::try_from(sequence).unwrap())
+            .bind(format!("batch-{index}"))
+            .bind(&raw_hash)
+            .bind(ciphertext)
+            .execute(db)
+            .await
+            .unwrap();
+            sequences.push(sequence);
+            event_ids.push(event_id);
+        }
+        let manifest_raw = serde_json::json!({
+            "schemaVersion": "context-manifest-v1",
+            "tenantId": tenant_id,
+            "threadId": thread_id,
+            "turnId": turn_id,
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO context_packet_manifests
+                (id, tenant_id, thread_id, turn_id, manifest_hash, manifest_json,
+                 raw_manifest_hash, raw_manifest_ciphertext, created_at)
+             VALUES (?, ?, ?, ?, ?, '{}', ?, ?, CURRENT_TIMESTAMP)",
+        )
+        .bind(format!("context-{thread_id}"))
+        .bind(tenant_id)
+        .bind(thread_id)
+        .bind(turn_id)
+        .bind(sha256_bytes(manifest_raw.as_bytes()))
+        .bind(sha256_bytes(manifest_raw.as_bytes()))
+        .bind(agent_gateway::crypto::encrypt(&manifest_raw).unwrap())
+        .execute(db)
+        .await
+        .unwrap();
+        (sequences, event_ids)
+    }
+
+    async fn append_compaction_test_messages(
+        db: &SqlitePool,
+        tenant_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        prefix: &str,
+        messages: &[runtime::ConversationMessage],
+    ) -> (Vec<u64>, Vec<String>) {
+        let mut sequence: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM agent_event_ledger
+             WHERE tenant_id = ? AND thread_id = ?",
+        )
+        .bind(tenant_id)
+        .bind(thread_id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+        let mut sequences = Vec::new();
+        let mut event_ids = Vec::new();
+        for (index, message) in messages.iter().enumerate() {
+            let event_id = format!("{prefix}-event-{index}");
+            let raw = serde_json::json!({"message": message}).to_string();
+            let raw_hash = sha256_bytes(raw.as_bytes());
+            sqlx::query(
+                "INSERT INTO agent_event_ledger
+                    (event_id, tenant_id, thread_id, turn_id, sequence, batch_id,
+                     schema_version, event_type, payload_json, payload_hash,
+                     durable, occurred_at, raw_payload_ciphertext)
+                 VALUES (?, ?, ?, ?, ?, ?, 1, 'conversation.message', '{}', ?, 1,
+                         CURRENT_TIMESTAMP, ?)",
+            )
+            .bind(&event_id)
+            .bind(tenant_id)
+            .bind(thread_id)
+            .bind(turn_id)
+            .bind(sequence)
+            .bind(format!("{prefix}-batch-{index}"))
+            .bind(&raw_hash)
+            .bind(agent_gateway::crypto::encrypt(&raw).unwrap())
+            .execute(db)
+            .await
+            .unwrap();
+            sequences.push(u64::try_from(sequence).unwrap());
+            event_ids.push(event_id);
+            sequence += 1;
+        }
+        (sequences, event_ids)
+    }
+
+    fn compaction_test_result(
+        tenant_id: &str,
+        user_id: &str,
+        thread_id: &str,
+        archived: &[runtime::ConversationMessage],
+        summary: &str,
+    ) -> runtime::CompactionResult {
+        let mut session = scoped_runtime_session(thread_id, tenant_id, user_id);
+        session.messages = archived.to_vec();
+        session
+            .messages
+            .push(runtime::ConversationMessage::user_text(
+                "retained tail after proof carrying compaction",
+            ));
+        runtime::compact_session_with_summary(
+            &session,
+            runtime::CompactionConfig {
+                preserve_recent_messages: 1,
+                max_estimated_tokens: 0,
+            },
+            summary,
+        )
+    }
+
+    fn deterministic_compaction_summary(
+        tenant_id: &str,
+        user_id: &str,
+        thread_id: &str,
+        archived: &[runtime::ConversationMessage],
+    ) -> String {
+        let mut session = scoped_runtime_session(thread_id, tenant_id, user_id);
+        session.messages = archived.to_vec();
+        session
+            .messages
+            .push(runtime::ConversationMessage::user_text(
+                "retained tail after proof carrying compaction",
+            ));
+        runtime::compact_session(
+            &session,
+            runtime::CompactionConfig {
+                preserve_recent_messages: 1,
+                max_estimated_tokens: 0,
+            },
+        )
+        .summary
     }
 
     fn scoped_runtime_session(
@@ -7355,6 +10223,32 @@ mod tests {
             .execute(&db)
             .await
             .unwrap();
+            // Production retrieval only admits projections with a current,
+            // confirmed structured fact. Seed the canonical fact alongside
+            // the projection so this fixture exercises the real Repository
+            // write contract instead of an impossible projection-only row.
+            sqlx::query(
+                "INSERT INTO structured_memory_facts
+                    (id, tenant_id, user_id, scope, app, session_id, channel,
+                     kind, subject_json, predicate, value_json, text, evidence_id,
+                     evidence_hash, observed_at, confidence, sensitivity, lifecycle,
+                     current, projection_memory_id, candidate_json)
+                 VALUES (?, 'tenant-context', ?, 'session', 'shared', ?,
+                         'long_term_memory', 'fact', '{\"kind\":\"memory\"}',
+                         'memory.fact', ?, ?, ?, ?, CURRENT_TIMESTAMP, 1.0,
+                         'internal', 'confirmed', 1, ?, '{}')",
+            )
+            .bind(format!("fact:{id}"))
+            .bind(user_id)
+            .bind(session_id)
+            .bind(serde_json::json!({"value": content}).to_string())
+            .bind(content)
+            .bind(format!("evidence:{id}"))
+            .bind(sha256_bytes(content.as_bytes()))
+            .bind(id)
+            .execute(&db)
+            .await
+            .unwrap();
         }
         for (artifact_id, owner_scope, locator, evidence_id) in [
             (
@@ -7459,7 +10353,22 @@ mod tests {
         .fetch_one(&db)
         .await
         .unwrap();
-        let exact = agent_gateway::crypto::decrypt(&raw_ciphertext).unwrap();
+        let context_manifest_id: String = sqlx::query_scalar(
+            "SELECT id FROM context_packet_manifests
+             WHERE tenant_id = 'tenant-context' AND thread_id = 'context-session'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let exact = agent_gateway::crypto::decrypt_scoped(
+            &raw_ciphertext,
+            &agent_gateway::crypto::scoped_aad(
+                "context_manifest.raw",
+                "tenant-context",
+                &context_manifest_id,
+            ),
+        )
+        .unwrap();
         assert_eq!(raw_hash, sha256_bytes(exact.as_bytes()));
         let exact: serde_json::Value = serde_json::from_str(&exact).unwrap();
         let packet: semantic_core::ContextPacket =
@@ -8456,7 +11365,11 @@ mod tests {
         .await
         .unwrap();
         assert!(!payload.is_empty());
-        let payload = String::from_utf8(payload).unwrap();
+        let payload = agent_gateway::crypto::decrypt_scoped(
+            std::str::from_utf8(&payload).unwrap(),
+            &agent_gateway::crypto::scoped_aad("artifact.payload", "tenant", "pm-final-task"),
+        )
+        .unwrap();
         assert!(payload.contains("answer"));
         assert!(!payload.contains("delivery-secret"));
         let source_projection_count: i64 = sqlx::query_scalar(
@@ -8842,17 +11755,24 @@ mod tests {
     #[tokio::test]
     async fn compaction_checkpoint_is_durable_and_structurally_redacted() {
         let db = db().await;
+        let messages = [runtime::ConversationMessage::user_text(format!(
+            "password=checkpoint-secret {}",
+            "governed source evidence ".repeat(200)
+        ))];
+        let (sequences, event_ids) =
+            seed_compaction_test_source(&db, "tenant", "user", "session", "turn", &messages).await;
         let transaction_id = prepare_compaction_transaction(
             &db,
             "tenant",
             "user",
             "session",
             "test",
-            &[1, 2, 3],
-            &[runtime::ConversationMessage::user_text(
-                "password=checkpoint-secret",
-            )],
+            &sequences,
+            &event_ids,
             &[],
+            &messages,
+            &[],
+            "deterministic replacement",
         )
         .await
         .unwrap();
@@ -8867,20 +11787,529 @@ mod tests {
         .unwrap();
         assert_eq!(row.0, "prepared");
         assert!(!row.2.contains("checkpoint-secret"));
-        let raw = agent_gateway::crypto::decrypt(&row.2).unwrap();
+        let raw = agent_gateway::crypto::decrypt_scoped(
+            &row.2,
+            &agent_gateway::crypto::scoped_aad(
+                "compaction.source_archive",
+                "tenant",
+                &transaction_id,
+            ),
+        )
+        .unwrap();
         assert_eq!(sha256_bytes(raw.as_bytes()), row.1);
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(parsed["sourceEventSeqs"], serde_json::json!([1, 2, 3]));
-        assert_eq!(
-            parsed["messages"][0]["blocks"][0]["Text"]["text"],
-            "password=checkpoint-secret"
-        );
+        assert_eq!(parsed["sourceEventSeqs"], serde_json::json!([1]));
+        assert!(parsed["messages"][0]["blocks"][0]["Text"]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("password=checkpoint-secret ")));
         let published_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM compaction_checkpoints")
                 .fetch_one(&db)
                 .await
                 .unwrap();
         assert_eq!(published_count, 0, "prepare cannot publish a checkpoint");
+
+        let result = compaction_test_result(
+            "tenant",
+            "user",
+            "session",
+            &messages,
+            "deterministic replacement",
+        );
+        commit_compaction_transaction(
+            &db,
+            "tenant",
+            "user",
+            "session",
+            "chat",
+            &transaction_id,
+            "test",
+            &result,
+        )
+        .await
+        .unwrap();
+        let committed: (String, i64, i64) = sqlx::query_as(
+            "SELECT status,
+                    (SELECT COUNT(*) FROM compaction_checkpoints
+                     WHERE tenant_id = 'tenant' AND thread_id = 'session'),
+                    (SELECT COUNT(*) FROM artifact_objects WHERE owner_scope = 'session')
+             FROM compaction_transactions WHERE id = ?",
+        )
+        .bind(&transaction_id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(committed.0, "committed");
+        assert_eq!(committed.1, 1);
+        assert_eq!(committed.2, 1);
+    }
+
+    #[tokio::test]
+    async fn compaction_prepare_rejects_missing_baseline_sequence_and_evidence_span() {
+        let first_db = db().await;
+        let messages = [runtime::ConversationMessage::user_text(
+            "Remember the governed warehouse contract for future analysis. ".repeat(80),
+        )];
+        let (sequences, event_ids) = seed_compaction_test_source(
+            &first_db,
+            "tenant-proof",
+            "user-proof",
+            "thread-proof",
+            "turn-proof",
+            &messages,
+        )
+        .await;
+        sqlx::query(
+            "DELETE FROM context_packet_manifests
+             WHERE tenant_id = 'tenant-proof' AND thread_id = 'thread-proof'",
+        )
+        .execute(&first_db)
+        .await
+        .unwrap();
+        let summary = deterministic_compaction_summary(
+            "tenant-proof",
+            "user-proof",
+            "thread-proof",
+            &messages,
+        );
+        let error = prepare_compaction_transaction(
+            &first_db,
+            "tenant-proof",
+            "user-proof",
+            "thread-proof",
+            "test",
+            &sequences,
+            &event_ids,
+            &[],
+            &messages,
+            &[],
+            &summary,
+        )
+        .await
+        .expect_err("missing exact baseline must fail closed");
+        assert!(error.to_string().contains("baseline"));
+
+        let db = db().await;
+        let (sequences, event_ids) = seed_compaction_test_source(
+            &db,
+            "tenant-proof",
+            "user-proof",
+            "thread-proof",
+            "turn-proof",
+            &messages,
+        )
+        .await;
+        let candidate = CompactionMemoryCandidate {
+            id: "candidate-invalid-span".into(),
+            channel: "long_term_memory".into(),
+            kind: "fact".into(),
+            subject: serde_json::json!({"entityType":"session","canonicalId":"thread-proof"}),
+            predicate: "contract".into(),
+            value: serde_json::json!("fabricated"),
+            text: "fabricated unsupported fact".into(),
+            evidence_id: "evidence".into(),
+            evidence_hash: "hash".into(),
+            observed_at: Utc::now().to_rfc3339(),
+            valid_until: None,
+            confidence: 0.99,
+            sensitivity: "internal".into(),
+            pinned: false,
+            source_cursor: "turn-proof".into(),
+            evidence_message_id: event_ids[0].clone(),
+            evidence_start: 0,
+            evidence_end: "fabricated unsupported fact".len(),
+        };
+        let mut unsorted = sequences.clone();
+        unsorted.push(sequences[0]);
+        let error = prepare_compaction_transaction(
+            &db,
+            "tenant-proof",
+            "user-proof",
+            "thread-proof",
+            "test",
+            &unsorted,
+            &event_ids,
+            &[],
+            &messages,
+            &[],
+            &summary,
+        )
+        .await
+        .expect_err("duplicate sequence coverage must fail closed");
+        assert!(error.to_string().contains("sorted and unique"));
+        let error = prepare_compaction_transaction(
+            &db,
+            "tenant-proof",
+            "user-proof",
+            "thread-proof",
+            "test",
+            &sequences,
+            &event_ids,
+            &[],
+            &messages,
+            &[candidate],
+            &summary,
+        )
+        .await
+        .expect_err("unsupported candidate span must fail closed");
+        assert!(error.to_string().contains("evidence span"));
+        let published: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM compaction_checkpoints) +
+                    (SELECT COUNT(*) FROM structured_memory_facts) +
+                    (SELECT COUNT(*) FROM artifact_objects)",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(published, 0);
+    }
+
+    #[tokio::test]
+    async fn compaction_commit_revalidates_hash_revision_baseline_and_token_proofs() {
+        for fault in [
+            "archive_hash",
+            "stream_revision",
+            "turn_revision",
+            "baseline",
+            "token",
+        ] {
+            let db = db().await;
+            let messages = [runtime::ConversationMessage::user_text(format!(
+                "Durable source for {fault}. {}",
+                "exact governed evidence ".repeat(160)
+            ))];
+            let (sequences, event_ids) = seed_compaction_test_source(
+                &db,
+                "tenant-proof",
+                "user-proof",
+                "thread-proof",
+                "turn-proof",
+                &messages,
+            )
+            .await;
+            let summary = if fault == "token" {
+                "unsupported oversized replacement ".repeat(400)
+            } else {
+                deterministic_compaction_summary(
+                    "tenant-proof",
+                    "user-proof",
+                    "thread-proof",
+                    &messages,
+                )
+            };
+            let transaction_id = prepare_compaction_transaction(
+                &db,
+                "tenant-proof",
+                "user-proof",
+                "thread-proof",
+                "test",
+                &sequences,
+                &event_ids,
+                &[],
+                &messages,
+                &[],
+                &summary,
+            )
+            .await
+            .unwrap();
+            match fault {
+                "archive_hash" => {
+                    sqlx::query(
+                        "UPDATE compaction_transactions SET source_archive_hash = 'tampered'
+                         WHERE id = ?",
+                    )
+                    .bind(&transaction_id)
+                    .execute(&db)
+                    .await
+                    .unwrap();
+                }
+                "stream_revision" => {
+                    append_compaction_test_messages(
+                        &db,
+                        "tenant-proof",
+                        "thread-proof",
+                        "turn-proof",
+                        "late",
+                        &[runtime::ConversationMessage::assistant(vec![
+                            runtime::ContentBlock::Text {
+                                text: "late concurrent message".into(),
+                            },
+                        ])],
+                    )
+                    .await;
+                }
+                "turn_revision" => {
+                    sqlx::query(
+                        "UPDATE agent_turns SET revision = revision + 1
+                         WHERE tenant_id = 'tenant-proof' AND id = 'turn-proof'",
+                    )
+                    .execute(&db)
+                    .await
+                    .unwrap();
+                }
+                "baseline" => {
+                    sqlx::query(
+                        "DELETE FROM context_packet_manifests
+                         WHERE tenant_id = 'tenant-proof' AND thread_id = 'thread-proof'",
+                    )
+                    .execute(&db)
+                    .await
+                    .unwrap();
+                }
+                "token" => {}
+                _ => unreachable!(),
+            }
+            let result = compaction_test_result(
+                "tenant-proof",
+                "user-proof",
+                "thread-proof",
+                &messages,
+                &summary,
+            );
+            let error = commit_compaction_transaction(
+                &db,
+                "tenant-proof",
+                "user-proof",
+                "thread-proof",
+                "chat",
+                &transaction_id,
+                "test",
+                &result,
+            )
+            .await
+            .expect_err("every proof mutation must fail closed");
+            let expected_fragment = match fault {
+                "archive_hash" => "archive hash",
+                "stream_revision" => "stream revision",
+                "turn_revision" => "turn revision",
+                "baseline" => "baseline",
+                "token" => "60% proof budget",
+                _ => unreachable!(),
+            };
+            assert!(
+                error.to_string().contains(expected_fragment),
+                "fault {fault} returned {error}"
+            );
+            let published: i64 = sqlx::query_scalar(
+                "SELECT (SELECT COUNT(*) FROM compaction_checkpoints) +
+                        (SELECT COUNT(*) FROM structured_memory_facts) +
+                        (SELECT COUNT(*) FROM artifact_objects)",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            assert_eq!(published, 0, "fault {fault} leaked derived state");
+        }
+    }
+
+    #[tokio::test]
+    async fn three_nested_compactions_keep_exact_non_overlapping_sources_and_reject_cycles() {
+        let db = db().await;
+        let first_archive = vec![
+            runtime::ConversationMessage::user_text("first source ".repeat(180)),
+            runtime::ConversationMessage::assistant(vec![runtime::ContentBlock::Text {
+                text: "first result ".repeat(180),
+            }]),
+        ];
+        let (first_sequences, first_event_ids) = seed_compaction_test_source(
+            &db,
+            "tenant-nested",
+            "user-nested",
+            "thread-nested",
+            "turn-nested",
+            &first_archive,
+        )
+        .await;
+        let first_summary = deterministic_compaction_summary(
+            "tenant-nested",
+            "user-nested",
+            "thread-nested",
+            &first_archive,
+        );
+        let first_id = prepare_compaction_transaction(
+            &db,
+            "tenant-nested",
+            "user-nested",
+            "thread-nested",
+            "test-1",
+            &first_sequences,
+            &first_event_ids,
+            &[],
+            &first_archive,
+            &[],
+            &first_summary,
+        )
+        .await
+        .unwrap();
+        let first_result = compaction_test_result(
+            "tenant-nested",
+            "user-nested",
+            "thread-nested",
+            &first_archive,
+            &first_summary,
+        );
+        commit_compaction_transaction(
+            &db,
+            "tenant-nested",
+            "user-nested",
+            "thread-nested",
+            "chat",
+            &first_id,
+            "test-1",
+            &first_result,
+        )
+        .await
+        .unwrap();
+
+        let mut parent_message = first_result.compacted_session.messages[0].clone();
+        let mut ids = vec![first_id.clone()];
+        let mut source_sets = vec![first_sequences.iter().copied().collect::<BTreeSet<_>>()];
+        for stage in 2..=3 {
+            let direct = vec![
+                runtime::ConversationMessage::user_text(format!(
+                    "stage {stage} direct user source {}",
+                    "new exact evidence ".repeat(180)
+                )),
+                runtime::ConversationMessage::assistant(vec![runtime::ContentBlock::Text {
+                    text: format!(
+                        "stage {stage} direct assistant source {}",
+                        "new exact result ".repeat(180)
+                    ),
+                }]),
+            ];
+            append_compaction_test_messages(
+                &db,
+                "tenant-nested",
+                "thread-nested",
+                "turn-nested",
+                &format!("stage-{stage}"),
+                &direct,
+            )
+            .await;
+            let mut archive = vec![parent_message.clone()];
+            archive.extend(direct);
+            let coverage =
+                ledger_coverage_for_archive(&db, "tenant-nested", "thread-nested", &archive)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                coverage.parent_compaction_ids,
+                vec![ids.last().unwrap().clone()]
+            );
+            let current_set = coverage
+                .event_sequences
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            assert!(source_sets
+                .iter()
+                .all(|prior| prior.is_disjoint(&current_set)));
+            let summary = deterministic_compaction_summary(
+                "tenant-nested",
+                "user-nested",
+                "thread-nested",
+                &archive,
+            );
+            let id = prepare_compaction_transaction(
+                &db,
+                "tenant-nested",
+                "user-nested",
+                "thread-nested",
+                &format!("test-{stage}"),
+                &coverage.event_sequences,
+                &coverage.message_event_ids,
+                &coverage.parent_compaction_ids,
+                &archive,
+                &[],
+                &summary,
+            )
+            .await
+            .unwrap();
+            let result = compaction_test_result(
+                "tenant-nested",
+                "user-nested",
+                "thread-nested",
+                &archive,
+                &summary,
+            );
+            commit_compaction_transaction(
+                &db,
+                "tenant-nested",
+                "user-nested",
+                "thread-nested",
+                "chat",
+                &id,
+                &format!("test-{stage}"),
+                &result,
+            )
+            .await
+            .unwrap();
+            parent_message = result.compacted_session.messages[0].clone();
+            ids.push(id);
+            source_sets.push(current_set);
+        }
+        let rows = sqlx::query_as::<Sqlite, (String, String, String)>(
+            "SELECT id, parent_compaction_ids_json, proof_result_json
+             FROM compaction_transactions
+             WHERE tenant_id = 'tenant-nested' AND thread_id = 'thread-nested'
+             ORDER BY committed_at, id",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|(_, _, proof)| {
+            serde_json::from_str::<serde_json::Value>(proof).unwrap()["status"] == "supported"
+        }));
+
+        sqlx::query(
+            "UPDATE compaction_transactions SET parent_compaction_ids_json = ? WHERE id = ?",
+        )
+        .bind(serde_json::json!([ids[2]]).to_string())
+        .bind(&ids[0])
+        .execute(&db)
+        .await
+        .unwrap();
+        let fourth_direct = vec![runtime::ConversationMessage::user_text(
+            "fourth source for cycle detection ".repeat(180),
+        )];
+        append_compaction_test_messages(
+            &db,
+            "tenant-nested",
+            "thread-nested",
+            "turn-nested",
+            "stage-4",
+            &fourth_direct,
+        )
+        .await;
+        let mut fourth_archive = vec![parent_message];
+        fourth_archive.extend(fourth_direct);
+        let coverage =
+            ledger_coverage_for_archive(&db, "tenant-nested", "thread-nested", &fourth_archive)
+                .await
+                .unwrap();
+        let summary = deterministic_compaction_summary(
+            "tenant-nested",
+            "user-nested",
+            "thread-nested",
+            &fourth_archive,
+        );
+        let error = prepare_compaction_transaction(
+            &db,
+            "tenant-nested",
+            "user-nested",
+            "thread-nested",
+            "test-4",
+            &coverage.event_sequences,
+            &coverage.message_event_ids,
+            &coverage.parent_compaction_ids,
+            &fourth_archive,
+            &[],
+            &summary,
+        )
+        .await
+        .expect_err("a nested provenance cycle must fail closed");
+        assert!(error.to_string().contains("cycle"));
     }
 
     #[tokio::test]
@@ -8912,11 +12341,88 @@ mod tests {
         .fetch_one(&db)
         .await
         .unwrap();
-        assert!(rotated.starts_with("aosenc:v1:"));
+        assert!(rotated.starts_with("aosenc:v2:"));
         assert_eq!(
-            agent_gateway::crypto::decrypt(&rotated).unwrap(),
+            agent_gateway::crypto::decrypt_scoped(
+                &rotated,
+                &agent_gateway::crypto::scoped_aad(
+                    "context_manifest.raw",
+                    "tenant",
+                    "rotation-manifest",
+                ),
+            )
+            .unwrap(),
             "exact provider packet"
         );
+        assert!(agent_gateway::crypto::decrypt_scoped(
+            &rotated,
+            &agent_gateway::crypto::scoped_aad("context_manifest.raw", "tenant", "different-row",),
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn bot_secret_rotation_migrates_plaintext_and_enforces_tenant_row_aad() {
+        let db = db().await;
+        sqlx::query(
+            "INSERT INTO bot_agent_channels
+                (id, tenant_id, agent_id, platform, name, inbound_secret,
+                 outbound_token, signing_secret, outbound_signing_secret)
+             VALUES ('channel-a', 'tenant-a', 'agent-a', 'feishu', 'A',
+                     'legacy-inbound', 'legacy-token', 'legacy-signing', 'legacy-outbound-signing')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        assert_eq!(rotate_encrypted_payload_batch(&db, 100).await.unwrap(), 4);
+        let encrypted = sqlx::query_as::<Sqlite, (String, String, String, String)>(
+            "SELECT inbound_secret, outbound_token, signing_secret, outbound_signing_secret
+             FROM bot_agent_channels WHERE id = 'channel-a'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        for value in [&encrypted.0, &encrypted.1, &encrypted.2, &encrypted.3] {
+            assert!(value.starts_with("aosenc:v2:"));
+            assert!(!value.contains("legacy-"));
+        }
+        for (store_id, value, expected) in [
+            (
+                "bot_agent_channels.inbound_secret",
+                &encrypted.0,
+                "legacy-inbound",
+            ),
+            (
+                "bot_agent_channels.outbound_token",
+                &encrypted.1,
+                "legacy-token",
+            ),
+            (
+                "bot_agent_channels.signing_secret",
+                &encrypted.2,
+                "legacy-signing",
+            ),
+            (
+                "bot_agent_channels.outbound_signing_secret",
+                &encrypted.3,
+                "legacy-outbound-signing",
+            ),
+        ] {
+            assert_eq!(
+                agent_gateway::crypto::decrypt_scoped(
+                    value,
+                    &agent_gateway::crypto::scoped_aad(store_id, "tenant-a", "channel-a"),
+                )
+                .unwrap(),
+                expected
+            );
+            assert!(agent_gateway::crypto::decrypt_scoped(
+                value,
+                &agent_gateway::crypto::scoped_aad(store_id, "tenant-b", "channel-a"),
+            )
+            .is_err());
+        }
     }
 
     #[tokio::test]
@@ -9239,6 +12745,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_pm_question_selection_uses_mature_observed_outcomes() {
+        let db = db().await;
+        for index in 0..20_i64 {
+            sqlx::query(
+                "INSERT INTO pm_question_outcomes
+                   (id, tenant_id, run_id, question_id, domain_bucket,
+                    raw_prior, calibrated_prior, raw_posterior,
+                    calibrated_posterior, answered, decision_changed,
+                    user_effort_ms)
+                 VALUES (?, 'tenant-calibration', ?, ?, 'scope', 0.4, 0.8,
+                         0.2, 0.2, 1, 1, ?)",
+            )
+            .bind(format!("history-{index}"))
+            .bind(format!("run-{index}"))
+            .bind(format!("question-{index}"))
+            .bind(120_000_i64 + index * 1_000)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        let state = persist_pm_requirement_state_delta(
+            &db,
+            "tenant-calibration",
+            "session",
+            "current-run",
+            "plan the launch scope",
+            &serde_json::json!({
+                "requirementDelta": {
+                    "openQuestions": [{
+                        "id": "launch-market",
+                        "question": "Which market should launch first?",
+                        "impact": "core",
+                        "answerability": "high",
+                        "userEffort": 1,
+                        "decisionTarget": "scope",
+                        "priorUncertainty": 0.01,
+                        "answerBranches": [
+                            {"id":"a","answer":"A","probability":0.99,
+                             "posteriorUncertainty":0.99,"decisionEffect":"launch A"},
+                            {"id":"b","answer":"B","probability":0.01,
+                             "posteriorUncertainty":0.99,"decisionEffect":"launch B"}
+                        ]
+                    }],
+                    "readiness": "needs_clarification"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let question = state.open_questions.first().unwrap();
+        assert_eq!(question.prior_uncertainty_basis_points, 9_250);
+        assert_eq!(question.expected_posterior_uncertainty_basis_points, 2_312);
+        assert_eq!(question.expected_information_gain_basis_points, 6_938);
+        assert_eq!(
+            question.user_effort, 5,
+            "observed median effort must affect ranking cost"
+        );
+        assert!(matches!(
+            pm_domain::requirement_state::planning_gate(&state),
+            pm_domain::requirement_state::RequirementPlanningGate::Ask(selected)
+                if selected.id == "launch-market"
+        ));
+        let stored: (f64, f64) = sqlx::query_as(
+            "SELECT raw_prior, calibrated_prior FROM pm_question_outcomes
+             WHERE tenant_id = 'tenant-calibration' AND run_id = 'current-run'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(stored, (0.01, 0.925));
+    }
+
+    #[tokio::test]
     async fn requirement_state_core_question_blocks_research_delivery() {
         let db = db().await;
         let plan = serde_json::json!({
@@ -9286,12 +12865,22 @@ mod tests {
         .unwrap();
         assert_eq!(
             state.open_questions[0].expected_posterior_uncertainty_basis_points,
-            1_000
+            5_525
         );
         assert_eq!(
             state.open_questions[0].expected_information_gain_basis_points,
-            8_000
+            2_975
         );
+        let calibration_before: (f64, f64, f64, f64, i64) = sqlx::query_as(
+            "SELECT raw_prior, calibrated_prior, raw_posterior,
+                    calibrated_posterior, answered
+             FROM pm_question_outcomes
+             WHERE tenant_id = 'tenant' AND question_id = 'target-market'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(calibration_before, (0.9, 0.85, 0.1, 0.5525, 0));
         assert!(matches!(
             pm_domain::requirement_state::planning_gate(&state),
             pm_domain::requirement_state::RequirementPlanningGate::Ask(question)
@@ -9333,6 +12922,15 @@ mod tests {
             8_200
         );
         assert!(resolved.question_resolutions[0].decision_changed);
+        let calibration_after: (i64, i64, f64, f64) = sqlx::query_as(
+            "SELECT answered, decision_changed, risk_reduced, calibrated_posterior
+             FROM pm_question_outcomes
+             WHERE tenant_id = 'tenant' AND question_id = 'target-market'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(calibration_after, (1, 1, 0.82, 0.08));
         let replayed = load_pm_requirement_state(&db, "tenant", "blocked-session")
             .await
             .expect("reload requirement state")
@@ -10004,7 +13602,22 @@ mod tests {
         assert!(manifest_json.contains("snapshot_version"));
         assert!(!manifest_json.contains("token=hidden"));
         assert_eq!(snapshot_version, 0);
-        let raw_manifest = agent_gateway::crypto::decrypt(&raw_ciphertext).unwrap();
+        let context_manifest_id: String = sqlx::query_scalar(
+            "SELECT id FROM context_packet_manifests
+             WHERE tenant_id = 'tenant' AND thread_id = 'session' AND turn_id = 'turn-1'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let raw_manifest = agent_gateway::crypto::decrypt_scoped(
+            &raw_ciphertext,
+            &agent_gateway::crypto::scoped_aad(
+                "context_manifest.raw",
+                "tenant",
+                &context_manifest_id,
+            ),
+        )
+        .unwrap();
         assert_eq!(raw_hash, sha256_bytes(raw_manifest.as_bytes()));
         assert!(raw_manifest.contains("system token=hidden"));
         let manifest: serde_json::Value = serde_json::from_str(&manifest_json).unwrap();
@@ -10073,8 +13686,13 @@ mod tests {
         .fetch_one(&db)
         .await
         .unwrap();
+        let payload = agent_gateway::crypto::decrypt_scoped(
+            std::str::from_utf8(&payload).unwrap(),
+            &agent_gateway::crypto::scoped_aad("artifact.payload", "tenant", artifact_id),
+        )
+        .unwrap();
         assert_eq!(payload.len(), 20_000);
-        assert!(payload.iter().all(|byte| *byte == b'x'));
+        assert!(payload.bytes().all(|byte| byte == b'x'));
         let model_payload: String = sqlx::query_scalar(
             "SELECT payload_json FROM artifact_projections
              WHERE artifact_id = ? AND projection_kind = 'model'",
@@ -10207,6 +13825,105 @@ mod tests {
             .execute(db)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_checkpoint_rejects_status_drift_cross_scope_and_duplicate_commit() {
+        let db = db().await;
+        let kernel = RuntimeExecutionKernel::new(db.clone(), "tenant", "user", "session");
+        kernel
+            .start_turn(runtime::RuntimeTurnStart {
+                turn_id: "terminal-turn".into(),
+                user_input: "finish exactly once".into(),
+            })
+            .await
+            .unwrap();
+
+        let mut running = scoped_runtime_session("session", "tenant", "user");
+        running.restore_turn(
+            "terminal-turn",
+            "finish exactly once",
+            0,
+            None,
+            runtime::SessionTurnStatus::Running,
+        );
+        assert!(kernel
+            .finish_turn_with_checkpoint(
+                "terminal-turn",
+                runtime::RuntimeTurnTerminalStatus::Completed,
+                None,
+                &running,
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("scope or status"));
+
+        let other_kernel =
+            RuntimeExecutionKernel::new(db.clone(), "tenant", "user", "other-session");
+        let mut other_session = scoped_runtime_session("other-session", "tenant", "user");
+        other_session.restore_turn(
+            "terminal-turn",
+            "finish exactly once",
+            0,
+            Some(0),
+            runtime::SessionTurnStatus::Completed,
+        );
+        assert!(other_kernel
+            .finish_turn_with_checkpoint(
+                "terminal-turn",
+                runtime::RuntimeTurnTerminalStatus::Completed,
+                None,
+                &other_session,
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not found in this scope"));
+
+        let mut completed = scoped_runtime_session("session", "tenant", "user");
+        completed.restore_turn(
+            "terminal-turn",
+            "finish exactly once",
+            0,
+            Some(0),
+            runtime::SessionTurnStatus::Completed,
+        );
+        kernel
+            .finish_turn_with_checkpoint(
+                "terminal-turn",
+                runtime::RuntimeTurnTerminalStatus::Completed,
+                None,
+                &completed,
+            )
+            .await
+            .unwrap();
+        assert!(kernel
+            .finish_turn_with_checkpoint(
+                "terminal-turn",
+                runtime::RuntimeTurnTerminalStatus::Completed,
+                None,
+                &completed,
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("already terminal"));
+
+        let committed: (String, i64, i64) = sqlx::query_as(
+            "SELECT status,
+                    (SELECT COUNT(*) FROM execution_checkpoints
+                     WHERE tenant_id = 'tenant' AND thread_id = 'session'),
+                    (SELECT COUNT(*) FROM agent_event_ledger
+                     WHERE tenant_id = 'tenant' AND thread_id = 'session'
+                       AND event_type = 'runtime.turn_terminal')
+             FROM agent_turns
+             WHERE tenant_id = 'tenant' AND thread_id = 'session' AND id = 'terminal-turn'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(committed, ("completed".into(), 1, 1));
     }
 
     #[tokio::test]
@@ -10490,7 +14207,7 @@ mod tests {
                 .await
                 .unwrap();
             let artifact_id = projection.artifact_id.expect("large output must spill");
-            let persisted: Vec<u8> = sqlx::query_scalar(
+            let persisted_ciphertext: Vec<u8> = sqlx::query_scalar(
                 "SELECT payload_blob FROM artifact_objects
                  WHERE id = ? AND tenant_id = 'tenant' AND owner_scope = 'artifact-session'",
             )
@@ -10498,7 +14215,12 @@ mod tests {
             .fetch_one(&db)
             .await
             .unwrap();
-            assert_eq!(persisted, output.as_bytes());
+            let persisted = agent_gateway::crypto::decrypt_scoped(
+                std::str::from_utf8(&persisted_ciphertext).unwrap(),
+                &agent_gateway::crypto::scoped_aad("artifact.payload", "tenant", &artifact_id),
+            )
+            .unwrap();
+            assert_eq!(persisted.as_bytes(), output.as_bytes());
             let model: String = sqlx::query_scalar(
                 "SELECT payload_json FROM artifact_projections
                  WHERE artifact_id = ? AND projection_kind = 'model'",
@@ -10662,11 +14384,19 @@ mod tests {
         assert_eq!(event.0, None);
         assert_eq!(event.1, "runtime.visible_message");
         assert!(!event.2.contains("sk-fake-visible-secret-1234"));
-        let recovered = agent_gateway::crypto::decrypt(
+        let event_id: String = sqlx::query_scalar(
+            "SELECT event_id FROM agent_event_ledger
+             WHERE tenant_id = 'tenant' AND thread_id = 'visible-session'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let recovered = agent_gateway::crypto::decrypt_scoped(
             event
                 .3
                 .as_deref()
                 .expect("exact recovery payload must be encrypted"),
+            &agent_gateway::crypto::scoped_aad("ledger.raw_payload", "tenant", &event_id),
         )
         .unwrap();
         assert!(recovered.contains("sk-fake-visible-secret-1234"));
@@ -11001,6 +14731,21 @@ mod tests {
         }
     }
 
+    async fn grant_approval_response_capability(db: &SqlitePool, session_id: &str) {
+        sqlx::query(
+            "INSERT INTO capability_tokens
+                (id, tenant_id, user_id, session_id, tool_name, resource_scope,
+                 action_scope, executor_scope, expires_at, remaining_uses)
+             VALUES (?, 'tenant', 'user', ?, 'approval_response', 'interaction:approval',
+                     'execute', 'web', datetime('now', '+1 hour'), 1)",
+        )
+        .bind(format!("approval-response-capability:{session_id}"))
+        .bind(session_id)
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn durable_approval_is_owner_scoped_and_authorizes_exactly_one_dispatch() {
         let db = db().await;
@@ -11014,6 +14759,7 @@ mod tests {
             .unwrap();
         let request = approval_request("turn-approval", "tool-approval");
         kernel.request_approval(&request).await.unwrap();
+        grant_approval_response_capability(&db, "session").await;
 
         let visible = list_runtime_approvals(&db, "tenant", "user", "session")
             .await
@@ -11043,7 +14789,34 @@ mod tests {
             kernel.resolve_approval(&resolution).await.unwrap(),
             runtime::RuntimeApprovalDecision::Approved
         );
-        assert!(kernel.resolve_approval(&resolution).await.is_err());
+        assert_eq!(
+            kernel.resolve_approval(&resolution).await.unwrap(),
+            runtime::RuntimeApprovalDecision::Approved,
+            "an identical response is idempotent"
+        );
+        let (interaction_state, projection_status, resume_outbox): (String, String, String) =
+            sqlx::query_as(
+                "SELECT
+                    (SELECT state FROM durable_interactions
+                     WHERE tenant_id = 'tenant' AND invocation_id = 'tool-approval'),
+                    (SELECT status FROM approval_requests
+                     WHERE tenant_id = 'tenant' AND invocation_id = 'tool-approval'),
+                    (SELECT state FROM durable_interaction_outbox
+                     WHERE tenant_id = 'tenant' AND intent = 'resume'
+                       AND interaction_id = (SELECT id FROM durable_interactions
+                         WHERE tenant_id = 'tenant' AND invocation_id = 'tool-approval'))",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                interaction_state.as_str(),
+                projection_status.as_str(),
+                resume_outbox.as_str()
+            ),
+            ("consumed", "approved", "settled")
+        );
 
         let intent = runtime::RuntimeToolIntent::new(
             "turn-approval",
@@ -11080,6 +14853,7 @@ mod tests {
             .unwrap();
         let request = approval_request("turn-expired", "tool-expired");
         kernel.request_approval(&request).await.unwrap();
+        grant_approval_response_capability(&db, "session").await;
         kernel
             .finish_turn(
                 "turn-expired",
@@ -11107,7 +14881,7 @@ mod tests {
         assert_eq!(turn_status, "suspended");
 
         sqlx::query(
-            "UPDATE approval_requests SET expires_at = '2000-01-01T00:00:00Z'
+            "UPDATE durable_interactions SET expires_at = '2000-01-01T00:00:00Z'
              WHERE tenant_id = 'tenant' AND invocation_id = 'tool-expired'",
         )
         .execute(&db)
@@ -11133,5 +14907,410 @@ mod tests {
         .unwrap();
         assert_eq!(approval_status, "expired");
         assert_eq!(invocation_status, "awaiting_authorization");
+    }
+
+    fn durable_interaction_request(
+        kind: InteractionKind,
+        interaction_id: &str,
+        turn_id: &str,
+    ) -> runtime::RuntimeInteractionRequest {
+        runtime::RuntimeInteractionRequest {
+            interaction_id: interaction_id.into(),
+            kind,
+            turn_id: turn_id.into(),
+            invocation_id: format!("invocation-{interaction_id}"),
+            owner_user_id: "owner".into(),
+            allowed_responder_ids: Vec::new(),
+            capability_requirement: None,
+            request_schema_hash: format!("schema-{interaction_id}"),
+            choice_schema_hash: None,
+            display_projection: serde_json::json!({"title":"external input required"}),
+            idempotency_key: format!("request-{interaction_id}"),
+            expected_turn_revision: 0,
+            expires_at: Some(Utc::now() + Duration::minutes(5)),
+        }
+    }
+
+    #[tokio::test]
+    async fn unified_interactions_survive_restart_enforce_scope_and_resume_exactly_once() {
+        let db = db().await;
+        let kernel =
+            RuntimeExecutionKernel::new(db.clone(), "tenant", "owner", "interaction-session");
+        kernel
+            .start_turn(runtime::RuntimeTurnStart {
+                turn_id: "question-turn".into(),
+                user_input: "ask before continuing".into(),
+            })
+            .await
+            .unwrap();
+        let request = durable_interaction_request(
+            InteractionKind::UserQuestion,
+            "question-interaction",
+            "question-turn",
+        );
+        kernel.request_interaction(&request).await.unwrap();
+        drop(kernel);
+
+        let restarted =
+            RuntimeExecutionKernel::new(db.clone(), "tenant", "owner", "interaction-session");
+        restarted.recover().await.unwrap();
+        let wrong_responder =
+            RuntimeExecutionKernel::new(db.clone(), "tenant", "other", "interaction-session");
+        let response = runtime::RuntimeInteractionResolution {
+            interaction_id: "question-interaction".into(),
+            turn_id: "question-turn".into(),
+            responder_user_id: "owner".into(),
+            state: InteractionState::Responded,
+            response_projection: Some(serde_json::json!({"choice":"continue"})),
+            encrypted_secret_ref: None,
+            idempotency_key: "question-answer".into(),
+        };
+        assert!(wrong_responder
+            .respond_interaction(&response)
+            .await
+            .is_err());
+        let answered = restarted.respond_interaction(&response).await.unwrap();
+        assert_eq!(answered.state, InteractionState::Responded);
+        assert_eq!(
+            restarted
+                .respond_interaction(&response)
+                .await
+                .unwrap()
+                .state,
+            InteractionState::Responded,
+            "duplicate response must return the original durable result"
+        );
+        assert_eq!(
+            restarted
+                .consume_interaction("question-interaction", "question-turn", "question-answer")
+                .await
+                .unwrap()
+                .state,
+            InteractionState::Consumed
+        );
+        assert_eq!(
+            restarted
+                .consume_interaction("question-interaction", "question-turn", "question-answer")
+                .await
+                .unwrap()
+                .state,
+            InteractionState::Consumed,
+            "duplicate resume claim must not dispatch a second turn"
+        );
+        let (turn_status, resume_count, consumed_events): (String, i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT status FROM agent_turns WHERE tenant_id = 'tenant'
+                  AND thread_id = 'interaction-session' AND id = 'question-turn'),
+                (SELECT COUNT(*) FROM durable_interaction_outbox
+                  WHERE tenant_id = 'tenant' AND interaction_id = 'question-interaction'
+                    AND intent = 'resume' AND state = 'settled'),
+                (SELECT COUNT(*) FROM agent_event_ledger
+                  WHERE tenant_id = 'tenant' AND thread_id = 'interaction-session'
+                    AND event_type = 'runtime.interaction_consumed')",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(turn_status, "running");
+        assert_eq!(resume_count, 1);
+        assert_eq!(consumed_events, 1);
+    }
+
+    #[tokio::test]
+    async fn production_user_question_command_lists_answers_and_consumes_after_restart() {
+        let db = db().await;
+        let kernel =
+            RuntimeExecutionKernel::new(db.clone(), "tenant", "owner", "question-command-session");
+        kernel
+            .start_turn(runtime::RuntimeTurnStart {
+                turn_id: "question-command-turn".into(),
+                user_input: "ask the owner".into(),
+            })
+            .await
+            .unwrap();
+        kernel
+            .request_interaction(&durable_interaction_request(
+                InteractionKind::UserQuestion,
+                "question-command",
+                "question-command-turn",
+            ))
+            .await
+            .unwrap();
+        drop(kernel);
+
+        let visible = list_runtime_interactions(&db, "tenant", "owner", "question-command-session")
+            .await
+            .unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].interaction_id, "question-command");
+        assert!(
+            list_runtime_interactions(&db, "tenant", "other", "question-command-session",)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let result = respond_to_runtime_user_question(
+            &db,
+            "tenant",
+            "owner",
+            "owner",
+            "question-command-session",
+            "question-command",
+            "continue with the confirmed scope",
+            "answer-once",
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.tool_use_id, "invocation-question-command");
+        assert!(result.output.contains("confirmed scope"));
+        let duplicate = respond_to_runtime_user_question(
+            &db,
+            "tenant",
+            "owner",
+            "owner",
+            "question-command-session",
+            "question-command",
+            "continue with the confirmed scope",
+            "answer-once",
+        )
+        .await
+        .unwrap();
+        assert_eq!(duplicate, result);
+        assert!(respond_to_runtime_user_question(
+            &db,
+            "tenant",
+            "owner",
+            "other",
+            "question-command-session",
+            "question-command",
+            "replace the answer",
+            "cross-owner",
+        )
+        .await
+        .is_err());
+        let (state, resume_events): (String, i64) = sqlx::query_as(
+            "SELECT state,
+                    (SELECT COUNT(*) FROM agent_event_ledger
+                     WHERE tenant_id = 'tenant'
+                       AND thread_id = 'question-command-session'
+                       AND event_type = 'runtime.interaction_consumed')
+             FROM durable_interactions WHERE id = 'question-command'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(state, "consumed");
+        assert_eq!(resume_events, 1);
+    }
+
+    #[tokio::test]
+    async fn interaction_resume_rechecks_and_atomically_consumes_capability() {
+        let db = db().await;
+        let kernel = RuntimeExecutionKernel::new(
+            db.clone(),
+            "tenant",
+            "owner",
+            "capability-interaction-session",
+        );
+        kernel
+            .start_turn(runtime::RuntimeTurnStart {
+                turn_id: "capability-interaction-turn".into(),
+                user_input: "request governed input".into(),
+            })
+            .await
+            .unwrap();
+        let mut request = durable_interaction_request(
+            InteractionKind::ExternalAuthorization,
+            "capability-interaction",
+            "capability-interaction-turn",
+        );
+        request.capability_requirement = Some("respond_external_authorization".into());
+        kernel.request_interaction(&request).await.unwrap();
+        let resolution = runtime::RuntimeInteractionResolution {
+            interaction_id: "capability-interaction".into(),
+            turn_id: "capability-interaction-turn".into(),
+            responder_user_id: "owner".into(),
+            state: InteractionState::Granted,
+            response_projection: Some(serde_json::json!({"grant":"opaque"})),
+            encrypted_secret_ref: None,
+            idempotency_key: "capability-response".into(),
+        };
+        assert!(kernel.respond_interaction(&resolution).await.is_err());
+        sqlx::query(
+            "INSERT INTO capability_tokens
+                (id, tenant_id, user_id, session_id, tool_name, resource_scope,
+                 action_scope, executor_scope, expires_at, remaining_uses)
+             VALUES ('interaction-capability', 'tenant', 'owner',
+                     'capability-interaction-session', 'external_authorization',
+                     'interaction:capability-interaction',
+                     'respond_external_authorization', 'web',
+                     datetime('now', '+1 hour'), 1)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        kernel.respond_interaction(&resolution).await.unwrap();
+        kernel
+            .consume_interaction(
+                "capability-interaction",
+                "capability-interaction-turn",
+                "capability-response",
+            )
+            .await
+            .unwrap();
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT remaining_uses FROM capability_tokens
+             WHERE id = 'interaction-capability'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn credential_and_oauth_interactions_store_only_governed_projections() {
+        let db = db().await;
+        for (index, kind) in [
+            InteractionKind::CredentialRequest,
+            InteractionKind::ExternalAuthorization,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let session_id = format!("secret-session-{index}");
+            let turn_id = format!("secret-turn-{index}");
+            let interaction_id = format!("secret-interaction-{index}");
+            let kernel =
+                RuntimeExecutionKernel::new(db.clone(), "tenant", "owner", session_id.clone());
+            kernel
+                .start_turn(runtime::RuntimeTurnStart {
+                    turn_id: turn_id.clone(),
+                    user_input: "authorize externally".into(),
+                })
+                .await
+                .unwrap();
+            kernel
+                .request_interaction(&durable_interaction_request(
+                    kind,
+                    &interaction_id,
+                    &turn_id,
+                ))
+                .await
+                .unwrap();
+            let resolution = if kind == InteractionKind::CredentialRequest {
+                runtime::RuntimeInteractionResolution {
+                    interaction_id: interaction_id.clone(),
+                    turn_id: turn_id.clone(),
+                    responder_user_id: "owner".into(),
+                    state: InteractionState::Responded,
+                    response_projection: None,
+                    encrypted_secret_ref: Some("secret://tenant/credential-1".into()),
+                    idempotency_key: format!("secret-response-{index}"),
+                }
+            } else {
+                runtime::RuntimeInteractionResolution {
+                    interaction_id: interaction_id.clone(),
+                    turn_id: turn_id.clone(),
+                    responder_user_id: "owner".into(),
+                    state: InteractionState::Granted,
+                    response_projection: Some(serde_json::json!({"grantId":"opaque-grant"})),
+                    encrypted_secret_ref: None,
+                    idempotency_key: format!("secret-response-{index}"),
+                }
+            };
+            let answered = kernel.respond_interaction(&resolution).await.unwrap();
+            kernel
+                .consume_interaction(&interaction_id, &turn_id, &resolution.idempotency_key)
+                .await
+                .unwrap();
+            if kind == InteractionKind::CredentialRequest {
+                assert!(answered.response_projection.is_none());
+                assert_eq!(
+                    answered.encrypted_secret_ref.as_deref(),
+                    Some("secret://tenant/credential-1")
+                );
+                let rejected = kernel
+                    .respond_interaction(&runtime::RuntimeInteractionResolution {
+                        interaction_id: interaction_id.clone(),
+                        turn_id: turn_id.clone(),
+                        responder_user_id: "owner".into(),
+                        state: InteractionState::Responded,
+                        response_projection: Some(serde_json::json!({"password":"plaintext"})),
+                        encrypted_secret_ref: None,
+                        idempotency_key: "plaintext-retry".into(),
+                    })
+                    .await;
+                assert!(rejected.is_err());
+            }
+        }
+        let plaintext_leaks: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM durable_interactions
+             WHERE response_projection_json LIKE '%plaintext%'
+                OR display_projection_json LIKE '%plaintext%'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(plaintext_leaks, 0);
+    }
+
+    #[tokio::test]
+    async fn interaction_create_fault_rolls_back_turn_event_projection_and_outbox() {
+        let db = db().await;
+        let kernel =
+            RuntimeExecutionKernel::new(db.clone(), "tenant", "owner", "rollback-interaction");
+        kernel
+            .start_turn(runtime::RuntimeTurnStart {
+                turn_id: "rollback-turn".into(),
+                user_input: "wait for a response".into(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_interaction_outbox
+             BEFORE INSERT ON durable_interaction_outbox
+             BEGIN SELECT RAISE(ABORT, 'injected interaction outbox failure'); END",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let error = kernel
+            .request_interaction(&durable_interaction_request(
+                InteractionKind::UserQuestion,
+                "rollback-request",
+                "rollback-turn",
+            ))
+            .await
+            .expect_err("the complete interaction command must roll back");
+        assert!(error
+            .to_string()
+            .contains("injected interaction outbox failure"));
+        let (interaction_count, event_count, turn_status): (i64, i64, String) = sqlx::query_as(
+            "SELECT
+                (SELECT COUNT(*) FROM durable_interactions WHERE id = 'rollback-request'),
+                (SELECT COUNT(*) FROM agent_event_ledger
+                  WHERE tenant_id = 'tenant' AND thread_id = 'rollback-interaction'
+                    AND event_type = 'runtime.interaction_requested'),
+                (SELECT status FROM agent_turns WHERE tenant_id = 'tenant'
+                  AND thread_id = 'rollback-interaction' AND id = 'rollback-turn')",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(interaction_count, 0);
+        assert_eq!(event_count, 0);
+        assert_eq!(turn_status, "running");
+    }
+
+    #[tokio::test]
+    async fn sqlite_adapter_satisfies_the_backend_neutral_memory_contract() {
+        let db = db().await;
+        memory_engine::exercise_repository_contract(
+            memory_engine::SqliteMemoryRepositoryAdapter::new(db),
+        )
+        .await
+        .unwrap();
     }
 }

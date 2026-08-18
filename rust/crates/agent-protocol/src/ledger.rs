@@ -14,7 +14,7 @@ pub struct AppendReceipt {
     pub sequence: u64,
     pub deduplicated: bool,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CorruptionKind {
     PayloadHash,
     SequenceGap,
@@ -81,7 +81,7 @@ impl EventLedger {
     }
     pub fn append(
         &mut self,
-        handle: WriterHandle,
+        handle: &WriterHandle,
         event: AgentEventEnvelope,
     ) -> Result<AppendReceipt, LedgerError> {
         let log = self
@@ -139,7 +139,7 @@ impl EventLedger {
     #[cfg(test)]
     pub fn append_uncommitted_for_test(
         &mut self,
-        handle: WriterHandle,
+        handle: &WriterHandle,
         event: AgentEventEnvelope,
     ) -> Result<(), LedgerError> {
         let log = self
@@ -152,7 +152,7 @@ impl EventLedger {
             .filter(|l| l.worker == handle.worker && l.fencing == handle.fencing)
             .is_none()
         {
-            return Err(LedgerError::StaleWriter(handle.thread_id));
+            return Err(LedgerError::StaleWriter(handle.thread_id.clone()));
         }
         log.records.push(LedgerRecord {
             event,
@@ -160,6 +160,7 @@ impl EventLedger {
         });
         Ok(())
     }
+    #[must_use]
     pub fn records(&self, thread_id: &str) -> Option<Vec<LedgerRecord>> {
         self.threads.get(thread_id).map(|l| l.records.clone())
     }
@@ -223,7 +224,7 @@ impl EventLedger {
             CorruptionKind::PayloadHash => record.event.payload_hash = "corrupt".into(),
             CorruptionKind::SequenceGap => record.event.sequence += 2,
             CorruptionKind::UnknownRequiredEvent => record.event.schema_version = u32::MAX,
-        };
+        }
         Ok(())
     }
 }
