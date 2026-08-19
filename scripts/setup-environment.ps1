@@ -1,6 +1,24 @@
 param([switch]$Install)
 
 $ErrorActionPreference = 'Stop'
+
+function Restore-RipgrepPath {
+    if (Get-Command rg -ErrorAction SilentlyContinue) { return }
+
+    $Candidates = @()
+    if ($env:AOS_RG_PATH) { $Candidates += $env:AOS_RG_PATH }
+    if ($env:RUNNER_TEMP) { $Candidates += (Join-Path $env:RUNNER_TEMP 'aos-tools\rg.exe') }
+
+    foreach ($Candidate in $Candidates) {
+        if (-not (Test-Path $Candidate -PathType Leaf)) { continue }
+        $Directory = Split-Path ([IO.Path]::GetFullPath($Candidate)) -Parent
+        $env:Path = "$Directory;$env:Path"
+        if (Get-Command rg -ErrorAction SilentlyContinue) { return }
+    }
+}
+
+Restore-RipgrepPath
+
 $Required = @(
     @{ Command = 'git'; Package = 'Git.Git'; Label = 'Git' },
     @{ Command = 'rg'; Package = 'BurntSushi.ripgrep.MSVC'; Label = 'ripgrep' },
