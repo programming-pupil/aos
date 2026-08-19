@@ -154,7 +154,7 @@ impl GitlabProjectManager {
         let branch = req.branch.unwrap_or_else(|| "main".to_string());
 
         // Encrypt the token before storing
-        let stored_token = req.gitlab_token.map(|t| encrypt_token(&t));
+        let stored_token = req.gitlab_token.map(|t| encrypt_repository_token(&t));
 
         sqlx::query(
             r"
@@ -395,7 +395,7 @@ impl GitlabProjectManager {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(encrypt_token)
+            .map(encrypt_repository_token)
             .or(current_token);
 
         let duplicate: Option<(String,)> = sqlx::query_as(
@@ -681,7 +681,7 @@ impl GitlabProjectManager {
             name,
             url,
             branch,
-            gitlab_token: token.map(|value| decrypt_token(&value)),
+            gitlab_token: token.map(|value| decrypt_repository_token(&value)),
             description,
             clone_path,
             is_cloned,
@@ -830,23 +830,14 @@ const TOKEN_NONCE_LEN: usize = 12;
 /// Existing deployments that stored the legacy XOR/base64 format remain
 /// readable through `decrypt_token`, but all new writes use authenticated
 /// encryption.
-fn encrypt_token(token: &str) -> String {
-    let cipher = Aes256Gcm::new_from_slice(&token_encryption_key())
-        .expect("SHA-256 token encryption key must be 32 bytes");
-    let nonce_bytes = token_nonce();
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let encrypted = cipher
-        .encrypt(nonce, token.as_bytes())
-        .expect("AES-GCM token encryption failed");
-    format!(
-        "{}{}:{}",
-        TOKEN_CIPHERTEXT_PREFIX,
-        BASE64_STANDARD.encode(nonce_bytes),
-        BASE64_STANDARD.encode(encrypted)
-    )
+pub fn encrypt_repository_token(token: &str) -> String {
+    crate::crypto::encrypt(token).expect("configured repository-token encryption must succeed")
 }
 
-fn decrypt_token(encrypted: &str) -> String {
+pub fn decrypt_repository_token(encrypted: &str) -> String {
+    if encrypted.starts_with("aosenc:v1:") {
+        return crate::crypto::decrypt(encrypted).unwrap_or_default();
+    }
     if let Some(value) = encrypted.strip_prefix(TOKEN_CIPHERTEXT_PREFIX) {
         return decrypt_aes_gcm_token(value).unwrap_or_default();
     }
@@ -871,14 +862,6 @@ fn token_encryption_key() -> [u8; 32] {
         }
     });
     Sha256::digest(key.as_bytes()).into()
-}
-
-fn token_nonce() -> [u8; TOKEN_NONCE_LEN] {
-    let random = uuid::Uuid::new_v4();
-    let digest = Sha256::digest(random.as_bytes());
-    let mut nonce = [0u8; TOKEN_NONCE_LEN];
-    nonce.copy_from_slice(&digest[..TOKEN_NONCE_LEN]);
-    nonce
 }
 
 fn decrypt_aes_gcm_token(value: &str) -> Option<String> {

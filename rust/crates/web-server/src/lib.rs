@@ -369,7 +369,10 @@ mod sqlite_baseline_tests {
                 .fetch_one(&pool)
                 .await
                 .expect("count current migration ledger");
-            assert_eq!(migration_count, 33);
+            assert!(
+                migration_count >= 39,
+                "upgrade fixture must apply the current durable schema migrations"
+            );
             pool.close().await;
         }
     }

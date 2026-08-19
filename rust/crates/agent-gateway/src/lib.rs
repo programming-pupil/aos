@@ -58,7 +58,10 @@ pub use events::{
     AgentEvent, CompactionRecord, SessionMetadata, StreamingTurnResult, TokenUsageRecord,
     ToolCallRecord, TurnResult,
 };
-pub use gitlab::{AddProjectRequest, GitlabProject, GitlabProjectManager, UpdateProjectRequest};
+pub use gitlab::{
+    decrypt_repository_token, AddProjectRequest, GitlabProject, GitlabProjectManager,
+    UpdateProjectRequest,
+};
 pub use path_safety::PathValidator;
 pub use runtime_builder::{CompactionHookContext, CompactionHookFactory, RuntimeBuilder};
 pub use session_manager::{

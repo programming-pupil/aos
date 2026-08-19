@@ -20,6 +20,8 @@ export type {
   AgentSessionStreamHandlers,
   RuntimeApprovalPaused,
   RuntimeApprovalRequest,
+  RuntimeQuestionPaused,
+  RuntimeQuestionRequest,
   SuperAssistantAnswer,
 } from './agent';
 export { agentOpsApi } from './agentOps';

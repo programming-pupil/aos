@@ -498,7 +498,9 @@ pub async fn persist_unified_memory_candidate(
     };
     if let Some(session_id) = session_id {
         let state = get_thread_memory_state(db, tenant_id, user_id, session_id).await;
-        if !state.generate_memories || state.pollution_state == "disabled" {
+        if !state.generate_memories
+            || matches!(state.pollution_state.as_str(), "polluted" | "disabled")
+        {
             return;
         }
     }
@@ -1452,6 +1454,9 @@ async fn persist_structured_memory_projection_in_transaction(
             .execute(&mut **tx)
             .await?;
             for projection_id in old_projection_ids {
+                if projection_id == item_id {
+                    continue;
+                }
                 sqlx::query(
                     "UPDATE agent_memory_items SET enabled = 0, updated_at = CURRENT_TIMESTAMP
                      WHERE tenant_id = ? AND user_id = ? AND id = ?",
@@ -1526,6 +1531,11 @@ async fn list_unified_memory_items_page(
         .push_bind(tenant_id)
         .push(" AND user_id = ")
         .push_bind(user_id);
+    if !include_disabled {
+        query.push(
+            " AND EXISTS (SELECT 1 FROM structured_memory_facts fact WHERE fact.projection_memory_id = agent_memory_items.id AND fact.tenant_id = agent_memory_items.tenant_id AND fact.user_id = agent_memory_items.user_id AND fact.current = 1)",
+        );
+    }
     if let Some(scope) = scope {
         query.push(" AND scope = ").push_bind(scope);
     }
@@ -1811,7 +1821,17 @@ pub(crate) async fn update_memory_item_internal(
         .as_ref()
         .map(serde_json::to_string)
         .transpose()?;
-
+    let source_type = req.source_type.unwrap_or(existing.source_type);
+    let confidence = req
+        .confidence
+        .unwrap_or(existing.confidence)
+        .clamp(0.0, 1.0);
+    let pinned = req.pinned.unwrap_or(existing.pinned);
+    let enabled = req.enabled.unwrap_or(existing.enabled);
+    let stale_at = req.stale_at.flatten().or(existing.stale_at);
+    let verified_at = req.verified_at.flatten().or(existing.verified_at);
+    let mut tx = db.begin().await?;
+    crate::acquire_sqlite_write_lock(&mut tx).await?;
     sqlx::query(
         r#"
         UPDATE agent_memory_items
@@ -1829,21 +1849,52 @@ pub(crate) async fn update_memory_item_internal(
     .bind(&memory_type)
     .bind(&content)
     .bind(content_hash)
-    .bind(req.source_type.unwrap_or(existing.source_type))
-    .bind(req.confidence.unwrap_or(existing.confidence).clamp(0.0, 1.0))
-    .bind(if req.pinned.unwrap_or(existing.pinned) { 1 } else { 0 })
-    .bind(if req.enabled.unwrap_or(existing.enabled) { 1 } else { 0 })
-    .bind(req.stale_at.flatten().or(existing.stale_at))
-    .bind(req.verified_at.flatten().or(existing.verified_at))
-    .bind(metadata_json)
+    .bind(&source_type)
+    .bind(confidence)
+    .bind(if pinned { 1 } else { 0 })
+    .bind(if enabled { 1 } else { 0 })
+    .bind(stale_at)
+    .bind(verified_at)
+    .bind(metadata_json.as_deref())
     .bind(embedding_model)
     .bind(embedding_dimensions)
     .bind(embedding_json)
     .bind(tenant_id)
     .bind(user_id)
     .bind(memory_id)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
+    if enabled {
+        persist_structured_memory_projection_in_transaction(
+            &mut tx,
+            tenant_id,
+            user_id,
+            memory_id,
+            &scope,
+            &app,
+            session_id.as_deref(),
+            &memory_type,
+            &content,
+            &source_type,
+            confidence,
+            pinned,
+            metadata_json.as_deref(),
+        )
+        .await?;
+    } else {
+        sqlx::query(
+            "UPDATE structured_memory_facts
+             SET current = 0, valid_until = COALESCE(valid_until, CURRENT_TIMESTAMP),
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE tenant_id = ? AND user_id = ? AND projection_memory_id = ? AND current = 1",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(memory_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
     let item = get_unified_memory_item(db, tenant_id, user_id, memory_id)
         .await?
         .ok_or_else(|| AppError::NotFound("memory not found".to_string()))?;
@@ -1897,6 +1948,18 @@ pub(crate) async fn delete_memory_item_internal(
         tx.commit().await?;
         return Ok(false);
     }
+    sqlx::query(
+        "UPDATE structured_memory_facts
+         SET current = 0, valid_until = COALESCE(valid_until, CURRENT_TIMESTAMP),
+             candidate_json = json_set(candidate_json, '$.forgotten', json('true')),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE tenant_id = ? AND user_id = ? AND projection_memory_id = ? AND current = 1",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(memory_id)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query(
         "DELETE FROM agent_memory_relations
          WHERE tenant_id = ? AND user_id = ?
@@ -2155,6 +2218,34 @@ async fn consolidate_memory_internal(
             temporal_relation,
             memory_engine::TemporalRelation::Supersedes
         ) {
+            let successor_fact_id = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM structured_memory_facts
+                 WHERE tenant_id = ? AND user_id = ? AND projection_memory_id = ? AND current = 1
+                 ORDER BY updated_at DESC LIMIT 1",
+            )
+            .bind(tenant_id)
+            .bind(user_id)
+            .bind(&relation.to_memory_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(successor_fact_id) = successor_fact_id else {
+                return Err(AppError::ValidationError(
+                    "superseding memory has no canonical structured fact".to_string(),
+                ));
+            };
+            sqlx::query(
+                "UPDATE structured_memory_facts
+                 SET current = 0, superseded_by = ?,
+                     valid_until = COALESCE(valid_until, CURRENT_TIMESTAMP),
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE tenant_id = ? AND user_id = ? AND projection_memory_id = ? AND current = 1",
+            )
+            .bind(&successor_fact_id)
+            .bind(tenant_id)
+            .bind(user_id)
+            .bind(&relation.from_memory_id)
+            .execute(&mut *tx)
+            .await?;
             sqlx::query(
                 "UPDATE agent_memory_items
                  SET enabled = 0, stale_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
@@ -2300,7 +2391,7 @@ pub(crate) async fn create_memory_item_internal(
         .bind(&existing_id)
         .execute(&mut *tx)
         .await?;
-        if let Err(error) = persist_structured_memory_projection_in_transaction(
+        persist_structured_memory_projection_in_transaction(
             &mut tx,
             tenant_id,
             user_id,
@@ -2315,16 +2406,7 @@ pub(crate) async fn create_memory_item_internal(
             pinned != 0,
             metadata_json.as_deref(),
         )
-        .await
-        {
-            if !matches!(&error, sqlx::Error::Database(db_error) if db_error.message().contains("no such table: structured_memory_facts"))
-            {
-                let _ = tx.rollback().await;
-                return Err(AppError::Internal(format!(
-                    "structured memory projection failed: {error}"
-                )));
-            }
-        }
+        .await?;
         tx.commit().await?;
         return get_unified_memory_item(db, tenant_id, user_id, &existing_id)
             .await?
@@ -2380,7 +2462,7 @@ pub(crate) async fn create_memory_item_internal(
     .bind(embedding.as_ref().and_then(|item| serialize_memory_vector(&item.vector)))
     .execute(&mut *tx)
     .await?;
-    if let Err(error) = persist_structured_memory_projection_in_transaction(
+    persist_structured_memory_projection_in_transaction(
         &mut tx,
         tenant_id,
         user_id,
@@ -2395,16 +2477,7 @@ pub(crate) async fn create_memory_item_internal(
         pinned != 0,
         metadata_json.as_deref(),
     )
-    .await
-    {
-        if !matches!(&error, sqlx::Error::Database(db_error) if db_error.message().contains("no such table: structured_memory_facts"))
-        {
-            let _ = tx.rollback().await;
-            return Err(AppError::Internal(format!(
-                "structured memory projection failed: {error}"
-            )));
-        }
-    }
+    .await?;
     tx.commit().await?;
     let item = sqlx::query(
         r#"
@@ -2448,12 +2521,13 @@ pub(crate) async fn get_unified_memory_item(
                CAST(created_at AS TEXT) AS created_at, CAST(updated_at AS TEXT) AS updated_at
         FROM agent_memory_items
         WHERE tenant_id = ? AND user_id = ? AND id = ?
-          AND (source_type <> 'compaction' OR EXISTS (
+          AND EXISTS (
               SELECT 1 FROM structured_memory_facts fact
               WHERE fact.projection_memory_id = agent_memory_items.id
                 AND fact.tenant_id = agent_memory_items.tenant_id
+                AND fact.user_id = agent_memory_items.user_id
                 AND fact.current = 1
-          ))
+          )
         "#,
     )
     .bind(tenant_id)
@@ -2489,12 +2563,13 @@ pub(crate) async fn list_unified_memory_items(
                 FROM agent_memory_items
                 WHERE tenant_id = ? AND user_id = ? AND enabled = 1 AND session_id = ?
                   AND (? IS NULL OR app = ? OR app = 'shared')
-                  AND (source_type <> 'compaction' OR EXISTS (
+                  AND EXISTS (
                       SELECT 1 FROM structured_memory_facts fact
                       WHERE fact.projection_memory_id = agent_memory_items.id
                         AND fact.tenant_id = agent_memory_items.tenant_id
+                        AND fact.user_id = agent_memory_items.user_id
                         AND fact.current = 1
-                  ))
+                  )
                 ORDER BY pinned DESC, updated_at DESC, id DESC
                 LIMIT ?
             ),
@@ -2503,12 +2578,13 @@ pub(crate) async fn list_unified_memory_items(
                 FROM agent_memory_items
                 WHERE tenant_id = ? AND user_id = ? AND enabled = 1 AND session_id IS NULL
                   AND (? IS NULL OR app = ? OR app = 'shared')
-                  AND (source_type <> 'compaction' OR EXISTS (
+                  AND EXISTS (
                       SELECT 1 FROM structured_memory_facts fact
                       WHERE fact.projection_memory_id = agent_memory_items.id
                         AND fact.tenant_id = agent_memory_items.tenant_id
+                        AND fact.user_id = agent_memory_items.user_id
                         AND fact.current = 1
-                  ))
+                  )
                 ORDER BY pinned DESC, updated_at DESC, id DESC
                 LIMIT ?
             ),
@@ -2568,9 +2644,11 @@ pub(crate) async fn list_unified_memory_items(
         .push_bind(tenant_id)
         .push(" AND user_id = ")
         .push_bind(user_id);
-    query.push(
-        " AND (source_type <> 'compaction' OR EXISTS (SELECT 1 FROM structured_memory_facts fact WHERE fact.projection_memory_id = agent_memory_items.id AND fact.tenant_id = agent_memory_items.tenant_id AND fact.current = 1))",
-    );
+    if !include_disabled {
+        query.push(
+            " AND EXISTS (SELECT 1 FROM structured_memory_facts fact WHERE fact.projection_memory_id = agent_memory_items.id AND fact.tenant_id = agent_memory_items.tenant_id AND fact.user_id = agent_memory_items.user_id AND fact.current = 1)",
+        );
+    }
     if let Some(scope) = scope {
         query.push(" AND scope = ").push_bind(scope);
     }
@@ -4241,6 +4319,36 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert memory fixture");
+        sqlx::query(
+            r#"
+            INSERT INTO structured_memory_facts (
+                id, tenant_id, user_id, scope, app, session_id, channel, kind,
+                subject_json, predicate, value_json, text, evidence_id, evidence_hash,
+                observed_at, confidence, sensitivity, current, projection_memory_id,
+                candidate_json, created_at, updated_at
+            ) VALUES (?, 'tenant', 'user', ?, 'chat', ?, 'long_term_memory', 'note',
+                      '{"memoryType":"note"}', 'note', ?, ?, ?, ?, ?, 1.0, 'internal',
+                      1, ?, '{}', ?, ?)
+            "#,
+        )
+        .bind(format!("fact-{id}"))
+        .bind(if session_id.is_some() {
+            "session"
+        } else {
+            "global"
+        })
+        .bind(session_id)
+        .bind(serde_json::Value::String(format!("memory {id}")).to_string())
+        .bind(format!("memory {id}"))
+        .bind(format!("memory:{id}"))
+        .bind(format!("hash:{id}"))
+        .bind(updated_at)
+        .bind(id)
+        .bind(updated_at)
+        .bind(updated_at)
+        .execute(pool)
+        .await
+        .expect("insert structured memory fixture");
     }
 
     fn test_memory_item(content: &str) -> AgentMemoryItem {
@@ -4295,6 +4403,29 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert consolidation fixture");
+        sqlx::query(
+            r#"
+            INSERT INTO structured_memory_facts (
+                id, tenant_id, user_id, scope, app, session_id, channel, kind,
+                subject_json, predicate, value_json, text, evidence_id, evidence_hash,
+                observed_at, confidence, sensitivity, current, projection_memory_id,
+                candidate_json, created_at, updated_at
+            ) VALUES (?, ?, ?, 'global', 'chat', NULL, 'long_term_memory', 'note',
+                      '{"memoryType":"note"}', 'note', ?, ?, ?, ?, CURRENT_TIMESTAMP,
+                      1.0, 'internal', 1, ?, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            "#,
+        )
+        .bind(format!("fact-{tenant_id}-{user_id}-{id}"))
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(serde_json::Value::String(format!("memory {id}")).to_string())
+        .bind(format!("memory {id}"))
+        .bind(format!("memory:{id}"))
+        .bind(format!("hash:{id}"))
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("insert consolidation structured fact");
     }
 
     fn consolidation_request(

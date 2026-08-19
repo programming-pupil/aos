@@ -267,6 +267,7 @@ pub enum SessionTurnStatus {
     Suspended,
     Completed,
     Failed,
+    Cancelled,
     RolledBack,
 }
 
@@ -2585,6 +2586,7 @@ impl SessionTurnStatus {
             Self::Suspended => "suspended",
             Self::Completed => "completed",
             Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
             Self::RolledBack => "rolled_back",
         }
     }
@@ -2595,6 +2597,7 @@ impl SessionTurnStatus {
             "suspended" => Ok(Self::Suspended),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
             "rolled_back" => Ok(Self::RolledBack),
             other => Err(SessionError::Format(format!(
                 "unsupported turn status: {other}"

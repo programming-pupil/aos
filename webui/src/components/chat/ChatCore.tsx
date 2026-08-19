@@ -75,6 +75,7 @@ import {
   streamPmResearchTask,
   type AgentSessionStreamHandlers,
   type RuntimeApprovalPaused,
+  type RuntimeQuestionPaused,
   type AgentManualCompactionResult,
   type AgentMemoryCitation,
   type PmTaskImageInput,
@@ -4133,6 +4134,10 @@ export function ChatCore({
   const [approvalPaused, setApprovalPaused] = useState<RuntimeApprovalPaused | null>(null);
   const [approvalResolvingId, setApprovalResolvingId] = useState<string | null>(null);
   const approvalPausedRef = useRef<RuntimeApprovalPaused | null>(null);
+  const [questionPaused, setQuestionPaused] = useState<RuntimeQuestionPaused | null>(null);
+  const [questionResolving, setQuestionResolving] = useState(false);
+  const [questionAnswers, setQuestionAnswers] = useState<Record<string, string>>({});
+  const questionPausedRef = useRef<RuntimeQuestionPaused | null>(null);
   const streamHandlersRef = useRef<SessionStreamHandlers | null>(null);
   const loadSessionMessagesRef = useRef<((sessionId: string | null) => Promise<void>) | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
@@ -4313,6 +4318,10 @@ export function ChatCore({
     approvalPausedRef.current = null;
     setApprovalPaused(null);
     setApprovalResolvingId(null);
+    questionPausedRef.current = null;
+    setQuestionPaused(null);
+    setQuestionResolving(false);
+    setQuestionAnswers({});
     if (streamHandlersRef.current?.sessionId !== activeSessionId) {
       streamHandlersRef.current = null;
     }
@@ -4338,6 +4347,23 @@ export function ChatCore({
       .catch(() => {
         // A missing approval projection must not prevent the normal history view.
       });
+    void agentApi
+      .listSessionQuestions(activeSessionId)
+      .then(({ questions }) => {
+        if (cancelled || questions.length === 0) return;
+        const paused: RuntimeQuestionPaused = {
+          sessionId: activeSessionId,
+          runtimeTurnId: questions[0].turnId,
+          questions,
+        };
+        questionPausedRef.current = paused;
+        setQuestionPaused(paused);
+        setIsStreaming(false);
+        onStreamingChange?.(false);
+      })
+      .catch(() => {
+        // A missing question projection must not prevent the normal history view.
+      });
     return () => {
       cancelled = true;
     };
@@ -4358,6 +4384,14 @@ export function ChatCore({
             approvalPausedRef.current = paused;
             setApprovalPaused(paused);
             setApprovalResolvingId(null);
+            setIsStreaming(false);
+            onStreamingChange?.(false);
+          },
+          onQuestionRequired: (paused: RuntimeQuestionPaused) => {
+            if (activeSessionIdRef.current !== activeSessionId) return;
+            questionPausedRef.current = paused;
+            setQuestionPaused(paused);
+            setQuestionResolving(false);
             setIsStreaming(false);
             onStreamingChange?.(false);
           },
@@ -4394,6 +4428,64 @@ export function ChatCore({
     },
     [activeSessionId, approvalResolvingId, onStreamingChange],
   );
+  const resolvePendingQuestions = useCallback(() => {
+    if (!activeSessionId || !questionPaused || questionResolving) return;
+    const answers = questionPaused.questions.map((question) => ({
+      requestId: question.requestId,
+      answer: (questionAnswers[question.requestId] ?? "").trim(),
+    }));
+    if (answers.some((answer) => answer.answer.length === 0)) return;
+    const handlers = approvalResumeHandlers(
+      activeSessionId,
+      streamHandlersRef.current,
+      {
+        onApprovalRequired: (paused) => {
+          if (activeSessionIdRef.current !== activeSessionId) return;
+          approvalPausedRef.current = paused;
+          setApprovalPaused(paused);
+          setQuestionResolving(false);
+          setIsStreaming(false);
+          onStreamingChange?.(false);
+        },
+        onQuestionRequired: (paused) => {
+          if (activeSessionIdRef.current !== activeSessionId) return;
+          questionPausedRef.current = paused;
+          setQuestionPaused(paused);
+          setQuestionResolving(false);
+          setIsStreaming(false);
+          onStreamingChange?.(false);
+        },
+        onStreamEnd: () => {
+          if (activeSessionIdRef.current !== activeSessionId) return;
+          questionPausedRef.current = null;
+          setQuestionPaused(null);
+          setQuestionAnswers({});
+          setQuestionResolving(false);
+          setIsStreaming(false);
+          onStreamingChange?.(false);
+          void loadSessionMessagesRef.current?.(activeSessionId);
+        },
+        onError: () => {
+          if (activeSessionIdRef.current !== activeSessionId) return;
+          setQuestionResolving(false);
+          setIsStreaming(false);
+          onStreamingChange?.(false);
+        },
+      },
+    );
+    setQuestionResolving(true);
+    setIsStreaming(true);
+    onStreamingChange?.(true);
+    abortRef.current = streamAgentSession(activeSessionId, "", handlers, {
+      questionAnswers: answers,
+    });
+  }, [
+    activeSessionId,
+    onStreamingChange,
+    questionAnswers,
+    questionPaused,
+    questionResolving,
+  ]);
   const superAssistantTurnIdRef = useRef<string | null>(null);
   const pmBackgroundTaskIdRef = useRef<string | null>(null);
   const stopTurnInFlightRef = useRef(false);
@@ -8510,6 +8602,16 @@ export function ChatCore({
         setIsStreaming(false);
         onStreamingChange?.(false);
       },
+      onQuestionRequired: (paused) => {
+        if (activeSessionIdRef.current !== sessionId) return;
+        markStreamActivity();
+        setQuestionResolving(false);
+        questionPausedRef.current = paused;
+        setQuestionPaused(paused);
+        setQuestionAnswers({});
+        setIsStreaming(false);
+        onStreamingChange?.(false);
+      },
       onSuperAssistantTurnId: (turnId) => {
         superAssistantTurnIdRef.current = turnId;
       },
@@ -8996,6 +9098,10 @@ export function ChatCore({
           setApprovalResolvingId(null);
           approvalPausedRef.current = null;
           setApprovalPaused(null);
+          questionPausedRef.current = null;
+          setQuestionPaused(null);
+          setQuestionResolving(false);
+          setQuestionAnswers({});
           if (superAssistantEndpoint) {
             superAssistantTurnIdRef.current = null;
           }
@@ -12023,6 +12129,72 @@ export function ChatCore({
                     </Space>
                   </div>
                 ))}
+              </Space>
+            </Card>
+          )}
+
+          {questionPaused && questionPaused.questions.length > 0 && (
+            <Card
+              size="small"
+              title={t("chat.questionRequired", "需要你的回答")}
+              style={{ margin: "8px 0", borderColor: "var(--primary-color, #1677ff)" }}
+            >
+              <Space direction="vertical" style={{ width: "100%" }} size={12}>
+                {questionPaused.questions.map((question) => (
+                  <div key={question.requestId} style={{ display: "grid", gap: 8 }}>
+                    <div>
+                      <Typography.Text strong>{question.question}</Typography.Text>
+                      {question.expired && (
+                        <Tag color="error" style={{ marginInlineStart: 8 }}>
+                          {t("chat.questionExpired", "已过期")}
+                        </Tag>
+                      )}
+                    </div>
+                    {question.options.length > 0 && (
+                      <div style={{ maxWidth: "100%", overflowX: "auto" }}>
+                        <Segmented
+                          options={question.options}
+                          value={questionAnswers[question.requestId]}
+                          disabled={questionResolving || question.expired}
+                          onChange={(value) =>
+                            setQuestionAnswers((current) => ({
+                              ...current,
+                              [question.requestId]: String(value),
+                            }))
+                          }
+                        />
+                      </div>
+                    )}
+                    <Input.TextArea
+                      value={questionAnswers[question.requestId] ?? ""}
+                      disabled={questionResolving || question.expired}
+                      autoSize={{ minRows: 1, maxRows: 4 }}
+                      placeholder={t("chat.questionAnswerPlaceholder", "输入回答")}
+                      onChange={(event) =>
+                        setQuestionAnswers((current) => ({
+                          ...current,
+                          [question.requestId]: event.target.value,
+                        }))
+                      }
+                    />
+                  </div>
+                ))}
+                <Button
+                  type="primary"
+                  icon={<SendOutlined />}
+                  loading={questionResolving}
+                  disabled={
+                    questionResolving ||
+                    questionPaused.questions.some(
+                      (question) =>
+                        question.expired ||
+                        !(questionAnswers[question.requestId] ?? "").trim(),
+                    )
+                  }
+                  onClick={resolvePendingQuestions}
+                >
+                  {t("chat.submitQuestionAnswers", "提交回答")}
+                </Button>
               </Space>
             </Card>
           )}

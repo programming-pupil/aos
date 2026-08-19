@@ -802,6 +802,9 @@ impl ProviderRequestLineageRecorder {
             crate::crypto::encrypt(&tool_schema_json).map_err(|error| {
                 RuntimeError::new(format!("cannot protect provider tool schema: {error}"))
             })?;
+        let tool_count = request.tools.as_ref().map_or(0_i64, |tools| {
+            i64::try_from(tools.len()).unwrap_or(i64::MAX)
+        });
         let extra_body_hash = request.extra_body.as_ref().map(|extra_body| {
             hex::encode(sha2::Sha256::digest(
                 serde_json::to_vec(extra_body).unwrap_or_default(),
@@ -821,6 +824,113 @@ impl ProviderRequestLineageRecorder {
             .begin()
             .await
             .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let context_manifest = match (&trace.turn_id, trace.iteration) {
+            (Some(turn_id), Some(iteration)) => Some(
+                sqlx::query_as::<sqlx::Sqlite, (String, String)>(
+                    "SELECT id, manifest_hash FROM context_packet_manifests
+                     WHERE tenant_id = ? AND thread_id = ? AND turn_id = ? AND iteration = ?",
+                )
+                .bind(&self.tenant_id)
+                .bind(&self.session_id)
+                .bind(turn_id)
+                .bind(i64::try_from(iteration).unwrap_or(i64::MAX))
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| RuntimeError::new(error.to_string()))?
+                .ok_or_else(|| {
+                    RuntimeError::new(
+                        "provider dispatch blocked: exact context manifest is missing",
+                    )
+                })?,
+            ),
+            _ => None,
+        };
+        let tool_manifest_id = format!(
+            "tool-manifest:{}",
+            hex::encode(sha2::Sha256::digest(
+                format!(
+                    "{}:{}:{}:{}",
+                    self.tenant_id, self.session_id, trace.request_group_id, tool_schema_hash
+                )
+                .as_bytes()
+            ))
+        );
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO tool_schema_manifests
+                (id, tenant_id, session_id, turn_id, iteration, schema_hash,
+                 schema_ciphertext, tool_count, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(&tool_manifest_id)
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(&trace.turn_id)
+        .bind(trace.iteration.and_then(|value| i64::try_from(value).ok()))
+        .bind(&tool_schema_hash)
+        .bind(&tool_schema_ciphertext)
+        .bind(tool_count)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let prompt_manifest_id = if let Some((context_manifest_id, context_hash)) =
+            context_manifest.as_ref()
+        {
+            let stable_prefix_hash = hex::encode(sha2::Sha256::digest(
+                request.system.as_deref().unwrap_or_default().as_bytes(),
+            ));
+            let task_packet_hash = hex::encode(sha2::Sha256::digest(
+                serde_json::to_vec(&request.messages).unwrap_or_default(),
+            ));
+            let manifest_id = format!(
+                "wire-prompt:{}",
+                hex::encode(sha2::Sha256::digest(
+                    format!(
+                        "{context_manifest_id}:{stable_prefix_hash}:{task_packet_hash}:{tool_schema_hash}:{}",
+                        request.model
+                    )
+                    .as_bytes()
+                ))
+            );
+            let manifest_json = json!({
+                "schemaVersion": "wire-prompt-manifest-v1",
+                "contextManifestId": context_manifest_id,
+                "contextManifestHash": context_hash,
+                "stablePrefixHash": stable_prefix_hash,
+                "taskPacketHash": task_packet_hash,
+                "toolSchemaManifestId": tool_manifest_id,
+                "toolSchemaHash": tool_schema_hash,
+                "model": request.model,
+            });
+            sqlx::query::<sqlx::Sqlite>(
+                "INSERT INTO prompt_manifests
+                    (id, tenant_id, thread_id, turn_id, run_id, prompt_id, version,
+                     variant, model, stable_prefix_hash, task_packet_hash,
+                     tool_schema_hash, context_manifest_id, input_budget, output_budget,
+                     trust_policy_version, eval_suite, manifest_json, created_at)
+                 VALUES (?, ?, ?, ?, ?, 'provider-wire', 'v1', 'attempt-specific', ?, ?, ?, ?, ?,
+                         0, ?, 'wire-lineage-v1', 'provider-dispatch', ?, CURRENT_TIMESTAMP)
+                 ON CONFLICT(id) DO NOTHING",
+            )
+            .bind(&manifest_id)
+            .bind(&self.tenant_id)
+            .bind(&self.session_id)
+            .bind(&trace.turn_id)
+            .bind(&trace.request_group_id)
+            .bind(&request.model)
+            .bind(&stable_prefix_hash)
+            .bind(&task_packet_hash)
+            .bind(&tool_schema_hash)
+            .bind(context_manifest_id)
+            .bind(i64::from(request.max_tokens))
+            .bind(manifest_json.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+            Some(manifest_id)
+        } else {
+            None
+        };
         let latest = sqlx::query_as::<sqlx::Sqlite, (String, i64)>(
             "SELECT id, attempt_index FROM provider_request_attempts
              WHERE tenant_id = ? AND session_id = ? AND request_group_id = ?
@@ -841,8 +951,10 @@ impl ProviderRequestLineageRecorder {
                  request_group_id, context_manifest_key, attempt_index, parent_attempt_id, provider_kind,
                  model, api_key_id, base_url_hash, search_stage, request_hash,
                  tool_schema_hash, tool_schema_ciphertext, native_search_mode,
-                 reasoning_effort, extra_body_hash, max_output_tokens, stream, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched')",
+                 reasoning_effort, extra_body_hash, max_output_tokens, stream, status,
+                 context_manifest_id, prompt_manifest_id, tool_manifest_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                     'dispatched', ?, ?, ?)",
         )
         .bind(&id)
         .bind(&self.tenant_id)
@@ -867,6 +979,9 @@ impl ProviderRequestLineageRecorder {
         .bind(extra_body_hash)
         .bind(i64::from(request.max_tokens))
         .bind(i64::from(request.stream))
+        .bind(context_manifest.as_ref().map(|(id, _)| id.as_str()))
+        .bind(prompt_manifest_id.as_deref())
+        .bind(&tool_manifest_id)
         .execute(&mut *tx)
         .await
         .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -946,6 +1061,13 @@ impl GatewayApiClient {
         allowed_tools: Option<Vec<String>>,
         tool_registry: GlobalToolRegistry,
     ) -> Result<Self> {
+        let allowed_tools = match allowed_tools {
+            Some(values) => tool_registry
+                .normalize_allowed_tools(&values)
+                .map_err(GatewayError::Validation)?
+                .map(|values| values.into_iter().collect()),
+            None => None,
+        };
         let (
             primary_key,
             primary_provider,
@@ -1217,9 +1339,9 @@ impl GatewayApiClient {
             .as_ref()
             .map(|v| v.iter().cloned().collect());
         let mut defs = self.tool_registry.definitions(allowed.as_ref());
-        defs.retain(|tool| !gateway_tool_is_terminal_only(&tool.name));
         if allowed.is_none() {
             let core = [
+                "AskUserQuestion",
                 "ToolSearch",
                 "complete_turn",
                 "read_file",
@@ -8458,6 +8580,7 @@ Freely iterate tree/find -> rg -> read/open -> change terms -> inspect adjacent 
 }
 
 async fn persist_gateway_structured_memory(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     context: &GatewayMemoryContext,
     item_id: &str,
     scope: &str,
@@ -8482,7 +8605,7 @@ async fn persist_gateway_structured_memory(
         "sourceType": "explicit_user",
     })
     .to_string();
-    let result = sqlx::query(
+    sqlx::query(
         "INSERT INTO structured_memory_facts
             (id, tenant_id, user_id, scope, app, session_id, channel, kind,
              subject_json, predicate, value_json, text, evidence_id, evidence_hash,
@@ -8517,19 +8640,10 @@ async fn persist_gateway_structured_memory(
         })
         .to_string(),
     )
-    .execute(&context.db)
-    .await;
-    match result {
-        Ok(_) => Ok(()),
-        Err(sqlx::Error::Database(error))
-            if error
-                .message()
-                .contains("no such table: structured_memory_facts") =>
-        {
-            Ok(())
-        }
-        Err(error) => Err(format!("failed to persist structured memory: {error}")),
-    }
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| format!("failed to persist structured memory: {error}"))?;
+    Ok(())
 }
 
 fn content_hash_for_structured_gateway(value: &str) -> String {
@@ -8590,6 +8704,15 @@ async fn gateway_memory_note(
         "tool": "memory_note",
     }))
     .map_err(|e| format!("failed to serialize memory metadata: {e}"))?;
+    let mut tx = context
+        .db
+        .begin()
+        .await
+        .map_err(|error| format!("failed to begin memory transaction: {error}"))?;
+    sqlx::query("SELECT 1")
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| format!("failed to acquire memory transaction: {error}"))?;
     sqlx::query(
         r#"
         INSERT INTO agent_memory_items
@@ -8616,7 +8739,7 @@ async fn gateway_memory_note(
     .bind(gateway_content_hash(&content))
     .bind(if pinned { 1 } else { 0 })
     .bind(metadata_json)
-    .execute(&context.db)
+    .execute(&mut *tx)
     .await
     .map_err(|e| format!("failed to save memory note: {e}"))?;
     let saved_id = sqlx::query_scalar::<_, String>(
@@ -8635,10 +8758,11 @@ async fn gateway_memory_note(
     .bind(&session_key)
     .bind(&memory_type)
     .bind(gateway_content_hash(&content))
-    .fetch_one(&context.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| format!("failed to reload memory note: {e}"))?;
     persist_gateway_structured_memory(
+        &mut tx,
         context,
         &saved_id,
         &scope,
@@ -8649,6 +8773,9 @@ async fn gateway_memory_note(
         pinned,
     )
     .await?;
+    tx.commit()
+        .await
+        .map_err(|error| format!("failed to commit memory note: {error}"))?;
     serde_json::to_string_pretty(&serde_json::json!({
         "ok": true,
         "id": saved_id,
@@ -8882,6 +9009,35 @@ impl ToolExecutor for GatewayToolExecutor {
     }
 
     fn execute_outcome(&mut self, tool_name: &str, input: &str) -> ToolExecutionOutcome {
+        if gateway_tool_is_terminal_only(tool_name) {
+            let parsed = match serde_json::from_str::<Value>(input) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return ToolExecutionOutcome::Completed(Err(ToolError::new(format!(
+                        "invalid AskUserQuestion input JSON: {error}"
+                    ))))
+                }
+            };
+            let question = parsed
+                .get("question")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            if question.is_empty() {
+                return ToolExecutionOutcome::Completed(Err(ToolError::new(
+                    "AskUserQuestion requires a non-empty question",
+                )));
+            }
+            return ToolExecutionOutcome::deferred(
+                json!({
+                    "kind": "user_question",
+                    "question": question,
+                    "options": parsed.get("options").cloned().unwrap_or_else(|| json!([])),
+                    "protocol": "aos-durable-interaction-v1"
+                })
+                .to_string(),
+            );
+        }
         if is_deferred_parent_tool_name(tool_name) {
             if serde_json::from_str::<Value>(input).is_err() {
                 return ToolExecutionOutcome::Completed(Err(ToolError::new(
@@ -10719,12 +10875,6 @@ pub(crate) async fn run_streaming_turn_streaming(
                 }
             } => result.map_err(GatewayError::Runtime),
             _ = cancel_rx => {
-                if let Err(error) = rollback_current_runtime_turn(runtime, rollback_message_len) {
-                    tracing::warn!(
-                        error = %error,
-                        "run_streaming_turn_streaming: failed to rollback cancelled turn messages"
-                    );
-                }
                 Err(GatewayError::TurnCancelled)
             },
         }
@@ -11559,7 +11709,7 @@ mod tests {
     }
 
     #[test]
-    fn gateway_never_exposes_or_executes_terminal_only_question_tool() {
+    fn gateway_exposes_durable_question_but_rejects_direct_execution() {
         let config = UserRuntimeConfig {
             db: None,
             user_id: "user".to_string(),
@@ -11598,7 +11748,7 @@ mod tests {
             registry.clone(),
         )
         .expect("gateway client");
-        assert!(!client
+        assert!(client
             .filter_tool_specs()
             .iter()
             .any(|definition| gateway_tool_is_terminal_only(&definition.name)));
@@ -11662,6 +11812,9 @@ mod tests {
               stream INTEGER NOT NULL,
               status TEXT NOT NULL,
               error_class TEXT,
+              context_manifest_id TEXT,
+              prompt_manifest_id TEXT,
+              tool_manifest_id TEXT,
               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
               completed_at TEXT,
               UNIQUE(tenant_id, session_id, request_group_id, attempt_index)
@@ -11671,6 +11824,50 @@ mod tests {
         .execute(&db)
         .await
         .expect("create provider attempt table");
+        sqlx::query(
+            "CREATE TABLE context_packet_manifests (
+                id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, thread_id TEXT NOT NULL,
+                turn_id TEXT, iteration INTEGER, manifest_hash TEXT NOT NULL
+            )",
+        )
+        .execute(&db)
+        .await
+        .expect("create context manifest table");
+        sqlx::query(
+            "CREATE TABLE tool_schema_manifests (
+                id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, session_id TEXT NOT NULL,
+                turn_id TEXT, iteration INTEGER, schema_hash TEXT NOT NULL,
+                schema_ciphertext TEXT NOT NULL, tool_count INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .execute(&db)
+        .await
+        .expect("create tool manifest table");
+        sqlx::query(
+            "CREATE TABLE prompt_manifests (
+                id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, thread_id TEXT NOT NULL,
+                turn_id TEXT, run_id TEXT NOT NULL, prompt_id TEXT NOT NULL,
+                version TEXT NOT NULL, variant TEXT NOT NULL, model TEXT NOT NULL,
+                stable_prefix_hash TEXT NOT NULL, task_packet_hash TEXT NOT NULL,
+                tool_schema_hash TEXT NOT NULL, context_manifest_id TEXT NOT NULL,
+                input_budget INTEGER NOT NULL, output_budget INTEGER NOT NULL,
+                trust_policy_version TEXT NOT NULL, eval_suite TEXT NOT NULL,
+                manifest_json TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .execute(&db)
+        .await
+        .expect("create prompt manifest table");
+        sqlx::query(
+            "INSERT INTO context_packet_manifests
+                (id, tenant_id, thread_id, turn_id, iteration, manifest_hash)
+             VALUES ('context-lineage', 'tenant-lineage', 'session-lineage',
+                     'turn-lineage', 7, 'context-hash')",
+        )
+        .execute(&db)
+        .await
+        .expect("seed exact context manifest");
         let config = UserRuntimeConfig {
             db: Some(db.clone()),
             user_id: "user-lineage".to_string(),
@@ -11804,7 +12001,8 @@ mod tests {
         let rows = sqlx::query(
             "SELECT id, parent_attempt_id, attempt_index, status, search_stage,
                     request_hash, tool_schema_hash, tool_schema_ciphertext,
-                    context_manifest_key, api_key_id
+                    context_manifest_key, api_key_id, context_manifest_id,
+                    prompt_manifest_id, tool_manifest_id
              FROM provider_request_attempts
              WHERE request_group_id = ? ORDER BY attempt_index",
         )
@@ -11827,6 +12025,15 @@ mod tests {
             Some(second_id)
         );
         assert_eq!(rows[2].get::<String, _>("status"), "completed");
+        for row in &rows {
+            assert_eq!(
+                row.get::<Option<String>, _>("context_manifest_id")
+                    .as_deref(),
+                Some("context-lineage")
+            );
+            assert!(row.get::<Option<String>, _>("prompt_manifest_id").is_some());
+            assert!(row.get::<Option<String>, _>("tool_manifest_id").is_some());
+        }
         assert_eq!(
             rows[2].get::<Option<String>, _>("context_manifest_key"),
             trace.context_manifest_key

@@ -433,28 +433,16 @@ pub fn get_encryption_key(
     Ok(key)
 }
 
-fn encrypt_config(
+pub(crate) fn encrypt_config(
     config: &serde_json::Value,
-    data_dir: &std::path::Path,
+    _data_dir: &std::path::Path,
 ) -> std::result::Result<serde_json::Value, CryptoError> {
-    let key = get_encryption_key(data_dir)?;
-    let cipher =
-        Aes256Gcm::new_from_slice(&key).map_err(|e| CryptoError::Encrypt(e.to_string()))?;
-    let nonce_bytes = generate_nonce();
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let plaintext = config.to_string();
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_bytes())
-        .map_err(|e| CryptoError::Encrypt(e.to_string()))?;
-
-    let mut combined = nonce_bytes.to_vec();
-    combined.extend(ciphertext);
-
+    let envelope = agent_gateway::crypto::encrypt(&config.to_string())
+        .map_err(|error| CryptoError::Encrypt(error.to_string()))?;
     Ok(serde_json::json!({
         "_encrypted": true,
-        "nonce": BASE64.encode(nonce_bytes),
-        "data": BASE64.encode(combined),
+        "codec": "aosenc-v1",
+        "envelope": envelope,
     }))
 }
 
@@ -466,6 +454,12 @@ pub fn decrypt_config(
     // unchanged so callers don't need to special-case it.
     if encrypted.get("_encrypted").and_then(|v| v.as_bool()) != Some(true) {
         return Ok(encrypted.clone());
+    }
+
+    if let Some(envelope) = encrypted.get("envelope").and_then(|value| value.as_str()) {
+        let plaintext = agent_gateway::crypto::decrypt(envelope)
+            .map_err(|error| CryptoError::Decrypt(error.to_string()))?;
+        return serde_json::from_str(&plaintext).map_err(CryptoError::from);
     }
 
     let combined_b64 = encrypted["data"]
@@ -4895,15 +4889,6 @@ async fn check_duplicate_config(
         }
     }
     None
-}
-
-fn generate_nonce() -> [u8; 12] {
-    let uuid = uuid::Uuid::new_v4();
-    let mut bytes = uuid.as_bytes().to_vec();
-    bytes.truncate(12);
-    let mut nonce = [0u8; 12];
-    nonce.copy_from_slice(&bytes);
-    nonce
 }
 
 #[cfg(test)]

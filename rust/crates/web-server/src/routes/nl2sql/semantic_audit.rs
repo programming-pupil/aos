@@ -1024,7 +1024,7 @@ mod tests {
             compile_question_intent("tenant", "ds", "按日期统计订单数", &["orders".into()]);
         let audit = compile_canonical_intent_with_contracts_and_joins(
             &canonical,
-            "SELECT stat_date, COUNT(*) AS order_count FROM orders GROUP BY stat_date",
+            "SELECT business_date, COUNT(*) AS order_count FROM orders GROUP BY business_date",
             &[],
             &[],
         )
@@ -1163,7 +1163,7 @@ mod tests {
 
         let audit = compile_canonical_intent_with_contracts_and_joins(
             &canonical,
-            "SELECT stat_date, COUNT(*) AS order_count FROM orders GROUP BY stat_date",
+            "SELECT business_date, COUNT(*) AS order_count FROM orders GROUP BY business_date",
             &[],
             &[],
         )
@@ -1175,7 +1175,7 @@ mod tests {
 
         let mismatch = compile_canonical_intent_with_contracts_and_joins(
             &canonical,
-            "SELECT stat_date, SUM(amount) AS order_count FROM orders GROUP BY stat_date",
+            "SELECT business_date, SUM(amount) AS order_count FROM orders GROUP BY business_date",
             &[],
             &[],
         )

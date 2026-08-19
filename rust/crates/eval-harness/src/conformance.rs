@@ -20,6 +20,8 @@ pub struct ConformanceCase {
     pub id: String,
     pub section: String,
     pub production: String,
+    #[serde(default)]
+    pub trace_anchor: Option<String>,
     pub test: String,
     pub trigger: String,
     pub expected: String,
@@ -146,6 +148,42 @@ fn assert_reference_exists(reference: &str) -> Result<(), ConformanceError> {
     Ok(())
 }
 
+fn function_body<'a>(source: &'a str, symbol: &str) -> Option<&'a str> {
+    let start = source.find(&format!("fn {symbol}"))?;
+    let body_start = source[start..].find('{')? + start;
+    let mut depth = 0_u32;
+    for (offset, character) in source[body_start..].char_indices() {
+        match character {
+            '{' => depth = depth.saturating_add(1),
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(&source[body_start..=body_start + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn test_has_production_evidence(
+    source: &str,
+    test_symbol: &str,
+    production_symbol: &str,
+    trace_anchor: Option<&str>,
+) -> bool {
+    let Some(body) = function_body(source, test_symbol) else {
+        return false;
+    };
+    let anchor = trace_anchor.unwrap_or(production_symbol);
+    body.contains(anchor)
+        && (body.contains("assert!(")
+            || body.contains("assert_eq!(")
+            || body.contains("assert_ne!(")
+            || body.contains(".await"))
+}
+
 pub fn assert_semantic_kernel_traceability_dataset(
 ) -> Result<Vec<ConformanceCase>, ConformanceError> {
     let cases = load_semantic_kernel_conformance_dataset()?;
@@ -158,6 +196,20 @@ pub fn assert_semantic_kernel_traceability_dataset(
     for case in &cases {
         assert_reference_exists(&case.production)?;
         assert_reference_exists(&case.test)?;
+        let (test_path, test_symbol) = source_and_symbol(&case.test)?;
+        let (_, production_symbol) = source_and_symbol(&case.production)?;
+        let source = fs::read_to_string(repo_path(test_path))?;
+        if !test_has_production_evidence(
+            &source,
+            test_symbol,
+            production_symbol,
+            case.trace_anchor.as_deref(),
+        ) {
+            return Err(ConformanceError::Invalid(format!(
+                "case {} test body has no production trace anchor/assertion evidence",
+                case.id
+            )));
+        }
     }
     let dataset_ids = cases
         .iter()
@@ -207,7 +259,10 @@ pub fn semantic_kernel_behavior_commands() -> Result<Vec<BehaviorCommand>, Confo
 
 #[cfg(test)]
 mod tests {
-    use super::{assert_semantic_kernel_traceability_dataset, semantic_kernel_behavior_commands};
+    use super::{
+        assert_semantic_kernel_traceability_dataset, semantic_kernel_behavior_commands,
+        test_has_production_evidence,
+    };
 
     #[test]
     fn every_p0_case_has_live_traceability_references() {
@@ -223,5 +278,36 @@ mod tests {
         assert!(commands
             .iter()
             .all(|command| !command.package.is_empty() && !command.test_filter.is_empty()));
+    }
+
+    #[test]
+    fn fake_helper_without_production_anchor_is_rejected() {
+        let fake = r#"
+            fn production_entry() { panic!("must not be called"); }
+            #[test]
+            fn dishonest_test() {
+                fake_helper();
+                assert!(true);
+            }
+        "#;
+        assert!(!test_has_production_evidence(
+            fake,
+            "dishonest_test",
+            "production_entry",
+            None,
+        ));
+        let honest = r#"
+            #[test]
+            fn honest_test() {
+                production_entry();
+                assert!(true);
+            }
+        "#;
+        assert!(test_has_production_evidence(
+            honest,
+            "honest_test",
+            "production_entry",
+            None,
+        ));
     }
 }

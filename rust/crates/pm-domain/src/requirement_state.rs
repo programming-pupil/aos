@@ -128,6 +128,20 @@ pub struct QuestionResolution {
     pub observed_convergence_basis_points: u16,
     pub decision_changed: bool,
     pub source_event_ids: Vec<String>,
+    #[serde(default)]
+    pub decision_target: QuestionDecisionTarget,
+    #[serde(default)]
+    pub predicted_information_gain_basis_points: u16,
+    #[serde(default)]
+    pub user_effort: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuestionCalibrationReport {
+    pub sample_count: u32,
+    pub mean_absolute_error_basis_points: u16,
+    pub decision_change_rate_basis_points: u16,
+    pub effort_adjusted_utility_basis_points: u16,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AcceptanceCriterion {
@@ -286,7 +300,7 @@ impl std::error::Error for RequirementDeltaError {}
 
 pub fn apply_delta(
     state: &RequirementState,
-    delta: RequirementStateDelta,
+    mut delta: RequirementStateDelta,
     applied_events: &[String],
 ) -> Result<RequirementState, RequirementDeltaError> {
     if let Some(id) = delta
@@ -341,6 +355,18 @@ pub fn apply_delta(
             }
         } else {
             next.decisions.push(decision);
+        }
+    }
+    for resolution in &mut delta.add_question_resolutions {
+        if let Some(question) = state
+            .open_questions
+            .iter()
+            .find(|question| question.id == resolution.question_id)
+        {
+            resolution.decision_target = question.decision_target.clone();
+            resolution.predicted_information_gain_basis_points =
+                question.expected_information_gain_basis_points;
+            resolution.user_effort = question.user_effort.max(1);
         }
     }
     if !delta.resolve_question_ids.is_empty() {
@@ -429,7 +455,9 @@ pub fn next_question(state: &RequirementState) -> Option<OpenQuestion> {
     state
         .open_questions
         .iter()
-        .max_by(|a, b| score(a).total_cmp(&score(b)))
+        .max_by(|a, b| {
+            calibrated_question_score(state, a).total_cmp(&calibrated_question_score(state, b))
+        })
         .cloned()
 }
 
@@ -467,6 +495,79 @@ fn score(q: &OpenQuestion) -> f32 {
     };
     let information_gain = f32::from(q.expected_information_gain_basis_points) / 10_000.0;
     impact * information_gain * answerability / f32::from(q.user_effort.max(1))
+}
+
+fn calibrated_question_score(state: &RequirementState, question: &OpenQuestion) -> f32 {
+    let relevant = state
+        .question_resolutions
+        .iter()
+        .filter(|resolution| resolution.decision_target == question.decision_target)
+        .collect::<Vec<_>>();
+    if relevant.is_empty() {
+        return score(question);
+    }
+    let absolute_error = relevant
+        .iter()
+        .map(|resolution| {
+            let observed = if resolution.decision_changed {
+                resolution.observed_convergence_basis_points
+            } else {
+                resolution.observed_convergence_basis_points / 2
+            };
+            resolution
+                .predicted_information_gain_basis_points
+                .abs_diff(observed)
+        })
+        .map(u32::from)
+        .sum::<u32>()
+        / u32::try_from(relevant.len()).unwrap_or(1);
+    let reliability = (1.0 - absolute_error as f32 / 10_000.0).clamp(0.25, 1.0);
+    score(question) * reliability
+}
+
+#[must_use]
+pub fn question_calibration_report(
+    resolutions: &[QuestionResolution],
+) -> QuestionCalibrationReport {
+    if resolutions.is_empty() {
+        return QuestionCalibrationReport {
+            sample_count: 0,
+            mean_absolute_error_basis_points: 0,
+            decision_change_rate_basis_points: 0,
+            effort_adjusted_utility_basis_points: 0,
+        };
+    }
+    let count = u32::try_from(resolutions.len()).unwrap_or(u32::MAX).max(1);
+    let error = resolutions
+        .iter()
+        .map(|resolution| {
+            resolution
+                .predicted_information_gain_basis_points
+                .abs_diff(resolution.observed_convergence_basis_points)
+        })
+        .map(u64::from)
+        .sum::<u64>()
+        / u64::from(count);
+    let changes = resolutions
+        .iter()
+        .filter(|resolution| resolution.decision_changed)
+        .count() as u64
+        * 10_000
+        / u64::from(count);
+    let utility = resolutions
+        .iter()
+        .map(|resolution| {
+            u64::from(resolution.observed_convergence_basis_points)
+                / u64::from(resolution.user_effort.max(1))
+        })
+        .sum::<u64>()
+        / u64::from(count);
+    QuestionCalibrationReport {
+        sample_count: count,
+        mean_absolute_error_basis_points: u16::try_from(error.min(10_000)).unwrap_or(10_000),
+        decision_change_rate_basis_points: u16::try_from(changes.min(10_000)).unwrap_or(10_000),
+        effort_adjusted_utility_basis_points: u16::try_from(utility.min(10_000)).unwrap_or(10_000),
+    }
 }
 
 fn expected_information_value(
@@ -677,6 +778,65 @@ mod tests {
         assert_eq!(selected.id, "population");
         assert_eq!(selected.expected_posterior_uncertainty_basis_points, 1_200);
         assert_eq!(selected.expected_information_gain_basis_points, 6_800);
+    }
+
+    #[test]
+    fn observed_question_outcomes_are_persisted_and_calibrated() {
+        let question = OpenQuestion {
+            id: "scope".into(),
+            question: "Which population?".into(),
+            impact: "high".into(),
+            answerability: "high".into(),
+            user_effort: 2,
+            decision_target: QuestionDecisionTarget::Population,
+            prior_uncertainty_basis_points: 8_000,
+            answer_branches: vec![
+                QuestionAnswerBranch {
+                    id: "new".into(),
+                    answer: "new".into(),
+                    probability_basis_points: 5_000,
+                    posterior_uncertainty_basis_points: 2_000,
+                    decision_effect: "new cohort".into(),
+                },
+                QuestionAnswerBranch {
+                    id: "all".into(),
+                    answer: "all".into(),
+                    probability_basis_points: 5_000,
+                    posterior_uncertainty_basis_points: 2_000,
+                    decision_effect: "all users".into(),
+                },
+            ],
+            expected_posterior_uncertainty_basis_points: 0,
+            expected_information_gain_basis_points: 0,
+        }
+        .with_recomputed_information_value();
+        let mut state = RequirementState::default();
+        state.open_questions.push(question);
+        let mut delta = RequirementStateDelta::default();
+        delta.resolve_question_ids.push("scope".into());
+        delta.add_question_resolutions.push(QuestionResolution {
+            question_id: "scope".into(),
+            selected_branch_id: Some("new".into()),
+            observed_posterior_uncertainty_basis_points: 3_000,
+            observed_convergence_basis_points: 5_000,
+            decision_changed: true,
+            source_event_ids: vec!["answer-event".into()],
+            decision_target: Default::default(),
+            predicted_information_gain_basis_points: 0,
+            user_effort: 0,
+        });
+        let next = apply_delta(&state, delta, &[]).unwrap();
+        let resolution = &next.question_resolutions[0];
+        assert_eq!(
+            resolution.decision_target,
+            QuestionDecisionTarget::Population
+        );
+        assert_eq!(resolution.predicted_information_gain_basis_points, 6_000);
+        assert_eq!(resolution.user_effort, 2);
+        let report = question_calibration_report(&next.question_resolutions);
+        assert_eq!(report.sample_count, 1);
+        assert_eq!(report.mean_absolute_error_basis_points, 1_000);
+        assert_eq!(report.effort_adjusted_utility_basis_points, 2_500);
     }
 
     #[test]

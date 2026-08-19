@@ -7,11 +7,12 @@
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{
     BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    Query, SelectItem, SetExpr, Statement,
+    ObjectName, Query, SelectItem, SetExpr, Statement, Visit, Visitor,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::BTreeSet;
+use std::ops::ControlFlow;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AnalyticObjective {
@@ -650,7 +651,11 @@ impl SemanticVerifier {
         let missing_mandatory = ir
             .filters
             .iter()
-            .filter(|filter| !sql_contains_filter(sql, filter))
+            .filter(|filter| {
+                query_shape
+                    .as_ref()
+                    .is_none_or(|shape| !shape_contains_filter(shape, filter))
+            })
             .count();
         let filter_completeness = if missing_mandatory > 0 {
             warn(
@@ -717,31 +722,40 @@ impl SemanticVerifier {
                 "metric name is inferred but no versioned contract is bound",
             )
         };
-        let denominator_equivalence = verify_denominator(ir, &bound_contracts, selected_columns);
+        let denominator_equivalence =
+            verify_denominator(ir, &bound_contracts, query_shape.as_ref());
         let population_equivalence = if ir.population.subject.trim().is_empty() {
             fail("population_missing", "population subject is empty")
-        } else if !population_subject_is_proven(sql, &ir.population.subject) {
+        } else if query_shape
+            .as_ref()
+            .is_none_or(|shape| !population_subject_is_proven(shape, &ir.population.subject))
+        {
             fail(
                 "population_subject_unproven",
                 "the requested population is not represented by the SQL candidate",
             )
-        } else if ir
-            .population
-            .dedup_key
-            .as_deref()
-            .is_some_and(|key| !population_dedup_is_proven(sql, key))
-        {
+        } else if ir.population.dedup_key.as_deref().is_some_and(|key| {
+            query_shape
+                .as_ref()
+                .is_none_or(|shape| !population_dedup_is_proven(shape, key))
+        }) {
             fail(
                 "population_dedup_unproven",
                 "the population deduplication policy is not proven by DISTINCT semantics",
             )
-        } else if ir.population.exclude_test_users && !population_exclusion_is_proven(sql, "test") {
+        } else if ir.population.exclude_test_users
+            && query_shape
+                .as_ref()
+                .is_none_or(|shape| !population_exclusion_is_proven(shape, "test"))
+        {
             fail(
                 "test_population_exclusion_unproven",
                 "test-user exclusion is required but is not proven in SQL",
             )
         } else if ir.population.exclude_internal_users
-            && !population_exclusion_is_proven(sql, "internal")
+            && query_shape
+                .as_ref()
+                .is_none_or(|shape| !population_exclusion_is_proven(shape, "internal"))
         {
             fail(
                 "internal_population_exclusion_unproven",
@@ -751,7 +765,18 @@ impl SemanticVerifier {
             .population
             .valid_record_rule
             .as_deref()
-            .is_some_and(|rule| !normalized_sql(sql).contains(&normalized_sql(rule)))
+            .is_some_and(|rule| {
+                let expected = parse_sql_expression(rule);
+                query_shape.as_ref().is_none_or(|shape| {
+                    expected.as_ref().is_none_or(|expected| {
+                        !shape.predicates.iter().any(|predicate| {
+                            any_expression(predicate, &|actual| {
+                                expression_equivalent(actual, expected)
+                            })
+                        })
+                    })
+                })
+            })
         {
             fail(
                 "valid_record_rule_unproven",
@@ -764,7 +789,10 @@ impl SemanticVerifier {
             )
         };
         let time_consistency = if let Some(time) = ir.time.as_ref() {
-            if sql_matches_time_semantics(sql, time) && sql_matches_timezone_semantics(sql, time) {
+            if query_shape.as_ref().is_some_and(|shape| {
+                sql_matches_time_semantics(shape, time)
+                    && sql_matches_timezone_semantics(shape, time)
+            }) {
                 pass(
                     "time_bound",
                     "time column, boundary semantics and timezone are represented",
@@ -906,7 +934,12 @@ impl SemanticVerifier {
 #[derive(Debug, Clone)]
 struct ParsedQueryShape {
     projection: Vec<String>,
+    projection_exprs: Vec<Expr>,
+    projection_aliases: Vec<String>,
     selection: Option<String>,
+    predicates: Vec<Expr>,
+    relations: BTreeSet<String>,
+    select_distinct: bool,
     order_by: Vec<(String, bool)>,
     limit: Option<u64>,
     has_aggregate: bool,
@@ -937,12 +970,28 @@ impl ParsedQueryShape {
                 SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => None,
             })
             .collect::<Vec<_>>();
-        let has_aggregate = projection.iter().any(|expression| {
-            let lower = expression.to_ascii_lowercase();
-            ["count(", "sum(", "avg(", "min(", "max(", "approx_distinct("]
-                .iter()
-                .any(|needle| lower.contains(needle))
-        });
+        let projection_exprs = select
+            .projection
+            .iter()
+            .filter_map(|item| match item {
+                SelectItem::UnnamedExpr(expression)
+                | SelectItem::ExprWithAlias {
+                    expr: expression, ..
+                } => Some(expression.clone()),
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => None,
+            })
+            .collect::<Vec<_>>();
+        let projection_aliases = select
+            .projection
+            .iter()
+            .filter_map(|item| match item {
+                SelectItem::ExprWithAlias { alias, .. } => Some(canonical_identifier(&alias.value)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let has_aggregate = projection_exprs.iter().any(expr_has_aggregate);
+        let mut facts = AstFacts::default();
+        let _ = query.visit(&mut facts);
         let order_by = query
             .order_by
             .as_ref()
@@ -960,7 +1009,17 @@ impl ParsedQueryShape {
             .and_then(|value| value.to_string().parse::<u64>().ok());
         Some(Self {
             projection,
+            projection_exprs,
+            projection_aliases,
             selection: select.selection.as_ref().map(ToString::to_string),
+            predicates: select
+                .selection
+                .iter()
+                .chain(select.having.iter())
+                .cloned()
+                .collect(),
+            relations: facts.relations,
+            select_distinct: select.distinct.is_some(),
             order_by,
             limit,
             has_aggregate,
@@ -968,10 +1027,125 @@ impl ParsedQueryShape {
     }
 }
 
+#[derive(Default)]
+struct AstFacts {
+    relations: BTreeSet<String>,
+}
+
+impl Visitor for AstFacts {
+    type Break = ();
+
+    fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<Self::Break> {
+        if let Some(identifier) = relation.0.last() {
+            self.relations.insert(identifier.value.to_ascii_lowercase());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn parse_sql_expression(value: &str) -> Option<Expr> {
+    let statements = Parser::parse_sql(&GenericDialect {}, &format!("SELECT {value}")).ok()?;
+    let Statement::Query(query) = statements.first()? else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    if statements.len() != 1 || select.projection.len() != 1 || !select.from.is_empty() {
+        return None;
+    }
+    match &select.projection[0] {
+        SelectItem::UnnamedExpr(expression)
+        | SelectItem::ExprWithAlias {
+            expr: expression, ..
+        } => Some(expression.clone()),
+        _ => None,
+    }
+}
+
+fn canonical_identifier(value: &str) -> String {
+    value
+        .trim_matches(|ch| matches!(ch, '`' | '"'))
+        .to_ascii_lowercase()
+}
+
+fn identifier_parts(expression: &Expr) -> Option<Vec<String>> {
+    match expression {
+        Expr::Identifier(identifier) => Some(vec![canonical_identifier(&identifier.value)]),
+        Expr::CompoundIdentifier(identifiers) => Some(
+            identifiers
+                .iter()
+                .map(|identifier| canonical_identifier(&identifier.value))
+                .collect(),
+        ),
+        Expr::Nested(expression) => identifier_parts(expression),
+        _ => None,
+    }
+}
+
+fn identifier_matches(expression: &Expr, expected: &str) -> bool {
+    let Some(actual) = identifier_parts(expression) else {
+        return false;
+    };
+    let expected = expected
+        .split('.')
+        .map(canonical_identifier)
+        .collect::<Vec<_>>();
+    !expected.is_empty()
+        && (actual == expected || (expected.len() == 1 && actual.last() == expected.last()))
+}
+
+fn expression_equivalent(left: &Expr, right: &Expr) -> bool {
+    match (identifier_parts(left), identifier_parts(right)) {
+        (Some(left), Some(right)) => left == right || left.last() == right.last(),
+        _ => normalized_sql(&left.to_string()) == normalized_sql(&right.to_string()),
+    }
+}
+
+fn any_expression(expression: &Expr, predicate: &impl Fn(&Expr) -> bool) -> bool {
+    if predicate(expression) {
+        return true;
+    }
+    struct Finder<'a, F> {
+        predicate: &'a F,
+        found: bool,
+        root_seen: bool,
+    }
+    impl<F: Fn(&Expr) -> bool> Visitor for Finder<'_, F> {
+        type Break = ();
+        fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
+            if self.root_seen && (self.predicate)(expression) {
+                self.found = true;
+                ControlFlow::Break(())
+            } else {
+                self.root_seen = true;
+                ControlFlow::Continue(())
+            }
+        }
+    }
+    let mut finder = Finder {
+        predicate,
+        found: false,
+        root_seen: false,
+    };
+    let _ = expression.visit(&mut finder);
+    finder.found
+}
+
+fn expr_has_aggregate(expression: &Expr) -> bool {
+    any_expression(expression, &|candidate| match candidate {
+        Expr::Function(function) => matches!(
+            function.name.to_string().to_ascii_lowercase().as_str(),
+            "count" | "sum" | "avg" | "min" | "max" | "approx_distinct"
+        ),
+        _ => false,
+    })
+}
+
 fn verify_denominator(
     ir: &AnalyticIntentIR,
     contracts: &[&MetricContract],
-    selected_columns: &[String],
+    shape: Option<&ParsedQueryShape>,
 ) -> CheckResult {
     let mut expected = Vec::new();
     if let Some(denominator) = ir.denominator.as_ref() {
@@ -989,15 +1163,16 @@ fn verify_denominator(
             "the intent and metric contracts do not require a denominator",
         );
     }
-    let selected = selected_columns
-        .iter()
-        .map(|value| metric_expression_canonical(strip_select_alias(value)))
-        .collect::<Vec<_>>();
+    let Some(shape) = shape else {
+        return fail("denominator_unproven", "SQL shape could not be parsed");
+    };
     if expected.iter().all(|denominator| {
-        let expected = metric_expression_canonical(denominator);
-        selected.iter().any(|actual| {
-            actual.contains(&expected)
-                || unqualified_sql(actual).contains(&unqualified_sql(&expected))
+        parse_sql_expression(denominator).is_some_and(|expected| {
+            shape.projection_exprs.iter().any(|actual| {
+                any_expression(actual, &|candidate| {
+                    expression_equivalent(candidate, &expected)
+                })
+            })
         })
     }) {
         pass(
@@ -1012,39 +1187,120 @@ fn verify_denominator(
     }
 }
 
-fn population_subject_is_proven(sql: &str, subject: &str) -> bool {
+fn population_subject_is_proven(shape: &ParsedQueryShape, subject: &str) -> bool {
     let subject = subject.trim();
     if subject.eq_ignore_ascii_case("query_rows") {
         return true;
     }
-    let sql = normalized_sql(sql);
-    let subject = normalized_sql(subject);
-    if subject.is_empty() {
-        return false;
+    let subject = canonical_identifier(subject);
+    if shape.relations.iter().any(|relation| {
+        relation == &subject
+            // Natural-language IR commonly stores a singular entity while
+            // SQL uses its conventional plural table name (order/orders,
+            // user/users). Treat that morphology as equivalent only after
+            // the relation has been parsed from the candidate AST.
+            || (relation.strip_suffix('s').unwrap_or(relation)
+                == subject.strip_suffix('s').unwrap_or(&subject))
+    }) {
+        return true;
     }
-    let singular = subject.strip_suffix('s').unwrap_or(&subject);
-    sql.contains(&subject) || (!singular.is_empty() && sql.contains(singular))
+    // Some governed schemas use opaque table names (for example
+    // `task_offer`) while the canonical IR still names the business entity
+    // (`order`). A count aggregate with an explicitly named subject alias is
+    // sufficient additional AST evidence; arbitrary SQL text is not.
+    shape.projection_aliases.iter().any(|alias| {
+        alias == &subject
+            || alias.strip_suffix('s').unwrap_or(alias)
+                == subject.strip_suffix('s').unwrap_or(&subject)
+            || alias.starts_with(&format!("{subject}_"))
+    }) || shape.projection_exprs.iter().any(|expression| {
+        expr_has_aggregate(expression)
+            && any_expression(expression, &|candidate| {
+                identifier_parts(candidate).is_some_and(|parts| {
+                    parts.last().is_some_and(|identifier| {
+                        identifier == &subject
+                            || identifier.strip_suffix('s').unwrap_or(identifier)
+                                == subject.strip_suffix('s').unwrap_or(&subject)
+                    })
+                })
+            })
+    })
 }
 
-fn population_dedup_is_proven(sql: &str, key: &str) -> bool {
-    let sql = unqualified_sql(&normalized_sql(sql));
-    let key = unqualified_sql(&normalized_sql(key));
-    if key.is_empty() {
-        return false;
+fn population_dedup_is_proven(shape: &ParsedQueryShape, key: &str) -> bool {
+    if shape.select_distinct
+        && shape
+            .projection_exprs
+            .iter()
+            .any(|expression| identifier_matches(expression, key))
+    {
+        return true;
     }
-    sql.contains(&format!("count(distinct{key}"))
-        || sql.contains(&format!("approxdistinct({key}"))
-        || sql.contains(&format!("selectdistinct{key}"))
+    shape.projection_exprs.iter().any(|expression| {
+        any_expression(expression, &|candidate| {
+            let Expr::Function(function) = candidate else {
+                return false;
+            };
+            let name = function.name.to_string().to_ascii_lowercase();
+            let FunctionArguments::List(arguments) = &function.args else {
+                return false;
+            };
+            let distinct = name == "approx_distinct"
+                || (name == "count"
+                    && matches!(
+                        arguments.duplicate_treatment,
+                        Some(DuplicateTreatment::Distinct)
+                    ));
+            distinct
+                && arguments.args.iter().any(|argument| match argument {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(expression)) => {
+                        identifier_matches(expression, key)
+                    }
+                    _ => false,
+                })
+        })
+    })
 }
 
-fn population_exclusion_is_proven(sql: &str, marker: &str) -> bool {
-    let sql = normalized_sql(sql);
-    sql.contains(marker)
-        && (sql.contains("!=")
-            || sql.contains("<>")
-            || sql.contains("=false")
-            || sql.contains("=0")
-            || sql.contains("notin"))
+fn population_exclusion_is_proven(shape: &ParsedQueryShape, marker: &str) -> bool {
+    shape.predicates.iter().any(|predicate| {
+        any_expression(predicate, &|candidate| match candidate {
+            Expr::IsFalse(expression) | Expr::IsNotTrue(expression) => {
+                identifier_has_semantic_token(expression, marker)
+            }
+            Expr::BinaryOp { left, op, right } => {
+                let excludes = matches!(op, BinaryOperator::NotEq)
+                    || (matches!(op, BinaryOperator::Eq) && expression_is_false_or_zero(right));
+                excludes
+                    && (identifier_has_semantic_token(left, marker)
+                        || identifier_has_semantic_token(right, marker))
+            }
+            Expr::InList { expr, negated, .. } => {
+                *negated && identifier_has_semantic_token(expr, marker)
+            }
+            _ => false,
+        })
+    })
+}
+
+fn identifier_has_semantic_token(expression: &Expr, token: &str) -> bool {
+    identifier_parts(expression).is_some_and(|parts| {
+        parts.iter().any(|part| {
+            part.split('_')
+                .any(|component| component.eq_ignore_ascii_case(token))
+        })
+    })
+}
+
+fn expression_is_false_or_zero(expression: &Expr) -> bool {
+    match expression {
+        Expr::Value(value) => match value {
+            sqlparser::ast::Value::Boolean(false) => true,
+            sqlparser::ast::Value::Number(number, false) => number == "0",
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 fn verify_comparison(ir: &AnalyticIntentIR, sql: &str) -> CheckResult {
@@ -1196,47 +1452,20 @@ fn verify_limit(ir: &AnalyticIntentIR, shape: Option<&ParsedQueryShape>) -> Chec
 }
 
 fn semantic_identifier_matches(required: &str, actual: &str) -> bool {
-    let normalized = |value: &str| {
-        value
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() {
-                    character.to_ascii_lowercase()
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>()
+    let Some(required) = parse_sql_expression(required) else {
+        return false;
     };
-    let required = normalized(required);
-    let actual = normalized(actual);
-    if actual.contains(&required) {
-        return true;
-    }
-    let family_matches = |family: &[&str]| {
-        family.iter().any(|term| required.contains(term))
-            && family.iter().any(|term| actual.contains(term))
+    let Some(actual) = parse_sql_expression(actual) else {
+        return false;
     };
-    family_matches(&[
-        "business_date",
-        "event_date",
-        "stat_date",
-        "date",
-        "day",
-        "dt",
-    ]) || family_matches(&["device", "terminal"])
-        || family_matches(&["app", "product", "channel"])
+    expression_equivalent(&required, &actual)
 }
 
 fn inferred_metrics_match(metrics: &[MetricRef], selected_columns: &[String]) -> bool {
     let aggregates = selected_columns
         .iter()
-        .filter(|expression| {
-            let lower = expression.to_ascii_lowercase();
-            ["count(", "sum(", "avg(", "min(", "max(", "approx_distinct("]
-                .iter()
-                .any(|needle| lower.contains(needle))
-        })
+        .filter_map(|expression| parse_sql_expression(expression))
+        .filter(expr_has_aggregate)
         .collect::<Vec<_>>();
     if aggregates.len() < metrics.len() {
         return false;
@@ -1245,17 +1474,32 @@ fn inferred_metrics_match(metrics: &[MetricRef], selected_columns: &[String]) ->
         let id = metric.id.to_ascii_lowercase();
         let display_name = metric.display_name.to_ascii_lowercase();
         aggregates.iter().any(|expression| {
-            let expression = expression.to_ascii_lowercase();
-            let count_shape =
-                expression.contains("count(") || expression.contains("approx_distinct(");
-            let sum_shape = expression.contains("sum(");
-            let ratio_shape = expression.contains('/')
-                || expression.contains("nullif(")
-                || expression.contains("divide(");
+            let count_shape = any_expression(expression, &|candidate| {
+                matches!(candidate, Expr::Function(function) if matches!(
+                    function.name.to_string().to_ascii_lowercase().as_str(),
+                    "count" | "approx_distinct"
+                ))
+            });
+            let sum_shape = any_expression(expression, &|candidate| {
+                matches!(candidate, Expr::Function(function) if function.name.to_string().eq_ignore_ascii_case("sum"))
+            });
+            let ratio_shape = any_expression(expression, &|candidate| {
+                matches!(candidate, Expr::BinaryOp { op: BinaryOperator::Divide, .. })
+                    || matches!(candidate, Expr::Function(function) if matches!(
+                        function.name.to_string().to_ascii_lowercase().as_str(),
+                        "nullif" | "divide"
+                    ))
+            });
             let id_stem = id.strip_suffix('s').unwrap_or(&id);
-            let named = expression.contains(&id)
-                || expression.contains(id_stem)
-                || expression.contains(&display_name);
+            let named = any_expression(expression, &|candidate| {
+                identifier_parts(candidate).is_some_and(|parts| {
+                    parts.last().is_some_and(|identifier| {
+                        identifier == &id
+                            || identifier == id_stem
+                            || identifier == &display_name
+                    })
+                })
+            });
             match id.as_str() {
                 "orders" | "order_count" | "users" | "user_count" => count_shape,
                 "revenue" | "gmv" => sum_shape && named,
@@ -1348,80 +1592,75 @@ fn metric_expression_canonical(value: &str) -> String {
         .join(" ")
 }
 
-fn contains_identifier(sql: &str, identifier: &str) -> bool {
-    let sql = unqualified_sql(&normalized_sql(sql));
-    let identifier = unqualified_sql(&normalized_sql(identifier));
-    !identifier.is_empty() && sql.contains(&identifier)
+fn expression_contains_identifier(expression: &Expr, identifier: &str) -> bool {
+    any_expression(expression, &|candidate| {
+        identifier_matches(candidate, identifier)
+    })
 }
 
-fn sql_has_filter_clause(sql: &str) -> bool {
-    let normalized = normalized_sql(sql);
-    normalized.contains("where") || normalized.contains("having")
+fn expression_contains_literal(expression: &Expr, expected: &str) -> bool {
+    any_expression(expression, &|candidate| match candidate {
+        Expr::Value(value) => match value {
+            sqlparser::ast::Value::SingleQuotedString(value)
+            | sqlparser::ast::Value::DoubleQuotedString(value)
+            | sqlparser::ast::Value::Number(value, _) => value == expected,
+            sqlparser::ast::Value::Boolean(value) => {
+                value.to_string().eq_ignore_ascii_case(expected)
+            }
+            _ => false,
+        },
+        Expr::TypedString { value, .. } => value == expected,
+        _ => false,
+    })
 }
 
-fn sql_has_bounded_time_filter(sql: &str, column: &str) -> bool {
-    sql_has_filter_clause(sql) && contains_identifier(sql, column)
-}
-
-fn literal_has_column_comparison(
-    normalized_sql: &str,
+fn comparison_proven(
+    shape: &ParsedQueryShape,
     column: &str,
     literal: &str,
-    operators: &[&str],
+    accepted: &[BinaryOperator],
 ) -> bool {
-    normalized_sql.match_indices(literal).any(|(index, _)| {
-        let prefix = &normalized_sql[..index];
-        prefix.rfind(column).is_some_and(|column_index| {
-            let comparison = &prefix[column_index..];
-            operators.iter().any(|operator| match *operator {
-                "=" => {
-                    comparison.contains('=')
-                        && !comparison.contains(">=")
-                        && !comparison.contains("<=")
-                        && !comparison.contains("!=")
-                        && !comparison.contains("<>")
-                }
-                "<" => comparison.contains('<') && !comparison.contains("<="),
-                ">" => comparison.contains('>') && !comparison.contains(">="),
-                other => comparison.contains(other),
-            })
+    shape.predicates.iter().any(|predicate| {
+        any_expression(predicate, &|candidate| {
+            let Expr::BinaryOp { left, op, right } = candidate else {
+                return false;
+            };
+            accepted.contains(op)
+                && ((expression_contains_identifier(left, column)
+                    && expression_contains_literal(right, literal))
+                    || (expression_contains_identifier(right, column)
+                        && expression_contains_literal(left, literal)))
         })
     })
 }
 
-fn sql_matches_time_semantics(sql: &str, time: &TimeSemantics) -> bool {
-    if !sql_has_bounded_time_filter(sql, &time.column) {
-        return false;
-    }
-    let normalized = unqualified_sql(&normalized_sql(sql));
-    let column = unqualified_sql(&normalized_sql(&time.column));
-    let start = normalized_sql(&time.start_inclusive);
-    let end = normalized_sql(&time.end_exclusive);
-    if column.is_empty() || start.is_empty() || !normalized.contains(&start) {
-        return false;
-    }
-
-    let equality = normalized.contains(&format!("{column}="))
-        || normalized.contains(&format!("date({column})="))
-        || normalized.contains(&format!("cast({column}asdate)="))
-        || literal_has_column_comparison(&normalized, &column, &start, &["="]);
+fn sql_matches_time_semantics(shape: &ParsedQueryShape, time: &TimeSemantics) -> bool {
+    let equality = comparison_proven(
+        shape,
+        &time.column,
+        &time.start_inclusive,
+        &[BinaryOperator::Eq],
+    );
     if equality {
-        let one_day = chrono::NaiveDate::parse_from_str(&time.start_inclusive, "%Y-%m-%d")
+        return chrono::NaiveDate::parse_from_str(&time.start_inclusive, "%Y-%m-%d")
             .ok()
             .zip(chrono::NaiveDate::parse_from_str(&time.end_exclusive, "%Y-%m-%d").ok())
             .is_some_and(|(start, end)| end.signed_duration_since(start).num_days() == 1);
-        return one_day;
     }
-
-    let inclusive_lower_bound = normalized.contains(&format!("{column}>="))
-        || literal_has_column_comparison(&normalized, &column, &start, &[">="]);
-    let exclusive_upper_bound = (normalized.contains(&format!("{column}<"))
-        && !normalized.contains(&format!("{column}<=")))
-        || literal_has_column_comparison(&normalized, &column, &end, &["<"]);
-    inclusive_lower_bound && exclusive_upper_bound && !end.is_empty() && normalized.contains(&end)
+    comparison_proven(
+        shape,
+        &time.column,
+        &time.start_inclusive,
+        &[BinaryOperator::GtEq],
+    ) && comparison_proven(
+        shape,
+        &time.column,
+        &time.end_exclusive,
+        &[BinaryOperator::Lt],
+    )
 }
 
-fn sql_matches_timezone_semantics(sql: &str, time: &TimeSemantics) -> bool {
+fn sql_matches_timezone_semantics(shape: &ParsedQueryShape, time: &TimeSemantics) -> bool {
     let column = time.column.to_ascii_lowercase();
     if ["date", "day", "dt"]
         .iter()
@@ -1433,45 +1672,105 @@ fn sql_matches_timezone_semantics(sql: &str, time: &TimeSemantics) -> bool {
     if timezone.is_empty() {
         return false;
     }
-    let normalized = normalized_sql(sql);
-    normalized.contains(&timezone)
-        && (normalized.contains("attimezone")
-            || normalized.contains("convert_tz(")
-            || normalized.contains("timezone(")
-            || normalized.contains("from_utc_timestamp(")
-            || normalized.contains("date_format("))
+    shape.predicates.iter().any(|predicate| {
+        any_expression(predicate, &|candidate| match candidate {
+            Expr::AtTimeZone {
+                timestamp,
+                time_zone,
+            } => {
+                expression_contains_identifier(timestamp, &time.column)
+                    && expression_contains_literal(time_zone, &time.timezone)
+            }
+            Expr::Function(function)
+                if matches!(
+                    function.name.to_string().to_ascii_lowercase().as_str(),
+                    "convert_tz" | "timezone" | "from_utc_timestamp" | "date_format"
+                ) =>
+            {
+                expression_contains_identifier(candidate, &time.column)
+                    && expression_contains_literal(candidate, &time.timezone)
+            }
+            _ => false,
+        })
+    })
 }
 
-fn sql_contains_filter(sql: &str, filter: &SemanticFilter) -> bool {
-    let normalized = unqualified_sql(&normalized_sql(sql));
+fn shape_contains_filter(shape: &ParsedQueryShape, filter: &SemanticFilter) -> bool {
+    let predicates = shape
+        .predicates
+        .iter()
+        .flat_map(|predicate| {
+            let mut nodes = Vec::new();
+            collect_expression_clones(predicate, &mut nodes);
+            nodes
+        })
+        .collect::<Vec<_>>();
     match filter {
-        SemanticFilter::Equals { field, value } => {
-            normalized.contains(&unqualified_sql(&normalized_sql(field)))
-                && normalized.contains(&normalized_sql(value))
-        }
-        SemanticFilter::In { field, values } => {
-            normalized.contains(&unqualified_sql(&normalized_sql(field)))
-                && values
-                    .iter()
-                    .all(|value| normalized.contains(&normalized_sql(value)))
-        }
+        SemanticFilter::Equals { field, value } => predicates.iter().any(|predicate| {
+            matches!(predicate, Expr::BinaryOp { left, op: BinaryOperator::Eq, right }
+                if (identifier_matches(&left, field) && expression_contains_literal(&right, value))
+                    || (identifier_matches(&right, field) && expression_contains_literal(&left, value)))
+        }),
+        SemanticFilter::In { field, values } => predicates.iter().any(|predicate| {
+            matches!(predicate, Expr::InList { expr, list, negated: false }
+                if identifier_matches(&expr, field)
+                    && values.iter().all(|value| list.iter().any(|item| expression_contains_literal(item, value))))
+        }),
         SemanticFilter::Compare {
             field,
             operator,
             value,
-        } => {
-            let field = unqualified_sql(&normalized_sql(field));
-            let operator = normalized_sql(operator);
-            !field.is_empty()
-                && matches!(operator.as_str(), ">" | ">=" | "<" | "<=" | "!=" | "<>")
-                && normalized.contains(&field)
-                && normalized.contains(&operator)
-                && normalized.contains(&normalized_sql(value))
-        }
-        SemanticFilter::RawBounded { expression } => {
-            normalized.contains(&unqualified_sql(&normalized_sql(expression)))
+        } => parse_binary_operator(operator).is_some_and(|expected_operator| {
+            predicates.iter().any(|predicate| {
+                matches!(predicate, Expr::BinaryOp { left, op, right }
+                    if *op == expected_operator
+                        && identifier_matches(&left, field)
+                        && expression_contains_literal(&right, value))
+            })
+        }),
+        SemanticFilter::RawBounded { expression } => parse_sql_expression(expression).is_some_and(
+            |expected| {
+                predicates
+                    .iter()
+                    .any(|actual| expression_equivalent(&actual, &expected))
+            },
+        ),
+    }
+}
+
+fn parse_binary_operator(operator: &str) -> Option<BinaryOperator> {
+    match operator.trim() {
+        ">" => Some(BinaryOperator::Gt),
+        ">=" => Some(BinaryOperator::GtEq),
+        "<" => Some(BinaryOperator::Lt),
+        "<=" => Some(BinaryOperator::LtEq),
+        "!=" | "<>" => Some(BinaryOperator::NotEq),
+        _ => None,
+    }
+}
+
+fn collect_expression_clones(expression: &Expr, output: &mut Vec<Expr>) {
+    output.push(expression.clone());
+    struct Collector<'a> {
+        output: &'a mut Vec<Expr>,
+        root_seen: bool,
+    }
+    impl Visitor for Collector<'_> {
+        type Break = ();
+        fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
+            if self.root_seen {
+                self.output.push(expression.clone());
+            } else {
+                self.root_seen = true;
+            }
+            ControlFlow::Continue(())
         }
     }
+    let mut collector = Collector {
+        output,
+        root_seen: false,
+    };
+    let _ = expression.visit(&mut collector);
 }
 fn pass(code: &str, message: &str) -> CheckResult {
     CheckResult {
@@ -1828,15 +2127,18 @@ mod tests {
             as_of: None,
         };
         assert!(sql_matches_time_semantics(
-            "SELECT COUNT(*) FROM orders WHERE business_date = DATE '2026-08-15'",
+            &ParsedQueryShape::parse(
+                "SELECT COUNT(*) FROM orders WHERE business_date = DATE '2026-08-15'"
+            )
+            .unwrap(),
             &one_day
         ));
         assert!(sql_matches_time_semantics(
-            "SELECT COUNT(*) FROM orders WHERE business_date >= DATE '2026-08-15' AND business_date < DATE '2026-08-16'",
+            &ParsedQueryShape::parse("SELECT COUNT(*) FROM orders WHERE business_date >= DATE '2026-08-15' AND business_date < DATE '2026-08-16'").unwrap(),
             &one_day
         ));
         assert!(!sql_matches_time_semantics(
-            "SELECT COUNT(*) FROM orders WHERE business_date >= DATE '2026-08-15' AND business_date <= DATE '2026-08-16'",
+            &ParsedQueryShape::parse("SELECT COUNT(*) FROM orders WHERE business_date >= DATE '2026-08-15' AND business_date <= DATE '2026-08-16'").unwrap(),
             &one_day
         ));
 
@@ -1845,9 +2147,35 @@ mod tests {
             ..one_day
         };
         assert!(!sql_matches_time_semantics(
-            "SELECT COUNT(*) FROM orders WHERE business_date = DATE '2026-08-15'",
+            &ParsedQueryShape::parse(
+                "SELECT COUNT(*) FROM orders WHERE business_date = DATE '2026-08-15'"
+            )
+            .unwrap(),
             &multi_day
         ));
+    }
+
+    #[test]
+    fn ast_verifier_rejects_substring_and_comment_spoofing() {
+        let mut input = ir();
+        input.time = None;
+        input.population.subject = "orders".into();
+        input.population.dedup_key = Some("user_id".into());
+        input.population.exclude_test_users = true;
+        input.filters = vec![SemanticFilter::Equals {
+            field: "country".into(),
+            value: "US".into(),
+        }];
+        let result = SemanticVerifier::default().verify(
+            &input,
+            &["business_date".into(), "COUNT(DISTINCT fake_user_id)".into()],
+            &["business_date".into()],
+            &[],
+            "SELECT business_date, COUNT(DISTINCT fake_user_id) FROM preorders WHERE contest = 'US' AND latest = 0 /* orders user_id country test */ GROUP BY business_date",
+        );
+        assert_eq!(result.population_equivalence.status, CheckStatus::Fail);
+        assert_eq!(result.filter_completeness.status, CheckStatus::Warn);
+        assert_ne!(result.release_decision, QueryReleaseDecision::Release);
     }
 
     #[test]

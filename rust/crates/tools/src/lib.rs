@@ -494,6 +494,7 @@ fn runtime_contract_for_registered_tool(
 ) -> RuntimeToolContract {
     let lower = tool_name.to_ascii_lowercase();
     let is_deferred = [
+        "askuserquestion",
         "deep_research_start",
         "super_adversarial_start",
         "nl2sql_analyze",

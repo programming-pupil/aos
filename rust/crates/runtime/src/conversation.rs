@@ -1249,13 +1249,25 @@ where
             let result = by_id
                 .remove(&tool_use_id)
                 .expect("pending deferred result was validated above");
+            let output = if is_user_question_tool(&tool_name) {
+                let Some(kernel) = self.execution_kernel.clone() else {
+                    return Err(RuntimeError::new(
+                        "user-question resume requires a durable execution kernel",
+                    ));
+                };
+                kernel
+                    .consume_user_question(&turn.turn_id, &tool_use_id, &result.output)
+                    .await?
+            } else {
+                result.output
+            };
             let projected = self
                 .finish_tool_in_kernel(RuntimeToolOutcome {
                     turn_id: turn.turn_id.clone(),
                     invocation_id: tool_use_id.clone(),
                     tool_name: tool_name.clone(),
                     input: input.clone(),
-                    output: result.output,
+                    output,
                     iteration: 0,
                     outcome: if result.is_error {
                         RuntimeToolOutcomeKind::Failed
@@ -2260,18 +2272,39 @@ where
     /// drops the in-flight future before the normal loop can emit a terminal
     /// event.
     pub async fn finish_latest_kernel_turn(
-        &self,
+        &mut self,
         status: RuntimeTurnTerminalStatus,
         detail: Option<&str>,
     ) -> Result<(), RuntimeError> {
-        let Some(turn) = self.session.turns.iter().rev().find(|turn| {
-            matches!(
-                turn.status,
-                SessionTurnStatus::Running | SessionTurnStatus::Suspended
-            )
-        }) else {
+        let Some(turn) = self
+            .session
+            .turns
+            .iter()
+            .rev()
+            .find(|turn| {
+                matches!(
+                    turn.status,
+                    SessionTurnStatus::Running | SessionTurnStatus::Suspended
+                )
+            })
+            .cloned()
+        else {
             return Ok(());
         };
+        let session_status = match status {
+            RuntimeTurnTerminalStatus::Completed => SessionTurnStatus::Completed,
+            RuntimeTurnTerminalStatus::Failed => SessionTurnStatus::Failed,
+            RuntimeTurnTerminalStatus::Cancelled => SessionTurnStatus::Cancelled,
+            RuntimeTurnTerminalStatus::Suspended => SessionTurnStatus::Suspended,
+        };
+        if matches!(status, RuntimeTurnTerminalStatus::Cancelled) {
+            self.session
+                .rollback_latest_turn_started_at(turn.start_message_count)
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+        }
+        self.session
+            .complete_turn(&turn.turn_id, session_status)
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
         self.finish_turn_in_kernel(&turn.turn_id, status, detail)
             .await
     }
@@ -2512,6 +2545,40 @@ where
         prepared: &PreparedToolUse,
         reporter: &mut R,
     ) -> Result<PreparedToolExecution, RuntimeError> {
+        if is_user_question_tool(&prepared.tool_name) {
+            let Some(kernel) = self.execution_kernel.clone() else {
+                return Err(RuntimeError::new(
+                    "AskUserQuestion requires a durable execution kernel",
+                ));
+            };
+            let input = parse_user_question_input(&prepared.effective_input)?;
+            self.authorize_tool_in_kernel(turn_id, iteration, prepared)
+                .await?;
+            let metadata = serde_json::json!({
+                "kind": "user_question",
+                "question": input.question,
+                "options": input.options,
+            })
+            .to_string();
+            let _ = kernel
+                .finish_tool(RuntimeToolOutcome {
+                    turn_id: turn_id.to_string(),
+                    invocation_id: prepared.tool_use_id.clone(),
+                    tool_name: prepared.tool_name.clone(),
+                    input: prepared.effective_input.clone(),
+                    output: metadata.clone(),
+                    iteration,
+                    outcome: RuntimeToolOutcomeKind::Deferred,
+                })
+                .await?;
+            reporter.on_runtime_status("waiting_input", "turn is waiting for the user's answer");
+            return Ok(PreparedToolExecution::Deferred(DeferredToolUse {
+                tool_use_id: prepared.tool_use_id.clone(),
+                tool_name: prepared.tool_name.clone(),
+                input: prepared.effective_input.clone(),
+                metadata,
+            }));
+        }
         if let PermissionOutcome::AwaitingApproval { request } = &prepared.permission_outcome {
             let Some(kernel) = self.execution_kernel.clone() else {
                 return Err(RuntimeError::new(
@@ -2816,9 +2883,8 @@ where
     ) -> Result<(), RuntimeError> {
         match self.execution_kernel.clone() {
             Some(kernel) => {
-                kernel.finish_turn(turn_id, status, detail).await?;
                 kernel
-                    .checkpoint_session("turn_terminal", &self.session)
+                    .finish_turn_with_checkpoint(turn_id, status, detail, &self.session)
                     .await
             }
             None => Ok(()),
@@ -2998,6 +3064,40 @@ where
             }
         }
     }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RuntimeUserQuestionInput {
+    question: String,
+    #[serde(default)]
+    options: Vec<String>,
+}
+
+fn is_user_question_tool(tool_name: &str) -> bool {
+    tool_name
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>()
+        == "askuserquestion"
+}
+
+fn parse_user_question_input(input: &str) -> Result<RuntimeUserQuestionInput, RuntimeError> {
+    let mut parsed: RuntimeUserQuestionInput = serde_json::from_str(input)
+        .map_err(|error| RuntimeError::new(format!("invalid AskUserQuestion input: {error}")))?;
+    parsed.question = parsed.question.trim().to_string();
+    parsed.options = parsed
+        .options
+        .into_iter()
+        .map(|option| option.trim().to_string())
+        .filter(|option| !option.is_empty())
+        .collect();
+    if parsed.question.is_empty() || parsed.question.len() > 4_000 || parsed.options.len() > 20 {
+        return Err(RuntimeError::new(
+            "AskUserQuestion requires a non-empty question <= 4000 bytes and at most 20 options",
+        ));
+    }
+    Ok(parsed)
 }
 
 fn turn_summary_from_accumulator<C, T>(
@@ -3555,7 +3655,9 @@ mod tests {
         PermissionRequest,
     };
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
-    use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+    use crate::session::{
+        ContentBlock, ConversationMessage, MessageRole, Session, SessionTurnStatus,
+    };
     use crate::usage::TokenUsage;
     use crate::ToolError;
     use serde_json::Value;
@@ -3815,6 +3917,7 @@ mod tests {
         visible_messages: Vec<(String, ConversationMessage)>,
         visible_attempt_ids: Vec<String>,
         reject_visible_message: bool,
+        terminal_checkpoints: Vec<(RuntimeTurnTerminalStatus, Session)>,
     }
 
     struct ApprovalTestKernel {
@@ -3932,6 +4035,66 @@ mod tests {
         ) -> Result<(), RuntimeError> {
             Ok(())
         }
+
+        async fn finish_turn_with_checkpoint(
+            &self,
+            turn_id: &str,
+            status: RuntimeTurnTerminalStatus,
+            detail: Option<&str>,
+            session: &Session,
+        ) -> Result<(), RuntimeError> {
+            self.state
+                .lock()
+                .unwrap()
+                .terminal_checkpoints
+                .push((status, session.clone()));
+            self.finish_turn(turn_id, status, detail).await?;
+            self.checkpoint_session("turn_terminal", session).await
+        }
+    }
+
+    #[tokio::test]
+    async fn outer_cancellation_checkpoints_a_cancelled_session_not_a_running_turn() {
+        let kernel = Arc::new(ApprovalTestKernel::new());
+        let mut session = Session::new();
+        let turn_id = session.begin_turn("cancel this request").unwrap();
+        session.push_user_text("cancel this request").unwrap();
+        session
+            .push_message(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "partial output".to_string(),
+            }]))
+            .unwrap();
+        let mut runtime = ConversationRuntime::new(
+            session,
+            ApprovalApiClient { call_count: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::ReadOnly),
+            Vec::new(),
+        )
+        .with_execution_kernel(kernel.clone());
+
+        runtime
+            .finish_latest_kernel_turn(
+                RuntimeTurnTerminalStatus::Cancelled,
+                Some("cancelled by outer coordinator"),
+            )
+            .await
+            .unwrap();
+
+        let turn = runtime.session().turns.last().unwrap();
+        assert_eq!(turn.turn_id, turn_id);
+        assert_eq!(turn.status, SessionTurnStatus::Cancelled);
+        assert!(runtime.session().messages.is_empty());
+        let state = kernel.state.lock().unwrap();
+        assert_eq!(state.terminal_checkpoints.len(), 1);
+        assert_eq!(
+            state.terminal_checkpoints[0].0,
+            RuntimeTurnTerminalStatus::Cancelled
+        );
+        assert_eq!(
+            state.terminal_checkpoints[0].1.turns.last().unwrap().status,
+            SessionTurnStatus::Cancelled
+        );
     }
 
     #[tokio::test]

@@ -226,6 +226,83 @@ mod tests {
     }
 
     #[test]
+    fn reducer_applies_risk_and_authority_matrix() {
+        let reducer = SemanticReducer::default();
+        let tool_evidence = EvidenceRef {
+            evidence_id: "tool-evidence".into(),
+            source_type: EvidenceSourceType::ToolResult,
+            source_locator: "tool://lookup".into(),
+            content_hash: "tool-hash".into(),
+            event_seq: Some(1),
+            byte_or_line_range: None,
+            collected_at: Utc::now(),
+            authority: EvidenceAuthority::Tool,
+        };
+        let owner_evidence = EvidenceRef {
+            evidence_id: "owner-evidence".into(),
+            content_hash: "owner-hash".into(),
+            authority: EvidenceAuthority::Owner,
+            ..tool_evidence.clone()
+        };
+        let mut evidence = EvidenceLedger::default();
+        evidence.append(tool_evidence.clone()).unwrap();
+        evidence.append(owner_evidence.clone()).unwrap();
+
+        let mut secret = assertion("secret", "credential", "tool-evidence");
+        secret.status = AssertionStatus::Confirmed;
+        secret.sensitivity = Sensitivity::Secret;
+        secret.source_refs = vec![tool_evidence.clone()];
+        let demoted = reducer
+            .apply(
+                &SemanticSnapshot::default(),
+                ProposedStateDelta::UpsertAssertion(secret),
+                &evidence,
+            )
+            .unwrap();
+        assert_eq!(
+            demoted.snapshot.assertions["secret"].status,
+            AssertionStatus::Proposed
+        );
+
+        let decision = |id: &str, rationale: EvidenceRef| DecisionRecord {
+            id: id.into(),
+            scope: AssertionScope::Session("s".into()),
+            question: "Ship?".into(),
+            decision: "yes".into(),
+            alternatives: vec![],
+            rationale: vec![rationale],
+            constraints: vec![],
+            acceptance_criteria: vec![],
+            owner: Some(EntityRef::new("user", "owner")),
+            status: DecisionStatus::Accepted,
+            valid_time: None,
+            version: 1,
+        };
+        let tool_decision = reducer
+            .apply(
+                &SemanticSnapshot::default(),
+                ProposedStateDelta::UpsertDecision(decision("tool-decision", tool_evidence)),
+                &evidence,
+            )
+            .unwrap();
+        assert_eq!(
+            tool_decision.snapshot.decisions["tool-decision"].status,
+            DecisionStatus::Proposed
+        );
+        let owner_decision = reducer
+            .apply(
+                &SemanticSnapshot::default(),
+                ProposedStateDelta::UpsertDecision(decision("owner-decision", owner_evidence)),
+                &evidence,
+            )
+            .unwrap();
+        assert_eq!(
+            owner_decision.snapshot.decisions["owner-decision"].status,
+            DecisionStatus::Accepted
+        );
+    }
+
+    #[test]
     fn evidence_requires_source_coverage_and_context_has_manifest() {
         let mut evidence = EvidenceLedger::default();
         evidence

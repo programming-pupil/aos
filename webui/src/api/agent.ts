@@ -483,6 +483,25 @@ export interface RuntimeApprovalPaused {
   iterations?: number;
 }
 
+export interface RuntimeQuestionRequest {
+  requestId: string;
+  turnId: string;
+  invocationId: string;
+  question: string;
+  options: string[];
+  status: string;
+  expiresAt: string;
+  expired: boolean;
+}
+
+export interface RuntimeQuestionPaused {
+  sessionId: string;
+  runtimeTurnId: string;
+  questions: RuntimeQuestionRequest[];
+  partialText?: string;
+  iterations?: number;
+}
+
 export interface ChatFileRecord {
   id: string;
   fileId: string;
@@ -959,6 +978,14 @@ export const agentApi = {
       )
       .then((r) => r.data),
 
+  /** Unanswered durable questions owned by the current authenticated session user. */
+  listSessionQuestions: (sessionId: string) =>
+    fastClient
+      .get<{ questions: RuntimeQuestionRequest[] }>(
+        `/agent/sessions/${encodeURIComponent(sessionId)}/questions`,
+      )
+      .then((r) => r.data),
+
   /** Toggle pin state of a session */
   togglePinSession: (sessionId: string) =>
     fastClient.post<{ pinned: boolean; is_pinned: boolean }>(
@@ -1179,6 +1206,8 @@ export function streamAgentSession(
     onImageContextWarning?: (payload: { message: string; detail?: string; code?: string }) => void;
     /** The transport ended cleanly while the durable turn waits for approval. */
     onApprovalRequired?: (payload: RuntimeApprovalPaused) => void;
+    /** The transport ended cleanly while the durable turn waits for user answers. */
+    onQuestionRequired?: (payload: RuntimeQuestionPaused) => void;
     /** Super Assistant route result for non-chat capabilities such as PM research or data attribution. */
     onSuperAssistantAnswer?: (answer: SuperAssistantAnswer) => void;
     /** Available synchronously for durable cancellation before the first SSE event arrives. */
@@ -1194,6 +1223,10 @@ export function streamAgentSession(
       decision: 'approve' | 'deny' | 'cancel';
       reason?: string;
     };
+    questionAnswers?: Array<{
+      requestId: string;
+      answer: string;
+    }>;
     superAssistant?: {
       app?: string;
       model?: string;
@@ -1417,6 +1450,7 @@ export function streamAgentSession(
         documents: options?.documents ?? [],
         turnOptions: options?.turnOptions ?? {},
         ...(options?.approval ? { approval: options.approval } : {}),
+        ...(options?.questionAnswers ? { questionAnswers: options.questionAnswers } : {}),
       };
 
   // POST avoids URL length limits for long messages and hides the prompt from logs.
@@ -1706,6 +1740,13 @@ export function streamAgentSession(
             ? data.data
             : data;
           handlers.onApprovalRequired?.(paused as RuntimeApprovalPaused);
+        } else if (currentEvent === 'question_paused') {
+          terminalEventSeen = true;
+          drainTextQueue();
+          const paused = (typeof data === 'object' && data.data !== undefined)
+            ? data.data
+            : data;
+          handlers.onQuestionRequired?.(paused as RuntimeQuestionPaused);
         } else if (currentEvent === 'super_assistant_answer') {
           const answerData = (typeof data === 'object' && data.data !== undefined) ? data.data : data;
           handlers.onSuperAssistantAnswer?.(answerData as SuperAssistantAnswer);

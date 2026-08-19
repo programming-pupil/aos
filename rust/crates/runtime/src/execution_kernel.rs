@@ -604,6 +604,18 @@ pub trait AgentExecutionKernel: Send + Sync {
         resolution: &RuntimeApprovalResolution,
     ) -> Result<RuntimeApprovalDecision, RuntimeError>;
 
+    /// Atomically consume a previously persisted user answer. Durable stores
+    /// must fence this transition so restart/retry cannot inject the answer or
+    /// resume the suspended turn twice.
+    async fn consume_user_question(
+        &self,
+        _turn_id: &str,
+        _invocation_id: &str,
+        answer: &str,
+    ) -> Result<String, RuntimeError> {
+        Ok(answer.to_string())
+    }
+
     /// Persist the complete result as a typed artifact when needed, settle the
     /// budget and return the bounded model-visible projection.
     async fn finish_tool(
@@ -616,6 +628,18 @@ pub trait AgentExecutionKernel: Send + Sync {
         turn_id: &str,
         status: RuntimeTurnTerminalStatus,
         detail: Option<&str>,
+    ) -> Result<(), RuntimeError>;
+
+    /// Atomically commit the terminal turn transition and the exact recovery
+    /// checkpoint representing that transition. Durable implementations must
+    /// use one storage transaction: exposing a terminal turn with an older
+    /// checkpoint makes the next provider request unrecoverable.
+    async fn finish_turn_with_checkpoint(
+        &self,
+        turn_id: &str,
+        status: RuntimeTurnTerminalStatus,
+        detail: Option<&str>,
+        session: &Session,
     ) -> Result<(), RuntimeError>;
 }
 

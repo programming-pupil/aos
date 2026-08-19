@@ -10,11 +10,15 @@ use thiserror::Error;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderRequestFixture {
     pub script_key: String,
+    #[serde(default)]
+    pub safe_for_replay: bool,
     pub canonical_request_hash: String,
     pub frames: Vec<ProviderFrame>,
     pub expected_tool_calls: Vec<String>,
     #[serde(default)]
     pub fault_script: Option<FaultScript>,
+    #[serde(default)]
+    pub expected_terminal_hash: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ProviderFrame {
@@ -54,6 +58,11 @@ pub enum ReplayError {
     UnsafeFixture,
     #[error("replay fixture still has {0} unconsumed fault point(s)")]
     UnconsumedFaults(usize),
+    #[error("terminal projection mismatch: expected {expected}, actual {actual:?}")]
+    TerminalMismatch {
+        expected: String,
+        actual: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -62,12 +71,16 @@ pub struct ProviderReplay {
     cursor: usize,
     consumed_tools: BTreeMap<String, u32>,
     remaining_faults: Vec<FaultPoint>,
+    terminal_hash: Option<String>,
 }
 impl ProviderReplay {
     pub fn new(
         fixture: ProviderRequestFixture,
         canonical_request: &serde_json::Value,
     ) -> Result<Self, ReplayError> {
+        if !fixture.safe_for_replay {
+            return Err(ReplayError::UnsafeFixture);
+        }
         let actual = canonical_hash(canonical_request);
         if actual != fixture.canonical_request_hash {
             return Err(ReplayError::RequestHashMismatch {
@@ -85,6 +98,7 @@ impl ProviderReplay {
             cursor: 0,
             consumed_tools: BTreeMap::new(),
             remaining_faults,
+            terminal_hash: None,
         })
     }
     pub fn next(&mut self) -> Option<ProviderFrame> {
@@ -96,11 +110,22 @@ impl ProviderReplay {
     }
     pub fn record_tool_call(&mut self, name: impl Into<String>) -> Result<(), ReplayError> {
         let name = name.into();
-        if !self.fixture.expected_tool_calls.contains(&name) {
+        let expected = self
+            .fixture
+            .expected_tool_calls
+            .iter()
+            .filter(|candidate| *candidate == &name)
+            .count() as u32;
+        let consumed = self.consumed_tools.get(&name).copied().unwrap_or_default();
+        if expected == 0 || consumed >= expected {
             return Err(ReplayError::UnexpectedCall(name));
         }
         *self.consumed_tools.entry(name).or_default() += 1;
         Ok(())
+    }
+
+    pub fn record_terminal_projection(&mut self, projection: &serde_json::Value) {
+        self.terminal_hash = Some(canonical_hash(projection));
     }
 
     /// Consume one declared fault at the point where the runtime injected it.
@@ -124,8 +149,15 @@ impl ProviderReplay {
                 self.fixture.frames.len() - self.cursor,
             ));
         }
-        for expected in &self.fixture.expected_tool_calls {
-            if self.consumed_tools.get(expected).copied().unwrap_or(0) == 0 {
+        let expected_counts = self.fixture.expected_tool_calls.iter().fold(
+            BTreeMap::<String, u32>::new(),
+            |mut counts, expected| {
+                *counts.entry(expected.clone()).or_default() += 1;
+                counts
+            },
+        );
+        for (expected, count) in expected_counts {
+            if self.consumed_tools.get(&expected).copied().unwrap_or(0) != count {
                 return Err(ReplayError::UnexpectedCall(format!(
                     "missing expected tool call {expected}"
                 )));
@@ -133,6 +165,14 @@ impl ProviderReplay {
         }
         if !self.remaining_faults.is_empty() {
             return Err(ReplayError::UnconsumedFaults(self.remaining_faults.len()));
+        }
+        if let Some(expected) = self.fixture.expected_terminal_hash.as_ref() {
+            if self.terminal_hash.as_ref() != Some(expected) {
+                return Err(ReplayError::TerminalMismatch {
+                    expected: expected.clone(),
+                    actual: self.terminal_hash.clone(),
+                });
+            }
         }
         Ok(())
     }
@@ -170,10 +210,12 @@ mod tests {
         let request = serde_json::json!({"model":"fixture","input":"hello"});
         let fixture = ProviderRequestFixture {
             script_key: "parent/turn-1".into(),
+            safe_for_replay: true,
             canonical_request_hash: canonical_hash(&request),
             frames: vec![ProviderFrame::Chunk("a".into()), ProviderFrame::Done],
             expected_tool_calls: vec!["search".into()],
             fault_script: None,
+            expected_terminal_hash: None,
         };
         let mut replay = ProviderReplay::new(fixture, &request).unwrap();
         assert!(replay.assert_consumed().is_err());
@@ -187,10 +229,12 @@ mod tests {
         let request = serde_json::json!({"x":1});
         let fixture = ProviderRequestFixture {
             script_key: "child/1".into(),
+            safe_for_replay: true,
             canonical_request_hash: canonical_hash(&request),
             frames: vec![],
             expected_tool_calls: vec!["read".into()],
             fault_script: None,
+            expected_terminal_hash: None,
         };
         let mut replay = ProviderReplay::new(fixture, &request).unwrap();
         assert!(replay.record_tool_call("write").is_err());
@@ -209,6 +253,7 @@ mod tests {
         let request = serde_json::json!({"model": "fixture"});
         let fixture = ProviderRequestFixture {
             script_key: "faults/1".into(),
+            safe_for_replay: true,
             canonical_request_hash: canonical_hash(&request),
             frames: vec![ProviderFrame::Timeout],
             expected_tool_calls: vec![],
@@ -216,6 +261,7 @@ mod tests {
                 seed: 7,
                 points: vec![FaultPoint::Timeout, FaultPoint::Cancel],
             }),
+            expected_terminal_hash: None,
         };
         let mut replay = ProviderReplay::new(fixture, &request).unwrap();
         assert!(replay.next().is_some());
@@ -225,6 +271,37 @@ mod tests {
             Err(ReplayError::UnconsumedFaults(1))
         ));
         assert!(replay.consume_fault(FaultPoint::Cancel));
+        assert!(replay.assert_consumed().is_ok());
+    }
+
+    #[test]
+    fn replay_rejects_unsafe_fixtures_duplicate_effects_and_wrong_terminal() {
+        let request = serde_json::json!({"model": "fixture"});
+        let terminal = serde_json::json!({"status": "completed", "effects": 1});
+        let fixture = ProviderRequestFixture {
+            script_key: "strict/1".into(),
+            safe_for_replay: false,
+            canonical_request_hash: canonical_hash(&request),
+            frames: vec![],
+            expected_tool_calls: vec!["write:invocation-1".into()],
+            fault_script: None,
+            expected_terminal_hash: Some(canonical_hash(&terminal)),
+        };
+        assert!(matches!(
+            ProviderReplay::new(fixture.clone(), &request),
+            Err(ReplayError::UnsafeFixture)
+        ));
+        let mut fixture = fixture;
+        fixture.safe_for_replay = true;
+        let mut replay = ProviderReplay::new(fixture, &request).unwrap();
+        replay.record_tool_call("write:invocation-1").unwrap();
+        assert!(replay.record_tool_call("write:invocation-1").is_err());
+        replay.record_terminal_projection(&serde_json::json!({"status": "failed"}));
+        assert!(matches!(
+            replay.assert_consumed(),
+            Err(ReplayError::TerminalMismatch { .. })
+        ));
+        replay.record_terminal_projection(&terminal);
         assert!(replay.assert_consumed().is_ok());
     }
 }

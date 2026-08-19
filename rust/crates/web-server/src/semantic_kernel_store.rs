@@ -18,6 +18,7 @@ use nl2sql_core::semantic_ir::{
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use std::path::PathBuf;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -162,6 +163,249 @@ pub(crate) async fn get_runtime_approval(
         .await?
         .into_iter()
         .find(|approval| approval.request_id == request_id))
+}
+
+/// Safe HTTP projection of a durable model-to-user question. Answers are not
+/// returned here: they enter model context only through the exactly-once tool
+/// result consumed by the suspended runtime turn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RuntimeQuestionView {
+    pub request_id: String,
+    pub turn_id: String,
+    pub invocation_id: String,
+    pub question: String,
+    pub options: Vec<String>,
+    pub status: String,
+    pub expires_at: Option<String>,
+    pub expired: bool,
+}
+
+pub(crate) async fn list_runtime_questions(
+    db: &SqlitePool,
+    tenant_id: &str,
+    user_id: &str,
+    session_id: &str,
+) -> Result<Vec<RuntimeQuestionView>, SemanticStoreError> {
+    let rows = sqlx::query_as::<
+        Sqlite,
+        (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+        ),
+    >(
+        "SELECT id, turn_id, invocation_id, question, options_json, status, expires_at
+         FROM durable_user_questions
+         WHERE tenant_id = ? AND user_id = ? AND session_id = ?
+           AND status IN ('pending', 'answered')
+         ORDER BY created_at ASC, id ASC",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(request_id, turn_id, invocation_id, question, options_json, status, expires_at)| {
+                let expired = expires_at
+                    .as_deref()
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.with_timezone(&Utc) <= Utc::now())
+                    .unwrap_or(false);
+                RuntimeQuestionView {
+                    request_id,
+                    turn_id,
+                    invocation_id,
+                    question,
+                    options: serde_json::from_str(&options_json).unwrap_or_default(),
+                    status,
+                    expires_at,
+                    expired,
+                }
+            },
+        )
+        .collect())
+}
+
+pub(crate) async fn get_runtime_question(
+    db: &SqlitePool,
+    tenant_id: &str,
+    user_id: &str,
+    session_id: &str,
+    request_id: &str,
+) -> Result<Option<RuntimeQuestionView>, SemanticStoreError> {
+    Ok(list_runtime_questions(db, tenant_id, user_id, session_id)
+        .await?
+        .into_iter()
+        .find(|question| question.request_id == request_id))
+}
+
+/// Persist an answer before attempting runtime resume. Repeating the same
+/// answer is idempotent; a different second answer fails closed.
+#[allow(dead_code)]
+pub(crate) async fn answer_runtime_question(
+    db: &SqlitePool,
+    tenant_id: &str,
+    user_id: &str,
+    session_id: &str,
+    request_id: &str,
+    answer: &str,
+) -> Result<String, SemanticStoreError> {
+    let mut answers =
+        answer_runtime_questions(db, tenant_id, user_id, session_id, &[(request_id, answer)])
+            .await?;
+    answers.pop().ok_or_else(|| {
+        SemanticStoreError::InvalidEvent("question answer batch was empty".to_string())
+    })
+}
+
+/// Atomically persist multiple durable question answers. All rows are read and
+/// validated before any update is issued, so a malformed, expired, or already
+/// conflicting answer cannot leave a partially answered suspended turn.
+pub(crate) async fn answer_runtime_questions(
+    db: &SqlitePool,
+    tenant_id: &str,
+    user_id: &str,
+    session_id: &str,
+    answers: &[(&str, &str)],
+) -> Result<Vec<String>, SemanticStoreError> {
+    if answers.is_empty() {
+        return Err(SemanticStoreError::InvalidEvent(
+            "question answer batch cannot be empty".to_string(),
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let normalized = answers
+        .iter()
+        .map(|(request_id, answer)| {
+            let request_id = request_id.trim();
+            let answer = answer.trim();
+            if request_id.is_empty() {
+                return Err(SemanticStoreError::InvalidEvent(
+                    "question requestId cannot be empty".to_string(),
+                ));
+            }
+            if answer.is_empty() {
+                return Err(SemanticStoreError::InvalidEvent(
+                    "question answer cannot be empty".to_string(),
+                ));
+            }
+            if !seen.insert(request_id.to_string()) {
+                return Err(SemanticStoreError::InvalidEvent(
+                    "question answer batch contains a duplicate requestId".to_string(),
+                ));
+            }
+            Ok((request_id.to_string(), answer.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut tx = db.begin().await?;
+    acquire_sqlite_write_lock(&mut tx).await?;
+    let mut updates = Vec::with_capacity(normalized.len());
+    for (request_id, answer) in &normalized {
+        let answer_hash = sha256_bytes(answer.as_bytes());
+        let row = sqlx::query::<Sqlite>(
+            "SELECT status, answer_hash, answer, expires_at
+         FROM durable_user_questions
+         WHERE id = ? AND tenant_id = ? AND user_id = ? AND session_id = ?",
+        )
+        .bind(request_id)
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            SemanticStoreError::InvalidEvent(
+                "question was not found in this authenticated session".to_string(),
+            )
+        })?;
+        let status = row.get::<String, _>("status");
+        let stored_hash = row.try_get::<Option<String>, _>("answer_hash")?;
+        let stored_answer = row.try_get::<Option<String>, _>("answer")?;
+        if status == "answered" {
+            if stored_hash.as_deref() != Some(answer_hash.as_str()) {
+                return Err(SemanticStoreError::InvalidEvent(
+                    "question already has a different answer".to_string(),
+                ));
+            }
+            let result = stored_answer.map_or_else(
+                || Ok(answer.to_string()),
+                |stored| decrypt_durable_question_answer(&stored),
+            )?;
+            updates.push((request_id.clone(), answer_hash, None, result));
+            continue;
+        }
+        if status != "pending" {
+            return Err(SemanticStoreError::InvalidEvent(format!(
+                "question is no longer answerable (status={status})"
+            )));
+        }
+        let expired = row
+            .try_get::<Option<String>, _>("expires_at")?
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc) <= Utc::now())
+            .unwrap_or(false);
+        if expired {
+            return Err(SemanticStoreError::InvalidEvent(
+                "question has expired".to_string(),
+            ));
+        }
+        let protected_answer = agent_gateway::crypto::encrypt(answer)
+            .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+        updates.push((
+            request_id.clone(),
+            answer_hash,
+            Some(protected_answer),
+            answer.clone(),
+        ));
+    }
+    for (request_id, answer_hash, protected_answer, _) in &updates {
+        let Some(protected_answer) = protected_answer else {
+            continue;
+        };
+        let changed = sqlx::query::<Sqlite>(
+            "UPDATE durable_user_questions
+         SET status = 'answered', answer = ?, answer_hash = ?,
+             answered_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND tenant_id = ? AND user_id = ? AND session_id = ?
+           AND status = 'pending'",
+        )
+        .bind(protected_answer)
+        .bind(answer_hash)
+        .bind(request_id)
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+        if changed.rows_affected() != 1 {
+            return Err(SemanticStoreError::InvalidEvent(
+                "question answer raced with another responder".to_string(),
+            ));
+        }
+    }
+    tx.commit().await?;
+    Ok(updates
+        .into_iter()
+        .map(|(_, _, _, result)| result)
+        .collect())
+}
+
+fn decrypt_durable_question_answer(answer: &str) -> Result<String, SemanticStoreError> {
+    if answer.starts_with("aosenc:v1:") {
+        agent_gateway::crypto::decrypt(answer)
+            .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))
+    } else {
+        Ok(answer.to_string())
+    }
 }
 
 fn parse_grain(value: &str) -> Grain {
@@ -1536,7 +1780,7 @@ impl RuntimeExecutionKernel {
         }
     }
 
-    async fn append_domain(
+    pub(crate) async fn append_domain(
         &self,
         turn_id: &str,
         item_id: &str,
@@ -2499,15 +2743,16 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             "INSERT INTO context_packet_manifests
                 (id, tenant_id, thread_id, turn_id, snapshot_version,
                  manifest_hash, manifest_json, model_version,
-                 raw_manifest_hash, raw_manifest_ciphertext, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                 raw_manifest_hash, raw_manifest_ciphertext, iteration, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
              ON CONFLICT(id) DO UPDATE SET
                 snapshot_version = excluded.snapshot_version,
                 manifest_json = excluded.manifest_json,
                 manifest_hash = excluded.manifest_hash,
                 model_version = excluded.model_version,
                 raw_manifest_hash = excluded.raw_manifest_hash,
-                raw_manifest_ciphertext = excluded.raw_manifest_ciphertext",
+                raw_manifest_ciphertext = excluded.raw_manifest_ciphertext,
+                iteration = excluded.iteration",
         )
         .bind(&id)
         .bind(&self.tenant_id)
@@ -2523,6 +2768,7 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         .bind(input.model_version.as_deref())
         .bind(&raw_manifest_hash)
         .bind(raw_manifest_ciphertext)
+        .bind(i64::try_from(input.iteration).unwrap_or(i64::MAX))
         .execute(&mut *tx)
         .await
         .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
@@ -2537,8 +2783,8 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                     (id, tenant_id, thread_id, turn_id, run_id, prompt_id, version,
                      variant, model, stable_prefix_hash, task_packet_hash,
                      tool_schema_hash, context_manifest_id, input_budget, output_budget,
-                     trust_policy_version, eval_suite, manifest_json, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                     trust_policy_version, eval_suite, manifest_json, iteration, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                  ON CONFLICT(id) DO UPDATE SET
                     version = excluded.version,
                     variant = excluded.variant,
@@ -2551,7 +2797,8 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                     output_budget = excluded.output_budget,
                     trust_policy_version = excluded.trust_policy_version,
                     eval_suite = excluded.eval_suite,
-                    manifest_json = excluded.manifest_json",
+                    manifest_json = excluded.manifest_json,
+                    iteration = excluded.iteration",
             )
             .bind(prompt_id)
             .bind(&self.tenant_id)
@@ -2581,6 +2828,7 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                 .0
                 .to_string(),
             )
+            .bind(i64::try_from(input.iteration).unwrap_or(i64::MAX))
             .execute(&mut *tx)
             .await
             .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
@@ -3133,6 +3381,133 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         })
     }
 
+    async fn consume_user_question(
+        &self,
+        turn_id: &str,
+        invocation_id: &str,
+        answer: &str,
+    ) -> Result<String, runtime::RuntimeError> {
+        let request_id = tenant_scoped_record_id(
+            "user-question",
+            &self.tenant_id,
+            &format!("{}:{turn_id}:{invocation_id}", self.session_id),
+        );
+        let supplied_hash = sha256_bytes(answer.trim().as_bytes());
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        acquire_sqlite_write_lock(&mut tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let row = sqlx::query::<Sqlite>(
+            "SELECT status, answer, answer_hash, expires_at
+             FROM durable_user_questions
+             WHERE id = ? AND tenant_id = ? AND user_id = ? AND session_id = ?
+               AND turn_id = ? AND invocation_id = ?",
+        )
+        .bind(&request_id)
+        .bind(&self.tenant_id)
+        .bind(&self.user_id)
+        .bind(&self.session_id)
+        .bind(turn_id)
+        .bind(invocation_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?
+        .ok_or_else(|| {
+            runtime::RuntimeError::new(
+                "user question was not found in this authenticated runtime scope",
+            )
+        })?;
+        let status = row.get::<String, _>("status");
+        let stored_answer_ciphertext = row
+            .try_get::<Option<String>, _>("answer")
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?
+            .ok_or_else(|| runtime::RuntimeError::new("user question has no durable answer"))?;
+        let stored_answer = decrypt_durable_question_answer(&stored_answer_ciphertext)
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let stored_hash = row
+            .try_get::<Option<String>, _>("answer_hash")
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?
+            .ok_or_else(|| runtime::RuntimeError::new("user question answer hash is missing"))?;
+        if supplied_hash != stored_hash {
+            return Err(runtime::RuntimeError::new(
+                "user question answer does not match the durable response",
+            ));
+        }
+        if status == "consumed" {
+            tx.commit()
+                .await
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            return Ok(stored_answer);
+        }
+        if status != "answered" {
+            return Err(runtime::RuntimeError::new(format!(
+                "user question cannot be consumed from status {status}"
+            )));
+        }
+        let expired = row
+            .try_get::<Option<String>, _>("expires_at")
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc) <= Utc::now())
+            .unwrap_or(false);
+        if expired {
+            sqlx::query::<Sqlite>(
+                "UPDATE durable_user_questions
+                 SET status = 'expired', updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ? AND status = 'answered'",
+            )
+            .bind(&request_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            return Err(runtime::RuntimeError::new(
+                "user question expired before runtime resume",
+            ));
+        }
+        let changed = sqlx::query::<Sqlite>(
+            "UPDATE durable_user_questions
+             SET status = 'consumed', consumed_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND status = 'answered' AND answer_hash = ?",
+        )
+        .bind(&request_id)
+        .bind(&stored_hash)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        if changed.rows_affected() != 1 {
+            return Err(runtime::RuntimeError::new(
+                "user question consume raced with another resume",
+            ));
+        }
+        self.append_domain_event_in_transaction(
+            &mut tx,
+            Some(turn_id),
+            &request_id,
+            "user_question_consumed",
+            serde_json::json!({
+                "requestId": request_id,
+                "invocationId": invocation_id,
+                "answerHash": stored_hash,
+            }),
+            format!("user-question-consumed:{turn_id}:{invocation_id}:{stored_hash}"),
+        )
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        Ok(stored_answer)
+    }
+
     async fn finish_tool(
         &self,
         outcome: runtime::RuntimeToolOutcome,
@@ -3292,21 +3667,22 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                 tracing::warn!(tenant_id = %self.tenant_id, session_id = %self.session_id, artifact_id, artifact_bytes, "artifact spill exceeded the session accounting allowance; result retained and overage recorded");
             }
         }
+        let outcome_state = format!("{:?}", outcome.outcome).to_ascii_lowercase();
         self.append_domain_event_in_transaction(
             &mut tx,
             Some(&outcome.turn_id),
-            &format!("tool-outcome:{}", outcome.invocation_id),
+            &format!("tool-outcome:{}:{outcome_state}", outcome.invocation_id),
             "tool_outcome",
             serde_json::json!({
                 "invocationId": outcome.invocation_id,
                 "toolName": outcome.tool_name,
-                "outcome": format!("{:?}", outcome.outcome).to_ascii_lowercase(),
+                "outcome": outcome_state,
                 "artifactId": artifact_id,
                 "contentHash": content_hash,
                 "output": outcome.output,
                 "modelOutput": model_output,
             }),
-            format!("tool-outcome:{}", outcome.invocation_id),
+            format!("tool-outcome:{}:{outcome_state}", outcome.invocation_id),
         )
         .await
         .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
@@ -3479,6 +3855,415 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             .await
             .map_err(|error| runtime::RuntimeError::new(error.to_string()))
     }
+
+    async fn finish_turn_with_checkpoint(
+        &self,
+        turn_id: &str,
+        status: runtime::RuntimeTurnTerminalStatus,
+        detail: Option<&str>,
+        session: &runtime::Session,
+    ) -> Result<(), runtime::RuntimeError> {
+        let expected_session_status = match status {
+            runtime::RuntimeTurnTerminalStatus::Completed => runtime::SessionTurnStatus::Completed,
+            runtime::RuntimeTurnTerminalStatus::Failed => runtime::SessionTurnStatus::Failed,
+            runtime::RuntimeTurnTerminalStatus::Cancelled => runtime::SessionTurnStatus::Cancelled,
+            runtime::RuntimeTurnTerminalStatus::Suspended => runtime::SessionTurnStatus::Suspended,
+        };
+        if session.session_id != self.session_id
+            || session.tenant_id.as_deref() != Some(self.tenant_id.as_str())
+            || session.user_id.as_deref() != Some(self.user_id.as_str())
+            || session.turns.last().map(|turn| turn.turn_id.as_str()) != Some(turn_id)
+            || session.turns.last().map(|turn| turn.status) != Some(expected_session_status)
+        {
+            return Err(runtime::RuntimeError::new(
+                "atomic terminal checkpoint scope or session turn status does not match its execution kernel",
+            ));
+        }
+        let session_json = session
+            .to_recovery_json()
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let state_hash = sha256_json(&session_json);
+        let status_text = match status {
+            runtime::RuntimeTurnTerminalStatus::Completed => "completed",
+            runtime::RuntimeTurnTerminalStatus::Failed => "failed",
+            runtime::RuntimeTurnTerminalStatus::Cancelled => "cancelled",
+            runtime::RuntimeTurnTerminalStatus::Suspended => "suspended",
+        };
+        let checkpoint_id = tenant_scoped_record_id(
+            "runtime-terminal-checkpoint",
+            &self.tenant_id,
+            &format!("{}:{turn_id}:{status_text}:{state_hash}", self.session_id),
+        );
+        let pending_questions = if matches!(status, runtime::RuntimeTurnTerminalStatus::Suspended) {
+            pending_user_questions(session, turn_id)?
+        } else {
+            Vec::new()
+        };
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        acquire_sqlite_write_lock(&mut tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+
+        for (invocation_id, question, options) in pending_questions {
+            let request_id = tenant_scoped_record_id(
+                "user-question",
+                &self.tenant_id,
+                &format!("{}:{turn_id}:{invocation_id}", self.session_id),
+            );
+            let expires_at = (Utc::now() + Duration::hours(24)).to_rfc3339();
+            let options_json = serde_json::to_string(&options)
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            sqlx::query::<Sqlite>(
+                "INSERT INTO durable_user_questions
+                    (id, tenant_id, user_id, session_id, turn_id, invocation_id,
+                     question, options_json, status, expires_at, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                 ON CONFLICT(tenant_id, session_id, turn_id, invocation_id) DO NOTHING",
+            )
+            .bind(&request_id)
+            .bind(&self.tenant_id)
+            .bind(&self.user_id)
+            .bind(&self.session_id)
+            .bind(turn_id)
+            .bind(&invocation_id)
+            .bind(&question)
+            .bind(&options_json)
+            .bind(&expires_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            self.append_domain_event_in_transaction(
+                &mut tx,
+                Some(turn_id),
+                &request_id,
+                "user_question_pending",
+                serde_json::json!({
+                    "requestId": request_id,
+                    "invocationId": invocation_id,
+                    "questionHash": sha256_bytes(question.as_bytes()),
+                    "optionCount": options.len(),
+                    "expiresAt": expires_at,
+                }),
+                format!("user-question-pending:{turn_id}:{invocation_id}"),
+            )
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        }
+
+        if !matches!(status, runtime::RuntimeTurnTerminalStatus::Suspended) {
+            settle_turn_budgets_in_transaction(&mut tx, &self.tenant_id, &self.session_id, turn_id)
+                .await?;
+        }
+        let changed = sqlx::query::<Sqlite>(
+            "UPDATE agent_turns
+             SET status = ?,
+                 ended_at = CASE WHEN ? <> 'suspended' THEN CURRENT_TIMESTAMP ELSE ended_at END,
+                 terminal_outcome = CASE WHEN ? <> 'suspended' THEN ? ELSE terminal_outcome END
+             WHERE tenant_id = ? AND thread_id = ? AND id = ?
+               AND status IN ('running', 'suspended')",
+        )
+        .bind(status_text)
+        .bind(status_text)
+        .bind(status_text)
+        .bind(status_text)
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(turn_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        if changed.rows_affected() != 1 {
+            let existing = sqlx::query::<Sqlite>(
+                "SELECT status FROM agent_turns
+                 WHERE tenant_id = ? AND thread_id = ? AND id = ?",
+            )
+            .bind(&self.tenant_id)
+            .bind(&self.session_id)
+            .bind(turn_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            let existing_status = existing
+                .and_then(|row| row.try_get::<String, _>("status").ok())
+                .unwrap_or_else(|| "missing".to_string());
+            let checkpoint_matches = sqlx::query_scalar::<Sqlite, i64>(
+                "SELECT COUNT(*) FROM execution_checkpoints
+                 WHERE id = ? AND tenant_id = ? AND thread_id = ? AND state_hash = ?",
+            )
+            .bind(&checkpoint_id)
+            .bind(&self.tenant_id)
+            .bind(&self.session_id)
+            .bind(&state_hash)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?
+                == 1;
+            if existing_status == status_text && checkpoint_matches {
+                // The caller may have lost the commit acknowledgement. The
+                // deterministic command id and state hash prove this exact
+                // terminal/checkpoint pair already committed.
+                return Ok(());
+            }
+            return Err(runtime::RuntimeError::new(format!(
+                "turn terminal transition fenced: expected running/suspended, found {existing_status}"
+            )));
+        }
+
+        let terminal_sequence = self
+            .append_domain_event_in_transaction(
+                &mut tx,
+                Some(turn_id),
+                &format!("turn-terminal:{turn_id}:{status_text}"),
+                "turn_terminal",
+                serde_json::json!({
+                    "status": status_text,
+                    "detail": detail,
+                    "checkpointId": checkpoint_id,
+                    "checkpointStateHash": state_hash,
+                }),
+                format!("turn-terminal:{turn_id}:{status_text}:{state_hash}"),
+            )
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let checkpoint_payload = serde_json::json!({
+            "schemaVersion": "runtime-session-checkpoint-v2",
+            "reason": "turn_terminal",
+            "sourceTurnId": turn_id,
+            "sourceTerminalSequence": terminal_sequence,
+            "sourceTerminalStatus": status_text,
+            "stateHash": state_hash,
+            "session": session_json,
+        });
+        let checkpoint_sequence = self
+            .append_domain_event_in_transaction(
+                &mut tx,
+                Some(turn_id),
+                &checkpoint_id,
+                "session_checkpoint_committed",
+                checkpoint_payload,
+                format!("terminal-checkpoint:{turn_id}:{status_text}:{state_hash}"),
+            )
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let projection = runtime::protect_sensitive_json(
+            &session_json,
+            runtime::configured_data_protection_mode(),
+        )
+        .0;
+        sqlx::query::<Sqlite>(
+            "INSERT INTO execution_checkpoints
+                (id, tenant_id, thread_id, sequence, state_hash, checkpoint_json,
+                 durable, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)",
+        )
+        .bind(&checkpoint_id)
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(i64::try_from(checkpoint_sequence).unwrap_or(i64::MAX))
+        .bind(&state_hash)
+        .bind(projection.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))
+    }
+}
+
+async fn settle_turn_budgets_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    tenant_id: &str,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<(), runtime::RuntimeError> {
+    let reservation_prefix = format!("model:{turn_id}:%");
+    let rows = sqlx::query::<Sqlite>(
+        "SELECT dimension, amount, parent_reservation_id
+         FROM resource_budget_entries
+         WHERE tenant_id = ? AND owner_scope = ? AND reservation_id LIKE ?
+           AND state = 'reserved'",
+    )
+    .bind(tenant_id)
+    .bind(session_id)
+    .bind(&reservation_prefix)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+    sqlx::query::<Sqlite>(
+        "UPDATE resource_budget_entries SET state = 'released'
+         WHERE tenant_id = ? AND owner_scope = ? AND reservation_id LIKE ? AND state = 'reserved'",
+    )
+    .bind(tenant_id)
+    .bind(session_id)
+    .bind(&reservation_prefix)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+    for row in rows {
+        let dimension = row
+            .try_get::<String, _>(0)
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let amount = row
+            .try_get::<i64, _>(1)
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let parent = row
+            .try_get::<Option<String>, _>(2)
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        if let Some(parent) = parent {
+            let restored = sqlx::query::<Sqlite>(
+                "UPDATE resource_budget_entries SET amount = amount + ?
+                 WHERE tenant_id = ? AND owner_scope = ? AND reservation_id = ?
+                   AND dimension = ? AND state = 'protected'",
+            )
+            .bind(amount)
+            .bind(tenant_id)
+            .bind(session_id)
+            .bind(parent)
+            .bind(&dimension)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            if restored.rows_affected() != 1 {
+                return Err(runtime::RuntimeError::new(
+                    "protected model budget parent missing during turn settlement",
+                ));
+            }
+        } else {
+            sqlx::query::<Sqlite>(
+                "UPDATE resource_budget_accounts
+                 SET reserved = MAX(reserved - ?, 0), available = available + ?
+                 WHERE tenant_id = ? AND owner_scope = ? AND dimension = ?",
+            )
+            .bind(amount)
+            .bind(amount)
+            .bind(tenant_id)
+            .bind(session_id)
+            .bind(&dimension)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        }
+    }
+    let protected_prefix = format!("model-protected:{turn_id}:%");
+    let protected_rows = sqlx::query::<Sqlite>(
+        "SELECT dimension, amount, committed_amount
+         FROM resource_budget_entries
+         WHERE tenant_id = ? AND owner_scope = ? AND reservation_id LIKE ?
+           AND state = 'protected'",
+    )
+    .bind(tenant_id)
+    .bind(session_id)
+    .bind(&protected_prefix)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+    for row in protected_rows {
+        let dimension = row
+            .try_get::<String, _>(0)
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let available = row
+            .try_get::<i64, _>(1)
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let committed = row
+            .try_get::<i64, _>(2)
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        sqlx::query::<Sqlite>(
+            "UPDATE resource_budget_accounts
+             SET reserved = MAX(reserved - ?, 0), available = available + ?, committed = committed + ?
+             WHERE tenant_id = ? AND owner_scope = ? AND dimension = ?",
+        )
+        .bind(available.saturating_add(committed))
+        .bind(available)
+        .bind(committed)
+        .bind(tenant_id)
+        .bind(session_id)
+        .bind(&dimension)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+    }
+    sqlx::query::<Sqlite>(
+        "UPDATE resource_budget_entries
+         SET state = CASE WHEN committed_amount > 0 THEN 'committed' ELSE 'released' END
+         WHERE tenant_id = ? AND owner_scope = ? AND reservation_id LIKE ? AND state = 'protected'",
+    )
+    .bind(tenant_id)
+    .bind(session_id)
+    .bind(&protected_prefix)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+    Ok(())
+}
+
+fn pending_user_questions(
+    session: &runtime::Session,
+    turn_id: &str,
+) -> Result<Vec<(String, String, Vec<String>)>, runtime::RuntimeError> {
+    let turn = session
+        .turns
+        .iter()
+        .find(|turn| turn.turn_id == turn_id)
+        .ok_or_else(|| runtime::RuntimeError::new("terminal checkpoint turn is missing"))?;
+    let end = turn.end_message_count.unwrap_or(session.messages.len());
+    let messages = session
+        .messages
+        .get(turn.start_message_count..end)
+        .ok_or_else(|| {
+            runtime::RuntimeError::new("terminal checkpoint message window is invalid")
+        })?;
+    let completed = messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            runtime::ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let mut questions = Vec::new();
+    for block in messages.iter().flat_map(|message| message.blocks.iter()) {
+        let runtime::ContentBlock::ToolUse { id, name, input } = block else {
+            continue;
+        };
+        let canonical = name
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        if canonical != "askuserquestion" || completed.contains(id.as_str()) {
+            continue;
+        }
+        let value = serde_json::from_str::<serde_json::Value>(input).map_err(|error| {
+            runtime::RuntimeError::new(format!("invalid durable question: {error}"))
+        })?;
+        let question = value
+            .get("question")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| runtime::RuntimeError::new("durable question text is missing"))?
+            .to_string();
+        let options = value
+            .get("options")
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        questions.push((id.clone(), question, options));
+    }
+    Ok(questions)
 }
 
 fn sha256_bytes(value: &[u8]) -> String {
@@ -4168,6 +4953,18 @@ pub(crate) async fn delete_session_artifacts(
     .execute(&mut *tx)
     .await?;
     sqlx::query::<Sqlite>(
+        "UPDATE structured_memory_facts
+         SET current = 0, valid_until = COALESCE(valid_until, CURRENT_TIMESTAMP),
+             candidate_json = json_set(candidate_json, '$.forgotten', 1,
+                                       '$.forgetReason', 'session_deleted'),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE tenant_id = ? AND session_id = ? AND current = 1",
+    )
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query::<Sqlite>(
         "DELETE FROM agent_memory_items
          WHERE tenant_id = ? AND session_id = ?",
     )
@@ -4640,30 +5437,158 @@ async fn append_event_in_transaction(
     Ok(())
 }
 
-/// Return the actual committed ledger positions available at a compaction
-/// boundary.  Runtime compaction must never synthesize `1..N` positions from a
-/// message count: those positions are only meaningful when they exist in the
-/// authoritative ledger.
-pub(crate) async fn ledger_sequences_for_thread(
+#[derive(Debug, Clone)]
+pub(crate) struct CompactionSourceCoverage {
+    pub event_sequences: Vec<u64>,
+    pub parent_compaction_ids: Vec<String>,
+    pub source_unit_hashes: Vec<String>,
+}
+
+/// Resolve every archived model-visible message to either its exact canonical
+/// event or a committed parent compaction. Missing/extra/out-of-order coverage
+/// fails closed instead of attaching the thread's entire history.
+pub(crate) async fn compaction_source_coverage(
     db: &SqlitePool,
     tenant_id: &str,
     thread_id: &str,
-) -> Result<Vec<u64>, SemanticStoreError> {
-    let rows = sqlx::query_scalar::<Sqlite, i64>(
-        "SELECT sequence FROM agent_event_ledger
+    archived_messages: &[runtime::ConversationMessage],
+) -> Result<CompactionSourceCoverage, SemanticStoreError> {
+    let rows = sqlx::query::<Sqlite>(
+        "SELECT sequence, event_type, payload_json, raw_payload_ciphertext
+         FROM agent_event_ledger
          WHERE tenant_id = ? AND thread_id = ? AND durable = 1
+           AND event_type IN ('runtime.turn_started', 'runtime.assistant_message', 'runtime.tool_outcome')
          ORDER BY sequence ASC",
     )
     .bind(tenant_id)
     .bind(thread_id)
     .fetch_all(db)
     .await?;
-    rows.into_iter()
-        .map(|value| {
-            u64::try_from(value)
-                .map_err(|_| SemanticStoreError::InvalidEvent("negative ledger sequence".into()))
-        })
-        .collect()
+    let mut event_messages = Vec::<(u64, runtime::ConversationMessage)>::new();
+    for row in rows {
+        let sequence = u64::try_from(row.get::<i64, _>("sequence"))
+            .map_err(|_| SemanticStoreError::InvalidEvent("negative ledger sequence".into()))?;
+        let event_type = row.get::<String, _>("event_type");
+        let projected = row.get::<String, _>("payload_json");
+        let raw = row
+            .try_get::<Option<String>, _>("raw_payload_ciphertext")?
+            .and_then(|ciphertext| agent_gateway::crypto::decrypt(&ciphertext).ok())
+            .unwrap_or(projected);
+        let payload = serde_json::from_str::<serde_json::Value>(&raw)
+            .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+        let message = match event_type.as_str() {
+            "runtime.turn_started" => payload
+                .get("userInput")
+                .and_then(serde_json::Value::as_str)
+                .map(runtime::ConversationMessage::user_text),
+            "runtime.assistant_message" => payload
+                .pointer("/message/message")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok()),
+            "runtime.tool_outcome" => {
+                let invocation_id = payload
+                    .get("invocationId")
+                    .and_then(serde_json::Value::as_str);
+                let tool_name = payload.get("toolName").and_then(serde_json::Value::as_str);
+                let output = payload
+                    .get("modelOutput")
+                    .and_then(serde_json::Value::as_str);
+                match (invocation_id, tool_name, output) {
+                    (Some(invocation_id), Some(tool_name), Some(output)) => {
+                        Some(runtime::ConversationMessage::tool_result(
+                            invocation_id,
+                            tool_name,
+                            output,
+                            payload.get("outcome").and_then(serde_json::Value::as_str)
+                                != Some("completed"),
+                        ))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(message) = message {
+            event_messages.push((sequence, message));
+        }
+    }
+
+    let parent_rows = sqlx::query::<Sqlite>(
+        "SELECT id, ledger_sequence, replacement_ciphertext
+         FROM compaction_transactions
+         WHERE tenant_id = ? AND thread_id = ? AND status = 'committed'
+         ORDER BY ledger_sequence ASC",
+    )
+    .bind(tenant_id)
+    .bind(thread_id)
+    .fetch_all(db)
+    .await?;
+    let mut parents = Vec::<(String, u64, Vec<runtime::ConversationMessage>)>::new();
+    for row in parent_rows {
+        let Some(ciphertext) = row.try_get::<Option<String>, _>("replacement_ciphertext")? else {
+            continue;
+        };
+        let raw = agent_gateway::crypto::decrypt(&ciphertext).map_err(|error| {
+            SemanticStoreError::InvalidEvent(format!("cannot decrypt parent compaction: {error}"))
+        })?;
+        let value = serde_json::from_str::<serde_json::Value>(&raw)
+            .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+        let messages = value
+            .get("messages")
+            .cloned()
+            .and_then(|messages| serde_json::from_value(messages).ok())
+            .unwrap_or_default();
+        let sequence = u64::try_from(row.get::<i64, _>("ledger_sequence"))
+            .map_err(|_| SemanticStoreError::InvalidEvent("negative compaction sequence".into()))?;
+        parents.push((row.get("id"), sequence, messages));
+    }
+
+    let mut event_cursor = 0_usize;
+    let mut sequences = Vec::new();
+    let mut parent_ids = Vec::new();
+    let mut unit_hashes = Vec::new();
+    for (unit_index, archived) in archived_messages.iter().enumerate() {
+        let unit_hash = sha256_json(&serde_json::json!({
+            "index": unit_index,
+            "message": archived,
+        }));
+        if let Some((offset, (sequence, _))) = event_messages[event_cursor..]
+            .iter()
+            .enumerate()
+            .find(|(_, (_, message))| message == archived)
+        {
+            event_cursor += offset + 1;
+            sequences.push(*sequence);
+            unit_hashes.push(unit_hash);
+            continue;
+        }
+        let Some((parent_id, sequence, _)) = parents
+            .iter()
+            .rev()
+            .find(|(_, _, messages)| messages.iter().any(|message| message == archived))
+        else {
+            return Err(SemanticStoreError::InvalidEvent(format!(
+                "compaction source unit has no exact event or parent coverage: {unit_hash}"
+            )));
+        };
+        sequences.push(*sequence);
+        parent_ids.push(parent_id.clone());
+        unit_hashes.push(unit_hash);
+    }
+    sequences.sort_unstable();
+    sequences.dedup();
+    parent_ids.sort();
+    parent_ids.dedup();
+    if sequences.is_empty() || unit_hashes.len() != archived_messages.len() {
+        return Err(SemanticStoreError::InvalidEvent(
+            "compaction exact source coverage is incomplete".into(),
+        ));
+    }
+    Ok(CompactionSourceCoverage {
+        event_sequences: sequences,
+        parent_compaction_ids: parent_ids,
+        source_unit_hashes: unit_hashes,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4695,10 +5620,23 @@ pub(crate) async fn prepare_compaction_transaction(
     user_id: &str,
     thread_id: &str,
     trigger: &str,
-    source_event_sequences: &[u64],
+    source_coverage: &CompactionSourceCoverage,
     archived_messages: &[runtime::ConversationMessage],
     candidates: &[CompactionMemoryCandidate],
 ) -> Result<String, SemanticStoreError> {
+    let source_event_sequences = &source_coverage.event_sequences;
+    let expected_unit_hashes = archived_messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            sha256_json(&serde_json::json!({"index": index, "message": message}))
+        })
+        .collect::<Vec<_>>();
+    if source_coverage.source_unit_hashes != expected_unit_hashes {
+        return Err(SemanticStoreError::InvalidEvent(
+            "compaction source unit hashes do not match the exact archive window".into(),
+        ));
+    }
     let Some(source_sequence_start) = source_event_sequences.first().copied() else {
         return Err(SemanticStoreError::InvalidEvent(
             "cannot prepare compaction without durable source coverage".into(),
@@ -4710,6 +5648,8 @@ pub(crate) async fn prepare_compaction_transaction(
     let archive = serde_json::json!({
         "schemaVersion": "exact-compaction-archive-v1",
         "sourceEventSeqs": source_event_sequences,
+        "parentCompactionIds": source_coverage.parent_compaction_ids,
+        "sourceUnitHashes": source_coverage.source_unit_hashes,
         "messages": archived_messages,
     });
     let archive_raw = archive.to_string();
@@ -4764,13 +5704,16 @@ pub(crate) async fn prepare_compaction_transaction(
             sqlx::query::<Sqlite>(
                 "UPDATE compaction_transactions
                  SET status = 'prepared', trigger = ?, source_archive_ciphertext = ?,
-                     memory_candidates_ciphertext = ?, abort_reason = NULL,
+                     memory_candidates_ciphertext = ?, parent_compaction_ids_json = ?,
+                     source_unit_hashes_json = ?, abort_reason = NULL,
                      aborted_at = NULL, prepared_at = CURRENT_TIMESTAMP
                  WHERE id = ? AND tenant_id = ? AND thread_id = ?",
             )
             .bind(trigger)
             .bind(source_archive_ciphertext)
             .bind(memory_candidates_ciphertext)
+            .bind(serde_json::to_string(&source_coverage.parent_compaction_ids).unwrap_or_default())
+            .bind(serde_json::to_string(&source_coverage.source_unit_hashes).unwrap_or_default())
             .bind(&transaction_id)
             .bind(tenant_id)
             .bind(thread_id)
@@ -4782,9 +5725,10 @@ pub(crate) async fn prepare_compaction_transaction(
                 "INSERT INTO compaction_transactions
                     (id, tenant_id, user_id, thread_id, trigger, status,
                      source_sequence_start, source_sequence_end, source_hash,
-                     source_archive_hash, source_archive_ciphertext,
-                     memory_candidates_ciphertext, prepared_at)
-                 VALUES (?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                    source_archive_hash, source_archive_ciphertext,
+                     memory_candidates_ciphertext, parent_compaction_ids_json,
+                     source_unit_hashes_json, prepared_at)
+                 VALUES (?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
             )
             .bind(&transaction_id)
             .bind(tenant_id)
@@ -4797,6 +5741,8 @@ pub(crate) async fn prepare_compaction_transaction(
             .bind(source_archive_hash)
             .bind(source_archive_ciphertext)
             .bind(memory_candidates_ciphertext)
+            .bind(serde_json::to_string(&source_coverage.parent_compaction_ids).unwrap_or_default())
+            .bind(serde_json::to_string(&source_coverage.source_unit_hashes).unwrap_or_default())
             .execute(&mut *transaction)
             .await?;
         }
@@ -5178,8 +6124,258 @@ pub(crate) async fn commit_compaction_transaction(
             "prepared compaction was concurrently consumed".into(),
         ));
     }
+    sqlx::query::<Sqlite>(
+        "INSERT INTO memory_learning_jobs
+            (id, tenant_id, user_id, session_id, app, compaction_transaction_id, status)
+         VALUES (?, ?, ?, ?, ?, ?, 'queued')
+         ON CONFLICT(tenant_id, compaction_transaction_id) DO NOTHING",
+    )
+    .bind(tenant_scoped_record_id(
+        "memory-learning-job",
+        tenant_id,
+        transaction_id,
+    ))
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(thread_id)
+    .bind(app)
+    .bind(transaction_id)
+    .execute(&mut *transaction)
+    .await?;
     transaction.commit().await?;
     Ok(())
+}
+
+/// Claims and executes one durable phase-2 memory-learning job.
+///
+/// Promotion is deliberately conservative: a fact must be current, high
+/// confidence, non-sensitive, and either explicitly pinned or independently
+/// observed in at least two sessions. Polluted sessions are quarantined and
+/// never feed global memory. The whole promotion and job settlement commit in
+/// one SQLite transaction, making lease-expiry retries idempotent.
+pub(crate) async fn run_memory_learning_job(
+    db: &SqlitePool,
+    worker_id: &str,
+) -> Result<bool, SemanticStoreError> {
+    let mut transaction = db.begin().await?;
+    acquire_sqlite_write_lock(&mut transaction).await?;
+    let claimed = sqlx::query::<Sqlite>(
+        "UPDATE memory_learning_jobs
+         SET status = 'leased', lease_owner = ?,
+             lease_expires_at = datetime('now', '+2 minutes'),
+             attempt = attempt + 1, updated_at = CURRENT_TIMESTAMP
+         WHERE id = (
+           SELECT id FROM memory_learning_jobs
+           WHERE (status IN ('queued', 'cooldown') AND next_attempt_at <= CURRENT_TIMESTAMP)
+              OR (status = 'leased' AND lease_expires_at < CURRENT_TIMESTAMP)
+           ORDER BY created_at, id LIMIT 1
+         )
+         RETURNING id, tenant_id, user_id, session_id, app, attempt",
+    )
+    .bind(worker_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(job) = claimed else {
+        transaction.rollback().await?;
+        return Ok(false);
+    };
+    let job_id = job.try_get::<String, _>("id")?;
+    let tenant_id = job.try_get::<String, _>("tenant_id")?;
+    let user_id = job.try_get::<String, _>("user_id")?;
+    let session_id = job.try_get::<String, _>("session_id")?;
+    let app = job.try_get::<String, _>("app")?;
+    let attempt = job.try_get::<i64, _>("attempt")?;
+
+    let pollution_state = sqlx::query_scalar::<Sqlite, String>(
+        "SELECT pollution_state FROM agent_thread_memory_state
+         WHERE tenant_id = ? AND user_id = ? AND session_id = ?",
+    )
+    .bind(&tenant_id)
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .unwrap_or_else(|| "clean".into());
+    if matches!(pollution_state.as_str(), "polluted" | "disabled") {
+        sqlx::query::<Sqlite>(
+            "UPDATE memory_learning_jobs
+             SET status = 'quarantined', lease_owner = NULL, lease_expires_at = NULL,
+                 last_error = 'source_session_not_clean', completed_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND lease_owner = ?",
+        )
+        .bind(job_id)
+        .bind(worker_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        return Ok(true);
+    }
+
+    let facts = sqlx::query::<Sqlite>(
+        "SELECT fact.id, fact.channel, fact.kind, fact.subject_json, fact.predicate,
+                fact.value_json, fact.text, fact.evidence_id, fact.evidence_hash,
+                fact.observed_at, fact.valid_until, fact.confidence, fact.sensitivity,
+                fact.projection_memory_id, fact.candidate_json,
+                COALESCE(json_extract(fact.candidate_json, '$.pinned'), 0) AS pinned,
+                (SELECT COUNT(DISTINCT peer.session_id)
+                   FROM structured_memory_facts peer
+                  WHERE peer.tenant_id = fact.tenant_id AND peer.user_id = fact.user_id
+                    AND peer.scope = 'session' AND peer.current = 1
+                    AND peer.subject_json = fact.subject_json
+                    AND peer.predicate = fact.predicate AND peer.value_json = fact.value_json
+                ) AS independent_sessions
+         FROM structured_memory_facts fact
+         WHERE fact.tenant_id = ? AND fact.user_id = ? AND fact.session_id = ?
+           AND fact.app = ? AND fact.scope = 'session' AND fact.current = 1
+           AND fact.confidence >= 0.90
+           AND lower(fact.sensitivity) IN ('public', 'internal')",
+    )
+    .bind(&tenant_id)
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&app)
+    .fetch_all(&mut *transaction)
+    .await?;
+    let mut promoted = 0_i64;
+    for fact in facts {
+        let pinned = fact.try_get::<i64, _>("pinned")? != 0;
+        let independent_sessions = fact.try_get::<i64, _>("independent_sessions")?;
+        if !pinned && independent_sessions < 2 {
+            continue;
+        }
+        let source_fact_id = fact.try_get::<String, _>("id")?;
+        let subject_json = fact.try_get::<String, _>("subject_json")?;
+        let predicate = fact.try_get::<String, _>("predicate")?;
+        let value_json = fact.try_get::<String, _>("value_json")?;
+        let identity = format!("{user_id}:{app}:{subject_json}:{predicate}:{value_json}");
+        let global_fact_id = tenant_scoped_record_id("global-memory-fact", &tenant_id, &identity);
+        let projection_id =
+            tenant_scoped_record_id("global-memory-projection", &tenant_id, &identity);
+        let text = fact.try_get::<String, _>("text")?;
+        let confidence = fact.try_get::<f64, _>("confidence")?;
+        let candidate_json = serde_json::json!({
+            "promotedFromFactId": source_fact_id,
+            "promotionPolicy": "pinned-or-two-independent-sessions-v1",
+            "independentSessions": independent_sessions,
+            "sourceCandidate": serde_json::from_str::<serde_json::Value>(
+                &fact.try_get::<String, _>("candidate_json")?
+            ).unwrap_or(serde_json::Value::Null),
+        });
+        sqlx::query::<Sqlite>(
+            "INSERT INTO structured_memory_facts
+                (id, tenant_id, user_id, scope, app, session_id, channel, kind,
+                 subject_json, predicate, value_json, text, evidence_id, evidence_hash,
+                 observed_at, valid_until, confidence, sensitivity, current,
+                 conflict_group, projection_memory_id, candidate_json)
+             VALUES (?, ?, ?, 'global', ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1,
+                     ?, ?, json(?))
+             ON CONFLICT(id) DO UPDATE SET
+                confidence = MAX(structured_memory_facts.confidence, excluded.confidence),
+                current = 1, candidate_json = excluded.candidate_json,
+                updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(&global_fact_id)
+        .bind(&tenant_id)
+        .bind(&user_id)
+        .bind(&app)
+        .bind(fact.try_get::<String, _>("channel")?)
+        .bind(fact.try_get::<String, _>("kind")?)
+        .bind(&subject_json)
+        .bind(&predicate)
+        .bind(&value_json)
+        .bind(&text)
+        .bind(fact.try_get::<String, _>("evidence_id")?)
+        .bind(fact.try_get::<String, _>("evidence_hash")?)
+        .bind(fact.try_get::<String, _>("observed_at")?)
+        .bind(fact.try_get::<Option<String>, _>("valid_until")?)
+        .bind(confidence)
+        .bind(fact.try_get::<String, _>("sensitivity")?)
+        .bind(tenant_scoped_record_id(
+            "global-memory-conflict",
+            &tenant_id,
+            &format!("{user_id}:{app}:{subject_json}:{predicate}"),
+        ))
+        .bind(&projection_id)
+        .bind(candidate_json.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        let metadata = serde_json::json!({
+            "structuredMemoryFactId": global_fact_id,
+            "promotedFromFactId": source_fact_id,
+            "promotionJobId": job_id,
+            "independentSessions": independent_sessions,
+        });
+        sqlx::query::<Sqlite>(
+            "INSERT INTO agent_memory_items
+                (id, tenant_id, user_id, scope, app, session_id, session_key,
+                 memory_type, content, content_hash, source_type, confidence,
+                 pinned, enabled, metadata_json)
+             VALUES (?, ?, ?, 'global', ?, NULL, '', ?, ?, ?, 'memory_learning', ?, ?, 1, json(?))
+             ON CONFLICT(id) DO UPDATE SET
+                content = excluded.content, content_hash = excluded.content_hash,
+                confidence = MAX(agent_memory_items.confidence, excluded.confidence),
+                enabled = 1, metadata_json = excluded.metadata_json,
+                updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(&projection_id)
+        .bind(&tenant_id)
+        .bind(&user_id)
+        .bind(&app)
+        .bind(fact.try_get::<String, _>("kind")?)
+        .bind(&text)
+        .bind(sha256_bytes(text.as_bytes()))
+        .bind(confidence)
+        .bind(i64::from(pinned))
+        .bind(metadata.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        promoted += 1;
+    }
+    let (status, next_attempt, completed_at) = if promoted > 0 {
+        ("completed", "CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP")
+    } else if attempt >= 5 {
+        ("completed", "CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP")
+    } else {
+        ("cooldown", "datetime('now', '+6 hours')", "NULL")
+    };
+    let settle = format!(
+        "UPDATE memory_learning_jobs
+         SET status = ?, promoted_count = promoted_count + ?, lease_owner = NULL,
+             lease_expires_at = NULL, next_attempt_at = {next_attempt},
+             completed_at = {completed_at}, last_error = NULL,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND lease_owner = ?"
+    );
+    sqlx::query::<Sqlite>(&settle)
+        .bind(status)
+        .bind(promoted)
+        .bind(job_id)
+        .bind(worker_id)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+pub(crate) fn start_memory_learning_worker(db: SqlitePool) {
+    tokio::spawn(async move {
+        let worker_id = format!("memory-learning:{}", Uuid::new_v4());
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            for _ in 0..100 {
+                match run_memory_learning_job(&db, &worker_id).await {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(error) => {
+                        tracing::error!(error = %error, "durable memory-learning worker failed");
+                        break;
+                    }
+                }
+            }
+        }
+    });
 }
 
 pub(crate) async fn load_pm_stage_snapshots(
@@ -6769,6 +7965,9 @@ pub(crate) async fn persist_pm_requirement_state_delta(
                             .collect()
                     })
                     .unwrap_or_default(),
+                decision_target: Default::default(),
+                predicted_information_gain_basis_points: 0,
+                user_effort: 0,
             });
         }
     }
@@ -7071,6 +8270,7 @@ pub(crate) async fn repair_ledger_thread(
 /// committed; compare-and-swap updates avoid overwriting concurrent writes.
 pub(crate) async fn rotate_encrypted_payload_batch(
     db: &SqlitePool,
+    data_dir: Option<&std::path::Path>,
     batch_size: i64,
 ) -> Result<usize, SemanticStoreError> {
     let active_key_id = agent_gateway::crypto::active_key_id()
@@ -7079,12 +8279,7 @@ pub(crate) async fn rotate_encrypted_payload_batch(
     let mut transaction = db.begin().await?;
     acquire_sqlite_write_lock(&mut transaction).await?;
     let mut rotated = 0_usize;
-    for (table, column) in [
-        ("api_keys", "encrypted_key"),
-        ("bot_channels", "auth_secret_ciphertext"),
-        ("agent_event_ledger", "raw_payload_ciphertext"),
-        ("context_packet_manifests", "raw_manifest_ciphertext"),
-    ] {
+    for (table, column) in CIPHERTEXT_REGISTRY {
         let column_exists = sqlx::query_scalar::<Sqlite, i64>(
             "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
         )
@@ -7097,11 +8292,22 @@ pub(crate) async fn rotate_encrypted_payload_batch(
             tracing::debug!(table, column, "skipping unavailable ciphertext store");
             continue;
         }
-        let select = format!(
-            "SELECT rowid, {column} FROM {table}
-             WHERE {column} IS NOT NULL AND {column} <> '' AND {column} NOT LIKE ?
-             LIMIT ?"
-        );
+        let select = if table == "data_sources" && column == "config" {
+            format!(
+                "SELECT rowid, CAST({column} AS TEXT) FROM {table}
+                 WHERE (json_extract({column}, '$.envelope') IS NOT NULL
+                   AND json_extract({column}, '$.envelope') NOT LIKE ?)
+                    OR (json_extract({column}, '$._encrypted') = 1
+                        AND json_extract({column}, '$.envelope') IS NULL)
+                 LIMIT ?"
+            )
+        } else {
+            format!(
+                "SELECT rowid, {column} FROM {table}
+                 WHERE {column} IS NOT NULL AND {column} <> '' AND {column} NOT LIKE ?
+                 LIMIT ?"
+            )
+        };
         let rows = sqlx::query::<Sqlite>(&select)
             .bind(&active_pattern)
             .bind(batch_size.max(1))
@@ -7110,8 +8316,55 @@ pub(crate) async fn rotate_encrypted_payload_batch(
         for row in rows {
             let row_id = row.try_get::<i64, _>(0)?;
             let old = row.try_get::<String, _>(1)?;
-            let replacement = agent_gateway::crypto::reencrypt(&old)
-                .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+            let replacement = if table == "data_sources" && column == "config" {
+                let mut document = serde_json::from_str::<serde_json::Value>(&old)
+                    .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+                if let Some(envelope) = document.get("envelope").and_then(serde_json::Value::as_str)
+                {
+                    let envelope = agent_gateway::crypto::reencrypt(envelope)
+                        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+                    document["envelope"] = serde_json::Value::String(envelope);
+                } else {
+                    let data_dir = data_dir.ok_or_else(|| {
+                        SemanticStoreError::InvalidEvent(
+                            "legacy data-source rotation requires the platform data directory"
+                                .into(),
+                        )
+                    })?;
+                    let plaintext =
+                        crate::routes::data_sources::decrypt_config(&document, data_dir)
+                            .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+                    document = crate::routes::data_sources::encrypt_config(&plaintext, data_dir)
+                        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+                }
+                serde_json::to_string(&document)
+                    .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?
+            } else if table == "durable_user_questions" && column == "answer" {
+                if old.starts_with("aosenc:v1:") {
+                    agent_gateway::crypto::reencrypt(&old)
+                        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?
+                } else {
+                    agent_gateway::crypto::encrypt(&old)
+                        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?
+                }
+            } else if table == "gitlab_projects" && column == "gitlab_token" {
+                if old.starts_with("aosenc:v1:") {
+                    agent_gateway::crypto::reencrypt(&old)
+                        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?
+                } else {
+                    let plaintext = agent_gateway::decrypt_repository_token(&old);
+                    if plaintext.is_empty() && !old.is_empty() {
+                        return Err(SemanticStoreError::InvalidEvent(
+                            "legacy repository token cannot be decrypted".into(),
+                        ));
+                    }
+                    agent_gateway::crypto::encrypt(&plaintext)
+                        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?
+                }
+            } else {
+                agent_gateway::crypto::reencrypt(&old)
+                    .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?
+            };
             if replacement == old {
                 continue;
             }
@@ -7130,13 +8383,116 @@ pub(crate) async fn rotate_encrypted_payload_batch(
     Ok(rotated)
 }
 
-pub(crate) fn start_encryption_key_rotation_worker(db: SqlitePool) {
+const CIPHERTEXT_REGISTRY: [(&str, &str); 12] = [
+    ("api_keys", "encrypted_key"),
+    ("bot_channels", "auth_secret_ciphertext"),
+    ("agent_event_ledger", "raw_payload_ciphertext"),
+    ("context_packet_manifests", "raw_manifest_ciphertext"),
+    ("provider_request_attempts", "tool_schema_ciphertext"),
+    ("tool_schema_manifests", "schema_ciphertext"),
+    ("compaction_transactions", "source_archive_ciphertext"),
+    ("compaction_transactions", "replacement_ciphertext"),
+    ("compaction_transactions", "memory_candidates_ciphertext"),
+    ("gitlab_projects", "gitlab_token"),
+    ("data_sources", "config"),
+    ("durable_user_questions", "answer"),
+];
+
+pub(crate) async fn count_old_key_references(db: &SqlitePool) -> Result<u64, SemanticStoreError> {
+    let active_key_id = agent_gateway::crypto::active_key_id()
+        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+    let active_pattern = format!("aosenc:v1:{active_key_id}:%");
+    let mut total = 0_u64;
+    for (table, column) in CIPHERTEXT_REGISTRY {
+        let column_exists = sqlx::query_scalar::<Sqlite, i64>(
+            "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(db)
+        .await?
+            > 0;
+        if !column_exists {
+            tracing::debug!(table, column, "skipping unavailable ciphertext store");
+            continue;
+        }
+        let sql = if table == "data_sources" && column == "config" {
+            format!(
+                "SELECT COUNT(*) FROM {table}
+                 WHERE (json_extract({column}, '$.envelope') IS NOT NULL
+                        AND json_extract({column}, '$.envelope') NOT LIKE ?)
+                    OR (json_extract({column}, '$._encrypted') = 1
+                        AND json_extract({column}, '$.envelope') IS NULL)"
+            )
+        } else {
+            format!(
+                "SELECT COUNT(*) FROM {table}
+                 WHERE {column} IS NOT NULL AND {column} <> '' AND {column} NOT LIKE ?"
+            )
+        };
+        let count = sqlx::query_scalar::<Sqlite, i64>(&sql)
+            .bind(&active_pattern)
+            .fetch_one(db)
+            .await?;
+        total = total.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+    }
+    Ok(total)
+}
+
+pub(crate) fn start_encryption_key_rotation_worker(db: SqlitePool, data_dir: PathBuf) {
     tokio::spawn(async move {
+        let active_key_id = match agent_gateway::crypto::active_key_id() {
+            Ok(key_id) => key_id,
+            Err(error) => {
+                tracing::error!(error = %error, "cannot start ciphertext rotation without an active key id");
+                return;
+            }
+        };
+        let job_id = Uuid::new_v4().to_string();
+        if let Err(error) = sqlx::query(
+            "INSERT INTO ciphertext_rotation_jobs
+                (id, active_key_id, status, started_at, heartbeat_at)
+             VALUES (?, ?, 'running', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(&job_id)
+        .bind(&active_key_id)
+        .execute(&db)
+        .await
+        {
+            tracing::error!(error = %error, "cannot persist ciphertext rotation job");
+            return;
+        }
         loop {
-            match rotate_encrypted_payload_batch(&db, 200).await {
-                Ok(0) => break,
+            match rotate_encrypted_payload_batch(&db, Some(&data_dir), 200).await {
+                Ok(0) => {
+                    let remaining = count_old_key_references(&db).await.unwrap_or(u64::MAX);
+                    let _ = sqlx::query(
+                        "UPDATE ciphertext_rotation_jobs
+                         SET status = CASE WHEN ? = 0 THEN 'completed' ELSE 'failed' END,
+                             remaining_old_key_references = ?, heartbeat_at = CURRENT_TIMESTAMP,
+                             completed_at = CURRENT_TIMESTAMP,
+                             last_error = CASE WHEN ? = 0 THEN NULL ELSE 'old_key_references_remain' END
+                         WHERE id = ?",
+                    )
+                    .bind(i64::try_from(remaining).unwrap_or(i64::MAX))
+                    .bind(i64::try_from(remaining).unwrap_or(i64::MAX))
+                    .bind(i64::try_from(remaining).unwrap_or(i64::MAX))
+                    .bind(&job_id)
+                    .execute(&db)
+                    .await;
+                    break;
+                }
                 Ok(rotated) => {
                     tracing::info!(rotated, "rotated durable ciphertext batch");
+                    let _ = sqlx::query(
+                        "UPDATE ciphertext_rotation_jobs
+                         SET rotated_count = rotated_count + ?, heartbeat_at = CURRENT_TIMESTAMP
+                         WHERE id = ? AND status = 'running'",
+                    )
+                    .bind(i64::try_from(rotated).unwrap_or(i64::MAX))
+                    .bind(&job_id)
+                    .execute(&db)
+                    .await;
                     tokio::task::yield_now().await;
                 }
                 Err(error) => {
@@ -7144,6 +8500,15 @@ pub(crate) fn start_encryption_key_rotation_worker(db: SqlitePool) {
                         error = %error,
                         "durable ciphertext rotation stopped; keep retired keys configured and retry"
                     );
+                    let _ = sqlx::query(
+                        "UPDATE ciphertext_rotation_jobs
+                         SET status = 'failed', last_error = ?, heartbeat_at = CURRENT_TIMESTAMP
+                         WHERE id = ?",
+                    )
+                    .bind(error.to_string())
+                    .bind(&job_id)
+                    .execute(&db)
+                    .await;
                     break;
                 }
             }
@@ -7352,6 +8717,27 @@ mod tests {
             .bind(content)
             .bind(sha256_bytes(content.as_bytes()))
             .bind(pinned)
+            .execute(&db)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO structured_memory_facts
+                    (id, tenant_id, user_id, scope, app, session_id, channel, kind,
+                     subject_json, predicate, value_json, text, evidence_id, evidence_hash,
+                     observed_at, confidence, sensitivity, current, projection_memory_id,
+                     candidate_json)
+                 VALUES (?, 'tenant-context', ?, 'session', 'shared', ?,
+                         'long_term_memory', 'fact', '{\"memoryType\":\"fact\"}',
+                         'fact', ?, ?, ?, ?, CURRENT_TIMESTAMP, 1.0, 'internal', 1, ?, '{}')",
+            )
+            .bind(format!("fact:{id}"))
+            .bind(user_id)
+            .bind(session_id)
+            .bind(serde_json::Value::String(content.to_string()).to_string())
+            .bind(content)
+            .bind(format!("memory:{id}"))
+            .bind(sha256_bytes(content.as_bytes()))
+            .bind(id)
             .execute(&db)
             .await
             .unwrap();
@@ -8848,7 +10234,16 @@ mod tests {
             "user",
             "session",
             "test",
-            &[1, 2, 3],
+            &CompactionSourceCoverage {
+                event_sequences: vec![1, 2, 3],
+                parent_compaction_ids: Vec::new(),
+                source_unit_hashes: vec![sha256_json(&serde_json::json!({
+                    "index": 0,
+                    "message": runtime::ConversationMessage::user_text(
+                        "password=checkpoint-secret",
+                    ),
+                }))],
+            },
             &[runtime::ConversationMessage::user_text(
                 "password=checkpoint-secret",
             )],
@@ -8904,7 +10299,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(rotate_encrypted_payload_batch(&db, 10).await.unwrap(), 1);
+        assert_eq!(
+            rotate_encrypted_payload_batch(&db, None, 10).await.unwrap(),
+            1
+        );
         let rotated: String = sqlx::query_scalar(
             "SELECT raw_manifest_ciphertext FROM context_packet_manifests
              WHERE id = 'rotation-manifest'",
@@ -8917,6 +10315,7 @@ mod tests {
             agent_gateway::crypto::decrypt(&rotated).unwrap(),
             "exact provider packet"
         );
+        assert_eq!(count_old_key_references(&db).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -9436,7 +10835,7 @@ mod tests {
              VALUES ('tenant-contract', 'ds-a', '订单数', '[\"orders\"]',
                      'COUNT(DISTINCT order_id)', 'published', 1, 'owner', 'owner',
                      '{\"is_test\":false}', 'day', 'business_date', 'Asia/Shanghai',
-                     '{\"subject\":\"order\",\"dedup_key\":\"order_id\",\"exclude_test_users\":true,\"exclude_internal_users\":false,\"valid_record_rule\":\"status <> cancelled\"}',
+                     '{\"subject\":\"order\",\"dedup_key\":\"order_id\",\"exclude_test_users\":true,\"exclude_internal_users\":false,\"valid_record_rule\":\"status <> ''cancelled''\"}',
                      '[\"day\"]', '[]', '[]')",
         )
         .execute(&db)
@@ -9475,7 +10874,7 @@ mod tests {
             &mut intent,
             &serde_json::json!([{
                 "table_name": "orders",
-                "columns": [{"name": "business_date"}, {"name": "order_id"}, {"name": "is_test"}]
+                "columns": [{"name": "business_date"}, {"name": "order_id"}, {"name": "is_test"}, {"name": "status"}]
             }]),
             &[],
         );
@@ -9486,7 +10885,7 @@ mod tests {
             .start_inclusive
             .clone();
         let valid_sql = format!(
-            "SELECT business_date, COUNT(DISTINCT order_id) AS orders FROM orders WHERE business_date = DATE '{start}' AND is_test = false GROUP BY business_date"
+            "SELECT business_date, COUNT(DISTINCT order_id) AS orders FROM orders WHERE business_date = DATE '{start}' AND is_test = false AND status <> 'cancelled' GROUP BY business_date"
         );
         let valid = crate::routes::nl2sql::semantic_audit::compile_canonical_intent_with_contracts_and_joins(
             &intent,
@@ -9500,7 +10899,7 @@ mod tests {
             nl2sql_core::semantic_ir::QueryReleaseDecision::Release
         );
         let wrong_metric_sql = format!(
-            "SELECT business_date, COUNT(*) AS orders FROM orders WHERE business_date = DATE '{start}' AND is_test = false GROUP BY business_date"
+            "SELECT business_date, COUNT(*) AS orders FROM orders WHERE business_date = DATE '{start}' AND is_test = false AND status <> 'cancelled' GROUP BY business_date"
         );
         let wrong_metric = crate::routes::nl2sql::semantic_audit::compile_canonical_intent_with_contracts_and_joins(
             &intent,
@@ -11133,5 +12532,392 @@ mod tests {
         .unwrap();
         assert_eq!(approval_status, "expired");
         assert_eq!(invocation_status, "awaiting_authorization");
+    }
+
+    #[tokio::test]
+    async fn terminal_and_checkpoint_commit_with_the_same_source_revision() {
+        let db = db().await;
+        let kernel = RuntimeExecutionKernel::new(db.clone(), "tenant", "user", "atomic-session");
+        kernel
+            .start_turn(runtime::RuntimeTurnStart {
+                turn_id: "atomic-turn".into(),
+                user_input: "finish atomically".into(),
+            })
+            .await
+            .unwrap();
+        let mut session = scoped_runtime_session("atomic-session", "tenant", "user");
+        session.restore_turn(
+            "atomic-turn",
+            "finish atomically",
+            0,
+            None,
+            runtime::SessionTurnStatus::Running,
+        );
+        session.push_user_text("finish atomically").unwrap();
+        session
+            .push_message(runtime::ConversationMessage::assistant(vec![
+                runtime::ContentBlock::Text {
+                    text: "done".into(),
+                },
+            ]))
+            .unwrap();
+        session
+            .complete_turn("atomic-turn", runtime::SessionTurnStatus::Completed)
+            .unwrap();
+        kernel
+            .finish_turn_with_checkpoint(
+                "atomic-turn",
+                runtime::RuntimeTurnTerminalStatus::Completed,
+                None,
+                &session,
+            )
+            .await
+            .unwrap();
+        // Lost commit acknowledgements retry the exact command without
+        // creating another terminal event or checkpoint.
+        kernel
+            .finish_turn_with_checkpoint(
+                "atomic-turn",
+                runtime::RuntimeTurnTerminalStatus::Completed,
+                None,
+                &session,
+            )
+            .await
+            .unwrap();
+
+        let (status, checkpoint_count): (String, i64) = sqlx::query_as(
+            "SELECT status,
+                (SELECT COUNT(*) FROM execution_checkpoints
+                 WHERE tenant_id = 'tenant' AND thread_id = 'atomic-session')
+             FROM agent_turns
+             WHERE tenant_id = 'tenant' AND thread_id = 'atomic-session' AND id = 'atomic-turn'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(status, "completed");
+        assert_eq!(checkpoint_count, 1);
+        let payload: String = sqlx::query_scalar(
+            "SELECT payload_json FROM agent_event_ledger
+             WHERE tenant_id = 'tenant' AND thread_id = 'atomic-session'
+               AND event_type = 'runtime.turn_terminal'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(payload.contains("checkpointStateHash"));
+
+        let mut inconsistent = scoped_runtime_session("atomic-session", "tenant", "user");
+        inconsistent.restore_turn(
+            "atomic-turn",
+            "finish atomically",
+            0,
+            None,
+            runtime::SessionTurnStatus::Running,
+        );
+        let error = kernel
+            .finish_turn_with_checkpoint(
+                "atomic-turn",
+                runtime::RuntimeTurnTerminalStatus::Cancelled,
+                None,
+                &inconsistent,
+            )
+            .await
+            .expect_err("a terminal status that disagrees with the checkpoint must fail closed");
+        assert!(error.to_string().contains("session turn status"));
+    }
+
+    #[tokio::test]
+    async fn compaction_coverage_maps_only_the_archived_message_window() {
+        let db = db().await;
+        let kernel = RuntimeExecutionKernel::new(db.clone(), "tenant", "user", "coverage-session");
+        kernel
+            .start_turn(runtime::RuntimeTurnStart {
+                turn_id: "coverage-turn".into(),
+                user_input: "first source unit".into(),
+            })
+            .await
+            .unwrap();
+        let assistant =
+            runtime::ConversationMessage::assistant(vec![runtime::ContentBlock::Text {
+                text: "second source unit".into(),
+            }]);
+        kernel
+            .record_assistant_message("coverage-turn", 1, &assistant)
+            .await
+            .unwrap();
+        // A later event in the same thread must not be attached to this exact
+        // two-message archive window.
+        kernel
+            .append_domain(
+                "coverage-turn",
+                "warning:later",
+                "runtime_warning",
+                serde_json::json!({"message": "later warning"}),
+                "warning:later".into(),
+            )
+            .await
+            .unwrap();
+        let archived = vec![
+            runtime::ConversationMessage::user_text("first source unit"),
+            assistant,
+        ];
+        let coverage = compaction_source_coverage(&db, "tenant", "coverage-session", &archived)
+            .await
+            .unwrap();
+        assert_eq!(coverage.event_sequences, [1, 2]);
+        assert_eq!(coverage.source_unit_hashes.len(), archived.len());
+        assert!(coverage.parent_compaction_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_question_is_owner_scoped_idempotent_and_consumed_once() {
+        let db = db().await;
+        let kernel = RuntimeExecutionKernel::new(db.clone(), "tenant", "user", "question-session");
+        kernel
+            .start_turn(runtime::RuntimeTurnStart {
+                turn_id: "question-turn".into(),
+                user_input: "choose".into(),
+            })
+            .await
+            .unwrap();
+        let mut session = scoped_runtime_session("question-session", "tenant", "user");
+        session.restore_turn(
+            "question-turn",
+            "choose",
+            0,
+            None,
+            runtime::SessionTurnStatus::Running,
+        );
+        session.push_user_text("choose").unwrap();
+        session
+            .push_message(runtime::ConversationMessage::assistant(vec![
+                runtime::ContentBlock::ToolUse {
+                    id: "question-call".into(),
+                    name: "AskUserQuestion".into(),
+                    input: serde_json::json!({
+                        "question": "Which environment?",
+                        "options": ["staging", "production"]
+                    })
+                    .to_string(),
+                },
+            ]))
+            .unwrap();
+        session
+            .complete_turn("question-turn", runtime::SessionTurnStatus::Suspended)
+            .unwrap();
+        kernel
+            .finish_turn_with_checkpoint(
+                "question-turn",
+                runtime::RuntimeTurnTerminalStatus::Suspended,
+                Some("waiting for user answer"),
+                &session,
+            )
+            .await
+            .unwrap();
+
+        let questions = list_runtime_questions(&db, "tenant", "user", "question-session")
+            .await
+            .unwrap();
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].options, ["staging", "production"]);
+        assert!(
+            list_runtime_questions(&db, "tenant", "intruder", "question-session")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let request_id = questions[0].request_id.clone();
+        assert_eq!(
+            answer_runtime_question(
+                &db,
+                "tenant",
+                "user",
+                "question-session",
+                &request_id,
+                "staging",
+            )
+            .await
+            .unwrap(),
+            "staging"
+        );
+        // Network retries of the same answer are safe.
+        answer_runtime_question(
+            &db,
+            "tenant",
+            "user",
+            "question-session",
+            &request_id,
+            "staging",
+        )
+        .await
+        .unwrap();
+        let protected_answer: String =
+            sqlx::query_scalar("SELECT answer FROM durable_user_questions WHERE id = ?")
+                .bind(&request_id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(protected_answer.starts_with("aosenc:v1:"));
+        assert!(!protected_answer.contains("staging"));
+        assert!(answer_runtime_question(
+            &db,
+            "tenant",
+            "user",
+            "question-session",
+            &request_id,
+            "production",
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            kernel
+                .consume_user_question("question-turn", "question-call", "staging")
+                .await
+                .unwrap(),
+            "staging"
+        );
+        // A crash after consume and before the next checkpoint can replay the
+        // same answer without creating a second response or side effect.
+        assert_eq!(
+            kernel
+                .consume_user_question("question-turn", "question-call", "staging")
+                .await
+                .unwrap(),
+            "staging"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_question_batch_answer_is_atomic_on_validation_failure() {
+        let db = db().await;
+        for (id, invocation_id) in [("question-a", "call-a"), ("question-b", "call-b")] {
+            sqlx::query(
+                "INSERT INTO durable_user_questions
+                    (id, tenant_id, user_id, session_id, turn_id, invocation_id,
+                     question, options_json, status)
+                 VALUES (?, 'tenant', 'user', 'batch-session', 'batch-turn', ?,
+                         'Choose', '[]', 'pending')",
+            )
+            .bind(id)
+            .bind(invocation_id)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+
+        let error = answer_runtime_questions(
+            &db,
+            "tenant",
+            "user",
+            "batch-session",
+            &[("question-a", "first"), ("missing-question", "second")],
+        )
+        .await
+        .expect_err("a missing answer target must reject the whole batch");
+        assert!(error.to_string().contains("was not found"));
+        let states = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT status, answer_hash FROM durable_user_questions
+             WHERE session_id = 'batch-session' ORDER BY id",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            states,
+            vec![("pending".into(), None), ("pending".into(), None)]
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_learning_promotes_pinned_facts_and_quarantines_polluted_sessions() {
+        let db = db().await;
+        for (session, compaction, state) in [
+            ("clean-session", "clean-compaction", "clean"),
+            ("polluted-session", "polluted-compaction", "polluted"),
+        ] {
+            sqlx::query(
+                "INSERT INTO compaction_transactions
+                    (id, tenant_id, user_id, thread_id, trigger, status,
+                     source_sequence_start, source_sequence_end, source_hash,
+                     source_archive_hash, source_archive_ciphertext)
+                 VALUES (?, 'tenant', 'user', ?, 'test', 'committed', 1, 1, ?, ?, ?)",
+            )
+            .bind(compaction)
+            .bind(session)
+            .bind(format!("source-{compaction}"))
+            .bind(format!("archive-{compaction}"))
+            .bind(agent_gateway::crypto::encrypt("[]").unwrap())
+            .execute(&db)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO agent_thread_memory_state
+                    (tenant_id, user_id, session_id, pollution_state)
+                 VALUES ('tenant', 'user', ?, ?)",
+            )
+            .bind(session)
+            .bind(state)
+            .execute(&db)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO structured_memory_facts
+                    (id, tenant_id, user_id, scope, app, session_id, channel, kind,
+                     subject_json, predicate, value_json, text, evidence_id,
+                     evidence_hash, observed_at, confidence, sensitivity,
+                     projection_memory_id, candidate_json)
+                 VALUES (?, 'tenant', 'user', 'session', 'assistant', ?,
+                         'continuity_state', 'preference', '{\"user\":true}',
+                         'deploy_target', '\"staging\"', 'Prefer staging', ?, ?,
+                         CURRENT_TIMESTAMP, 0.99, 'internal', ?, '{\"pinned\":true}')",
+            )
+            .bind(format!("fact-{session}"))
+            .bind(session)
+            .bind(format!("evidence-{session}"))
+            .bind(format!("hash-{session}"))
+            .bind(format!("projection-{session}"))
+            .execute(&db)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO memory_learning_jobs
+                    (id, tenant_id, user_id, session_id, app,
+                     compaction_transaction_id, status)
+                 VALUES (?, 'tenant', 'user', ?, 'assistant', ?, 'queued')",
+            )
+            .bind(format!("job-{session}"))
+            .bind(session)
+            .bind(compaction)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+
+        assert!(run_memory_learning_job(&db, "worker").await.unwrap());
+        assert!(run_memory_learning_job(&db, "worker").await.unwrap());
+        assert!(!run_memory_learning_job(&db, "worker").await.unwrap());
+        let global_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM structured_memory_facts
+             WHERE tenant_id = 'tenant' AND user_id = 'user' AND scope = 'global' AND current = 1",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(global_count, 1);
+        let clean_status: String = sqlx::query_scalar(
+            "SELECT status FROM memory_learning_jobs WHERE id = 'job-clean-session'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let polluted_status: String = sqlx::query_scalar(
+            "SELECT status FROM memory_learning_jobs WHERE id = 'job-polluted-session'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(clean_status, "completed");
+        assert_eq!(polluted_status, "quarantined");
     }
 }

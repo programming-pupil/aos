@@ -1,6 +1,6 @@
 use crate::{
-    AssertionStatus, DecisionStatus, EvidenceAuthority, EvidenceLedger, ProposedStateDelta,
-    SemanticSnapshot,
+    AssertionStatus, DecisionRecord, DecisionStatus, EvidenceAuthority, EvidenceLedger,
+    ProposedStateDelta, SemanticAssertion, SemanticSnapshot, Sensitivity,
 };
 use thiserror::Error;
 
@@ -54,12 +54,9 @@ impl SemanticReducer {
                         });
                     }
                 }
-                let has_non_model_authority = candidate.source_refs.iter().any(|source| {
-                    evidence
-                        .get(&source.evidence_id)
-                        .is_some_and(|entry| entry.authority != EvidenceAuthority::Model)
-                });
-                if candidate.status == AssertionStatus::Confirmed && !has_non_model_authority {
+                if candidate.status == AssertionStatus::Confirmed
+                    && !assertion_confirmation_authorized(&candidate, evidence)
+                {
                     candidate.status = AssertionStatus::Proposed;
                 }
                 if let Some(existing) = next.assertions.get(&candidate.id) {
@@ -135,12 +132,9 @@ impl SemanticReducer {
                         });
                     }
                 }
-                let has_non_model_authority = decision.rationale.iter().any(|source| {
-                    evidence
-                        .get(&source.evidence_id)
-                        .is_some_and(|entry| entry.authority != EvidenceAuthority::Model)
-                });
-                if decision.status == DecisionStatus::Accepted && !has_non_model_authority {
+                if decision.status == DecisionStatus::Accepted
+                    && !decision_acceptance_authorized(&decision, evidence)
+                {
                     decision.status = DecisionStatus::Proposed;
                     outcome.needs_confirmation.push(decision.id.clone());
                 }
@@ -166,4 +160,35 @@ impl SemanticReducer {
         outcome.snapshot = next;
         Ok(outcome)
     }
+}
+
+fn assertion_confirmation_authorized(
+    assertion: &SemanticAssertion,
+    evidence: &EvidenceLedger,
+) -> bool {
+    assertion.source_refs.iter().any(|source| {
+        evidence.get(&source.evidence_id).is_some_and(|entry| {
+            matches!(
+                entry.authority,
+                EvidenceAuthority::User | EvidenceAuthority::Owner
+            ) || (matches!(
+                assertion.sensitivity,
+                Sensitivity::Public | Sensitivity::Internal
+            ) && matches!(
+                entry.authority,
+                EvidenceAuthority::Tool | EvidenceAuthority::Document
+            ))
+        })
+    })
+}
+
+fn decision_acceptance_authorized(decision: &DecisionRecord, evidence: &EvidenceLedger) -> bool {
+    decision.rationale.iter().any(|source| {
+        evidence.get(&source.evidence_id).is_some_and(|entry| {
+            matches!(
+                entry.authority,
+                EvidenceAuthority::User | EvidenceAuthority::Owner
+            )
+        })
+    })
 }

@@ -44,19 +44,27 @@ describe("approval resume handlers", () => {
 
   it("provides callbacks after a page reload", () => {
     const onApprovalRequired = vi.fn();
+    const onQuestionRequired = vi.fn();
     const onStreamEnd = vi.fn();
     const onError = vi.fn();
     const result = approvalResumeHandlers("session-1", null, {
       onApprovalRequired,
+      onQuestionRequired,
       onStreamEnd,
       onError,
     });
 
     result.onApprovalRequired?.(paused);
+    result.onQuestionRequired?.({
+      sessionId: "session-1",
+      runtimeTurnId: "turn-1",
+      questions: [],
+    });
     result.onStreamEnd?.(0);
     result.onError?.("resume failed");
 
     expect(onApprovalRequired).toHaveBeenCalledWith(paused);
+    expect(onQuestionRequired).toHaveBeenCalledOnce();
     expect(onStreamEnd).toHaveBeenCalledOnce();
     expect(onError).toHaveBeenCalledWith("resume failed");
   });

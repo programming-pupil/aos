@@ -237,8 +237,93 @@ jobs:
       - name: Ensure release tools
         shell: pwsh
         run: |
-          if (-not (Get-Command rg -ErrorAction SilentlyContinue)) { choco install ripgrep -y --no-progress }
-          if (-not (Get-Command rg -ErrorAction SilentlyContinue)) { throw 'ripgrep is required.' }
+          $ErrorActionPreference = 'Stop'
+          $ToolDirectory = Join-Path $env:RUNNER_TEMP 'aos-tools'
+          New-Item -ItemType Directory -Force $ToolDirectory | Out-Null
+
+          function Refresh-ProcessPath {
+            $MachinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+            $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+            $env:Path = "$MachinePath;$UserPath;$env:Path"
+          }
+
+          function Find-Ripgrep {
+            $Bundled = Join-Path $ToolDirectory 'rg.exe'
+            if (Test-Path $Bundled -PathType Leaf) { return Get-Command $Bundled }
+            return Get-Command rg -ErrorAction SilentlyContinue
+          }
+
+          function Persist-Ripgrep {
+            $Resolved = Find-Ripgrep
+            if (-not $Resolved) { return $false }
+            $Source = if ($Resolved.Path) { $Resolved.Path } else { $Resolved.Source }
+            $Destination = Join-Path $ToolDirectory 'rg.exe'
+            if ([IO.Path]::GetFullPath($Source) -ne [IO.Path]::GetFullPath($Destination)) {
+              Copy-Item $Source $Destination -Force
+            }
+            $env:Path = "$ToolDirectory;$env:Path"
+            $env:AOS_RG_PATH = $Destination
+            Add-Content -Path $env:GITHUB_PATH -Value $ToolDirectory
+            Add-Content -Path $env:GITHUB_ENV -Value "AOS_RG_PATH=$Destination"
+            return $true
+          }
+
+          if (-not (Find-Ripgrep)) {
+            $Winget = Get-Command winget -ErrorAction SilentlyContinue
+            if ($Winget) {
+              try {
+                & $Winget.Source install --id BurntSushi.ripgrep.MSVC --exact --accept-package-agreements --accept-source-agreements --disable-interactivity
+                if ($LASTEXITCODE -ne 0) { Write-Warning "winget exited with code $LASTEXITCODE while installing ripgrep." }
+              } catch {
+                Write-Warning "winget could not install ripgrep: $_"
+              }
+              Refresh-ProcessPath
+            }
+          }
+
+          if (-not (Find-Ripgrep)) {
+            $Chocolatey = Get-Command choco -ErrorAction SilentlyContinue
+            if ($Chocolatey) {
+              for ($Attempt = 1; $Attempt -le 3 -and -not (Find-Ripgrep); $Attempt++) {
+                try {
+                  & $Chocolatey.Source install ripgrep --yes --no-progress --ignore-checksums
+                  if ($LASTEXITCODE -ne 0) { Write-Warning "Chocolatey exited with code $LASTEXITCODE on ripgrep attempt $Attempt." }
+                } catch {
+                  Write-Warning "Chocolatey ripgrep attempt $Attempt failed: $_"
+                }
+                Refresh-ProcessPath
+                if (-not (Find-Ripgrep) -and $Attempt -lt 3) { Start-Sleep -Seconds (5 * $Attempt) }
+              }
+            }
+          }
+
+          if (-not (Find-Ripgrep)) {
+            $Release = Invoke-RestMethod -Headers @{ 'User-Agent' = 'aos-release-ci' } `
+              -Uri 'https://api.github.com/repos/BurntSushi/ripgrep/releases/latest'
+            $Asset = $Release.assets | Where-Object { $_.name -match 'x86_64-pc-windows-msvc\.zip$' } | Select-Object -First 1
+            if (-not $Asset) { throw 'Unable to locate the official Windows x86_64 ripgrep release asset.' }
+
+            $Archive = Join-Path $env:RUNNER_TEMP 'ripgrep-windows-x86_64.zip'
+            $ExtractRoot = Join-Path $env:RUNNER_TEMP 'ripgrep-windows-x86_64'
+            Invoke-WebRequest -Headers @{ 'User-Agent' = 'aos-release-ci' } -Uri $Asset.browser_download_url -OutFile $Archive
+            if (Test-Path $ExtractRoot) { Remove-Item $ExtractRoot -Recurse -Force }
+            Expand-Archive -Path $Archive -DestinationPath $ExtractRoot -Force
+            $RgBinary = Get-ChildItem $ExtractRoot -Filter rg.exe -Recurse -File | Select-Object -First 1
+            if (-not $RgBinary) { throw 'The official ripgrep archive did not contain rg.exe.' }
+
+            Copy-Item $RgBinary.FullName (Join-Path $ToolDirectory 'rg.exe') -Force
+          }
+
+          if (-not (Persist-Ripgrep)) { throw 'ripgrep is required after all installation and download fallbacks.' }
+          Write-Host "Using ripgrep: $((Find-Ripgrep).Source)"
+
+      - name: Verify release tool handoff
+        shell: pwsh
+        run: |
+          if (-not $env:AOS_RG_PATH -or -not (Test-Path $env:AOS_RG_PATH -PathType Leaf)) {
+            throw 'The persisted ripgrep executable is unavailable in this workflow step.'
+          }
+          & .\scripts\setup-environment.ps1
 
       - name: Build release backend
         shell: pwsh

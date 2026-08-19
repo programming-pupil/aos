@@ -2406,19 +2406,14 @@ impl runtime::CompactionHook for RuntimeCompactionHook {
         default_summary: &str,
         trigger: &str,
     ) -> Result<runtime::PreparedCompaction, runtime::RuntimeError> {
-        let source_event_sequences = crate::semantic_kernel_store::ledger_sequences_for_thread(
+        let source_coverage = crate::semantic_kernel_store::compaction_source_coverage(
             &self.db,
             &self.tenant_id,
             &self.session_id,
+            archived_messages,
         )
         .await
         .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
-        if source_event_sequences.is_empty() {
-            return Err(runtime::RuntimeError::new(
-                "cannot commit compaction without durable source event coverage",
-            ));
-        }
-
         let extracted = extract_key_info_dual_channel_for_compaction(
             self.config_registry.as_deref(),
             &self.tenant_id,
@@ -2484,7 +2479,7 @@ impl runtime::CompactionHook for RuntimeCompactionHook {
             &self.user_id,
             &self.session_id,
             trigger,
-            &source_event_sequences,
+            &source_coverage,
             archived_messages,
             &candidates,
         )
@@ -15932,24 +15927,27 @@ mod dual_channel_extraction_tests {
             "user",
             "memory-session",
         );
+        let user_message = "The primary datastore is the analytics warehouse. \
+                            The temporary API key is sk-fake-memory-secret-1234567890.";
         kernel
             .start_turn(runtime::RuntimeTurnStart {
                 turn_id: "memory-turn".into(),
-                user_input: "establish durable memory".into(),
+                user_input: user_message.into(),
             })
             .await
             .unwrap();
         let hook =
             RuntimeCompactionHook::new(db.clone(), "tenant", "user", "memory-session", "chat");
         let archived = vec![
-            ConversationMessage::user_text("The primary datastore is the analytics warehouse."),
+            ConversationMessage::user_text(user_message),
             ConversationMessage::assistant(vec![ContentBlock::Text {
                 text: "We must finish verification before release.".into(),
             }]),
-            ConversationMessage::user_text(
-                "The temporary API key is sk-fake-memory-secret-1234567890.",
-            ),
         ];
+        kernel
+            .record_assistant_message("memory-turn", 1, &archived[1])
+            .await
+            .unwrap();
         let mut session = Session::new();
         session.session_id = "memory-session".into();
         session.tenant_id = Some("tenant".into());
@@ -16068,7 +16066,7 @@ mod dual_channel_extraction_tests {
             .prepare_compaction(&archived, "must not commit", "test")
             .await
             .expect_err("compaction without source events must fail before derived writes");
-        assert!(error.to_string().contains("source event coverage"));
+        assert!(error.to_string().contains("exact event or parent coverage"));
         let leaked: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_memory_items
              WHERE tenant_id = 'tenant' AND session_key = 'uncovered-session'",
@@ -16091,24 +16089,34 @@ mod dual_channel_extraction_tests {
         kernel
             .start_turn(runtime::RuntimeTurnStart {
                 turn_id: "rollback-turn".into(),
-                user_input: "prepare rollback fixture".into(),
+                user_input: "system contract".into(),
             })
             .await
             .unwrap();
         let hook =
             RuntimeCompactionHook::new(db.clone(), "tenant", "user", "rollback-session", "chat");
-        let mut system_message = ConversationMessage::user_text("system contract");
-        system_message.role = MessageRole::System;
+        let system_message = ConversationMessage::user_text("system contract");
         let archived = vec![
             system_message,
-            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
-                id: "tool-1".into(),
-                name: "lookup".into(),
-                input: serde_json::json!({"key":"value"}).to_string(),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "exact assistant result".into(),
             }]),
-            ConversationMessage::tool_result("tool-1", "lookup", "exact tool result", false),
             ConversationMessage::user_text("The release region is APAC."),
         ];
+        kernel
+            .record_assistant_message("rollback-turn", 1, &archived[1])
+            .await
+            .unwrap();
+        kernel
+            .append_domain(
+                "rollback-turn",
+                "turn-start:region",
+                "turn_started",
+                serde_json::json!({"userInput": "The release region is APAC."}),
+                "turn-start:region".into(),
+            )
+            .await
+            .unwrap();
         let mut session = Session::new();
         session.session_id = "rollback-session".into();
         session.tenant_id = Some("tenant".into());
@@ -16177,7 +16185,15 @@ mod dual_channel_extraction_tests {
         .fetch_all(&db)
         .await
         .unwrap();
-        assert_eq!(ledger_kinds.len(), 1, "only turn_started may remain");
+        assert_eq!(
+            ledger_kinds,
+            vec![
+                "runtime.turn_started".to_string(),
+                "runtime.assistant_message".to_string(),
+                "runtime.turn_started".to_string(),
+            ],
+            "source lineage events must remain while derived compaction writes roll back"
+        );
     }
 
     proptest! {
