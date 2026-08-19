@@ -2237,8 +2237,7 @@ impl SessionArchiveWindow {
                 .get("window_id")
                 .and_then(JsonValue::as_str)
                 .filter(|value| !value.trim().is_empty())
-                .map(ToOwned::to_owned)
-                .map_or_else(generate_window_id, std::convert::identity),
+                .map_or_else(generate_window_id, ToOwned::to_owned),
             previous_window_id: object
                 .get("previous_window_id")
                 .and_then(JsonValue::as_str)
