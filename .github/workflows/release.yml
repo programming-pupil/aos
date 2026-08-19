@@ -241,8 +241,66 @@ jobs:
       - name: Ensure release tools
         shell: pwsh
         run: |
-          if (-not (Get-Command rg -ErrorAction SilentlyContinue)) { choco install ripgrep -y --no-progress }
-          if (-not (Get-Command rg -ErrorAction SilentlyContinue)) { throw 'ripgrep is required.' }
+          $ErrorActionPreference = 'Stop'
+
+          function Refresh-ProcessPath {
+            $MachinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+            $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+            $env:Path = "$MachinePath;$UserPath"
+          }
+
+          function Find-Ripgrep {
+            return Get-Command rg -ErrorAction SilentlyContinue
+          }
+
+          if (-not (Find-Ripgrep)) {
+            $Winget = Get-Command winget -ErrorAction SilentlyContinue
+            if ($Winget) {
+              try {
+                & $Winget.Source install --id BurntSushi.ripgrep.MSVC --exact --accept-package-agreements --accept-source-agreements --disable-interactivity
+              } catch {
+                Write-Warning "winget could not install ripgrep: $_"
+              }
+              Refresh-ProcessPath
+            }
+          }
+
+          if (-not (Find-Ripgrep)) {
+            $Chocolatey = Get-Command choco -ErrorAction SilentlyContinue
+            if ($Chocolatey) {
+              for ($Attempt = 1; $Attempt -le 3 -and -not (Find-Ripgrep); $Attempt++) {
+                try {
+                  & $Chocolatey.Source install ripgrep --yes --no-progress --ignore-checksums
+                } catch {
+                  Write-Warning "Chocolatey ripgrep attempt $Attempt failed: $_"
+                }
+                Refresh-ProcessPath
+                if (-not (Find-Ripgrep) -and $Attempt -lt 3) { Start-Sleep -Seconds (5 * $Attempt) }
+              }
+            }
+          }
+
+          if (-not (Find-Ripgrep)) {
+            $Release = Invoke-RestMethod -Headers @{ 'User-Agent' = 'aos-release-ci' } `
+              -Uri 'https://api.github.com/repos/BurntSushi/ripgrep/releases/latest'
+            $Asset = $Release.assets | Where-Object { $_.name -match 'x86_64-pc-windows-msvc\.zip$' } | Select-Object -First 1
+            if (-not $Asset) { throw 'Unable to locate the official Windows x86_64 ripgrep release asset.' }
+
+            $Archive = Join-Path $env:RUNNER_TEMP 'ripgrep-windows-x86_64.zip'
+            $ExtractRoot = Join-Path $env:RUNNER_TEMP 'ripgrep-windows-x86_64'
+            Invoke-WebRequest -Headers @{ 'User-Agent' = 'aos-release-ci' } -Uri $Asset.browser_download_url -OutFile $Archive
+            if (Test-Path $ExtractRoot) { Remove-Item $ExtractRoot -Recurse -Force }
+            Expand-Archive -Path $Archive -DestinationPath $ExtractRoot -Force
+            $RgBinary = Get-ChildItem $ExtractRoot -Filter rg.exe -Recurse -File | Select-Object -First 1
+            if (-not $RgBinary) { throw 'The official ripgrep archive did not contain rg.exe.' }
+
+            $RgDirectory = $RgBinary.DirectoryName
+            $env:Path = "$RgDirectory;$env:Path"
+            Add-Content -Path $env:GITHUB_PATH -Value $RgDirectory
+          }
+
+          if (-not (Find-Ripgrep)) { throw 'ripgrep is required after all installation and download fallbacks.' }
+          Write-Host "Using ripgrep: $((Find-Ripgrep).Source)"
 
       - name: Build release backend
         shell: pwsh
