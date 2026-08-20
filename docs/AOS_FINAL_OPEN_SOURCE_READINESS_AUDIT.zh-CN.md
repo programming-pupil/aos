@@ -1,7 +1,7 @@
 # AOS 最终开源就绪审计与实现核销
 
 > 审计与实现日期：2026-08-20
-> AOS 实现基线：本次最终 merge commit（由紧随其后的审计记录提交固化实际 commit hash）
+> AOS 实现基线：`580632ac33d49fb5de71088bbf8b3715f6de5997`（最终 merge commit；本审计记录提交紧随其后）
 > OpenAI Codex 对照：`3929c99a97d1aa0fb8000903a4b57b24fbabe742`（2026-08-19）
 > DeepSeek Harness 对照：`99f6f02fecdb7dff40c3fbc9470f5907c29f74ca`（2026-08-17）
 > 性质：源码级发布审计、缺口修复记录和发布声明边界
