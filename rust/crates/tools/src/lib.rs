@@ -2474,69 +2474,90 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
 }
 
 /// Classify bash command permission based on command type and path.
-/// ROADMAP #50: Read-only commands targeting CWD paths get `WorkspaceWrite`,
-/// all others remain `DangerFullAccess`.
+///
+/// Only a single, non-programmable read command over workspace paths is
+/// eligible for `ReadOnly`. Shell composition, expansion, interpreters, build
+/// tools, and ambiguous paths require `DangerFullAccess`; trying to parse a
+/// shell with a first-token heuristic creates an authorization bypass.
 fn classify_bash_permission(command: &str) -> PermissionMode {
-    // Read-only commands that are safe when targeting workspace paths
     const READ_ONLY_COMMANDS: &[&str] = &[
-        "cat", "head", "tail", "less", "more", "ls", "ll", "dir", "find", "test", "[", "[[",
-        "grep", "rg", "awk", "sed", "file", "stat", "readlink", "wc", "sort", "uniq", "cut", "tr",
-        "pwd", "echo", "printf",
+        "cat",
+        "head",
+        "tail",
+        "ls",
+        "dir",
+        "test",
+        "grep",
+        "file",
+        "stat",
+        "readlink",
+        "wc",
+        "cut",
+        "tr",
+        "pwd",
+        "which",
+        "whoami",
+        "date",
+        "df",
+        "du",
+        "uname",
+        "basename",
+        "dirname",
+        "sha256sum",
+        "md5sum",
+        "b3sum",
+        "xxd",
+        "hexdump",
+        "od",
+        "strings",
+        "tree",
+        "jq",
     ];
 
-    // Get the base command (first word before any args or pipes)
-    let base_cmd = command.split_whitespace().next().unwrap_or("");
-    let base_cmd = base_cmd.split('|').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split(';').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split('>').next().unwrap_or("").trim();
-    let base_cmd = base_cmd.split('<').next().unwrap_or("").trim();
-
-    // Check if it's a read-only command
-    let cmd_name = base_cmd.split('/').next_back().unwrap_or(base_cmd);
-    let is_read_only = READ_ONLY_COMMANDS.contains(&cmd_name);
-
-    if !is_read_only {
+    if has_shell_control_syntax(command) {
         return PermissionMode::DangerFullAccess;
     }
 
-    // Check if any path argument is outside workspace
-    // Simple heuristic: check for absolute paths not starting with CWD
+    let base_cmd = command.split_whitespace().next().unwrap_or("");
+    let cmd_name = base_cmd.split('/').next_back().unwrap_or(base_cmd);
+    if !READ_ONLY_COMMANDS.contains(&cmd_name) {
+        return PermissionMode::DangerFullAccess;
+    }
+
     if has_dangerous_paths(command) {
         return PermissionMode::DangerFullAccess;
     }
 
-    PermissionMode::WorkspaceWrite
+    PermissionMode::ReadOnly
+}
+
+fn has_shell_control_syntax(command: &str) -> bool {
+    command.trim().is_empty()
+        || command.contains([
+            '\n', '\r', ';', '|', '&', '>', '<', '`', '$', '(', ')', '*', '?', '[', ']',
+        ])
 }
 
 /// Check if command has dangerous paths (outside workspace).
 fn has_dangerous_paths(command: &str) -> bool {
-    // Look for absolute paths
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-
-    for token in tokens {
-        // Skip flags/options
+    for token in command.split_whitespace().skip(1) {
+        let token = token.trim_matches(|character: char| matches!(character, '\'' | '"' | ','));
         if token.starts_with('-') {
+            if token.contains("=/") || token.contains("=~") {
+                return true;
+            }
             continue;
         }
-
-        // Check for absolute paths
-        if token.starts_with('/') || token.starts_with("~/") {
-            // Check if it's within CWD
-            let path =
-                PathBuf::from(token.replace('~', &std::env::var("HOME").unwrap_or_default()));
-            if let Ok(cwd) = std::env::current_dir() {
-                if !path.starts_with(&cwd) {
-                    return true; // Path outside workspace
-                }
-            }
+        if token.starts_with('~') {
+            return true;
         }
-
-        // Check for parent directory traversal that escapes workspace
-        if token.contains("../..") || token.starts_with("../") && !token.starts_with("./") {
+        let candidate = PathBuf::from(token);
+        if (candidate.is_absolute() || token.contains("..") || candidate.exists())
+            && !path_within_current_workspace(token, false)
+        {
             return true;
         }
     }
-
     false
 }
 
@@ -2893,11 +2914,15 @@ fn classify_powershell_permission(command: &str) -> PermissionMode {
         "Select-String",
     ];
 
-    // Check if command starts with a read-only cmdlet
-    let cmd_lower = command.trim().to_lowercase();
+    if has_shell_control_syntax(command) {
+        return PermissionMode::DangerFullAccess;
+    }
+
+    // Check if command starts with a read-only cmdlet.
+    let command_name = command.split_whitespace().next().unwrap_or_default();
     let is_read_only_cmd = READ_ONLY_COMMANDS
         .iter()
-        .any(|cmd| cmd_lower.starts_with(&cmd.to_lowercase()));
+        .any(|cmd| command_name.eq_ignore_ascii_case(cmd));
 
     if !is_read_only_cmd {
         return PermissionMode::DangerFullAccess;
@@ -2907,8 +2932,9 @@ fn classify_powershell_permission(command: &str) -> PermissionMode {
     // Extract path from command - look for -Path or positional parameter
     let path = extract_powershell_path(command);
     match path {
-        Some(p) if is_within_workspace(&p) => PermissionMode::WorkspaceWrite,
-        _ => PermissionMode::DangerFullAccess,
+        Some(path) if path_within_current_workspace(&path, false) => PermissionMode::ReadOnly,
+        None => PermissionMode::ReadOnly,
+        Some(_) => PermissionMode::DangerFullAccess,
     }
 }
 
@@ -2921,33 +2947,13 @@ fn extract_powershell_path(command: &str) -> Option<String> {
         return Some(path.trim_matches('"').trim_matches('\'').to_string());
     }
 
-    // Look for positional path parameter (after command name)
+    // Look for a positional path parameter (after the command name).
     let parts: Vec<&str> = command.split_whitespace().collect();
-    if parts.len() >= 2 {
-        // Skip the cmdlet name and take the first argument
-        let first_arg = parts[1];
-        // Check if it looks like a path (contains \, /, or .)
-        if first_arg.contains(['\\', '/', '.']) {
-            return Some(first_arg.trim_matches('"').trim_matches('\'').to_string());
-        }
+    if let Some(first_arg) = parts.get(1).filter(|value| !value.starts_with('-')) {
+        return Some(first_arg.trim_matches('"').trim_matches('\'').to_string());
     }
 
     None
-}
-
-/// Check if a path is within the current workspace.
-fn is_within_workspace(path: &str) -> bool {
-    let path = PathBuf::from(path);
-
-    // If path is absolute, check if it starts with CWD
-    if path.is_absolute() {
-        if let Ok(cwd) = std::env::current_dir() {
-            return path.starts_with(&cwd);
-        }
-    }
-
-    // Relative paths are assumed to be within workspace
-    !path.starts_with("/") && !path.starts_with("\\") && !path.starts_with("..")
 }
 
 fn run_powershell(input: PowerShellInput) -> Result<String, String> {
@@ -11384,6 +11390,44 @@ mod tests {
         assert!(error
             .to_string()
             .contains("requires 'workspace-write' permission"));
+    }
+
+    #[test]
+    fn shell_permission_classifier_rejects_composition_and_programmable_commands() {
+        assert_eq!(
+            super::classify_bash_permission("cat Cargo.toml"),
+            PermissionMode::ReadOnly
+        );
+        for command in [
+            "cat Cargo.toml; touch owned",
+            "cat $(touch owned)",
+            "cat $HOME/.ssh/id_rsa",
+            "python -c 'open(\"owned\", \"w\")'",
+            "cargo test",
+            "rg needle . | tee owned",
+        ] {
+            assert_eq!(
+                super::classify_bash_permission(command),
+                PermissionMode::DangerFullAccess,
+                "{command} must not inherit the first command's read permission"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_permission_classifier_rejects_compound_commands() {
+        assert_eq!(
+            super::classify_powershell_permission("Get-Content Cargo.toml"),
+            PermissionMode::ReadOnly
+        );
+        assert_eq!(
+            super::classify_powershell_permission("Get-Content Cargo.toml; Remove-Item Cargo.toml"),
+            PermissionMode::DangerFullAccess
+        );
+        assert_eq!(
+            super::classify_powershell_permission("Get-ContentEvil Cargo.toml"),
+            PermissionMode::DangerFullAccess
+        );
     }
 
     #[test]

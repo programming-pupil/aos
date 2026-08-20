@@ -60,6 +60,7 @@ pub struct SandboxStatus {
     pub network_supported: bool,
     pub network_active: bool,
     pub filesystem_mode: FilesystemIsolationMode,
+    pub filesystem_supported: bool,
     pub filesystem_active: bool,
     pub allowed_mounts: Vec<String>,
     pub in_container: bool,
@@ -163,8 +164,13 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
     let container = detect_container_environment();
     let namespace_supported = cfg!(target_os = "linux") && unshare_user_namespace_works();
     let network_supported = namespace_supported;
-    let filesystem_active =
-        request.enabled && request.filesystem_mode != FilesystemIsolationMode::Off;
+    // The current `unshare` launcher creates namespaces but does not bind a
+    // restricted root or install a Landlock policy. HOME/TMPDIR environment
+    // variables are not filesystem isolation and must never be reported as
+    // such. A bwrap/Landlock implementation can flip these fields only after a
+    // real escape probe succeeds.
+    let filesystem_supported = false;
+    let filesystem_active = false;
     let mut fallback_reasons = Vec::new();
 
     if request.enabled && request.namespace_restrictions && !namespace_supported {
@@ -175,6 +181,12 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
         fallback_reasons
             .push("network isolation unavailable (requires Linux with `unshare`)".to_string());
     }
+    if request.enabled && request.filesystem_mode != FilesystemIsolationMode::Off {
+        fallback_reasons.push(
+            "filesystem isolation unavailable (the unshare launcher does not enforce mount or Landlock policy)"
+                .to_string(),
+        );
+    }
     if request.enabled
         && request.filesystem_mode == FilesystemIsolationMode::AllowList
         && request.allowed_mounts.is_empty()
@@ -183,22 +195,24 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
             .push("filesystem allow-list requested without configured mounts".to_string());
     }
 
-    let active = request.enabled
-        && (!request.namespace_restrictions || namespace_supported)
-        && (!request.network_isolation || network_supported);
+    let supported = (!request.namespace_restrictions || namespace_supported)
+        && (!request.network_isolation || network_supported)
+        && (request.filesystem_mode == FilesystemIsolationMode::Off || filesystem_supported);
+    let active = request.enabled && supported;
 
     let allowed_mounts = normalize_mounts(&request.allowed_mounts, cwd);
 
     SandboxStatus {
         enabled: request.enabled,
         requested: request.clone(),
-        supported: namespace_supported,
+        supported,
         active,
         namespace_supported,
         namespace_active: request.enabled && request.namespace_restrictions && namespace_supported,
         network_supported,
         network_active: request.enabled && request.network_isolation && network_supported,
         filesystem_mode: request.filesystem_mode,
+        filesystem_supported,
         filesystem_active,
         allowed_mounts,
         in_container: container.in_container,
@@ -241,14 +255,6 @@ pub fn build_linux_sandbox_command(
     let mut env = vec![
         ("HOME".to_string(), sandbox_home.display().to_string()),
         ("TMPDIR".to_string(), sandbox_tmp.display().to_string()),
-        (
-            "CLAWD_SANDBOX_FILESYSTEM_MODE".to_string(),
-            status.filesystem_mode.as_str().to_string(),
-        ),
-        (
-            "CLAWD_SANDBOX_ALLOWED_MOUNTS".to_string(),
-            status.allowed_mounts.join(":"),
-        ),
     ];
     if let Ok(path) = env::var("PATH") {
         env.push(("PATH".to_string(), path));
@@ -381,5 +387,26 @@ mod tests {
             assert!(launcher.args.iter().any(|arg| arg == "--mount"));
             assert!(launcher.args.iter().any(|arg| arg == "--net") == status.network_active);
         }
+    }
+
+    #[test]
+    fn does_not_claim_environment_variables_are_filesystem_isolation() {
+        let request = SandboxConfig::default().resolve_request(
+            Some(true),
+            Some(false),
+            Some(false),
+            Some(FilesystemIsolationMode::WorkspaceOnly),
+            None,
+        );
+        let status = super::resolve_sandbox_status_for_request(&request, Path::new("/workspace"));
+
+        assert!(!status.filesystem_supported);
+        assert!(!status.filesystem_active);
+        assert!(!status.supported);
+        assert!(!status.active);
+        assert!(status
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("does not enforce mount or Landlock")));
     }
 }

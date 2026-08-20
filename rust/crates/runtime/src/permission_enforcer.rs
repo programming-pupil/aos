@@ -10,6 +10,7 @@ use crate::permissions::{
     permission_mode_satisfies, PermissionMode, PermissionOutcome, PermissionPolicy,
 };
 use serde::{Deserialize, Serialize};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome")]
@@ -172,25 +173,75 @@ impl PermissionEnforcer {
     }
 }
 
-/// Simple workspace boundary check via string prefix.
+/// Resolve a path against the workspace with component-aware and symlink-aware
+/// checks. A string prefix is not a security boundary: both `..` and symlinks
+/// can escape it.
 fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
-    let normalized = if path.starts_with('/') {
-        path.to_owned()
+    let root = absolute_lexical(Path::new(workspace_root));
+    let candidate = if Path::new(path).is_absolute() {
+        absolute_lexical(Path::new(path))
     } else {
-        format!("{workspace_root}/{path}")
+        lexical_normalize(&root.join(path))
     };
+    let resolved_root = resolve_with_existing_ancestor(&root);
+    let resolved_candidate = resolve_with_existing_ancestor(&candidate);
 
-    let root = if workspace_root.ends_with('/') {
-        workspace_root.to_owned()
+    resolved_candidate == resolved_root || resolved_candidate.starts_with(&resolved_root)
+}
+
+fn absolute_lexical(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        lexical_normalize(path)
     } else {
-        format!("{workspace_root}/")
-    };
+        std::env::current_dir()
+            .map(|cwd| lexical_normalize(&cwd.join(path)))
+            .unwrap_or_else(|_| lexical_normalize(path))
+    }
+}
 
-    normalized.starts_with(&root) || normalized == workspace_root.trim_end_matches('/')
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            Component::Normal(segment) => normalized.push(segment),
+        }
+    }
+    normalized
+}
+
+fn resolve_with_existing_ancestor(path: &Path) -> PathBuf {
+    let mut existing = path.to_path_buf();
+    let mut suffix = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name().map(ToOwned::to_owned) else {
+            return path.to_path_buf();
+        };
+        suffix.push(name);
+        if !existing.pop() {
+            return path.to_path_buf();
+        }
+    }
+
+    let mut resolved = existing.canonicalize().unwrap_or(existing);
+    for segment in suffix.iter().rev() {
+        resolved.push(segment);
+    }
+    lexical_normalize(&resolved)
 }
 
 /// Conservative heuristic: is this bash command read-only?
 fn is_read_only_command(command: &str) -> bool {
+    if command.trim().is_empty()
+        || command.contains(['\n', '\r', ';', '|', '&', '>', '<', '`', '$'])
+    {
+        return false;
+    }
     let first_token = command
         .split_whitespace()
         .next()
@@ -204,23 +255,14 @@ fn is_read_only_command(command: &str) -> bool {
         "cat"
             | "head"
             | "tail"
-            | "less"
-            | "more"
             | "wc"
             | "ls"
-            | "find"
             | "grep"
             | "rg"
-            | "awk"
-            | "sed"
-            | "echo"
-            | "printf"
             | "which"
             | "where"
             | "whoami"
             | "pwd"
-            | "env"
-            | "printenv"
             | "date"
             | "cal"
             | "df"
@@ -231,13 +273,9 @@ fn is_read_only_command(command: &str) -> bool {
             | "file"
             | "stat"
             | "diff"
-            | "sort"
-            | "uniq"
             | "tr"
             | "cut"
             | "paste"
-            | "tee"
-            | "xargs"
             | "test"
             | "true"
             | "false"
@@ -256,18 +294,9 @@ fn is_read_only_command(command: &str) -> bool {
             | "tree"
             | "jq"
             | "yq"
-            | "python3"
-            | "python"
-            | "node"
-            | "ruby"
-            | "cargo"
-            | "rustc"
-            | "git"
-            | "gh"
-    ) && !command.contains("-i ")
-        && !command.contains("--in-place")
-        && !command.contains(" > ")
-        && !command.contains(" >> ")
+    ) && !command
+        .split_whitespace()
+        .any(|token| token == "-i" || token.starts_with("-i") || token == "--in-place")
 }
 
 #[cfg(test)]
@@ -382,13 +411,17 @@ mod tests {
         assert!(is_within_workspace("/workspace", "/workspace"));
         assert!(!is_within_workspace("/etc/passwd", "/workspace"));
         assert!(!is_within_workspace("/workspacex/hack", "/workspace"));
+        assert!(!is_within_workspace("../etc/passwd", "/workspace"));
     }
 
     #[test]
     fn read_only_command_heuristic() {
         assert!(is_read_only_command("cat file.txt"));
         assert!(is_read_only_command("grep pattern file"));
-        assert!(is_read_only_command("git log --oneline"));
+        assert!(!is_read_only_command("git log --oneline"));
+        assert!(!is_read_only_command("python -c 'open(\"owned\", \"w\")'"));
+        assert!(!is_read_only_command("cat file; rm file"));
+        assert!(!is_read_only_command("cat $HOME/.ssh/id_rsa"));
         assert!(!is_read_only_command("rm file.txt"));
         assert!(!is_read_only_command("echo test > file.txt"));
         assert!(!is_read_only_command("sed -i 's/a/b/' file"));
@@ -504,7 +537,31 @@ mod tests {
 
         // then
         assert!(cat_result);
-        assert!(git_result);
+        assert!(!git_result);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_boundary_rejects_symlink_escape_for_missing_child() {
+        use std::os::unix::fs::symlink;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("aos-permission-root-{unique}"));
+        let outside = std::env::temp_dir().join(format!("aos-permission-outside-{unique}"));
+        std::fs::create_dir_all(&root).expect("workspace root");
+        std::fs::create_dir_all(&outside).expect("outside root");
+        symlink(&outside, root.join("escape")).expect("symlink");
+
+        assert!(!is_within_workspace(
+            &root.join("escape/new.txt").to_string_lossy(),
+            &root.to_string_lossy()
+        ));
+
+        std::fs::remove_dir_all(&root).expect("remove workspace root");
+        std::fs::remove_dir_all(&outside).expect("remove outside root");
     }
 
     #[test]
