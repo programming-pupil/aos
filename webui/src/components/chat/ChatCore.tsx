@@ -75,6 +75,7 @@ import {
   streamPmResearchTask,
   type AgentSessionStreamHandlers,
   type RuntimeApprovalPaused,
+  type RuntimeQuestionRequest,
   type RuntimeQuestionPaused,
   type AgentManualCompactionResult,
   type AgentMemoryCitation,
@@ -4348,8 +4349,24 @@ export function ChatCore({
         // A missing approval projection must not prevent the normal history view.
       });
     void agentApi
-      .listSessionQuestions(activeSessionId)
-      .then(({ questions }) => {
+      .listSessionInteractions(activeSessionId)
+      .then(({ interactions }) => {
+        const questions: RuntimeQuestionRequest[] = interactions
+          .filter((interaction) => interaction.kind === "user_question")
+          .map((interaction) => {
+            const expiresAt = interaction.expires_at ?? "";
+            return {
+              requestId: interaction.interaction_id,
+              idempotencyKey: interaction.idempotency_key,
+              turnId: interaction.scope.turn_id,
+              invocationId: interaction.scope.invocation_id,
+              question: interaction.display_projection.question ?? "",
+              options: interaction.display_projection.options ?? [],
+              status: interaction.state,
+              expiresAt,
+              expired: expiresAt.length > 0 && Date.parse(expiresAt) <= Date.now(),
+            };
+          });
         if (cancelled || questions.length === 0) return;
         const paused: RuntimeQuestionPaused = {
           sessionId: activeSessionId,
@@ -4431,8 +4448,9 @@ export function ChatCore({
   const resolvePendingQuestions = useCallback(() => {
     if (!activeSessionId || !questionPaused || questionResolving) return;
     const answers = questionPaused.questions.map((question) => ({
-      requestId: question.requestId,
+      interactionId: question.requestId,
       answer: (questionAnswers[question.requestId] ?? "").trim(),
+      idempotencyKey: question.idempotencyKey,
     }));
     if (answers.some((answer) => answer.answer.length === 0)) return;
     const handlers = approvalResumeHandlers(
@@ -4477,7 +4495,7 @@ export function ChatCore({
     setIsStreaming(true);
     onStreamingChange?.(true);
     abortRef.current = streamAgentSession(activeSessionId, "", handlers, {
-      questionAnswers: answers,
+      interactions: answers,
     });
   }, [
     activeSessionId,

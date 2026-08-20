@@ -387,6 +387,7 @@ async fn recover_claimed_parent_turn(
     claims: &Claims,
     input: &UnifiedParentTurnInput,
 ) -> Result<()> {
+    crate::behavior_trace("CHILD-001");
     state
         .agent_manager()
         .get_owned_session(&input.session_id, &claims.tenant_id, &claims.sub)

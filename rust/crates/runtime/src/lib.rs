@@ -69,6 +69,15 @@ pub use approval_tokens::{
     ApprovalTokenGrant, ApprovalTokenLedger, ApprovalTokenStatus,
 };
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
+
+pub(crate) fn behavior_trace(case_id: &str) {
+    if std::env::var("AOS_BEHAVIOR_TRACE_CASE").as_deref() == Ok(case_id) {
+        static EMITTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if EMITTED.set(()).is_ok() {
+            eprintln!("AOS_PRODUCTION_TRACE\t{case_id}");
+        }
+    }
+}
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
 pub use compact::{
@@ -108,6 +117,7 @@ pub use execution_kernel::{
     reduce_runtime_artifact, AgentExecutionKernel, RuntimeApprovalDecision, RuntimeApprovalRequest,
     RuntimeApprovalResolution, RuntimeArtifactKind, RuntimeArtifactPreview,
     RuntimeContextManifestInput, RuntimeContextSupplement, RuntimeContextSupplementRequest,
+    RuntimeInteractionRequest, RuntimeInteractionResolution, RuntimeManifestLineage,
     RuntimeModelBudgetStage, RuntimeToolCancellationContract, RuntimeToolContract,
     RuntimeToolIntent, RuntimeToolOutcome, RuntimeToolOutcomeKind, RuntimeToolProjection,
     RuntimeToolRetryPolicy, RuntimeToolRiskLevel, RuntimeToolSideEffectClass, RuntimeTurnStart,

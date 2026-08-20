@@ -1,8 +1,58 @@
 use crate::{
-    AssertionStatus, DecisionRecord, DecisionStatus, EvidenceAuthority, EvidenceLedger,
-    ProposedStateDelta, SemanticAssertion, SemanticSnapshot, Sensitivity,
+    AssertionStatus, DecisionStatus, EvidenceAuthority, EvidenceLedger, ProposedStateDelta,
+    SemanticAssertion, SemanticSnapshot, TypedValue,
 };
+use std::collections::BTreeSet;
 use thiserror::Error;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthorityRisk {
+    Standard,
+    HighImpact,
+}
+
+fn assertion_authority_risk(assertion: &SemanticAssertion) -> AuthorityRisk {
+    let explicitly_high_impact = assertion.qualifiers.get("impact").is_some_and(|value| {
+        matches!(value, TypedValue::String(impact) if matches!(impact.to_ascii_lowercase().as_str(), "high" | "critical"))
+    });
+    let governed_subject = matches!(
+        assertion.subject.kind.as_str(),
+        "research_claim" | "financial_metric" | "permission" | "legal_constraint"
+    );
+    if explicitly_high_impact || governed_subject {
+        AuthorityRisk::HighImpact
+    } else {
+        AuthorityRisk::Standard
+    }
+}
+
+fn evidence_satisfies_authority(
+    source_ids: impl Iterator<Item = String>,
+    evidence: &EvidenceLedger,
+    risk: AuthorityRisk,
+) -> bool {
+    let entries = source_ids
+        .filter_map(|id| evidence.get(&id))
+        .filter(|entry| entry.authority != EvidenceAuthority::Model)
+        .collect::<Vec<_>>();
+    if entries.iter().any(|entry| {
+        matches!(
+            entry.authority,
+            EvidenceAuthority::User | EvidenceAuthority::Owner
+        )
+    }) {
+        return true;
+    }
+    if risk == AuthorityRisk::Standard {
+        return !entries.is_empty();
+    }
+    entries
+        .iter()
+        .map(|entry| (entry.source_locator.clone(), entry.content_hash.clone()))
+        .collect::<BTreeSet<_>>()
+        .len()
+        >= 2
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ReductionError {
@@ -30,12 +80,16 @@ pub struct ReductionOutcome {
 #[derive(Debug, Clone, Default)]
 pub struct SemanticReducer;
 impl SemanticReducer {
+    // Keeping the exhaustive state transition in one function makes the
+    // reducer's atomic authority/conflict/supersession policy auditable.
+    #[allow(clippy::too_many_lines)]
     pub fn apply(
         &self,
         current: &SemanticSnapshot,
         delta: ProposedStateDelta,
         evidence: &EvidenceLedger,
     ) -> Result<ReductionOutcome, ReductionError> {
+        crate::behavior_trace("CORE-002");
         let mut next = current.clone();
         let mut outcome = ReductionOutcome {
             snapshot: current.clone(),
@@ -54,9 +108,15 @@ impl SemanticReducer {
                         });
                     }
                 }
-                if candidate.status == AssertionStatus::Confirmed
-                    && !assertion_confirmation_authorized(&candidate, evidence)
-                {
+                let authority_admitted = evidence_satisfies_authority(
+                    candidate
+                        .source_refs
+                        .iter()
+                        .map(|source| source.evidence_id.clone()),
+                    evidence,
+                    assertion_authority_risk(&candidate),
+                );
+                if candidate.status == AssertionStatus::Confirmed && !authority_admitted {
                     candidate.status = AssertionStatus::Proposed;
                 }
                 if let Some(existing) = next.assertions.get(&candidate.id) {
@@ -132,9 +192,15 @@ impl SemanticReducer {
                         });
                     }
                 }
-                if decision.status == DecisionStatus::Accepted
-                    && !decision_acceptance_authorized(&decision, evidence)
-                {
+                let authority_admitted = evidence_satisfies_authority(
+                    decision
+                        .rationale
+                        .iter()
+                        .map(|source| source.evidence_id.clone()),
+                    evidence,
+                    AuthorityRisk::HighImpact,
+                );
+                if decision.status == DecisionStatus::Accepted && !authority_admitted {
                     decision.status = DecisionStatus::Proposed;
                     outcome.needs_confirmation.push(decision.id.clone());
                 }
@@ -160,35 +226,4 @@ impl SemanticReducer {
         outcome.snapshot = next;
         Ok(outcome)
     }
-}
-
-fn assertion_confirmation_authorized(
-    assertion: &SemanticAssertion,
-    evidence: &EvidenceLedger,
-) -> bool {
-    assertion.source_refs.iter().any(|source| {
-        evidence.get(&source.evidence_id).is_some_and(|entry| {
-            matches!(
-                entry.authority,
-                EvidenceAuthority::User | EvidenceAuthority::Owner
-            ) || (matches!(
-                assertion.sensitivity,
-                Sensitivity::Public | Sensitivity::Internal
-            ) && matches!(
-                entry.authority,
-                EvidenceAuthority::Tool | EvidenceAuthority::Document
-            ))
-        })
-    })
-}
-
-fn decision_acceptance_authorized(decision: &DecisionRecord, evidence: &EvidenceLedger) -> bool {
-    decision.rationale.iter().any(|source| {
-        evidence.get(&source.evidence_id).is_some_and(|entry| {
-            matches!(
-                entry.authority,
-                EvidenceAuthority::User | EvidenceAuthority::Owner
-            )
-        })
-    })
 }

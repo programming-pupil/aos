@@ -240,6 +240,7 @@ fn pm_final_readability_contract() -> &'static str {
     "Final readability contract: improve scanability without reducing depth. Use clear H2/H3 headings, short paragraphs with blank lines between major ideas, and compact bullets/tables only when they make comparison easier. Preserve all important evidence, segment logic, assumptions, risks, experiments, guardrails, metrics, and concrete recommendations; never make the answer shorter or more generic just to look tidy."
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn build_pm_retrieve_prompt(
     original_question: &str,
     plan: &Value,
@@ -677,6 +678,7 @@ Return the final answer now.",
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_pm_contract_repair_prompt(
     contract_name: &str,
     user_question: &str,
@@ -824,6 +826,11 @@ pub fn extract_pm_preface_visible_text(preface_text: &str) -> String {
     joined.chars().take(3200).collect()
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::needless_pass_by_value
+)]
 pub fn build_pm_retry_prompt(
     original_question: &str,
     previous_answer: &str,

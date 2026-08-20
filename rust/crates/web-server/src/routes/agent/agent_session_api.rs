@@ -262,9 +262,9 @@ pub(super) async fn list_session_approvals(
     }
 }
 
-/// GET `/api/v1/agent/sessions/{session_id}/questions` - list durable pending
-/// questions for the authenticated session owner.
-pub(super) async fn list_session_questions(
+/// GET `/api/v1/agent/sessions/{session_id}/interactions` - list the
+/// authenticated owner's pending durable interactions.
+pub(super) async fn list_session_interactions(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     Path(session_id): Path<String>,
@@ -275,7 +275,7 @@ pub(super) async fn list_session_questions(
     if handle.user_id != claims.sub || handle.tenant_id != claims.tenant_id {
         return AppError::Forbidden.into_response();
     }
-    match crate::semantic_kernel_store::list_runtime_questions(
+    match crate::semantic_kernel_store::list_runtime_interactions(
         &state.db,
         &claims.tenant_id,
         &claims.sub,
@@ -283,7 +283,9 @@ pub(super) async fn list_session_questions(
     )
     .await
     {
-        Ok(questions) => Json(serde_json::json!({ "questions": questions })).into_response(),
+        Ok(interactions) => {
+            Json(serde_json::json!({ "interactions": interactions })).into_response()
+        }
         Err(error) => AppError::Internal(error.to_string()).into_response(),
     }
 }

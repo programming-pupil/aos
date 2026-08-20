@@ -1,6 +1,7 @@
 //! Memory 2.0 pure engine.  It deliberately stores evidence references and
 //! versioned candidates instead of silently rewriting a single summary.
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use semantic_core::{
@@ -10,6 +11,21 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use thiserror::Error;
+
+mod repository;
+pub use repository::{
+    FactLifecycle, MemoryEmbeddingUpdate, MemoryFactDraft, MemoryRepository, MemoryRepositoryError,
+    SqliteMemoryRepository, SqliteMemoryRepositoryAdapter, SqliteMemoryTransaction,
+};
+
+pub(crate) fn behavior_trace(case_id: &str) {
+    if std::env::var("AOS_BEHAVIOR_TRACE_CASE").as_deref() == Ok(case_id) {
+        static EMITTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if EMITTED.set(()).is_ok() {
+            eprintln!("AOS_PRODUCTION_TRACE\t{case_id}");
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MemoryChannel {
@@ -91,7 +107,7 @@ pub enum MemoryError {
 
 /// Stateless production policy kernel. Durable adapters own storage, while
 /// every admission, lexical signal, hybrid score and temporal relation passes
-/// through this type so SQLite and test repositories cannot drift.
+/// through this type so `SQLite` and test repositories cannot drift.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MemoryEngine;
 
@@ -120,6 +136,19 @@ pub enum TemporalRelation {
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryMemoryRepository {
     records: BTreeMap<String, MemoryCandidate>,
+    drafts: BTreeMap<String, MemoryFactDraft>,
+}
+
+fn ratio_f64(numerator: usize, denominator: usize) -> f64 {
+    let numerator = u32::try_from(numerator).unwrap_or(u32::MAX);
+    let denominator = u32::try_from(denominator).unwrap_or(u32::MAX).max(1);
+    f64::from(numerator) / f64::from(denominator)
+}
+
+fn ratio_f32(numerator: usize, denominator: usize) -> f32 {
+    let numerator = u16::try_from(numerator).unwrap_or(u16::MAX);
+    let denominator = u16::try_from(denominator).unwrap_or(u16::MAX).max(1);
+    f32::from(numerator) / f32::from(denominator)
 }
 
 impl MemoryEngine {
@@ -136,7 +165,7 @@ impl MemoryEngine {
     }
 
     /// Canonical lexical component for hybrid retrieval. Keeping tokenization
-    /// here prevents the SQLite adapter and the in-memory engine from silently
+    /// here prevents the `SQLite` adapter and the in-memory engine from silently
     /// ranking the same candidate differently.
     #[must_use]
     pub fn lexical_relevance(query: &str, text: &str) -> f64 {
@@ -155,11 +184,13 @@ impl MemoryEngine {
             return 0.0;
         }
         let haystack = text.to_lowercase();
-        terms
-            .iter()
-            .filter(|term| haystack.contains(term.as_str()) || text.contains(term.as_str()))
-            .count() as f64
-            / terms.len() as f64
+        ratio_f64(
+            terms
+                .iter()
+                .filter(|term| haystack.contains(term.as_str()) || text.contains(term.as_str()))
+                .count(),
+            terms.len(),
+        )
     }
 
     #[must_use]
@@ -212,7 +243,7 @@ impl InMemoryMemoryRepository {
     }
     pub fn ingest_channels(
         &mut self,
-        extraction: DualChannelExtraction,
+        extraction: &DualChannelExtraction,
     ) -> Result<usize, MemoryError> {
         let mut inserted = 0;
         for candidate in extraction.all().cloned() {
@@ -244,8 +275,10 @@ impl InMemoryMemoryRepository {
                     candidate.text, candidate.predicate, candidate.value
                 )
                 .to_lowercase();
-                let lexical = terms.iter().filter(|t| text.contains(t.as_str())).count() as f32
-                    / terms.len().max(1) as f32;
+                let lexical = ratio_f32(
+                    terms.iter().filter(|t| text.contains(t.as_str())).count(),
+                    terms.len(),
+                );
                 let entity = if query.contains(&candidate.subject.id) {
                     1.0
                 } else {
@@ -256,9 +289,11 @@ impl InMemoryMemoryRepository {
                     | semantic_core::EvidenceAuthority::Owner => 1.0,
                     semantic_core::EvidenceAuthority::Document
                     | semantic_core::EvidenceAuthority::Tool => 0.8,
-                    _ => 0.3,
+                    semantic_core::EvidenceAuthority::Model => 0.3,
                 };
-                let age_days = (now - candidate.observed_at).num_days().max(0) as f32;
+                let age_days = u16::try_from((now - candidate.observed_at).num_days().max(0))
+                    .unwrap_or(u16::MAX);
+                let age_days = f32::from(age_days);
                 let recency = 1.0 / (1.0 + age_days / 30.0);
                 let breakdown = ScoreBreakdown {
                     lexical,
@@ -284,6 +319,7 @@ impl InMemoryMemoryRepository {
         hits.truncate(limit);
         hits
     }
+    #[must_use]
     pub fn conflicts(&self, scope: &AssertionScope) -> Vec<ConflictBundle> {
         let mut groups: BTreeMap<(EntityRef, String), Vec<MemoryCandidate>> = BTreeMap::new();
         for candidate in self.records.values().filter(|c| &c.scope == scope) {
@@ -316,11 +352,113 @@ impl InMemoryMemoryRepository {
             })
             .collect()
     }
+    #[must_use]
     pub fn len(&self) -> usize {
         self.records.len()
     }
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
+    }
+}
+
+#[async_trait]
+impl MemoryRepository for InMemoryMemoryRepository {
+    async fn upsert(&mut self, draft: MemoryFactDraft) -> Result<(), MemoryRepositoryError> {
+        MemoryEngine::admit_text(&draft.text)
+            .map_err(|error| MemoryRepositoryError::Admission(error.to_string()))?;
+        if draft.fact_id.is_empty() || draft.projection_id.is_empty() {
+            return Err(MemoryRepositoryError::Scope(
+                "fact and projection identifiers are required".into(),
+            ));
+        }
+        if draft.lifecycle == FactLifecycle::Confirmed && !draft.pollution_lineage.is_empty() {
+            return Err(MemoryRepositoryError::Admission(
+                "polluted evidence cannot enter Confirmed memory".into(),
+            ));
+        }
+        if let Some(existing) = self.drafts.get(&draft.fact_id) {
+            if existing != &draft {
+                return Err(MemoryRepositoryError::Scope(
+                    "immutable fact ID was reused with a different payload".into(),
+                ));
+            }
+            return Ok(());
+        }
+        self.drafts.insert(draft.fact_id.clone(), draft);
+        Ok(())
+    }
+
+    async fn transition(
+        &mut self,
+        _tenant_id: &str,
+        _user_id: &str,
+        fact_id: &str,
+        target: FactLifecycle,
+        _source_event_ids: &[String],
+        independent_confirmation: bool,
+    ) -> Result<(), MemoryRepositoryError> {
+        let draft = self
+            .drafts
+            .get_mut(fact_id)
+            .ok_or_else(|| MemoryRepositoryError::Scope("fact does not exist".into()))?;
+        if draft.lifecycle == target {
+            return Ok(());
+        }
+        if !draft.lifecycle.can_transition_to(target) {
+            return Err(MemoryRepositoryError::Lifecycle(format!(
+                "illegal transition {} -> {} for {fact_id}",
+                draft.lifecycle.as_str(),
+                target.as_str()
+            )));
+        }
+        if target == FactLifecycle::Confirmed
+            && !draft.pollution_lineage.is_empty()
+            && !independent_confirmation
+        {
+            return Err(MemoryRepositoryError::Admission(
+                "quarantined evidence requires an independent authority before promotion".into(),
+            ));
+        }
+        draft.lifecycle = target;
+        Ok(())
+    }
+
+    async fn forget(
+        &mut self,
+        _tenant_id: &str,
+        _user_id: &str,
+        projection_id: &str,
+        _source_event_ids: &[String],
+    ) -> Result<(), MemoryRepositoryError> {
+        let draft = self
+            .drafts
+            .values_mut()
+            .find(|draft| draft.projection_id == projection_id)
+            .ok_or_else(|| MemoryRepositoryError::Scope("projection does not exist".into()))?;
+        draft.lifecycle = FactLifecycle::Forgotten;
+        Ok(())
+    }
+
+    async fn rebuild_projection(
+        &mut self,
+        _tenant_id: &str,
+        _user_id: &str,
+    ) -> Result<String, MemoryRepositoryError> {
+        let rows = self
+            .drafts
+            .values()
+            .map(|draft| {
+                format!(
+                    "{}:{}:{}:{}",
+                    draft.fact_id,
+                    draft.projection_id,
+                    draft.lifecycle.as_str(),
+                    draft.evidence_hash
+                )
+            })
+            .collect::<Vec<_>>();
+        Ok(stable_source_hash(&rows.join("\n")))
     }
 }
 fn contains_secret(text: &str) -> bool {
@@ -352,10 +490,7 @@ fn contains_secret(text: &str) -> bool {
     {
         return true;
     }
-    let digit_count = text
-        .chars()
-        .filter(|character| character.is_ascii_digit())
-        .count();
+    let digit_count = text.chars().filter(char::is_ascii_digit).count();
     digit_count >= 14 && digit_count * 2 >= text.chars().count()
 }
 
@@ -371,8 +506,169 @@ pub fn validate_memory_text(text: &str) -> Result<(), MemoryError> {
     }
     Ok(())
 }
+
+#[must_use]
+pub fn pollution_lineage_for_text(text: &str) -> Vec<String> {
+    let lower = text.to_ascii_lowercase();
+    let markers = [
+        ("ignore previous", "instruction_override"),
+        ("ignore all previous", "instruction_override"),
+        ("system prompt", "system_prompt_reference"),
+        ("developer message", "authority_impersonation"),
+        ("you are now", "role_override"),
+        ("disregard", "instruction_override"),
+        ("忽略之前", "instruction_override"),
+        ("系统提示词", "system_prompt_reference"),
+        ("你现在是", "role_override"),
+    ];
+    let mut found = markers
+        .iter()
+        .filter(|(needle, _)| lower.contains(needle))
+        .map(|(_, marker)| (*marker).to_string())
+        .collect::<Vec<_>>();
+    found.sort();
+    found.dedup();
+    found
+}
+#[must_use]
 pub fn stable_source_hash(text: &str) -> String {
     hex::encode(Sha256::digest(text.as_bytes()))
+}
+
+/// Execute the public repository contract against any backend adapter. This
+/// is intentionally small and deterministic: it exercises idempotent upsert,
+/// pollution quarantine, lifecycle promotion, projection rebuild and forget,
+/// so adapters cannot claim compatibility by merely implementing the trait.
+// A repository TCK is deliberately linear: every adapter must visibly execute
+// the same lifecycle sequence rather than hiding contract steps in test helpers.
+#[allow(clippy::too_many_lines)]
+pub async fn exercise_repository_contract<R>(mut repository: R) -> Result<(), MemoryRepositoryError>
+where
+    R: MemoryRepository,
+{
+    behavior_trace("TCK-001");
+    let draft = MemoryFactDraft {
+        fact_id: "contract-fact".into(),
+        projection_id: "contract-projection".into(),
+        tenant_id: "contract-tenant".into(),
+        user_id: "contract-user".into(),
+        scope: "user".into(),
+        app: "contract".into(),
+        session_id: Some("contract-session".into()),
+        channel: "long_term".into(),
+        kind: "fact".into(),
+        subject: serde_json::json!({"kind":"user","id":"contract-user"}),
+        predicate: "timezone".into(),
+        value: serde_json::json!("UTC"),
+        text: "The user's timezone is UTC".into(),
+        evidence_id: "contract-evidence".into(),
+        evidence_hash: stable_source_hash("contract-evidence"),
+        valid_from: None,
+        valid_until: None,
+        confidence: 1.0,
+        sensitivity: "internal".into(),
+        lifecycle: FactLifecycle::Candidate,
+        authority: vec!["user".into()],
+        source_event_ids: vec!["contract-event".into()],
+        pollution_lineage: Vec::new(),
+        memory_type: "fact".into(),
+        source_type: "message".into(),
+        pinned: false,
+        metadata: serde_json::json!({}),
+        stale_at: None,
+        verified_at: None,
+        embedding_model: None,
+        embedding_dimensions: None,
+        embedding_json: None,
+    };
+    repository.upsert(draft.clone()).await?;
+    repository.upsert(draft).await?;
+    repository
+        .transition(
+            "contract-tenant",
+            "contract-user",
+            "contract-fact",
+            FactLifecycle::Confirmed,
+            &["contract-confirmation".into()],
+            true,
+        )
+        .await?;
+    let projection_hash = repository
+        .rebuild_projection("contract-tenant", "contract-user")
+        .await?;
+    if projection_hash.is_empty() {
+        return Err(MemoryRepositoryError::Admission(
+            "repository contract produced an empty projection hash".into(),
+        ));
+    }
+    repository
+        .forget(
+            "contract-tenant",
+            "contract-user",
+            "contract-projection",
+            &["contract-forget".into()],
+        )
+        .await?;
+
+    let mut polluted = MemoryFactDraft {
+        fact_id: "contract-polluted".into(),
+        projection_id: "contract-polluted-projection".into(),
+        lifecycle: FactLifecycle::Candidate,
+        pollution_lineage: vec!["prompt_injection".into()],
+        ..MemoryFactDraft {
+            fact_id: "contract-polluted".into(),
+            projection_id: "contract-polluted-projection".into(),
+            tenant_id: "contract-tenant".into(),
+            user_id: "contract-user".into(),
+            scope: "user".into(),
+            app: "contract".into(),
+            session_id: Some("contract-session".into()),
+            channel: "long_term".into(),
+            kind: "fact".into(),
+            subject: serde_json::json!({"kind":"user","id":"contract-user"}),
+            predicate: "role".into(),
+            value: serde_json::json!("admin"),
+            text: "A suspicious source claims the user is an admin".into(),
+            evidence_id: "contract-polluted-evidence".into(),
+            evidence_hash: stable_source_hash("contract-polluted-evidence"),
+            valid_from: None,
+            valid_until: None,
+            confidence: 0.1,
+            sensitivity: "internal".into(),
+            lifecycle: FactLifecycle::Candidate,
+            authority: vec!["model".into()],
+            source_event_ids: vec!["contract-polluted-event".into()],
+            pollution_lineage: vec!["prompt_injection".into()],
+            memory_type: "fact".into(),
+            source_type: "tool".into(),
+            pinned: false,
+            metadata: serde_json::json!({}),
+            stale_at: None,
+            verified_at: None,
+            embedding_model: None,
+            embedding_dimensions: None,
+            embedding_json: None,
+        }
+    };
+    polluted.lifecycle = FactLifecycle::Candidate;
+    repository.upsert(polluted).await?;
+    if repository
+        .transition(
+            "contract-tenant",
+            "contract-user",
+            "contract-polluted",
+            FactLifecycle::Confirmed,
+            &["contract-polluted-confirmation".into()],
+            false,
+        )
+        .await
+        .is_ok()
+    {
+        return Err(MemoryRepositoryError::Admission(
+            "polluted candidate was promoted without independent confirmation".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -416,7 +712,7 @@ mod tests {
         long_term.channel = MemoryChannel::LongTermMemory;
         assert_eq!(
             engine
-                .ingest_channels(DualChannelExtraction {
+                .ingest_channels(&DualChannelExtraction {
                     continuity_state: vec![continuity],
                     long_term_memory: vec![long_term]
                 })
@@ -464,5 +760,11 @@ mod tests {
             TemporalRelation::Supersedes
         );
         assert!(MemoryEngine::temporal_relation("overwrites").is_err());
+    }
+
+    #[tokio::test]
+    async fn repository_contract_is_enforced_by_the_reference_adapter() {
+        let result = exercise_repository_contract(InMemoryMemoryRepository::default()).await;
+        assert!(result.is_ok(), "repository contract failed: {result:?}");
     }
 }

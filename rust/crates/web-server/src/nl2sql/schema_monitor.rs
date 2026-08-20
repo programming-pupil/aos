@@ -48,7 +48,7 @@ impl SchemaMonitor {
     /// Returns `Some(SchemaChangeReport)` if changes were found, `None` otherwise.
     pub async fn check_datasource(
         &self,
-        _tenant_id: &str,
+        tenant_id: &str,
         datasource_id: &str,
     ) -> anyhow::Result<Option<SchemaChangeReport>> {
         // Load cached schema
@@ -76,8 +76,13 @@ impl SchemaMonitor {
 
         let encrypted_config: serde_json::Value = serde_json::from_str(&config_json)
             .map_err(|error| anyhow::anyhow!("invalid encrypted datasource config: {error}"))?;
-        let config = crate::routes::data_sources::decrypt_config(&encrypted_config, &self.data_dir)
-            .map_err(|error| anyhow::anyhow!("failed to decrypt datasource config: {error}"))?;
+        let config = crate::routes::data_sources::decrypt_config(
+            &encrypted_config,
+            &self.data_dir,
+            tenant_id,
+            datasource_id,
+        )
+        .map_err(|error| anyhow::anyhow!("failed to decrypt datasource config: {error}"))?;
 
         // Discover live schema
         let live_schema = match self.discovery.discover(&db_type, &config).await {

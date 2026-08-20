@@ -5,6 +5,12 @@ use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 use crate::token_estimator::estimate_message_tokens;
 use std::collections::{BTreeMap, BTreeSet};
 
+fn usize_ratio(numerator: usize, denominator: usize) -> f64 {
+    let numerator = u32::try_from(numerator).unwrap_or(u32::MAX);
+    let denominator = u32::try_from(denominator).unwrap_or(u32::MAX).max(1);
+    f64::from(numerator) / f64::from(denominator)
+}
+
 /// Configuration for the Trident compaction pipeline.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TridentConfig {
@@ -32,7 +38,7 @@ impl Default for TridentConfig {
 }
 
 /// Statistics from a Trident compaction run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TridentStats {
     pub superseded_count: usize,
     pub collapsed_chains: usize,
@@ -44,25 +50,11 @@ pub struct TridentStats {
     pub final_message_count: usize,
 }
 
-impl Default for TridentStats {
-    fn default() -> Self {
-        Self {
-            superseded_count: 0,
-            collapsed_chains: 0,
-            messages_collapsed: 0,
-            clusters_found: 0,
-            messages_clustered: 0,
-            tokens_saved_estimate: 0,
-            original_message_count: 0,
-            final_message_count: 0,
-        }
-    }
-}
-
 impl TridentStats {
+    #[must_use]
     pub fn format_report(&self) -> String {
         let compression = if self.final_message_count > 0 {
-            self.original_message_count as f64 / self.final_message_count as f64
+            usize_ratio(self.original_message_count, self.final_message_count)
         } else {
             1.0
         };
@@ -187,7 +179,9 @@ pub fn trident_compact_session(
         result.compacted_session = final_session;
         result.removed_message_count += post_compact_sanitized_count;
         if let Some(compaction) = result.compacted_session.compaction.as_mut() {
-            compaction.replacement_messages = result.compacted_session.messages.clone();
+            compaction
+                .replacement_messages
+                .clone_from(&result.compacted_session.messages);
         }
     }
 
@@ -348,7 +342,7 @@ fn stage1_supersede(messages: &[ConversationMessage]) -> (Vec<ConversationMessag
 
     let mut obsolete_indices: BTreeSet<usize> = BTreeSet::new();
 
-    for (_path, ops) in &file_ops {
+    for ops in file_ops.values() {
         if ops.len() < 2 {
             continue;
         }
@@ -361,9 +355,9 @@ fn stage1_supersede(messages: &[ConversationMessage]) -> (Vec<ConversationMessag
 
         if let Some(last_write) = last_write_idx {
             for op in ops {
-                if op.op_type == FileOp::Read && op.index < last_write {
-                    obsolete_indices.insert(op.index);
-                } else if (op.op_type == FileOp::Write || op.op_type == FileOp::Edit)
+                if (op.op_type == FileOp::Read
+                    || op.op_type == FileOp::Write
+                    || op.op_type == FileOp::Edit)
                     && op.index < last_write
                 {
                     obsolete_indices.insert(op.index);
@@ -482,7 +476,7 @@ fn stage2_collapse(
                     usage: None,
                 });
             } else {
-                result.extend(buffer.drain(..));
+                result.append(&mut buffer);
             }
             buffer.clear();
             result.push(msg.clone());
@@ -519,7 +513,7 @@ fn is_chatty_message(msg: &ConversationMessage) -> bool {
             ContentBlock::ToolResult { output, .. } => output.len(),
         })
         .sum::<usize>()
-        + msg.thinking.as_deref().map(str::len).unwrap_or(0);
+        + msg.thinking.as_deref().map_or(0, str::len);
 
     let has_tool_use = msg
         .blocks
@@ -635,7 +629,7 @@ fn stage3_cluster(
     }
 
     let total_clustered: usize = cluster_assignments.len();
-    let clusters_found = cluster_id as usize;
+    let clusters_found = cluster_id;
 
     let mut result: Vec<ConversationMessage> = Vec::new();
     let mut cluster_buffers: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -719,7 +713,7 @@ fn fingerprint_message(index: usize, msg: &ConversationMessage) -> Option<Messag
             }
         }
     }
-    text_length += msg.thinking.as_deref().map(str::len).unwrap_or(0);
+    text_length += msg.thinking.as_deref().map_or(0, str::len);
 
     Some(MessageFingerprint {
         index,
@@ -742,7 +736,7 @@ fn compute_similarity(a: &MessageFingerprint, b: &MessageFingerprint) -> f64 {
     } else {
         let intersection: usize = a.tool_names.intersection(&b.tool_names).count();
         let union: usize = a.tool_names.union(&b.tool_names).count();
-        intersection as f64 / union as f64
+        usize_ratio(intersection, union)
     };
 
     let file_overlap = if a.file_paths.is_empty() && b.file_paths.is_empty() {
@@ -752,7 +746,7 @@ fn compute_similarity(a: &MessageFingerprint, b: &MessageFingerprint) -> f64 {
     } else {
         let intersection: usize = a.file_paths.intersection(&b.file_paths).count();
         let union: usize = a.file_paths.union(&b.file_paths).count();
-        intersection as f64 / union as f64
+        usize_ratio(intersection, union)
     };
 
     let length_similarity = if a.text_length == 0 && b.text_length == 0 {
@@ -760,9 +754,10 @@ fn compute_similarity(a: &MessageFingerprint, b: &MessageFingerprint) -> f64 {
     } else if a.text_length == 0 || b.text_length == 0 {
         0.0
     } else {
-        let min_len = a.text_length.min(b.text_length) as f64;
-        let max_len = a.text_length.max(b.text_length) as f64;
-        min_len / max_len
+        usize_ratio(
+            a.text_length.min(b.text_length),
+            a.text_length.max(b.text_length),
+        )
     };
 
     0.4 * tool_overlap + 0.4 * file_overlap + 0.2 * length_similarity
@@ -887,7 +882,7 @@ mod tests {
     fn stage2_collapses_chatty_messages() {
         let mut messages = vec![];
         for i in 0..6 {
-            messages.push(ConversationMessage::user_text(&format!("ok {i}")));
+            messages.push(ConversationMessage::user_text(format!("ok {i}")));
             messages.push(ConversationMessage::assistant(vec![ContentBlock::Text {
                 text: format!("got {i}"),
             }]));

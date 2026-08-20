@@ -1,14 +1,14 @@
 # AOS 最终开源就绪审计与实现核销
 
-> 审计与实现日期：2026-08-19
-> AOS 基线：`7a8b14fad65be817816757df11c3b7db0e5ce479`（本报告同时核销其后的工作区实现）
+> 审计与实现日期：2026-08-20
+> AOS 实现基线：本次最终 merge commit（由紧随其后的审计记录提交固化实际 commit hash）
 > OpenAI Codex 对照：`3929c99a97d1aa0fb8000903a4b57b24fbabe742`（2026-08-19）
 > DeepSeek Harness 对照：`99f6f02fecdb7dff40c3fbc9470f5907c29f74ca`（2026-08-17）
 > 性质：源码级发布审计、缺口修复记录和发布声明边界
 
 ## 1. 结论
 
-原审计识别的八项 P0 已全部产生生产实现，不再处于“只有表、trait、测试名或文档”的状态。关键请求路径现在具备 durable interaction、canonical memory、原子终态、精确压缩来源、四层 manifest、统一密文轮换、AST 语义校验和可反证行为门禁。Codex 的两阶段 Memory 运行纪律也已落为持久化 phase-2 worker；DeepSeek Harness 的 replay/fail-closed 思路已进入 provider fixture 和行为证据。
+原审计识别的八项 P0 已全部产生生产实现，不再处于“只有表、trait、测试名或文档”的状态。关键请求路径现在具备 canonical durable interaction、canonical memory、原子终态、精确压缩来源、四层 manifest、统一密文轮换、AST 语义校验和可反证行为门禁。Codex 的两阶段 Memory 运行纪律已落为 `memory_extraction_outbox`、`memory_consolidation_batches` 和 `memory_embedding_rebuild_outbox` 驱动的持久化 governance worker；DeepSeek Harness 的 replay/fail-closed 思路已进入 provider fixture 和行为证据。
 
 这份结论刻意区分两件事：
 
@@ -37,7 +37,7 @@ DeepSeek Harness 的主要对照面：
 
 | ID | 实现状态 | 生产实现与不变量 | 反证/恢复证据 |
 | --- | --- | --- | --- |
-| K-P0-01 Durable Question | `implemented` | Runtime 在 executor 前截获 `AskUserQuestion`；问题与 suspended terminal/checkpoint 同事务；Web API 按 tenant/user/session/turn/invocation 授权；答案加密且按 hash 幂等，resume exactly-once | owner scope、重复相同答案、冲突答案、加密落盘、consume/replay 测试；直接 executor fail-closed |
+| K-P0-01 Durable Question | `implemented` | Runtime 在 executor 前截获 `AskUserQuestion`；问题与 suspended terminal/checkpoint 同事务；Web API 只接受 canonical `durable_interactions`；批量答案在一笔事务中完成授权、幂等、响应事件、outbox、turn revision 和 exactly-once consume | owner scope、重启恢复、重复相同答案、跨 owner、批次第二项失败时第一项保持 pending、直接 executor fail-closed |
 | K-P0-02 Memory single source | `implemented` | `structured_memory_facts` 为 canonical owner，`agent_memory_items` 为可重建 projection；create/update/delete/supersede/compaction/Gateway 写入同事务；active read 必须存在 current canonical fact；polluted/disabled 禁止抽取 | migration 全量 backfill；删除/覆盖同步；projection-only 创建 fail-closed；phase-2 worker 污染 quarantine 测试 |
 | K-P0-03 Atomic terminal/checkpoint | `implemented` | Runtime 生产终态只调用 `finish_turn_with_checkpoint`；预算 settlement、terminal event、checkpoint event、完整 session checkpoint 和 projection 单事务提交 | 相同命令 lost-ack 重试幂等；terminal 与 checkpoint 同 source revision/hash 测试 |
 | K-P0-04 Exact compaction provenance | `implemented` | archive unit 按 ordinal+message hash 映射 exact durable runtime events；保存显式 source event set、parent compaction IDs 和 unit hashes；missing/extra/hash mismatch fail-closed | 测试证明 warning/窗口外事件不会进入 coverage，manifest 不再使用 thread 全历史 |
@@ -56,8 +56,8 @@ Memory 当前链路是：
 runtime/gateway/compaction command
   -> structured_memory_facts (canonical fact)
   -> agent_memory_items (same-transaction projection)
-  -> durable memory_learning_jobs
-  -> leased phase-2 worker
+  -> memory_extraction_outbox / memory_consolidation_batches
+  -> leased governance worker
   -> conservative global canonical fact + projection
 ```
 
@@ -66,9 +66,9 @@ runtime/gateway/compaction command
 1. projection 无对应 `current=1` canonical fact时不能参与 active recall。
 2. update、delete、supersede、forget 先改变 canonical 状态，并在同事务维护 projection。
 3. 自动抽取只接受 clean session；`polluted` 和 `disabled` 都 fail-closed。
-4. 全局晋升只接受置信度至少 0.90、`public/internal` 且“用户 pinned 或至少两个独立 session 重复”的事实。
-5. job 支持 queued/leased/cooldown/completed/quarantined/failed，带 lease expiry、attempt、next attempt 和幂等 transaction identity。
-6. 晋升事务和 job settlement 原子提交；worker 崩溃后 lease 到期可安全重放。
+4. 全局晋升只接受有证据、满足 lifecycle/authority 规则且未污染的事实。
+5. extraction、consolidation、embedding 三类 outbox 都带 lease expiry、attempt/backoff、fencing 和幂等 source window。
+6. 晋升事务、projection 更新和 outbox settlement 原子提交；worker 崩溃后 lease 到期可安全重放。
 
 这吸收了 Codex phase-1/phase-2 的运行纪律，同时保留 AOS 的 typed fact、evidence、sensitivity、tenant isolation、supersession 和污染闭环。
 
@@ -119,13 +119,20 @@ git diff --check
 
 行为门禁会生成 `target/conformance/semantic-kernel-behavior.jsonl`。该文件逐 case 记录 production reference、源码 hash、trace anchor 和实际通过的测试，便于 code review/CI 保存为 artifact。
 
-本次工作区执行的定向验证覆盖：`nl2sql-core` 全量 79 tests、`pm-domain` 全量 68 tests、`semantic-core` authority tests、`eval-harness` conformance/replay tests、Gateway provider manifest lineage 与 durable question exposure tests，以及 SQLite migration、terminal/checkpoint、question、compaction coverage、rotation、memory worker tests和 Runtime/Tools/Gateway/Web Server 联合 compile check。最终退出码以本次提交对应 CI 日志为准，不得把历史数字当成未来提交的永久绿灯。
+本轮最终实现工作树执行并通过：
 
-本轮最终工作区已通过 `cargo test --workspace --all-features`（所有 workspace 单元、集成、文档测试均为 0 failed）、`cargo check --workspace --all-features`、Rust 格式检查、`git diff --check`、WebUI `typecheck`、WebUI 167 个 Vitest 测试以及 `npm run build`。Memory 28 项、NL2SQL semantic-audit 11 项、NL2SQL core 79 项、取消/checkpoint、批量问题原子性、compaction 正向/回滚以及 production-prefixed regression 均已通过。行为门禁 `scripts/check-semantic-kernel-behavior.sh` 已完整执行全部 case 并生成 `target/conformance/semantic-kernel-behavior.jsonl`；CI 仍应在干净 runner 重复这些门禁作为发布前保护。
+- `cargo fmt --all -- --check`；
+- `cargo check --workspace --all-features`；
+- `cargo test --workspace --all-features`，其中 `web-server` 1172 passed、`runtime` 561 passed、`nl2sql-core` 86 passed、`pm-domain` 70 passed、`eval-harness` 61 passed、`memory-engine` 6 passed，进程故障集成测试 2 passed；仅跳过明确要求外部 API、网络、真实 Trino 或本地 ONNX 环境的测试；
+- WebUI `npm run typecheck`、38 个测试文件/167 个 Vitest 测试和 `npm run build`；
+- `scripts/check-semantic-kernel-behavior.sh`，40/40 case 均执行真实生产路径并产生唯一 production trace，包括进程 kill/restart 和 key rotation/restart；
+- `git diff --check` 与冲突标记扫描。
+
+这些数字记录本次实现基线的本地可复现结果，不替代后续 CI，也不应被复用为未来提交的永久绿灯。
 
 ## 10. 仍需外部证据、但不应伪装成代码缺口的项目
 
-- 真实 OS process kill/restart 矩阵及不同 SQLite busy/IO fault 条件；
+- 更广的跨 OS/文件系统 process kill/restart 矩阵及不同 SQLite busy/IO fault 条件；当前 deterministic kill/restart TCK 已通过；
 - 新存储 adapter 的 backend-neutral contract suite（当前正式支持边界为 SQLite）；
 - Memory/Compaction hidden facts 的 precision、recall、false-memory、forgetting 和 continuation；
 - PM 的 critical omission、unsupported claim、提问负担、返工和 calibration error；

@@ -434,7 +434,7 @@ async fn resolve_remote_embedding_config(
             continue;
         }
 
-        match crate::routes::apikeys::decrypt_api_key(encrypted_key) {
+        match crate::routes::apikeys::decrypt_api_key(encrypted_key, tenant_id, key_id) {
             Ok(api_key) => {
                 let resolved = EmbeddingTenantConfig {
                     api_key,

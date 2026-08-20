@@ -19,10 +19,6 @@ ALTER TABLE prompt_manifests ADD COLUMN iteration INTEGER;
 CREATE UNIQUE INDEX idx_prompt_manifest_attempt
   ON prompt_manifests(tenant_id, thread_id, turn_id, iteration);
 
-ALTER TABLE provider_request_attempts ADD COLUMN context_manifest_id TEXT;
-ALTER TABLE provider_request_attempts ADD COLUMN prompt_manifest_id TEXT;
-ALTER TABLE provider_request_attempts ADD COLUMN tool_manifest_id TEXT;
-
 CREATE INDEX idx_provider_attempt_manifests
   ON provider_request_attempts(
     tenant_id, session_id, context_manifest_id, prompt_manifest_id, tool_manifest_id

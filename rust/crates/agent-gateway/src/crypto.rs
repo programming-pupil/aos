@@ -5,7 +5,7 @@
 //! id; legacy base64 payloads remain readable during online rotation.
 
 use aes_gcm::{
-    aead::{rand_core::RngCore, Aead, KeyInit, OsRng},
+    aead::{rand_core::RngCore, Aead, KeyInit, OsRng, Payload},
     Aes256Gcm, Nonce,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -13,6 +13,7 @@ use thiserror::Error;
 
 const NONCE_SIZE: usize = 12;
 const ENVELOPE_PREFIX: &str = "aosenc:v1:";
+const SCOPED_ENVELOPE_PREFIX: &str = "aosenc:v2:";
 const DEFAULT_KEY_ID: &str = "primary";
 
 #[derive(Debug, Error)]
@@ -31,6 +32,14 @@ pub enum CryptoError {
     UnknownKeyId(String),
     #[error("encryption key ring is invalid: {0}")]
     InvalidKeyRing(String),
+}
+
+/// Build the canonical associated-data identity for a durable ciphertext row.
+/// Callers must use the registry store id, not a physical table/column name, so
+/// schema refactors cannot silently weaken or fork the cryptographic boundary.
+#[must_use]
+pub fn scoped_aad(store_id: &str, tenant_id: &str, row_id: &str) -> String {
+    format!("aos.semantic-kernel/v1/{store_id}/{tenant_id}/{row_id}")
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +165,16 @@ pub fn encrypt(plaintext: &str) -> Result<String, CryptoError> {
     Ok(format!("{ENVELOPE_PREFIX}{key_id}:{encoded}"))
 }
 
+pub fn encrypt_scoped(plaintext: &str, aad: &str) -> Result<String, CryptoError> {
+    let ring = KeyRing::load()?;
+    let (key_id, key) = ring.active();
+    let aad_hash = aad_digest(aad);
+    let encoded = encrypt_payload_with_aad(plaintext, key, aad_hash.as_bytes())?;
+    Ok(format!(
+        "{SCOPED_ENVELOPE_PREFIX}{key_id}:{aad_hash}:{encoded}"
+    ))
+}
+
 fn encrypt_payload(plaintext: &str, key: &[u8; 32]) -> Result<String, CryptoError> {
     let cipher =
         Aes256Gcm::new_from_slice(key).map_err(|e| CryptoError::EncryptionFailed(e.to_string()))?;
@@ -175,10 +194,39 @@ fn encrypt_payload(plaintext: &str, key: &[u8; 32]) -> Result<String, CryptoErro
     Ok(BASE64.encode(&combined))
 }
 
+fn encrypt_payload_with_aad(
+    plaintext: &str,
+    key: &[u8; 32],
+    aad: &[u8],
+) -> Result<String, CryptoError> {
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|e| CryptoError::EncryptionFailed(e.to_string()))?;
+    let mut nonce_bytes = [0_u8; NONCE_SIZE];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: plaintext.as_bytes(),
+                aad,
+            },
+        )
+        .map_err(|e| CryptoError::EncryptionFailed(e.to_string()))?;
+    let mut combined = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
+    combined.extend_from_slice(&nonce_bytes);
+    combined.extend_from_slice(&ciphertext);
+    Ok(BASE64.encode(combined))
+}
+
 /// Decrypt ciphertext using AES-256-GCM.
 /// Input: base64(nonce || `ciphertext_with_tag`).
 pub fn decrypt(encrypted: &str) -> Result<String, CryptoError> {
     let ring = KeyRing::load()?;
+    if encrypted.starts_with(SCOPED_ENVELOPE_PREFIX) {
+        return Err(CryptoError::DecryptionFailed(
+            "scoped ciphertext requires decrypt_scoped with its tenant/store/row identity".into(),
+        ));
+    }
     if let Some(rest) = encrypted.strip_prefix(ENVELOPE_PREFIX) {
         let (key_id, payload) = rest.split_once(':').ok_or_else(|| {
             CryptoError::DecryptionFailed("versioned ciphertext is missing its key id".into())
@@ -198,6 +246,31 @@ pub fn decrypt(encrypted: &str) -> Result<String, CryptoError> {
     Err(last_error.unwrap_or_else(|| {
         CryptoError::DecryptionFailed("no configured key could decrypt legacy ciphertext".into())
     }))
+}
+
+pub fn decrypt_scoped(encrypted: &str, aad: &str) -> Result<String, CryptoError> {
+    let Some(rest) = encrypted.strip_prefix(SCOPED_ENVELOPE_PREFIX) else {
+        return decrypt(encrypted);
+    };
+    let mut fields = rest.splitn(3, ':');
+    let key_id = fields.next().unwrap_or_default();
+    let stored_aad_hash = fields.next().ok_or_else(|| {
+        CryptoError::DecryptionFailed("scoped ciphertext is missing its AAD hash".into())
+    })?;
+    let expected_aad_hash = aad_digest(aad);
+    if stored_aad_hash != expected_aad_hash {
+        return Err(CryptoError::DecryptionFailed(
+            "ciphertext AAD does not match its tenant/store/row identity".into(),
+        ));
+    }
+    let payload = fields.next().ok_or_else(|| {
+        CryptoError::DecryptionFailed("scoped ciphertext is missing its payload".into())
+    })?;
+    let ring = KeyRing::load()?;
+    let key = ring
+        .by_id(key_id)
+        .ok_or_else(|| CryptoError::UnknownKeyId(key_id.to_string()))?;
+    decrypt_payload_with_aad(payload, key, stored_aad_hash.as_bytes())
 }
 
 fn decrypt_payload(encrypted: &str, key: &[u8; 32]) -> Result<String, CryptoError> {
@@ -222,16 +295,59 @@ fn decrypt_payload(encrypted: &str, key: &[u8; 32]) -> Result<String, CryptoErro
     String::from_utf8(plaintext).map_err(|e| CryptoError::DecryptionFailed(e.to_string()))
 }
 
+fn decrypt_payload_with_aad(
+    encrypted: &str,
+    key: &[u8; 32],
+    aad: &[u8],
+) -> Result<String, CryptoError> {
+    let combined = BASE64
+        .decode(encrypted)
+        .map_err(|e| CryptoError::InvalidBase64(e.to_string()))?;
+    if combined.len() < NONCE_SIZE + 16 {
+        return Err(CryptoError::DecryptionFailed("data too short".into()));
+    }
+    let (nonce_bytes, ciphertext) = combined.split_at(NONCE_SIZE);
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?;
+    let plaintext = cipher
+        .decrypt(
+            Nonce::from_slice(nonce_bytes),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?;
+    String::from_utf8(plaintext).map_err(|e| CryptoError::DecryptionFailed(e.to_string()))
+}
+
+fn aad_digest(aad: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(aad.as_bytes()))
+}
+
 /// Return the key id embedded in a versioned ciphertext. Legacy ciphertexts
 /// intentionally return `None` so callers can schedule online re-encryption.
 pub fn ciphertext_key_id(encrypted: &str) -> Option<&str> {
     encrypted
-        .strip_prefix(ENVELOPE_PREFIX)
+        .strip_prefix(SCOPED_ENVELOPE_PREFIX)
+        .or_else(|| encrypted.strip_prefix(ENVELOPE_PREFIX))
         .and_then(|rest| rest.split_once(':').map(|(id, _)| id))
 }
 
 pub fn active_key_id() -> Result<String, CryptoError> {
     Ok(KeyRing::load()?.active_id)
+}
+
+pub fn configured_key_ids() -> Result<Vec<String>, CryptoError> {
+    let ring = KeyRing::load()?;
+    let mut ids = ring
+        .keys
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    ids.sort();
+    Ok(ids)
 }
 
 pub fn needs_reencryption(encrypted: &str) -> Result<bool, CryptoError> {
@@ -244,6 +360,19 @@ pub fn reencrypt(encrypted: &str) -> Result<String, CryptoError> {
         return Ok(encrypted.to_string());
     }
     encrypt(&decrypt(encrypted)?)
+}
+
+pub fn reencrypt_scoped(encrypted: &str, aad: &str) -> Result<String, CryptoError> {
+    let plaintext = if encrypted.starts_with(SCOPED_ENVELOPE_PREFIX) {
+        decrypt_scoped(encrypted, aad)?
+    } else {
+        decrypt(encrypted)?
+    };
+    let active_key_id = active_key_id()?;
+    if encrypted.starts_with(&format!("{SCOPED_ENVELOPE_PREFIX}{active_key_id}:")) {
+        return Ok(encrypted.to_string());
+    }
+    encrypt_scoped(&plaintext, aad)
 }
 
 #[cfg(test)]
@@ -287,5 +416,33 @@ mod tests {
         let rotated = reencrypt(&old).unwrap();
         assert_eq!(ciphertext_key_id(&rotated), Some("new"));
         assert_eq!(decrypt(&rotated).unwrap(), "durable payload");
+    }
+
+    #[test]
+    fn scoped_ciphertext_rejects_cross_row_movement_and_rotates() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ENCRYPTION_KEY", "11111111111111111111111111111111");
+        std::env::set_var("ENCRYPTION_KEY_ID", "old");
+        std::env::remove_var("ENCRYPTION_KEY_RING");
+        let old = encrypt_scoped("tenant secret", "tenant-a/api_keys/key-1").unwrap();
+        assert_eq!(
+            decrypt_scoped(&old, "tenant-a/api_keys/key-1").unwrap(),
+            "tenant secret"
+        );
+        assert!(decrypt(&old).is_err());
+        assert!(decrypt_scoped(&old, "tenant-a/api_keys/key-2").is_err());
+
+        std::env::set_var("ENCRYPTION_KEY", "22222222222222222222222222222222");
+        std::env::set_var("ENCRYPTION_KEY_ID", "new");
+        std::env::set_var(
+            "ENCRYPTION_KEY_RING",
+            r#"{"old":"11111111111111111111111111111111"}"#,
+        );
+        let rotated = reencrypt_scoped(&old, "tenant-a/api_keys/key-1").unwrap();
+        assert!(rotated.starts_with("aosenc:v2:new:"));
+        assert_eq!(
+            decrypt_scoped(&rotated, "tenant-a/api_keys/key-1").unwrap(),
+            "tenant secret"
+        );
     }
 }

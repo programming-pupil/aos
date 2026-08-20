@@ -9,8 +9,8 @@
 
 use chrono::Datelike;
 use nl2sql_core::semantic_ir::{
-    AnalyticIntentIR, AnalyticObjective, DataQualityPolicy, DimensionRef, Grain, JoinContract,
-    MetricContract, MetricRef, NullPolicy, PopulationDefinition, SecurityScopeRef,
+    AnalyticIntentIR, AnalyticObjective, ComparisonWindow, DataQualityPolicy, DimensionRef, Grain,
+    JoinContract, MetricContract, MetricRef, NullPolicy, PopulationDefinition, SecurityScopeRef,
     SemanticAmbiguity, SemanticFilter, SemanticVerifier,
 };
 use serde_json::Value;
@@ -211,7 +211,7 @@ pub(crate) fn apply_query_understanding(
                             .map(|value| value.timezone.clone())
                             .unwrap_or_else(|| "Asia/Shanghai".into()),
                         start_inclusive: start.clone(),
-                        end_exclusive: end.clone(),
+                        end_exclusive: inclusive_date_end_to_exclusive(end),
                         business_calendar: None,
                         as_of: None,
                     });
@@ -258,12 +258,51 @@ pub(crate) fn apply_query_understanding(
     }
 
     if let Some(comparison) = understanding.entities.comparisons.first() {
+        let (treatment_window, baseline_window) = understanding
+            .entities
+            .time
+            .as_ref()
+            .filter(|time| time.ranges.len() >= 2)
+            .map(|time| {
+                let to_window = |(start, end): &(String, String)| ComparisonWindow {
+                    column: intent
+                        .time
+                        .as_ref()
+                        .map(|value| value.column.clone())
+                        .unwrap_or_else(|| "business_date".into()),
+                    start_inclusive: start.clone(),
+                    end_exclusive: inclusive_date_end_to_exclusive(end),
+                    timezone: intent
+                        .time
+                        .as_ref()
+                        .map(|value| value.timezone.clone())
+                        .unwrap_or_else(|| "Asia/Shanghai".into()),
+                    business_calendar: intent
+                        .time
+                        .as_ref()
+                        .and_then(|value| value.business_calendar.clone()),
+                };
+                (
+                    Some(to_window(&time.ranges[0])),
+                    Some(to_window(&time.ranges[1])),
+                )
+            })
+            .unwrap_or((None, None));
         intent.comparison = Some(nl2sql_core::semantic_ir::ComparisonSpec {
             baseline: comparison.raw.clone(),
             treatment: understanding.rewritten_question.clone(),
             method: comparison.comparison_type.clone(),
+            baseline_window,
+            treatment_window,
         });
     }
+}
+
+fn inclusive_date_end_to_exclusive(value: &str) -> String {
+    chrono::NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d")
+        .ok()
+        .and_then(|date| date.succ_opt())
+        .map_or_else(|| value.to_string(), |date| date.to_string())
 }
 
 /// Bind natural-language metric candidates to the tenant's versioned contracts.
@@ -354,6 +393,7 @@ pub(crate) fn bind_schema_dimensions(
     schema_tables: &Value,
     explicit_columns: &[String],
 ) {
+    crate::behavior_trace("SQL-005");
     let mut columns = schema_tables
         .as_array()
         .into_iter()
@@ -995,6 +1035,50 @@ pub(crate) fn hash_json(value: &Value) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+#[cfg(test)]
+pub(crate) fn bind_test_count_metric_contract(
+    intent: &mut AnalyticIntentIR,
+    time_column: &str,
+) -> MetricContract {
+    use nl2sql_core::semantic_ir::MetricExpressionIR;
+
+    let metric_id = intent
+        .metrics
+        .first()
+        .expect("count fixture requires a compiled metric")
+        .id
+        .clone();
+    let contract = MetricContract {
+        id: metric_id.clone(),
+        version: 1,
+        names: vec![metric_id],
+        expression: MetricExpressionIR::Aggregate {
+            function: "COUNT".into(),
+            expression: Box::new(MetricExpressionIR::Literal("*".into())),
+            distinct: false,
+        },
+        denominator: None,
+        population: intent.population.clone(),
+        default_grain: intent.grain.clone(),
+        allowed_grains: vec![intent.grain.clone()],
+        time_column: time_column.into(),
+        timezone: intent
+            .time
+            .as_ref()
+            .map(|time| time.timezone.clone())
+            .unwrap_or_else(|| "UTC".into()),
+        mandatory_filters: intent.filters.clone(),
+        join_contracts: vec![],
+        invariants: vec![],
+        valid_from: "2026-01-01".into(),
+        valid_until: None,
+        owner: Some("analytics-test".into()),
+        evidence_refs: vec!["test://metric/count/v1".into()],
+    };
+    bind_metric_contracts(intent, std::slice::from_ref(&contract));
+    contract
+}
+
 fn hash_text(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
 }
@@ -1020,12 +1104,13 @@ mod tests {
 
     #[test]
     fn canonical_ir_is_the_audit_source_of_truth_after_sql_generation() {
-        let canonical =
+        let mut canonical =
             compile_question_intent("tenant", "ds", "按日期统计订单数", &["orders".into()]);
+        let contract = bind_test_count_metric_contract(&mut canonical, "business_date");
         let audit = compile_canonical_intent_with_contracts_and_joins(
             &canonical,
             "SELECT business_date, COUNT(*) AS order_count FROM orders GROUP BY business_date",
-            &[],
+            &[contract],
             &[],
         )
         .expect("semantic audit");
@@ -1097,13 +1182,15 @@ mod tests {
             &[],
         );
         assert_eq!(canonical.time.as_ref().unwrap().column, "created_at");
+        let contract = bind_test_count_metric_contract(&mut canonical, "created_at");
         let time = canonical.time.as_ref().expect("time semantics");
         let sql = format!(
             "SELECT COUNT(*) AS order_count FROM orders WHERE created_at AT TIME ZONE 'Asia/Shanghai' >= DATE '{}' AND created_at AT TIME ZONE 'Asia/Shanghai' < DATE '{}'",
             time.start_inclusive, time.end_exclusive
         );
-        let audit = compile_canonical_intent_with_contracts_and_joins(&canonical, &sql, &[], &[])
-            .expect("semantic audit");
+        let audit =
+            compile_canonical_intent_with_contracts_and_joins(&canonical, &sql, &[contract], &[])
+                .expect("semantic audit");
         assert_eq!(
             audit.verification.release_decision,
             nl2sql_core::semantic_ir::QueryReleaseDecision::Release
@@ -1151,7 +1238,7 @@ mod tests {
     }
 
     #[test]
-    fn inferred_aggregate_without_a_contract_is_released_only_when_shape_matches() {
+    fn inferred_aggregate_without_a_contract_requires_clarification_even_when_shape_matches() {
         let mut canonical =
             compile_question_intent("tenant", "ds", "按日期统计订单数", &["orders".into()]);
         bind_metric_contracts(&mut canonical, &[]);
@@ -1170,7 +1257,7 @@ mod tests {
         .expect("semantic audit");
         assert_eq!(
             audit.verification.release_decision,
-            nl2sql_core::semantic_ir::QueryReleaseDecision::Release
+            nl2sql_core::semantic_ir::QueryReleaseDecision::NeedsClarification
         );
 
         let mismatch = compile_canonical_intent_with_contracts_and_joins(

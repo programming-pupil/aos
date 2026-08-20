@@ -51,7 +51,7 @@ mod tests {
     use super::*;
     #[test]
     fn compaction_is_fail_closed_and_requires_real_reduction() {
-        let validator = CompactionValidator::default();
+        let validator = CompactionValidator;
         let candidate = CompactionCandidate {
             source_event_seqs: vec![1, 2],
             narrative_summary: "summary".into(),

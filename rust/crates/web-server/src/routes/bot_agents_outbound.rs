@@ -732,16 +732,39 @@ async fn load_channel(
     .await?
     .ok_or_else(|| AppError::NotFound(format!("bot channel '{channel_id}' not found")))?;
 
+    let channel_id: String = row.get("id");
+    let stored_tenant_id: String = row.get("tenant_id");
+    let decrypt = |value, kind| {
+        crate::routes::bot_agents_types::decrypt_bot_channel_secret(
+            value,
+            &stored_tenant_id,
+            &channel_id,
+            kind,
+        )
+        .map_err(|error| AppError::Internal(format!("Bot channel secret decrypt failed: {error}")))
+    };
+    let outbound_token = decrypt(
+        row.get("outbound_token"),
+        crate::routes::bot_agents_types::BotChannelSecretKind::OutboundToken,
+    )?;
+    let signing_secret = decrypt(
+        row.get("signing_secret"),
+        crate::routes::bot_agents_types::BotChannelSecretKind::SigningSecret,
+    )?;
+    let outbound_signing_secret = decrypt(
+        row.get("outbound_signing_secret"),
+        crate::routes::bot_agents_types::BotChannelSecretKind::OutboundSigningSecret,
+    )?;
     Ok(ChannelDeliveryConfig {
-        tenant_id: row.get("tenant_id"),
+        tenant_id: stored_tenant_id,
         agent_id: row.get("agent_id"),
-        id: row.get("id"),
+        id: channel_id,
         platform: row.get("platform"),
         enabled: row.get("enabled"),
         outbound_webhook_url: row.get("outbound_webhook_url"),
-        outbound_token: row.get("outbound_token"),
-        signing_secret: row.get("signing_secret"),
-        outbound_signing_secret: row.get("outbound_signing_secret"),
+        outbound_token,
+        signing_secret,
+        outbound_signing_secret,
         config_json: parse_json_opt(row.get("config_json")),
     })
 }

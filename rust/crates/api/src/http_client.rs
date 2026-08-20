@@ -43,13 +43,11 @@ impl TimeoutConfig {
         let connect_timeout = std::env::var("CLAW_API_CONNECT_TIMEOUT")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(default.connect_timeout);
+            .map_or(default.connect_timeout, Duration::from_secs);
         let request_timeout = std::env::var("CLAW_API_REQUEST_TIMEOUT")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(default.request_timeout);
+            .map_or(default.request_timeout, Duration::from_secs);
         Self {
             connect_timeout,
             request_timeout,

@@ -85,6 +85,16 @@ pub struct ApprovalEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InteractionEvent {
+    pub interaction_id: String,
+    pub kind: crate::InteractionKind,
+    pub state: crate::InteractionState,
+    pub invocation_id: String,
+    pub expected_turn_revision: u64,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactEvent {
     pub artifact_id: ArtifactId,
     pub content_hash: String,
@@ -140,6 +150,7 @@ pub enum AgentEventV1 {
     Message(MessageItem),
     Tool(ToolInvocationEvent),
     Approval(ApprovalEvent),
+    Interaction(InteractionEvent),
     Artifact(ArtifactEvent),
     Memory(MemoryEvent),
     Checkpoint(CheckpointEvent),
@@ -185,6 +196,7 @@ impl AgentEventEnvelope {
         event: AgentEventV1,
         sequence: u64,
     ) -> Self {
+        crate::behavior_trace("PROTO-001");
         let mut envelope = Self {
             event_id: Uuid::new_v4().to_string(),
             thread_id: thread_id.into(),
@@ -267,6 +279,7 @@ pub enum ProtocolError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ExecutorCapabilities {
     pub name: String,
     pub version: String,

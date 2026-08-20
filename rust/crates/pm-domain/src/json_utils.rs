@@ -39,10 +39,8 @@ pub fn extract_first_json_object(text: &str) -> Option<String> {
 
 fn normalize_jsonish_text(input: &str) -> String {
     input
-        .replace('“', "\"")
-        .replace('”', "\"")
-        .replace('‘', "'")
-        .replace('’', "'")
+        .replace(['“', '”'], "\"")
+        .replace(['‘', '’'], "'")
         .replace('：', ":")
 }
 

@@ -393,26 +393,45 @@ async fn load_enabled_channels(state: &AppState) -> Result<Vec<InboundChannelRun
     .fetch_all(state.control_db())
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            let inbound_mode = clean_opt(row.get::<Option<String>, _>("inbound_mode"))
-                .unwrap_or_else(|| "auto".to_string());
-            InboundChannelRuntimeConfig {
-                tenant_id: row.get("tenant_id"),
-                channel_id: row.get("id"),
-                platform: row.get("platform"),
-                inbound_mode,
-                inbound_cursor: row.get("inbound_cursor"),
-                outbound_token: row.get("outbound_token"),
-                signing_secret: row.get("signing_secret"),
-                config_json: parse_json_opt(row.get("config_json")),
-            }
-        })
-        .filter(|channel| {
-            resolve_inbound_mode(&channel.platform, &channel.inbound_mode) != "webhook"
-        })
-        .collect())
+    let mut channels = Vec::with_capacity(rows.len());
+    for row in rows {
+        let inbound_mode = clean_opt(row.get::<Option<String>, _>("inbound_mode"))
+            .unwrap_or_else(|| "auto".to_string());
+        let tenant_id: String = row.get("tenant_id");
+        let channel_id: String = row.get("id");
+        let outbound_token = crate::routes::bot_agents_types::decrypt_bot_channel_secret(
+            row.get("outbound_token"),
+            &tenant_id,
+            &channel_id,
+            crate::routes::bot_agents_types::BotChannelSecretKind::OutboundToken,
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("Bot channel secret decrypt failed: {error}"))
+        })?;
+        let signing_secret = crate::routes::bot_agents_types::decrypt_bot_channel_secret(
+            row.get("signing_secret"),
+            &tenant_id,
+            &channel_id,
+            crate::routes::bot_agents_types::BotChannelSecretKind::SigningSecret,
+        )
+        .map_err(|error| {
+            AppError::Internal(format!("Bot channel secret decrypt failed: {error}"))
+        })?;
+        let channel = InboundChannelRuntimeConfig {
+            tenant_id,
+            channel_id,
+            platform: row.get("platform"),
+            inbound_mode,
+            inbound_cursor: row.get("inbound_cursor"),
+            outbound_token,
+            signing_secret,
+            config_json: parse_json_opt(row.get("config_json")),
+        };
+        if resolve_inbound_mode(&channel.platform, &channel.inbound_mode) != "webhook" {
+            channels.push(channel);
+        }
+    }
+    Ok(channels)
 }
 
 async fn update_channel_status(

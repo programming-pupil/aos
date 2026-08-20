@@ -856,12 +856,24 @@ pub struct ApiKeyStats {
 
 /// Decrypts an API key value using the same AES-256-GCM scheme used in the API
 /// key CRUD handlers. Returns the plaintext key or a string error message.
-#[cfg(feature = "nl2sql")]
-pub fn decrypt_api_key(encrypted: &str) -> std::result::Result<String, String> {
-    crypto::decrypt(encrypted).map_err(|e| e.to_string())
+pub fn decrypt_api_key(
+    encrypted: &str,
+    tenant_id: &str,
+    key_id: &str,
+) -> std::result::Result<String, String> {
+    crypto::decrypt_scoped(
+        encrypted,
+        &crypto::scoped_aad("api_keys.encrypted_key", tenant_id, key_id),
+    )
+    .map_err(|e| e.to_string())
 }
 
-fn api_key_runtime_status(enabled: bool, encrypted_key: &str) -> (bool, Option<String>) {
+fn api_key_runtime_status(
+    enabled: bool,
+    encrypted_key: &str,
+    tenant_id: &str,
+    key_id: &str,
+) -> (bool, Option<String>) {
     if !enabled {
         return (false, Some("disabled".to_string()));
     }
@@ -874,7 +886,7 @@ fn api_key_runtime_status(enabled: bool, encrypted_key: &str) -> (bool, Option<S
             (false, Some("encrypted tenant API key is empty".to_string()))
         };
     }
-    match crypto::decrypt(encrypted_key) {
+    match decrypt_api_key(encrypted_key, tenant_id, key_id) {
         Ok(_) => (true, None),
         Err(e) => (false, Some(format!("decryption failed: {e}"))),
     }
@@ -972,7 +984,7 @@ async fn resolve_probe_api_key(
             .fetch_optional(&state.db)
             .await?;
     let encrypted = encrypted.ok_or_else(|| AppError::NotFound("API key not found".into()))?;
-    crypto::decrypt(&encrypted)
+    decrypt_api_key(&encrypted, tenant_id, existing_key_id)
         .map_err(|error| AppError::Internal(format!("API key decryption failed: {error}")))
 }
 
@@ -2121,12 +2133,13 @@ async fn list(
                 expires_at: sqlx::Row::get(&row, "profile_expires_at"),
             });
             let created_at: DateTime<Utc> = sqlx::Row::get(&row, "created_at");
+            let id: String = sqlx::Row::get(&row, "id");
             let enabled: bool = sqlx::Row::get(&row, "enabled");
             let encrypted_key: String = sqlx::Row::get(&row, "encrypted_key");
             let (runtime_available, runtime_error) =
-                api_key_runtime_status(enabled, &encrypted_key);
+                api_key_runtime_status(enabled, &encrypted_key, &claims.tenant_id, &id);
             ApiKeyRecord {
-                id: sqlx::Row::get(&row, "id"),
+                id,
                 name: sqlx::Row::get(&row, "name"),
                 provider: sqlx::Row::get(&row, "provider"),
                 base_url: sqlx::Row::get(&row, "base_url"),
@@ -2237,8 +2250,11 @@ async fn create(
         .rev()
         .collect();
     let key_hash = bcrypt::hash(&req.key_value, bcrypt::DEFAULT_COST)?;
-    let encrypted_key = crypto::encrypt(&req.key_value)
-        .map_err(|e| AppError::Internal(format!("encryption failed: {e}")))?;
+    let encrypted_key = crypto::encrypt_scoped(
+        &req.key_value,
+        &crypto::scoped_aad("api_keys.encrypted_key", &claims.tenant_id, &id),
+    )
+    .map_err(|e| AppError::Internal(format!("encryption failed: {e}")))?;
 
     let scenarios_json =
         normalize_api_key_scenarios_for_model_type(&model_type, req.scenarios.as_ref())?;
@@ -2446,8 +2462,11 @@ async fn update(
             .rev()
             .collect();
         let hash = bcrypt::hash(key_value, bcrypt::DEFAULT_COST)?;
-        let encrypted = crypto::encrypt(key_value)
-            .map_err(|e| AppError::Internal(format!("encryption failed: {e}")))?;
+        let encrypted = crypto::encrypt_scoped(
+            key_value,
+            &crypto::scoped_aad("api_keys.encrypted_key", &claims.tenant_id, &id),
+        )
+        .map_err(|e| AppError::Internal(format!("encryption failed: {e}")))?;
         (Some(hash), Some(hint), Some(encrypted))
     } else {
         (None, None, None)
@@ -2822,12 +2841,13 @@ async fn update(
                 expires_at: sqlx::Row::get(&row, "profile_expires_at"),
             });
             let created_at: DateTime<Utc> = sqlx::Row::get(&row, "created_at");
+            let row_id: String = sqlx::Row::get(&row, "id");
             let enabled: bool = sqlx::Row::get(&row, "enabled");
             let encrypted_key: String = sqlx::Row::get(&row, "encrypted_key");
             let (runtime_available, runtime_error) =
-                api_key_runtime_status(enabled, &encrypted_key);
+                api_key_runtime_status(enabled, &encrypted_key, &claims.tenant_id, &row_id);
             Ok(Json(ApiKeyRecord {
-                id: sqlx::Row::get(&row, "id"),
+                id: row_id,
                 name: sqlx::Row::get(&row, "name"),
                 provider: sqlx::Row::get(&row, "provider"),
                 base_url: sqlx::Row::get(&row, "base_url"),
@@ -2964,7 +2984,7 @@ pub async fn test_health(
     };
     let resolved_model = model.unwrap_or_default();
 
-    let api_key = match crypto::decrypt(&encrypted_key) {
+    let api_key = match decrypt_api_key(&encrypted_key, &claims.tenant_id, &key_id) {
         Ok(k) => k,
         Err(e) => {
             return Ok(Json(HealthTestResult {

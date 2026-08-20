@@ -4,7 +4,6 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -223,29 +222,6 @@ struct MemoryNoteRequest {
     metadata: Option<Value>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MemoryConsolidateRequest {
-    app: Option<String>,
-    session_id: Option<String>,
-    summary: Option<String>,
-    turn_count: Option<i32>,
-    metadata: Option<Value>,
-    #[serde(default)]
-    cursor: Option<String>,
-    #[serde(default)]
-    relations: Vec<MemoryConsolidationRelation>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MemoryConsolidationRelation {
-    from_memory_id: String,
-    to_memory_id: String,
-    relation: String,
-    reason: String,
-}
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(not(feature = "agent"), allow(dead_code))]
@@ -298,7 +274,6 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/read", post(read_memory_path))
         .route("/note", post(note_memory))
         .route("/summaries", get(list_memory_summaries))
-        .route("/consolidate", post(consolidate_memory))
         .layer(axum::middleware::from_fn_with_state(
             state,
             crate::auth_middleware::require_auth,
@@ -419,7 +394,7 @@ pub async fn build_unified_memory_prompt(
             scope: None,
             app: Some(app.to_string()),
             session_id: session_id.map(ToOwned::to_owned),
-            include_legacy: Some(true),
+            include_legacy: Some(false),
             pinned_only: pinned_only.then_some(true),
             limit: Some(MEMORY_PROMPT_LIMIT),
         };
@@ -1290,7 +1265,10 @@ async fn list_memory_items(
         fetch_limit,
     )
     .await?;
-    if query.include_legacy.unwrap_or(true) {
+    // Projection-only legacy rows never participate in default long-term
+    // retrieval. They remain available only through an explicit migration or
+    // history request and cannot bypass canonical fact admission.
+    if query.include_legacy.unwrap_or(false) {
         items.extend(
             list_legacy_memory_items_page(
                 &state.db,
@@ -1338,8 +1316,14 @@ async fn persist_structured_memory_projection_in_transaction(
     source_type: &str,
     confidence: f64,
     pinned: bool,
+    enabled: bool,
     metadata_json: Option<&str>,
-) -> Result<(), sqlx::Error> {
+    stale_at: Option<&str>,
+    verified_at: Option<&str>,
+    embedding_model: Option<&str>,
+    embedding_dimensions: Option<i32>,
+    embedding_json: Option<String>,
+) -> Result<(), memory_engine::MemoryRepositoryError> {
     let content_hash = memory_engine::stable_source_hash(content);
     let session_key = session_id.unwrap_or_default();
     let id = format!(
@@ -1353,8 +1337,6 @@ async fn persist_structured_memory_projection_in_transaction(
         "sessionId": session_id,
         "sourceType": source_type,
     });
-    let subject_json = subject.to_string();
-    let predicate = memory_type.to_string();
     let evidence_id = metadata_json
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
         .and_then(|value| value.get("sourceEvidence").cloned())
@@ -1365,112 +1347,62 @@ async fn persist_structured_memory_projection_in_transaction(
                 .map(|turn| format!("turn:{turn}"))
         })
         .unwrap_or_else(|| format!("memory:{item_id}"));
-    let candidate_json = serde_json::json!({
-        "projectionMemoryId": item_id,
-        "content": content,
-        "sourceType": source_type,
-        "pinned": pinned,
-        "confidence": confidence,
-    });
-    let result = sqlx::query(
-        "INSERT INTO structured_memory_facts
-            (id, tenant_id, user_id, scope, app, session_id, channel, kind,
-             subject_json, predicate, value_json, text, evidence_id, evidence_hash,
-             observed_at, valid_until, confidence, sensitivity, current,
-             conflict_group, projection_memory_id, candidate_json,
-             created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP,
-                 NULL, ?, 'internal', 1, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-         ON CONFLICT(id) DO UPDATE SET
-             text = excluded.text, value_json = excluded.value_json,
-             confidence = MAX(structured_memory_facts.confidence, excluded.confidence),
-             current = 1, projection_memory_id = excluded.projection_memory_id,
-             candidate_json = excluded.candidate_json,
-             updated_at = CURRENT_TIMESTAMP",
-    )
-    .bind(&id)
-    .bind(tenant_id)
-    .bind(user_id)
-    .bind(scope)
-    .bind(app)
-    .bind(session_id)
-    .bind(if source_type == "compaction" {
-        "continuity_state"
+    let metadata = metadata_json
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let user_authoritative = matches!(source_type, "manual" | "explicit_user");
+    let lifecycle = if enabled && user_authoritative {
+        memory_engine::FactLifecycle::Confirmed
+    } else if enabled {
+        memory_engine::FactLifecycle::Candidate
     } else {
-        "long_term_memory"
-    })
-    .bind(memory_type)
-    .bind(&subject_json)
-    .bind(&predicate)
-    .bind(serde_json::Value::String(content.to_string()).to_string())
-    .bind(content)
-    .bind(&evidence_id)
-    .bind(&content_hash)
-    .bind(confidence.clamp(0.0, 1.0))
-    .bind(memory_engine::stable_source_hash(&format!(
-        "{subject_json}:{predicate}"
-    )))
-    .bind(item_id)
-    .bind(candidate_json.to_string())
-    .execute(&mut **tx)
-    .await;
-    match result {
-        Ok(_) => {
-            let old_projection_ids = sqlx::query_scalar::<_, String>(
-                "SELECT projection_memory_id FROM structured_memory_facts
-                 WHERE tenant_id = ? AND user_id = ? AND scope = ? AND app = ?
-                   AND (session_id = ? OR (session_id IS NULL AND ? IS NULL))
-                   AND subject_json = ? AND predicate = ? AND current = 1 AND id <> ?
-                   AND projection_memory_id IS NOT NULL",
-            )
-            .bind(tenant_id)
-            .bind(user_id)
-            .bind(scope)
-            .bind(app)
-            .bind(session_id)
-            .bind(session_id)
-            .bind(&subject_json)
-            .bind(&predicate)
-            .bind(&id)
-            .fetch_all(&mut **tx)
-            .await?;
-            sqlx::query(
-                "UPDATE structured_memory_facts
-                 SET current = 0, superseded_by = ?, updated_at = CURRENT_TIMESTAMP
-                 WHERE tenant_id = ? AND user_id = ? AND scope = ? AND app = ?
-                   AND (session_id = ? OR (session_id IS NULL AND ? IS NULL))
-                   AND subject_json = ? AND predicate = ? AND current = 1 AND id <> ?",
-            )
-            .bind(&id)
-            .bind(tenant_id)
-            .bind(user_id)
-            .bind(scope)
-            .bind(app)
-            .bind(session_id)
-            .bind(session_id)
-            .bind(&subject_json)
-            .bind(&predicate)
-            .bind(&id)
-            .execute(&mut **tx)
-            .await?;
-            for projection_id in old_projection_ids {
-                if projection_id == item_id {
-                    continue;
-                }
-                sqlx::query(
-                    "UPDATE agent_memory_items SET enabled = 0, updated_at = CURRENT_TIMESTAMP
-                     WHERE tenant_id = ? AND user_id = ? AND id = ?",
-                )
-                .bind(tenant_id)
-                .bind(user_id)
-                .bind(projection_id)
-                .execute(&mut **tx)
-                .await?;
-            }
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+        memory_engine::FactLifecycle::Forgotten
+    };
+    memory_engine::SqliteMemoryTransaction::upsert_in_transaction(
+        tx,
+        &memory_engine::MemoryFactDraft {
+            fact_id: id,
+            projection_id: item_id.to_string(),
+            tenant_id: tenant_id.to_string(),
+            user_id: user_id.to_string(),
+            scope: scope.to_string(),
+            app: app.to_string(),
+            session_id: session_id.map(str::to_string),
+            channel: if source_type == "compaction" {
+                "continuity_state".into()
+            } else {
+                "long_term_memory".into()
+            },
+            kind: memory_type.to_string(),
+            subject,
+            predicate: memory_type.to_string(),
+            value: serde_json::Value::String(content.to_string()),
+            text: content.to_string(),
+            evidence_id,
+            evidence_hash: content_hash,
+            valid_from: None,
+            valid_until: None,
+            confidence,
+            sensitivity: "internal".into(),
+            lifecycle,
+            authority: user_authoritative
+                .then(|| "user".to_string())
+                .into_iter()
+                .collect(),
+            source_event_ids: Vec::new(),
+            pollution_lineage: Vec::new(),
+            memory_type: memory_type.to_string(),
+            source_type: source_type.to_string(),
+            pinned,
+            metadata,
+            stale_at: stale_at.map(str::to_string),
+            verified_at: verified_at.map(str::to_string),
+            embedding_model: embedding_model.map(str::to_string),
+            embedding_dimensions,
+            embedding_json,
+        },
+    )
+    .await
 }
 
 fn memory_list_order(left: &AgentMemoryItem, right: &AgentMemoryItem) -> Ordering {
@@ -1786,10 +1718,8 @@ pub(crate) async fn update_memory_item_internal(
     let scope = req.scope.unwrap_or(existing.scope);
     let app = req.app.unwrap_or(existing.app);
     let session_id = req.session_id.or(existing.session_id);
-    let session_key = session_id.clone().unwrap_or_default();
     let memory_type = req.memory_type.unwrap_or(existing.memory_type);
     let content = req.content.unwrap_or(existing.content);
-    let content_hash = content_hash(&content);
     let embedding = embed_memory_text_best_effort(db, tenant_id, &app, &content).await;
     let embedding_model = embedding
         .as_ref()
@@ -1832,68 +1762,29 @@ pub(crate) async fn update_memory_item_internal(
     let verified_at = req.verified_at.flatten().or(existing.verified_at);
     let mut tx = db.begin().await?;
     crate::acquire_sqlite_write_lock(&mut tx).await?;
-    sqlx::query(
-        r#"
-        UPDATE agent_memory_items
-        SET scope = ?, app = ?, session_id = ?, session_key = ?, memory_type = ?, content = ?, content_hash = ?,
-            source_type = ?, confidence = ?, pinned = ?, enabled = ?, stale_at = ?,
-            verified_at = ?, metadata_json = json(?),
-            embedding_model = ?, embedding_dimensions = ?, embedding_json = ?
-        WHERE tenant_id = ? AND user_id = ? AND id = ?
-        "#,
+    persist_structured_memory_projection_in_transaction(
+        &mut tx,
+        tenant_id,
+        user_id,
+        memory_id,
+        &scope,
+        &app,
+        session_id.as_deref(),
+        &memory_type,
+        &content,
+        &source_type,
+        confidence,
+        pinned,
+        enabled,
+        metadata_json.as_deref(),
+        stale_at.as_deref(),
+        verified_at.as_deref(),
+        embedding_model.as_deref(),
+        embedding_dimensions,
+        embedding_json,
     )
-    .bind(&scope)
-    .bind(&app)
-    .bind(&session_id)
-    .bind(&session_key)
-    .bind(&memory_type)
-    .bind(&content)
-    .bind(content_hash)
-    .bind(&source_type)
-    .bind(confidence)
-    .bind(if pinned { 1 } else { 0 })
-    .bind(if enabled { 1 } else { 0 })
-    .bind(stale_at)
-    .bind(verified_at)
-    .bind(metadata_json.as_deref())
-    .bind(embedding_model)
-    .bind(embedding_dimensions)
-    .bind(embedding_json)
-    .bind(tenant_id)
-    .bind(user_id)
-    .bind(memory_id)
-    .execute(&mut *tx)
-    .await?;
-    if enabled {
-        persist_structured_memory_projection_in_transaction(
-            &mut tx,
-            tenant_id,
-            user_id,
-            memory_id,
-            &scope,
-            &app,
-            session_id.as_deref(),
-            &memory_type,
-            &content,
-            &source_type,
-            confidence,
-            pinned,
-            metadata_json.as_deref(),
-        )
-        .await?;
-    } else {
-        sqlx::query(
-            "UPDATE structured_memory_facts
-             SET current = 0, valid_until = COALESCE(valid_until, CURRENT_TIMESTAMP),
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE tenant_id = ? AND user_id = ? AND projection_memory_id = ? AND current = 1",
-        )
-        .bind(tenant_id)
-        .bind(user_id)
-        .bind(memory_id)
-        .execute(&mut *tx)
-        .await?;
-    }
+    .await
+    .map_err(|error| AppError::Internal(format!("memory repository failed: {error}")))?;
     tx.commit().await?;
     let item = get_unified_memory_item(db, tenant_id, user_id, memory_id)
         .await?
@@ -1935,31 +1826,27 @@ pub(crate) async fn delete_memory_item_internal(
     .fetch_optional(&mut *tx)
     .await?
     .flatten();
-    let affected = sqlx::query(
-        "DELETE FROM agent_memory_items WHERE tenant_id = ? AND user_id = ? AND id = ?",
+    let affected = sqlx::query_scalar::<sqlx::Sqlite, i64>(
+        "SELECT COUNT(*) FROM agent_memory_items WHERE tenant_id = ? AND user_id = ? AND id = ?",
     )
     .bind(tenant_id)
     .bind(user_id)
     .bind(memory_id)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
+    .fetch_one(&mut *tx)
+    .await?;
     if affected == 0 {
         tx.commit().await?;
         return Ok(false);
     }
-    sqlx::query(
-        "UPDATE structured_memory_facts
-         SET current = 0, valid_until = COALESCE(valid_until, CURRENT_TIMESTAMP),
-             candidate_json = json_set(candidate_json, '$.forgotten', json('true')),
-             updated_at = CURRENT_TIMESTAMP
-         WHERE tenant_id = ? AND user_id = ? AND projection_memory_id = ? AND current = 1",
+    memory_engine::SqliteMemoryTransaction::forget_in_transaction(
+        &mut tx,
+        tenant_id,
+        user_id,
+        memory_id,
+        &[format!("user-delete:{memory_id}")],
     )
-    .bind(tenant_id)
-    .bind(user_id)
-    .bind(memory_id)
-    .execute(&mut *tx)
-    .await?;
+    .await
+    .map_err(|error| AppError::Internal(format!("memory repository failed: {error}")))?;
     sqlx::query(
         "DELETE FROM agent_memory_relations
          WHERE tenant_id = ? AND user_id = ?
@@ -2104,218 +1991,13 @@ async fn list_memory_summaries(
     Ok(Json(json!({ "items": items })))
 }
 
-async fn consolidate_memory(
-    State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
-    Json(req): Json<MemoryConsolidateRequest>,
-) -> Result<Json<Value>, AppError> {
-    let result =
-        consolidate_memory_internal(&state.db, &claims.tenant_id, &claims.sub, req).await?;
-    Ok(Json(result))
-}
-
-async fn consolidate_memory_internal(
-    db: &sqlx::SqlitePool,
-    tenant_id: &str,
-    user_id: &str,
-    req: MemoryConsolidateRequest,
-) -> Result<Value, AppError> {
-    let app = normalize_app(req.app.as_deref());
-    let scope = if req.session_id.is_some() {
-        "session".to_string()
-    } else {
-        "global".to_string()
-    };
-    let summary = req
-        .summary
-        .map(|value| compact_text(&value, 8_000))
-        .unwrap_or_else(|| "Manual consolidation checkpoint.".to_string());
-    let session_key = req.session_id.clone().unwrap_or_default();
-    let cursor = req.cursor.clone().unwrap_or_else(|| {
-        format!(
-            "{}:{}",
-            Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            summary.len()
-        )
-    });
-    let id = format!(
-        "summary:{}",
-        content_hash(&format!(
-            "{}|{}|{}|{}|{}",
-            tenant_id, user_id, scope, app, session_key
-        ))
-    );
-    let metadata_json = req
-        .metadata
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()?;
-    let mut tx = db.begin().await?;
-    crate::acquire_sqlite_write_lock(&mut tx).await?;
-    let existing_cursor = sqlx::query_scalar::<_, String>(
-        "SELECT cursor FROM agent_memory_consolidation_cursors
-         WHERE tenant_id = ? AND user_id = ? AND scope = ? AND app = ? AND session_key = ?",
-    )
-    .bind(tenant_id)
-    .bind(user_id)
-    .bind(&scope)
-    .bind(&app)
-    .bind(&session_key)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if existing_cursor.as_deref() == Some(cursor.as_str()) {
-        tx.commit().await?;
-        return Ok(json!({
-            "ok": true,
-            "idempotent": true,
-            "scope": scope,
-            "app": app,
-            "sessionId": req.session_id,
-            "cursor": cursor,
-            "relationCount": req.relations.len()
-        }));
-    }
-    for relation in &req.relations {
-        let temporal_relation = memory_engine::MemoryEngine::temporal_relation(&relation.relation)
-            .map_err(|error| AppError::ValidationError(error.to_string()))?;
-        let relation_kind = match temporal_relation {
-            memory_engine::TemporalRelation::Supersedes => "supersedes",
-            memory_engine::TemporalRelation::ConflictsWith => "conflicts_with",
-        };
-        let valid_ids: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM agent_memory_items
-             WHERE tenant_id = ? AND user_id = ? AND id IN (?, ?)",
-        )
-        .bind(tenant_id)
-        .bind(user_id)
-        .bind(&relation.from_memory_id)
-        .bind(&relation.to_memory_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if valid_ids != 2 {
-            return Err(AppError::ValidationError(
-                "memory relation references an inaccessible item".to_string(),
-            ));
-        }
-        sqlx::query(
-            "INSERT INTO agent_memory_relations
-                (id, tenant_id, user_id, from_memory_id, to_memory_id, relation, reason, source_cursor)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(tenant_id, user_id, from_memory_id, to_memory_id, relation) DO UPDATE SET
-                reason = excluded.reason, source_cursor = excluded.source_cursor",
-        )
-        .bind(uuid::Uuid::new_v4().to_string())
-        .bind(tenant_id)
-        .bind(user_id)
-        .bind(&relation.from_memory_id)
-        .bind(&relation.to_memory_id)
-        .bind(relation_kind)
-        .bind(compact_text(&relation.reason, 1_000))
-        .bind(&cursor)
-        .execute(&mut *tx)
-        .await?;
-        if matches!(
-            temporal_relation,
-            memory_engine::TemporalRelation::Supersedes
-        ) {
-            let successor_fact_id = sqlx::query_scalar::<_, String>(
-                "SELECT id FROM structured_memory_facts
-                 WHERE tenant_id = ? AND user_id = ? AND projection_memory_id = ? AND current = 1
-                 ORDER BY updated_at DESC LIMIT 1",
-            )
-            .bind(tenant_id)
-            .bind(user_id)
-            .bind(&relation.to_memory_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            let Some(successor_fact_id) = successor_fact_id else {
-                return Err(AppError::ValidationError(
-                    "superseding memory has no canonical structured fact".to_string(),
-                ));
-            };
-            sqlx::query(
-                "UPDATE structured_memory_facts
-                 SET current = 0, superseded_by = ?,
-                     valid_until = COALESCE(valid_until, CURRENT_TIMESTAMP),
-                     updated_at = CURRENT_TIMESTAMP
-                 WHERE tenant_id = ? AND user_id = ? AND projection_memory_id = ? AND current = 1",
-            )
-            .bind(&successor_fact_id)
-            .bind(tenant_id)
-            .bind(user_id)
-            .bind(&relation.from_memory_id)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query(
-                "UPDATE agent_memory_items
-                 SET enabled = 0, stale_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-                 WHERE tenant_id = ? AND user_id = ? AND id = ?",
-            )
-            .bind(tenant_id)
-            .bind(user_id)
-            .bind(&relation.from_memory_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-    }
-    sqlx::query(
-        r#"
-        INSERT INTO agent_memory_summaries
-          (id, tenant_id, user_id, scope, app, session_id, session_key, summary, source_type, turn_count, metadata_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'session_summary', ?, json(?))
-        ON CONFLICT(id) DO UPDATE SET
-          summary = excluded.summary,
-          source_type = excluded.source_type,
-          turn_count = excluded.turn_count,
-          metadata_json = excluded.metadata_json,
-          updated_at = CURRENT_TIMESTAMP
-        "#,
-    )
-    .bind(&id)
-    .bind(tenant_id)
-    .bind(user_id)
-    .bind(&scope)
-    .bind(&app)
-    .bind(&req.session_id)
-    .bind(&session_key)
-    .bind(&summary)
-    .bind(req.turn_count.unwrap_or(0))
-    .bind(metadata_json)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        "INSERT INTO agent_memory_consolidation_cursors
-            (tenant_id, user_id, scope, app, session_key, cursor, revision)
-         VALUES (?, ?, ?, ?, ?, ?, 1)
-         ON CONFLICT(tenant_id, user_id, scope, app, session_key) DO UPDATE SET
-            cursor = excluded.cursor, revision = revision + 1, updated_at = CURRENT_TIMESTAMP",
-    )
-    .bind(tenant_id)
-    .bind(user_id)
-    .bind(&scope)
-    .bind(&app)
-    .bind(&session_key)
-    .bind(&cursor)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(json!({
-        "ok": true,
-        "idempotent": false,
-        "scope": scope,
-        "app": app,
-        "sessionId": req.session_id,
-        "cursor": cursor,
-        "relationCount": req.relations.len()
-    }))
-}
-
 pub(crate) async fn create_memory_item_internal(
     db: &sqlx::SqlitePool,
     tenant_id: &str,
     user_id: &str,
     req: MemoryUpsertRequest,
 ) -> Result<AgentMemoryItem, AppError> {
+    crate::behavior_trace("MEM-003");
     let content = compact_text(&req.content, 2_000);
     memory_engine::MemoryEngine::admit_text(&content).map_err(|error| {
         AppError::ValidationError(format!("memory content was rejected: {error}"))
@@ -2362,35 +2044,6 @@ pub(crate) async fn create_memory_item_internal(
     .fetch_optional(&mut *tx)
     .await?;
     if let Some(existing_id) = existing_id {
-        sqlx::query(
-            r#"
-            UPDATE agent_memory_items
-            SET updated_at = CURRENT_TIMESTAMP,
-                confidence = MAX(confidence, ?),
-                pinned = MAX(pinned, ?),
-                enabled = ?,
-                source_type = CASE
-                    WHEN source_type = 'manual' OR ? = 'manual' THEN 'manual'
-                    ELSE source_type
-                END,
-                stale_at = COALESCE(?, stale_at),
-                verified_at = COALESCE(?, verified_at),
-                metadata_json = COALESCE(json(?), metadata_json)
-            WHERE tenant_id = ? AND user_id = ? AND id = ?
-            "#,
-        )
-        .bind(confidence)
-        .bind(pinned)
-        .bind(enabled)
-        .bind(&source_type)
-        .bind(&req.stale_at)
-        .bind(&req.verified_at)
-        .bind(&metadata_json)
-        .bind(tenant_id)
-        .bind(user_id)
-        .bind(&existing_id)
-        .execute(&mut *tx)
-        .await?;
         persist_structured_memory_projection_in_transaction(
             &mut tx,
             tenant_id,
@@ -2404,9 +2057,20 @@ pub(crate) async fn create_memory_item_internal(
             &source_type,
             confidence,
             pinned != 0,
+            enabled != 0,
             metadata_json.as_deref(),
+            req.stale_at.as_deref(),
+            req.verified_at.as_deref(),
+            embedding.as_ref().map(|item| item.model.as_str()),
+            embedding
+                .as_ref()
+                .map(|item| i32::try_from(item.vector.len()).unwrap_or(i32::MAX)),
+            embedding
+                .as_ref()
+                .and_then(|item| serialize_memory_vector(&item.vector)),
         )
-        .await?;
+        .await
+        .map_err(|error| AppError::Internal(format!("memory repository failed: {error}")))?;
         tx.commit().await?;
         return get_unified_memory_item(db, tenant_id, user_id, &existing_id)
             .await?
@@ -2414,54 +2078,6 @@ pub(crate) async fn create_memory_item_internal(
                 AppError::Internal("updated memory item could not be reloaded".to_string())
             });
     }
-    sqlx::query(
-        r#"
-        INSERT INTO agent_memory_items
-          (id, tenant_id, user_id, scope, app, session_id, session_key, memory_type, content, content_hash,
-           source_type, confidence, pinned, enabled, stale_at, verified_at, metadata_json,
-           embedding_model, embedding_dimensions, embedding_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, json(?), ?, ?, ?)
-        ON CONFLICT DO UPDATE SET
-          updated_at = CURRENT_TIMESTAMP,
-          confidence = MAX(confidence, excluded.confidence),
-          pinned = MAX(pinned, excluded.pinned),
-          enabled = excluded.enabled,
-          source_type = CASE
-              WHEN source_type = 'manual' OR excluded.source_type = 'manual' THEN 'manual'
-              ELSE source_type
-          END,
-          metadata_json = COALESCE(excluded.metadata_json, metadata_json),
-          embedding_model = COALESCE(excluded.embedding_model, embedding_model),
-          embedding_dimensions = COALESCE(excluded.embedding_dimensions, embedding_dimensions),
-          embedding_json = COALESCE(excluded.embedding_json, embedding_json)
-        "#,
-    )
-    .bind(&id)
-    .bind(tenant_id)
-    .bind(user_id)
-    .bind(&scope)
-    .bind(&app)
-    .bind(&session_id)
-    .bind(&session_key)
-    .bind(&memory_type)
-    .bind(&content)
-    .bind(&content_hash)
-    .bind(&source_type)
-    .bind(confidence)
-    .bind(pinned)
-    .bind(enabled)
-    .bind(req.stale_at)
-    .bind(req.verified_at)
-    .bind(metadata_json.as_deref())
-    .bind(embedding.as_ref().map(|item| item.model.as_str()))
-    .bind(
-        embedding
-            .as_ref()
-            .map(|item| i32::try_from(item.vector.len()).unwrap_or(i32::MAX)),
-    )
-    .bind(embedding.as_ref().and_then(|item| serialize_memory_vector(&item.vector)))
-    .execute(&mut *tx)
-    .await?;
     persist_structured_memory_projection_in_transaction(
         &mut tx,
         tenant_id,
@@ -2475,9 +2091,20 @@ pub(crate) async fn create_memory_item_internal(
         &source_type,
         confidence,
         pinned != 0,
+        enabled != 0,
         metadata_json.as_deref(),
+        req.stale_at.as_deref(),
+        req.verified_at.as_deref(),
+        embedding.as_ref().map(|item| item.model.as_str()),
+        embedding
+            .as_ref()
+            .map(|item| i32::try_from(item.vector.len()).unwrap_or(i32::MAX)),
+        embedding
+            .as_ref()
+            .and_then(|item| serialize_memory_vector(&item.vector)),
     )
-    .await?;
+    .await
+    .map_err(|error| AppError::Internal(format!("memory repository failed: {error}")))?;
     tx.commit().await?;
     let item = sqlx::query(
         r#"
@@ -2526,7 +2153,7 @@ pub(crate) async fn get_unified_memory_item(
               WHERE fact.projection_memory_id = agent_memory_items.id
                 AND fact.tenant_id = agent_memory_items.tenant_id
                 AND fact.user_id = agent_memory_items.user_id
-                AND fact.current = 1
+                AND fact.lifecycle = 'confirmed' AND fact.current = 1
           )
         "#,
     )
@@ -2568,7 +2195,7 @@ pub(crate) async fn list_unified_memory_items(
                       WHERE fact.projection_memory_id = agent_memory_items.id
                         AND fact.tenant_id = agent_memory_items.tenant_id
                         AND fact.user_id = agent_memory_items.user_id
-                        AND fact.current = 1
+                        AND fact.lifecycle = 'confirmed' AND fact.current = 1
                   )
                 ORDER BY pinned DESC, updated_at DESC, id DESC
                 LIMIT ?
@@ -2583,7 +2210,7 @@ pub(crate) async fn list_unified_memory_items(
                       WHERE fact.projection_memory_id = agent_memory_items.id
                         AND fact.tenant_id = agent_memory_items.tenant_id
                         AND fact.user_id = agent_memory_items.user_id
-                        AND fact.current = 1
+                        AND fact.lifecycle = 'confirmed' AND fact.current = 1
                   )
                 ORDER BY pinned DESC, updated_at DESC, id DESC
                 LIMIT ?
@@ -2644,11 +2271,9 @@ pub(crate) async fn list_unified_memory_items(
         .push_bind(tenant_id)
         .push(" AND user_id = ")
         .push_bind(user_id);
-    if !include_disabled {
-        query.push(
-            " AND EXISTS (SELECT 1 FROM structured_memory_facts fact WHERE fact.projection_memory_id = agent_memory_items.id AND fact.tenant_id = agent_memory_items.tenant_id AND fact.user_id = agent_memory_items.user_id AND fact.current = 1)",
-        );
-    }
+    query.push(
+        " AND EXISTS (SELECT 1 FROM structured_memory_facts fact WHERE fact.projection_memory_id = agent_memory_items.id AND fact.tenant_id = agent_memory_items.tenant_id AND fact.user_id = agent_memory_items.user_id AND fact.lifecycle = 'confirmed' AND fact.current = 1)",
+    );
     if let Some(scope) = scope {
         query.push(" AND scope = ").push_bind(scope);
     }
@@ -2944,7 +2569,7 @@ async fn list_earliest_context_archive_items(
 }
 
 /// Gather the candidate memory items that [`search_memory_internal`] scores:
-/// unified memory rows, plus (when `include_legacy`) legacy memory rows and
+/// unified memory rows, optional projection-only legacy rows, and optional
 /// durable context-archive rows. Internal `user_context` snapshots and
 /// observability-only route/recall measurements are kept in the exact archive
 /// for audit/replay, but deliberately excluded from retrieval: composed prompts
@@ -2964,6 +2589,7 @@ pub(crate) async fn gather_memory_candidates(
     app: Option<&str>,
     session_id: Option<&str>,
     include_legacy: bool,
+    include_archives: bool,
 ) -> Result<Vec<AgentMemoryItem>, AppError> {
     let mut items =
         list_unified_memory_items(db, tenant_id, user_id, scope, app, session_id, false, 300)
@@ -2975,6 +2601,8 @@ pub(crate) async fn gather_memory_candidates(
                 .await
                 .unwrap_or_default(),
         );
+    }
+    if include_archives {
         items.extend(
             list_context_archive_items(db, tenant_id, user_id, session_id, 300)
                 .await
@@ -2995,6 +2623,7 @@ pub(crate) async fn gather_memory_candidates_for_query(
     app: Option<&str>,
     session_id: Option<&str>,
     include_legacy: bool,
+    include_archives: bool,
     query: &str,
 ) -> Result<Vec<AgentMemoryItem>, AppError> {
     let mut items = gather_memory_candidates(
@@ -3005,9 +2634,10 @@ pub(crate) async fn gather_memory_candidates_for_query(
         app,
         session_id,
         include_legacy,
+        include_archives,
     )
     .await?;
-    if include_legacy
+    if include_archives
         && scope.is_none_or(|value| value.eq_ignore_ascii_case("session"))
         && query_requests_exact_history(query)
     {
@@ -3068,7 +2698,8 @@ pub(crate) async fn search_memory_internal(
         req.scope.as_deref(),
         req.app.as_deref(),
         req.session_id.as_deref(),
-        req.include_legacy.unwrap_or(true),
+        req.include_legacy.unwrap_or(false),
+        true,
         &req.query,
     )
     .await?;
@@ -3187,7 +2818,7 @@ async fn baseline_memory_results(
     message: &str,
     pinned_only: bool,
 ) -> Result<Vec<MemorySearchResult>, AppError> {
-    let mut items = list_unified_memory_items(
+    let items = list_unified_memory_items(
         db,
         tenant_id,
         user_id,
@@ -3198,11 +2829,6 @@ async fn baseline_memory_results(
         120,
     )
     .await?;
-    items.extend(
-        list_legacy_memory_items(db, tenant_id, user_id, Some(app), session_id, 80)
-            .await
-            .unwrap_or_default(),
-    );
     let mut scored = items
         .into_iter()
         .filter(|item| item.enabled)
@@ -3919,13 +3545,13 @@ pub(crate) fn query_requests_exact_history(query: &str) -> bool {
     .any(|needle| lower.contains(needle) || query.contains(needle))
 }
 
-struct MemoryEmbedding {
-    model: String,
-    vector: Vec<f32>,
+pub(crate) struct MemoryEmbedding {
+    pub(crate) model: String,
+    pub(crate) vector: Vec<f32>,
 }
 
 #[cfg(feature = "nl2sql")]
-async fn embed_memory_text_best_effort(
+pub(crate) async fn embed_memory_text_best_effort(
     db: &sqlx::SqlitePool,
     tenant_id: &str,
     app: &str,
@@ -4011,7 +3637,7 @@ async fn embed_memory_text_with_timeout(
 }
 
 #[cfg(not(feature = "nl2sql"))]
-async fn embed_memory_text_best_effort(
+pub(crate) async fn embed_memory_text_best_effort(
     _db: &sqlx::SqlitePool,
     _tenant_id: &str,
     _app: &str,
@@ -4279,7 +3905,8 @@ mod tests {
                 predicate TEXT NOT NULL, value_json TEXT NOT NULL, text TEXT NOT NULL,
                 evidence_id TEXT NOT NULL, evidence_hash TEXT NOT NULL,
                 observed_at TEXT NOT NULL, valid_until TEXT, confidence REAL NOT NULL,
-                sensitivity TEXT NOT NULL, current INTEGER NOT NULL DEFAULT 1,
+                sensitivity TEXT NOT NULL, lifecycle TEXT NOT NULL DEFAULT 'confirmed',
+                current INTEGER NOT NULL DEFAULT 1,
                 superseded_by TEXT, conflict_group TEXT, projection_memory_id TEXT,
                 candidate_json TEXT NOT NULL, created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL)",
@@ -4320,35 +3947,33 @@ mod tests {
         .await
         .expect("insert memory fixture");
         sqlx::query(
-            r#"
-            INSERT INTO structured_memory_facts (
-                id, tenant_id, user_id, scope, app, session_id, channel, kind,
-                subject_json, predicate, value_json, text, evidence_id, evidence_hash,
-                observed_at, confidence, sensitivity, current, projection_memory_id,
-                candidate_json, created_at, updated_at
-            ) VALUES (?, 'tenant', 'user', ?, 'chat', ?, 'long_term_memory', 'note',
-                      '{"memoryType":"note"}', 'note', ?, ?, ?, ?, ?, 1.0, 'internal',
-                      1, ?, '{}', ?, ?)
-            "#,
+            "INSERT INTO structured_memory_facts
+               (id, tenant_id, user_id, scope, app, session_id, channel, kind,
+                subject_json, predicate, value_json, text, evidence_id,
+                evidence_hash, observed_at, confidence, sensitivity, lifecycle,
+                current, projection_memory_id, candidate_json, created_at, updated_at)
+             VALUES (?, 'tenant', 'user', ?, 'chat', ?, 'continuity', 'note',
+                     '{}', ?, '{}', ?, ?, ?, ?, 1.0, 'internal', 'confirmed',
+                     1, ?, '{}', ?, ?)",
         )
-        .bind(format!("fact-{id}"))
+        .bind(format!("fact:{id}"))
         .bind(if session_id.is_some() {
             "session"
         } else {
             "global"
         })
         .bind(session_id)
-        .bind(serde_json::Value::String(format!("memory {id}")).to_string())
+        .bind(format!("fixture.{id}"))
         .bind(format!("memory {id}"))
-        .bind(format!("memory:{id}"))
-        .bind(format!("hash:{id}"))
+        .bind(format!("evidence:{id}"))
+        .bind(content_hash(id))
         .bind(updated_at)
         .bind(id)
         .bind(updated_at)
         .bind(updated_at)
         .execute(pool)
         .await
-        .expect("insert structured memory fixture");
+        .expect("insert canonical fact fixture");
     }
 
     fn test_memory_item(content: &str) -> AgentMemoryItem {
@@ -4381,143 +4006,59 @@ mod tests {
         }
     }
 
-    async fn insert_consolidation_fixture(
+    async fn insert_canonical_memory_fixture(
         pool: &sqlx::SqlitePool,
         id: &str,
         tenant_id: &str,
         user_id: &str,
     ) {
-        sqlx::query(
-            "INSERT INTO agent_memory_items
-                (id, tenant_id, user_id, scope, app, session_id, session_key,
-                 memory_type, content, content_hash, source_type, confidence,
-                 pinned, enabled)
-             VALUES (?, ?, ?, 'global', 'chat', NULL, '', 'note', ?, ?,
-                     'manual', 1.0, 0, 1)",
-        )
-        .bind(id)
-        .bind(tenant_id)
-        .bind(user_id)
-        .bind(format!("memory {id}"))
-        .bind(content_hash(id))
-        .execute(pool)
-        .await
-        .expect("insert consolidation fixture");
-        sqlx::query(
-            r#"
-            INSERT INTO structured_memory_facts (
-                id, tenant_id, user_id, scope, app, session_id, channel, kind,
-                subject_json, predicate, value_json, text, evidence_id, evidence_hash,
-                observed_at, confidence, sensitivity, current, projection_memory_id,
-                candidate_json, created_at, updated_at
-            ) VALUES (?, ?, ?, 'global', 'chat', NULL, 'long_term_memory', 'note',
-                      '{"memoryType":"note"}', 'note', ?, ?, ?, ?, CURRENT_TIMESTAMP,
-                      1.0, 'internal', 1, ?, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            "#,
-        )
-        .bind(format!("fact-{tenant_id}-{user_id}-{id}"))
-        .bind(tenant_id)
-        .bind(user_id)
-        .bind(serde_json::Value::String(format!("memory {id}")).to_string())
-        .bind(format!("memory {id}"))
-        .bind(format!("memory:{id}"))
-        .bind(format!("hash:{id}"))
-        .bind(id)
-        .execute(pool)
-        .await
-        .expect("insert consolidation structured fact");
-    }
-
-    fn consolidation_request(
-        cursor: &str,
-        relation: &str,
-        from_memory_id: &str,
-        to_memory_id: &str,
-    ) -> MemoryConsolidateRequest {
-        MemoryConsolidateRequest {
-            app: Some("chat".into()),
+        let content = format!("memory {id}");
+        let draft = memory_engine::MemoryFactDraft {
+            fact_id: format!("fact:{id}"),
+            projection_id: id.to_string(),
+            tenant_id: tenant_id.to_string(),
+            user_id: user_id.to_string(),
+            scope: "global".into(),
+            app: "chat".into(),
             session_id: None,
-            summary: Some("current consolidated facts".into()),
-            turn_count: Some(2),
-            metadata: None,
-            cursor: Some(cursor.into()),
-            relations: vec![MemoryConsolidationRelation {
-                from_memory_id: from_memory_id.into(),
-                to_memory_id: to_memory_id.into(),
-                relation: relation.into(),
-                reason: "new evidence".into(),
-            }],
-        }
-    }
-
-    #[tokio::test]
-    async fn consolidation_is_transactional_idempotent_and_tenant_scoped() {
-        let db = crate::test_sqlite_pool().await;
-        insert_consolidation_fixture(&db, "old", "tenant", "user").await;
-        insert_consolidation_fixture(&db, "new", "tenant", "user").await;
-        insert_consolidation_fixture(&db, "foreign", "other", "user").await;
-
-        let first = consolidate_memory_internal(
-            &db,
-            "tenant",
-            "user",
-            consolidation_request("cursor-1", "supersedes", "old", "new"),
-        )
-        .await
-        .expect("first consolidation");
-        assert_eq!(first["idempotent"], false);
-        let old_state: (i64, Option<String>) =
-            sqlx::query_as("SELECT enabled, stale_at FROM agent_memory_items WHERE id = 'old'")
-                .fetch_one(&db)
-                .await
-                .unwrap();
-        assert_eq!(old_state.0, 0);
-        assert!(old_state.1.is_some());
-
-        let retry = consolidate_memory_internal(
-            &db,
-            "tenant",
-            "user",
-            consolidation_request("cursor-1", "supersedes", "old", "new"),
-        )
-        .await
-        .expect("idempotent retry");
-        assert_eq!(retry["idempotent"], true);
-        let (revision, relation_count): (i64, i64) = sqlx::query_as(
-            "SELECT
-                (SELECT revision FROM agent_memory_consolidation_cursors
-                 WHERE tenant_id = 'tenant' AND user_id = 'user' AND app = 'chat'),
-                (SELECT COUNT(*) FROM agent_memory_relations
-                 WHERE tenant_id = 'tenant' AND user_id = 'user')",
-        )
-        .fetch_one(&db)
-        .await
-        .unwrap();
-        assert_eq!((revision, relation_count), (1, 1));
-
-        let rejected = consolidate_memory_internal(
-            &db,
-            "tenant",
-            "user",
-            consolidation_request("cursor-2", "conflicts_with", "new", "foreign"),
-        )
-        .await;
-        assert!(rejected.is_err());
-        let cursor: String = sqlx::query_scalar(
-            "SELECT cursor FROM agent_memory_consolidation_cursors
-             WHERE tenant_id = 'tenant' AND user_id = 'user' AND app = 'chat'",
-        )
-        .fetch_one(&db)
-        .await
-        .unwrap();
-        assert_eq!(cursor, "cursor-1");
+            channel: "continuity".into(),
+            kind: "note".into(),
+            subject: json!({"kind":"memory","id":id}),
+            predicate: format!("memory.note.{id}"),
+            value: json!({"text":content}),
+            text: content,
+            evidence_id: format!("user:{id}"),
+            evidence_hash: content_hash(id),
+            valid_from: None,
+            valid_until: None,
+            confidence: 1.0,
+            sensitivity: "internal".into(),
+            lifecycle: memory_engine::FactLifecycle::Confirmed,
+            authority: vec!["user".into()],
+            source_event_ids: vec![format!("fixture:{id}")],
+            pollution_lineage: Vec::new(),
+            memory_type: "note".into(),
+            source_type: "manual".into(),
+            pinned: false,
+            metadata: json!({}),
+            stale_at: None,
+            verified_at: None,
+            embedding_model: None,
+            embedding_dimensions: None,
+            embedding_json: None,
+        };
+        let mut tx = pool.begin().await.expect("begin Memory fixture");
+        memory_engine::SqliteMemoryTransaction::upsert_in_transaction(&mut tx, &draft)
+            .await
+            .expect("insert canonical Memory fixture");
+        tx.commit().await.expect("commit Memory fixture");
     }
 
     #[tokio::test]
     async fn deleting_memory_removes_graph_citations_and_session_summary() {
         let db = crate::test_sqlite_pool().await;
-        insert_consolidation_fixture(&db, "memory-delete", "tenant", "user").await;
-        insert_consolidation_fixture(&db, "memory-keep", "tenant", "user").await;
+        insert_canonical_memory_fixture(&db, "memory-delete", "tenant", "user").await;
+        insert_canonical_memory_fixture(&db, "memory-keep", "tenant", "user").await;
         sqlx::query(
             "UPDATE agent_memory_items SET session_id = 'session-delete', scope = 'session'
              WHERE tenant_id = 'tenant' AND user_id = 'user' AND id IN ('memory-delete', 'memory-keep')",
@@ -4601,69 +4142,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conflict_and_supersession_control_current_memory_retrieval() {
-        let db = crate::test_sqlite_pool().await;
-        insert_consolidation_fixture(&db, "left", "tenant", "user").await;
-        insert_consolidation_fixture(&db, "right", "tenant", "user").await;
-        consolidate_memory_internal(
-            &db,
-            "tenant",
-            "user",
-            consolidation_request("cursor-conflict", "conflicts_with", "left", "right"),
-        )
-        .await
-        .expect("record conflict");
-        let enabled: Vec<i64> = sqlx::query_scalar(
-            "SELECT enabled FROM agent_memory_items
-             WHERE id IN ('left', 'right') ORDER BY id",
-        )
-        .fetch_all(&db)
-        .await
-        .unwrap();
-        assert_eq!(enabled, vec![1, 1]);
-
-        insert_consolidation_fixture(&db, "old", "tenant", "user").await;
-        insert_consolidation_fixture(&db, "new", "tenant", "user").await;
-        consolidate_memory_internal(
-            &db,
-            "tenant",
-            "user",
-            consolidation_request("cursor-supersedes", "supersedes", "old", "new"),
-        )
-        .await
-        .expect("record supersession");
-        let results = search_memory_internal(
-            &db,
-            "tenant",
-            "user",
-            &MemorySearchRequest {
-                query: "memory".into(),
-                scope: Some("global".into()),
-                app: Some("chat".into()),
-                session_id: None,
-                include_legacy: Some(false),
-                pinned_only: None,
-                limit: Some(20),
-            },
-        )
-        .await
-        .expect("search current memories");
-        assert!(results.iter().any(|item| item.id == "new"));
-        assert!(!results.iter().any(|item| item.id == "old"));
-        let relation: String = sqlx::query_scalar(
-            "SELECT relation FROM agent_memory_relations
-             WHERE tenant_id = 'tenant' AND from_memory_id = 'old' AND to_memory_id = 'new'",
-        )
-        .fetch_one(&db)
-        .await
-        .unwrap();
-        assert_eq!(
-            memory_engine::MemoryEngine::temporal_relation(&relation).unwrap(),
-            memory_engine::TemporalRelation::Supersedes
-        );
-    }
-
-    #[tokio::test]
     async fn unified_memory_list_combines_current_session_and_global_rows() {
         let pool = memory_test_pool().await;
         insert_memory_fixture(
@@ -4704,6 +4182,45 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["global", "session"]
         );
+    }
+
+    #[tokio::test]
+    async fn projection_only_memory_is_not_a_default_long_term_fact() {
+        let pool = memory_test_pool().await;
+        sqlx::query(
+            "INSERT INTO agent_memory_items
+               (id, tenant_id, user_id, scope, app, session_id, memory_type,
+                content, source_type, confidence, pinned, enabled, created_at, updated_at)
+             VALUES ('projection-only', 'tenant', 'user', 'global', 'chat', NULL,
+                     'note', 'unverified projection content', 'legacy', 1.0, 1, 1,
+                     CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let listed =
+            list_unified_memory_items(&pool, "tenant", "user", None, Some("chat"), None, false, 20)
+                .await
+                .unwrap();
+        assert!(listed.is_empty());
+        let searched = search_memory_internal(
+            &pool,
+            "tenant",
+            "user",
+            &MemorySearchRequest {
+                query: "unverified projection".into(),
+                scope: None,
+                app: Some("chat".into()),
+                session_id: None,
+                include_legacy: None,
+                pinned_only: None,
+                limit: Some(10),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(searched.is_empty());
     }
 
     #[test]

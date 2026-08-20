@@ -82,6 +82,10 @@ docs/plans/
 docs/operations/
 docs/AOS_VS_CODEX_GAP.md
 docs/MEMORY_COMPACTION_BASELINE.md
+docs/*_VS_*_EVAL.md
+docs/*SEMANTIC_KERNEL_REFACTOR*.md
+docs/*SEMANTIC_KERNEL_GAP_AUDIT*.md
+docs/*SEMANTIC_KERNEL_ARCHITECTURE*.md
 
 # ── Local test/build leftovers ───────────────────────────────────────────────
 webui/test-results/

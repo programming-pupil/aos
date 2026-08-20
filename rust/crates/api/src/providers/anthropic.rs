@@ -860,7 +860,7 @@ fn anthropic_wire_model(model: &str) -> &str {
     model.strip_prefix("anthropic/").unwrap_or(model)
 }
 
-/// Renders the JSON request body for the Anthropic Messages / count_tokens
+/// Renders the JSON request body for the Anthropic Messages / `count_tokens`
 /// endpoints, normalizing the wire model name and stripping body fields the
 /// API does not accept.
 fn render_standard_messages_body(
@@ -1755,11 +1755,9 @@ mod tests {
             extra_body: Some(extra_body),
             ..Default::default()
         };
-        let rendered = super::render_standard_messages_body(
-            &AnthropicClient::new("test-key").request_profile(),
-            &request,
-        )
-        .expect("body should render");
+        let client = AnthropicClient::new("test-key");
+        let rendered = super::render_standard_messages_body(client.request_profile(), &request)
+            .expect("body should render");
 
         assert_eq!(
             rendered.get("model").and_then(serde_json::Value::as_str),

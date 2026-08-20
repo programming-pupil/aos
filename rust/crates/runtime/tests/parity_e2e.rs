@@ -131,7 +131,7 @@ impl ToolExecutor for WorkspaceToolExecutor {
     }
 }
 
-fn tool_use(id: &str, name: &str, input: serde_json::Value) -> AssistantEvent {
+fn tool_use(id: &str, name: &str, input: &serde_json::Value) -> AssistantEvent {
     AssistantEvent::ToolUse {
         id: id.to_string(),
         name: name.to_string(),
@@ -158,7 +158,7 @@ async fn agent_edits_real_workspace_file_through_tool_loop() {
             tool_use(
                 "t1",
                 "read_file",
-                serde_json::json!({ "path": "greeting.txt" }),
+                &serde_json::json!({ "path": "greeting.txt" }),
             ),
             AssistantEvent::MessageStop,
         ],
@@ -166,7 +166,7 @@ async fn agent_edits_real_workspace_file_through_tool_loop() {
             tool_use(
                 "t2",
                 "edit_file",
-                serde_json::json!({
+                &serde_json::json!({
                     "path": "greeting.txt",
                     "old_string": "hello world",
                     "new_string": "hello parity"
@@ -347,7 +347,7 @@ async fn agent_fixes_its_own_broken_edit_across_turns() {
             tool_use(
                 "t1",
                 "edit_file",
-                serde_json::json!({
+                &serde_json::json!({
                     "path": "calc.txt",
                     "old_string": "result = 1 + 1",
                     "new_string": "result = 3"
@@ -386,7 +386,7 @@ async fn agent_fixes_its_own_broken_edit_across_turns() {
             tool_use(
                 "t2",
                 "edit_file",
-                serde_json::json!({
+                &serde_json::json!({
                     "path": "calc.txt",
                     "old_string": "result = 3",
                     "new_string": "result = 2"

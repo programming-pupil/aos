@@ -756,10 +756,7 @@ impl RuntimeHookConfig {
 
     #[must_use]
     pub fn lifecycle_event(&self, event_key: &str) -> &[RuntimeHookEntry] {
-        self.lifecycle
-            .get(event_key)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.lifecycle.get(event_key).map_or(&[], Vec::as_slice)
     }
 
     #[must_use]

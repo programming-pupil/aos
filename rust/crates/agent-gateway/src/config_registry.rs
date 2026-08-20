@@ -706,7 +706,10 @@ impl TenantConfigRegistry {
                     .then(|| std::env::var("ANTHROPIC_API_KEY").ok())
                     .flatten()
             } else {
-                match crate::crypto::decrypt(&encrypted_key) {
+                match crate::crypto::decrypt_scoped(
+                    &encrypted_key,
+                    &crate::crypto::scoped_aad("api_keys.encrypted_key", tenant_id, &id),
+                ) {
                     Ok(k) => Some(k),
                     Err(e) => {
                         decrypt_error_count += 1;
@@ -823,7 +826,14 @@ impl TenantConfigRegistry {
                     if ciphertext.trim().is_empty() {
                         None
                     } else {
-                        match crate::crypto::decrypt(&ciphertext) {
+                        match crate::crypto::decrypt_scoped(
+                            &ciphertext,
+                            &crate::crypto::scoped_aad(
+                                "pm_search.auth_secret",
+                                tenant_id,
+                                &Row::get::<String, _>(&row, "id"),
+                            ),
+                        ) {
                             Ok(secret) => Some(secret),
                             Err(error) => {
                                 tracing::warn!(

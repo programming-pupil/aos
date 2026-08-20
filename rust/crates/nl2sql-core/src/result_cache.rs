@@ -114,6 +114,7 @@ pub async fn lookup(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn store(
     db: &SqlitePool,
     tenant_id: &str,
@@ -125,12 +126,10 @@ pub async fn store(
     rows: Option<&[serde_json::Value]>,
     lineage: &CacheLineage,
 ) {
-    let snapshot = rows
-        .map(|r| {
-            let capped: Vec<_> = r.iter().take(max_rows()).cloned().collect();
-            serde_json::to_string(&capped).ok()
-        })
-        .flatten();
+    let snapshot = rows.and_then(|r| {
+        let capped: Vec<_> = r.iter().take(max_rows()).cloned().collect();
+        serde_json::to_string(&capped).ok()
+    });
 
     if let Err(e) = sqlx::query(
         "INSERT INTO nl2sql_result_cache \

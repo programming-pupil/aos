@@ -987,7 +987,7 @@ pub fn render_pm_report_html(report_json: &serde_json::Value) -> String {
         );
         nav_links.push_str("<a href=\"#");
         nav_links.push_str(section_id);
-        nav_links.push_str("\"");
+        nav_links.push('"');
         if index == 0 {
             nav_links.push_str(" class=\"active\"");
         }

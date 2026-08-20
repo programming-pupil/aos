@@ -756,7 +756,7 @@ pub fn pm_route_usage_key(route_id: Option<&str>, route_channel: Option<&str>) -
 }
 
 pub fn pm_should_consume_source_quota(probe_kernel_active: bool, best_turn_adopted: bool) -> bool {
-    !(probe_kernel_active && !best_turn_adopted)
+    !probe_kernel_active || best_turn_adopted
 }
 
 pub fn is_pm_route_over_quota(

@@ -154,7 +154,9 @@ impl GitlabProjectManager {
         let branch = req.branch.unwrap_or_else(|| "main".to_string());
 
         // Encrypt the token before storing
-        let stored_token = req.gitlab_token.map(|t| encrypt_repository_token(&t));
+        let stored_token = req
+            .gitlab_token
+            .map(|token| encrypt_token(&token, tenant_id, &id));
 
         sqlx::query(
             r"
@@ -395,7 +397,7 @@ impl GitlabProjectManager {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(encrypt_repository_token)
+            .map(|token| encrypt_token(token, tenant_id, project_id))
             .or(current_token);
 
         let duplicate: Option<(String,)> = sqlx::query_as(
@@ -681,7 +683,7 @@ impl GitlabProjectManager {
             name,
             url,
             branch,
-            gitlab_token: token.map(|value| decrypt_repository_token(&value)),
+            gitlab_token: token.map(|value| decrypt_token(&value, tenant_id, project_id)),
             description,
             clone_path,
             is_cloned,
@@ -830,11 +832,19 @@ const TOKEN_NONCE_LEN: usize = 12;
 /// Existing deployments that stored the legacy XOR/base64 format remain
 /// readable through `decrypt_token`, but all new writes use authenticated
 /// encryption.
-pub fn encrypt_repository_token(token: &str) -> String {
-    crate::crypto::encrypt(token).expect("configured repository-token encryption must succeed")
+pub fn encrypt_token(token: &str, tenant_id: &str, project_id: &str) -> String {
+    crate::crypto::encrypt_scoped(token, &repository_token_aad(tenant_id, project_id))
+        .expect("repository token encryption failed")
 }
 
-pub fn decrypt_repository_token(encrypted: &str) -> String {
+pub fn decrypt_token(encrypted: &str, tenant_id: &str, project_id: &str) -> String {
+    if encrypted.starts_with("aosenc:v2:") {
+        return crate::crypto::decrypt_scoped(
+            encrypted,
+            &repository_token_aad(tenant_id, project_id),
+        )
+        .unwrap_or_default();
+    }
     if encrypted.starts_with("aosenc:v1:") {
         return crate::crypto::decrypt(encrypted).unwrap_or_default();
     }
@@ -842,6 +852,10 @@ pub fn decrypt_repository_token(encrypted: &str) -> String {
         return decrypt_aes_gcm_token(value).unwrap_or_default();
     }
     decrypt_legacy_xor_token(encrypted)
+}
+
+fn repository_token_aad(tenant_id: &str, project_id: &str) -> String {
+    crate::crypto::scoped_aad("repository.token", tenant_id, project_id)
 }
 
 fn token_encryption_key() -> [u8; 32] {

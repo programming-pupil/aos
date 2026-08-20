@@ -138,6 +138,7 @@ pub struct SessionArchiveWindow {
 /// not only messages, but also the model/tool/memory/file/search environment that
 /// shaped those messages.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct SessionRuntimeContext {
     pub turn_id: Option<String>,
     pub model: Option<String>,
@@ -505,10 +506,9 @@ impl Session {
         }
         self.messages.truncate(len);
         for turn in &mut self.turns {
-            if turn.start_message_count >= len {
-                turn.end_message_count = Some(len);
-                turn.status = SessionTurnStatus::RolledBack;
-            } else if turn.end_message_count.is_some_and(|end| end > len) {
+            if turn.start_message_count >= len
+                || turn.end_message_count.is_some_and(|end| end > len)
+            {
                 turn.end_message_count = Some(len);
                 turn.status = SessionTurnStatus::RolledBack;
             }
@@ -717,13 +717,13 @@ impl Session {
         if let Some(context) = runtime_context.as_mut() {
             context.window_number = Some(window_number);
             context.window_id = Some(window_id.clone());
-            context.previous_window_id = previous_window_id.clone();
+            context.previous_window_id.clone_from(&previous_window_id);
         }
         let mut context_baseline = self.context_baseline.clone();
         if let Some(baseline) = context_baseline.as_mut() {
             baseline.window_number = Some(window_number);
             baseline.window_id = Some(window_id.clone());
-            baseline.previous_window_id = previous_window_id.clone();
+            baseline.previous_window_id.clone_from(&previous_window_id);
         }
         self.compaction = Some(SessionCompaction {
             count,
@@ -772,7 +772,7 @@ impl Session {
         }
         self.runtime_context = Some(context);
         if let Some(compaction) = self.compaction.as_mut() {
-            compaction.runtime_context = self.runtime_context.clone();
+            compaction.runtime_context.clone_from(&self.runtime_context);
         }
     }
 
@@ -806,7 +806,9 @@ impl Session {
         }
         self.context_baseline = Some(baseline);
         if let Some(compaction) = self.compaction.as_mut() {
-            compaction.context_baseline = self.context_baseline.clone();
+            compaction
+                .context_baseline
+                .clone_from(&self.context_baseline);
         }
     }
 
@@ -841,7 +843,7 @@ impl Session {
     }
 
     /// Insert a turn recovered from an external durable ledger without
-    /// appending a second JSONL record.  The SQLite execution ledger uses this
+    /// appending a second `JSONL` record.  The `SQLite` execution ledger uses this
     /// during restart recovery; normal live turns must use `begin_turn`.
     pub fn restore_turn(
         &mut self,
@@ -887,7 +889,7 @@ impl Session {
         let messages = self.messages.clone();
         let mut compaction = self.compaction.clone();
         if let Some(compaction) = compaction.as_mut() {
-            compaction.replacement_messages = messages.clone();
+            compaction.replacement_messages.clone_from(&messages);
         }
         let mut turns = self.turns.clone();
         for turn in &mut turns {
@@ -1022,6 +1024,7 @@ impl Session {
         Self::from_json(&parsed)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
         let object = value
             .as_object()
@@ -1223,7 +1226,7 @@ impl Session {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn parse_jsonl_record(
         object: &BTreeMap<String, crate::json::JsonValue>,
         line_number: usize,
@@ -1750,6 +1753,9 @@ impl ConversationMessage {
         JsonValue::Object(object)
     }
 
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines)]
     fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
         let object = value
             .as_object()
@@ -2062,6 +2068,7 @@ impl SessionCompaction {
         Ok(JsonValue::Object(object))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
         let object = value
             .as_object()
@@ -2123,14 +2130,15 @@ impl SessionCompaction {
             .get("window_id")
             .and_then(JsonValue::as_str)
             .filter(|value| !value.trim().is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| format!("window-legacy-{window_number}"));
+            .map_or_else(
+                || format!("window-legacy-{window_number}"),
+                ToOwned::to_owned,
+            );
         let first_window_id = object
             .get("first_window_id")
             .and_then(JsonValue::as_str)
             .filter(|value| !value.trim().is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| window_id.clone());
+            .map_or_else(|| window_id.clone(), ToOwned::to_owned);
         let previous_window_id = object
             .get("previous_window_id")
             .and_then(JsonValue::as_str)
@@ -2229,8 +2237,7 @@ impl SessionArchiveWindow {
                 .get("window_id")
                 .and_then(JsonValue::as_str)
                 .filter(|value| !value.trim().is_empty())
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(generate_window_id),
+                .map_or_else(generate_window_id, ToOwned::to_owned),
             previous_window_id: object
                 .get("previous_window_id")
                 .and_then(JsonValue::as_str)
@@ -2825,11 +2832,10 @@ fn replay_records_from(
             SessionReplayRecord::Message(message) => messages.push(message.clone()),
             SessionReplayRecord::Compaction(compaction) => {
                 if !compaction.replacement_messages.is_empty() {
-                    messages = compaction.replacement_messages.clone();
+                    messages.clone_from(&compaction.replacement_messages);
                 }
             }
-            SessionReplayRecord::RuntimeContext(_) => {}
-            SessionReplayRecord::ContextBaseline(_) => {}
+            SessionReplayRecord::RuntimeContext(_) | SessionReplayRecord::ContextBaseline(_) => {}
             SessionReplayRecord::RollbackTo { message_count } => {
                 messages.truncate((*message_count).min(messages.len()));
                 for turn in &mut turns {
@@ -2960,8 +2966,7 @@ fn replay_runtime_context_from(records: &[SessionReplayRecord]) -> Option<Sessio
             SessionReplayRecord::RollbackTurns { turn_count } => {
                 apply_turn_rollback_count(&mut turns, *turn_count);
             }
-            SessionReplayRecord::Message(_) => {}
-            SessionReplayRecord::ContextBaseline(_) => {}
+            SessionReplayRecord::Message(_) | SessionReplayRecord::ContextBaseline(_) => {}
         }
     }
     turns

@@ -112,11 +112,51 @@ pub struct OpenQuestion {
 impl OpenQuestion {
     #[must_use]
     pub fn with_recomputed_information_value(mut self) -> Self {
-        let (posterior, gain) =
-            expected_information_value(self.prior_uncertainty_basis_points, &self.answer_branches);
+        self = self.with_calibrated_information_value(&QuestionCalibrationProfile::default());
+        self
+    }
+
+    /// Recompute question value from observed outcomes. Model-authored
+    /// probability and posterior fields are deliberately ignored; only the
+    /// branch structure is used until a sufficiently large historical bucket
+    /// exists.
+    #[must_use]
+    pub fn with_calibrated_information_value(
+        mut self,
+        profile: &QuestionCalibrationProfile,
+    ) -> Self {
+        let (prior, posterior, gain) = calibrated_information_value(&self, profile);
+        self.prior_uncertainty_basis_points = prior;
         self.expected_posterior_uncertainty_basis_points = posterior;
         self.expected_information_gain_basis_points = gain;
+        let calibrated_effort_units = profile
+            .median_user_effort_ms
+            .saturating_add(29_999)
+            .saturating_div(30_000)
+            .clamp(1, 10) as u8;
+        self.user_effort = self.user_effort.max(calibrated_effort_units);
         self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuestionCalibrationProfile {
+    pub domain_bucket: String,
+    pub sample_count: u32,
+    pub decision_change_rate_basis_points: u16,
+    pub remaining_uncertainty_ratio_basis_points: u16,
+    pub median_user_effort_ms: u32,
+}
+
+impl Default for QuestionCalibrationProfile {
+    fn default() -> Self {
+        Self {
+            domain_bucket: "conservative_default".into(),
+            sample_count: 0,
+            decision_change_rate_basis_points: 0,
+            remaining_uncertainty_ratio_basis_points: 6_500,
+            median_user_effort_ms: 30_000,
+        }
     }
 }
 
@@ -238,7 +278,7 @@ impl Default for RequirementState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct RequirementStateDelta {
     pub source_event_ids: Vec<String>,
     pub problem_frame: Option<Option<ProblemFrame>>,
@@ -259,30 +299,6 @@ pub struct RequirementStateDelta {
     pub add_experiments: Vec<ValidationExperiment>,
     pub readiness: Option<RequirementReadiness>,
 }
-impl Default for RequirementStateDelta {
-    fn default() -> Self {
-        Self {
-            source_event_ids: vec![],
-            problem_frame: None,
-            add_stakeholders: vec![],
-            add_jobs: vec![],
-            add_pains: vec![],
-            add_outcomes: vec![],
-            add_constraints: vec![],
-            add_assumptions: vec![],
-            scope: None,
-            add_decisions: vec![],
-            add_questions: vec![],
-            resolve_question_ids: vec![],
-            add_question_resolutions: vec![],
-            add_acceptance_criteria: vec![],
-            add_evidence_links: vec![],
-            add_experiments: vec![],
-            readiness: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequirementDeltaError {
     DuplicateEvent(String),
@@ -379,11 +395,7 @@ pub fn apply_delta(
     }
     upsert_by(
         &mut next.open_questions,
-        delta
-            .add_questions
-            .into_iter()
-            .map(OpenQuestion::with_recomputed_information_value)
-            .collect(),
+        delta.add_questions,
         |left, right| left.id == right.id,
     );
     upsert_by(
@@ -570,36 +582,57 @@ pub fn question_calibration_report(
     }
 }
 
-fn expected_information_value(
-    prior_uncertainty_basis_points: u16,
-    branches: &[QuestionAnswerBranch],
-) -> (u16, u16) {
-    let prior = prior_uncertainty_basis_points.min(10_000);
-    let distinct_effects = branches
+fn calibrated_information_value(
+    question: &OpenQuestion,
+    profile: &QuestionCalibrationProfile,
+) -> (u16, u16, u16) {
+    let distinct_effects = question
+        .answer_branches
         .iter()
         .filter_map(|branch| {
             let effect = branch.decision_effect.trim();
             (!effect.is_empty()).then_some(effect.to_ascii_lowercase())
         })
         .collect::<std::collections::BTreeSet<_>>();
-    let total_probability = branches
-        .iter()
-        .map(|branch| u64::from(branch.probability_basis_points.min(10_000)))
-        .sum::<u64>();
-    if branches.len() < 2 || distinct_effects.len() < 2 || total_probability == 0 {
-        return (prior, 0);
+    let conservative_prior = match question.impact.as_str() {
+        "core" => 8_500_u16,
+        "high" => 7_000,
+        _ => 4_500,
+    };
+    let target_adjustment = match question.decision_target {
+        QuestionDecisionTarget::OutcomeMetric
+        | QuestionDecisionTarget::Population
+        | QuestionDecisionTarget::Constraint => 500_u16,
+        QuestionDecisionTarget::ProblemFrame
+        | QuestionDecisionTarget::Stakeholder
+        | QuestionDecisionTarget::Scope
+        | QuestionDecisionTarget::Solution
+        | QuestionDecisionTarget::Deliverable => 0,
+    };
+    let conservative_prior = conservative_prior
+        .saturating_add(target_adjustment)
+        .min(10_000);
+    let prior = if profile.sample_count >= 20 {
+        let observed = profile.decision_change_rate_basis_points.min(10_000);
+        u16::try_from((u32::from(conservative_prior) + u32::from(observed)) / 2)
+            .unwrap_or(conservative_prior)
+    } else {
+        conservative_prior
+    };
+    if question.answer_branches.len() < 2 || distinct_effects.len() < 2 {
+        return (prior, prior, 0);
     }
-    let weighted_posterior = branches
-        .iter()
-        .map(|branch| {
-            u64::from(branch.probability_basis_points.min(10_000))
-                * u64::from(branch.posterior_uncertainty_basis_points.min(10_000))
-        })
-        .sum::<u64>();
-    let posterior = u16::try_from(weighted_posterior / total_probability)
+    let remaining_ratio = if profile.sample_count >= 20 {
+        profile
+            .remaining_uncertainty_ratio_basis_points
+            .clamp(1_000, 9_500)
+    } else {
+        6_500
+    };
+    let posterior = u16::try_from(u32::from(prior) * u32::from(remaining_ratio) / 10_000)
         .unwrap_or(10_000)
         .min(10_000);
-    (posterior, prior.saturating_sub(posterior))
+    (prior, posterior, prior.saturating_sub(posterior))
 }
 
 #[cfg(test)]
@@ -776,8 +809,101 @@ mod tests {
         state.open_questions = vec![non_discriminating, discriminating];
         let selected = next_question(&state).expect("select a question");
         assert_eq!(selected.id, "population");
-        assert_eq!(selected.expected_posterior_uncertainty_basis_points, 1_200);
-        assert_eq!(selected.expected_information_gain_basis_points, 6_800);
+        assert_eq!(selected.prior_uncertainty_basis_points, 7_500);
+        assert_eq!(selected.expected_posterior_uncertainty_basis_points, 4_875);
+        assert_eq!(selected.expected_information_gain_basis_points, 2_625);
+    }
+
+    #[test]
+    fn question_calibration_ignores_model_probabilities_and_uses_mature_history() {
+        let question = OpenQuestion {
+            id: "metric".into(),
+            question: "Which success metric controls release?".into(),
+            impact: "high".into(),
+            answerability: "high".into(),
+            user_effort: 2,
+            decision_target: QuestionDecisionTarget::OutcomeMetric,
+            prior_uncertainty_basis_points: 1,
+            answer_branches: vec![
+                QuestionAnswerBranch {
+                    id: "retention".into(),
+                    answer: "retention".into(),
+                    probability_basis_points: 9_999,
+                    posterior_uncertainty_basis_points: 0,
+                    decision_effect: "retention release gate".into(),
+                },
+                QuestionAnswerBranch {
+                    id: "revenue".into(),
+                    answer: "revenue".into(),
+                    probability_basis_points: 1,
+                    posterior_uncertainty_basis_points: 10_000,
+                    decision_effect: "revenue release gate".into(),
+                },
+            ],
+            expected_posterior_uncertainty_basis_points: 9_999,
+            expected_information_gain_basis_points: 1,
+        };
+        let conservative = question.clone().with_recomputed_information_value();
+        assert_eq!(conservative.prior_uncertainty_basis_points, 7_500);
+        assert_eq!(
+            conservative.expected_posterior_uncertainty_basis_points,
+            4_875
+        );
+
+        let calibrated = question.with_calibrated_information_value(&QuestionCalibrationProfile {
+            domain_bucket: "outcome_metric".into(),
+            sample_count: 120,
+            decision_change_rate_basis_points: 9_000,
+            remaining_uncertainty_ratio_basis_points: 2_000,
+            median_user_effort_ms: 12_000,
+        });
+        assert_eq!(calibrated.prior_uncertainty_basis_points, 8_250);
+        assert_eq!(
+            calibrated.expected_posterior_uncertainty_basis_points,
+            1_650
+        );
+        assert_eq!(calibrated.expected_information_gain_basis_points, 6_600);
+    }
+
+    #[test]
+    fn applying_delta_preserves_observed_question_calibration() {
+        let calibrated = OpenQuestion {
+            id: "scope".into(),
+            question: "Which market is in scope?".into(),
+            impact: "core".into(),
+            answerability: "high".into(),
+            user_effort: 5,
+            decision_target: QuestionDecisionTarget::Scope,
+            prior_uncertainty_basis_points: 9_250,
+            answer_branches: vec![
+                QuestionAnswerBranch {
+                    id: "a".into(),
+                    answer: "A".into(),
+                    probability_basis_points: 5_000,
+                    posterior_uncertainty_basis_points: 2_500,
+                    decision_effect: "launch A".into(),
+                },
+                QuestionAnswerBranch {
+                    id: "b".into(),
+                    answer: "B".into(),
+                    probability_basis_points: 5_000,
+                    posterior_uncertainty_basis_points: 2_500,
+                    decision_effect: "launch B".into(),
+                },
+            ],
+            expected_posterior_uncertainty_basis_points: 2_312,
+            expected_information_gain_basis_points: 6_938,
+        };
+        let next = apply_delta(
+            &RequirementState::default(),
+            RequirementStateDelta {
+                add_questions: vec![calibrated.clone()],
+                ..RequirementStateDelta::default()
+            },
+            &[],
+        )
+        .expect("apply calibrated question");
+        assert_eq!(next.open_questions, vec![calibrated]);
     }
 
     #[test]
@@ -831,11 +957,11 @@ mod tests {
             resolution.decision_target,
             QuestionDecisionTarget::Population
         );
-        assert_eq!(resolution.predicted_information_gain_basis_points, 6_000);
+        assert_eq!(resolution.predicted_information_gain_basis_points, 2_625);
         assert_eq!(resolution.user_effort, 2);
         let report = question_calibration_report(&next.question_resolutions);
         assert_eq!(report.sample_count, 1);
-        assert_eq!(report.mean_absolute_error_basis_points, 1_000);
+        assert_eq!(report.mean_absolute_error_basis_points, 2_375);
         assert_eq!(report.effort_adjusted_utility_basis_points, 2_500);
     }
 

@@ -15,9 +15,9 @@ use crate::config::RuntimeFeatureConfig;
 use crate::execution_kernel::{
     AgentExecutionKernel, RuntimeApprovalDecision, RuntimeApprovalRequest,
     RuntimeApprovalResolution, RuntimeContextManifestInput, RuntimeContextSupplement,
-    RuntimeContextSupplementRequest, RuntimeModelBudgetStage, RuntimeToolContract,
-    RuntimeToolIntent, RuntimeToolOutcome, RuntimeToolOutcomeKind, RuntimeTurnStart,
-    RuntimeTurnTerminalStatus,
+    RuntimeContextSupplementRequest, RuntimeInteractionRequest, RuntimeModelBudgetStage,
+    RuntimeToolContract, RuntimeToolIntent, RuntimeToolOutcome, RuntimeToolOutcomeKind,
+    RuntimeTurnStart, RuntimeTurnTerminalStatus,
 };
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::permissions::{
@@ -85,10 +85,11 @@ fn message_context_block(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn compile_model_visible_context_with_budget(
     system_prompt: Vec<String>,
     messages: Vec<ConversationMessage>,
-    supplement: RuntimeContextSupplement,
+    supplement: &RuntimeContextSupplement,
     max_tokens: u64,
 ) -> Result<CompiledModelVisibleRequest, RuntimeError> {
     let current_user_index = messages
@@ -122,7 +123,7 @@ fn compile_model_visible_context_with_budget(
         blocks.push(message_context_block(index, message, current_user_index));
     }
     blocks.extend(supplement.blocks.iter().cloned());
-    let packet = semantic_core::ContextCompiler::default()
+    let packet = semantic_core::ContextCompiler
         .compile_for_model(
             semantic_core::ContextSelection {
                 objective: "provider request".to_string(),
@@ -191,7 +192,7 @@ fn compile_model_visible_context_with_budget(
                 complete_tool_transactions.contains(tool_use_id)
             }
             ContentBlock::ToolUse { id, .. } => complete_tool_transactions.contains(id),
-            _ => true,
+            ContentBlock::Text { .. } => true,
         });
     }
     selected_messages.retain(|(_, message)| !message.blocks.is_empty());
@@ -272,7 +273,7 @@ fn compile_model_visible_context_with_budget(
             content_hash: block.source_hash.clone(),
         })
         .collect();
-    let mut context_packet = semantic_core::ContextCompiler::default()
+    let mut context_packet = semantic_core::ContextCompiler
         .compile(
             semantic_core::ContextSelection {
                 objective: packet.objective,
@@ -301,7 +302,7 @@ fn compile_model_visible_request_with_budget(
     let compiled = compile_model_visible_context_with_budget(
         system_prompt,
         messages,
-        RuntimeContextSupplement::default(),
+        &RuntimeContextSupplement::default(),
         max_tokens,
     )?;
     Ok((compiled.system_prompt, compiled.messages))
@@ -338,6 +339,9 @@ pub struct ProviderRequestTrace {
     pub iteration: Option<usize>,
     pub request_group_id: String,
     pub context_manifest_key: Option<String>,
+    pub context_manifest_id: Option<String>,
+    pub prompt_manifest_id: Option<String>,
+    pub context_manifest_hash: Option<String>,
 }
 
 impl ProviderRequestTrace {
@@ -348,6 +352,9 @@ impl ProviderRequestTrace {
             iteration: Some(iteration),
             request_group_id: format!("turn:{turn_id}:iteration:{iteration}"),
             context_manifest_key: Some(format!("{turn_id}:{iteration}")),
+            context_manifest_id: None,
+            prompt_manifest_id: None,
+            context_manifest_hash: None,
         }
     }
 
@@ -359,12 +366,16 @@ impl ProviderRequestTrace {
             iteration: None,
             request_group_id: format!("background:{label}:{sequence}"),
             context_manifest_key: None,
+            context_manifest_id: None,
+            prompt_manifest_id: None,
+            context_manifest_hash: None,
         }
     }
 }
 
 /// Streamed events emitted while processing a single assistant turn.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum AssistantEvent {
     TextDelta(String),
     /// A delta of extended thinking/reasoning content (e.g. Claude's internal reasoning).
@@ -385,7 +396,7 @@ pub enum AssistantEvent {
 }
 
 /// Prompt-cache telemetry captured from the provider response stream.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PromptCacheEvent {
     pub unexpected: bool,
     pub reason: String,
@@ -545,6 +556,7 @@ fn resolve_executor_tool_contract<E: ToolExecutor>(
     executor: &E,
     tool_name: &str,
 ) -> Result<RuntimeToolContract, RuntimeError> {
+    crate::behavior_trace("TOOL-001");
     let contract = match executor.tool_contract(tool_name) {
         Some(contract) => contract,
         None if !executor.requires_tool_contracts() => {
@@ -1127,6 +1139,7 @@ where
         prompter: Option<&mut (dyn PermissionPrompter + Send)>,
         reporter: R,
     ) -> Result<TurnSummary, RuntimeError> {
+        crate::behavior_trace("PROMPT-001");
         match self
             .run_turn_resumable(user_input, prompter, reporter)
             .await?
@@ -1197,12 +1210,6 @@ where
                 TurnAccumulator::default(),
             )
             .await;
-        if let Err(error) = outcome.as_ref() {
-            let detail = error.to_string();
-            let _ = self
-                .finish_turn_in_kernel(&turn_id, RuntimeTurnTerminalStatus::Failed, Some(&detail))
-                .await;
-        }
         outcome
     }
 
@@ -1249,25 +1256,13 @@ where
             let result = by_id
                 .remove(&tool_use_id)
                 .expect("pending deferred result was validated above");
-            let output = if is_user_question_tool(&tool_name) {
-                let Some(kernel) = self.execution_kernel.clone() else {
-                    return Err(RuntimeError::new(
-                        "user-question resume requires a durable execution kernel",
-                    ));
-                };
-                kernel
-                    .consume_user_question(&turn.turn_id, &tool_use_id, &result.output)
-                    .await?
-            } else {
-                result.output
-            };
             let projected = self
                 .finish_tool_in_kernel(RuntimeToolOutcome {
                     turn_id: turn.turn_id.clone(),
                     invocation_id: tool_use_id.clone(),
                     tool_name: tool_name.clone(),
                     input: input.clone(),
-                    output,
+                    output: result.output,
                     iteration: 0,
                     outcome: if result.is_error {
                         RuntimeToolOutcomeKind::Failed
@@ -1293,26 +1288,15 @@ where
             accumulator.tool_results.push(message);
         }
         self.complete_session_turn(&turn.turn_id, SessionTurnStatus::Running);
-        let outcome = self
-            .continue_resumable_turn(&turn.turn_id, prompter, &mut reporter, accumulator)
-            .await;
-        if let Err(error) = outcome.as_ref() {
-            let detail = error.to_string();
-            let _ = self
-                .finish_turn_in_kernel(
-                    &turn.turn_id,
-                    RuntimeTurnTerminalStatus::Failed,
-                    Some(&detail),
-                )
-                .await;
-        }
-        outcome
+        self.continue_resumable_turn(&turn.turn_id, prompter, &mut reporter, accumulator)
+            .await
     }
 
     /// Resolve externally approved tool calls and resume the same durable turn.
     /// Approved calls are executed only after the resolution and the normal
     /// intent/capability record have both committed. Explicit deny policy and
     /// current pre-tool hooks are re-evaluated immediately before execution.
+    #[allow(clippy::too_many_lines)]
     pub async fn resume_turn_with_approval_decisions<R: RuntimeEventReporter>(
         &mut self,
         decisions: Vec<DeferredApprovalDecision>,
@@ -1447,26 +1431,14 @@ where
         }
 
         self.complete_session_turn(&turn.turn_id, SessionTurnStatus::Running);
-        let outcome = self
-            .continue_resumable_turn(&turn.turn_id, prompter, &mut reporter, accumulator)
-            .await;
-        if let Err(error) = outcome.as_ref() {
-            let detail = error.to_string();
-            let _ = self
-                .finish_turn_in_kernel(
-                    &turn.turn_id,
-                    RuntimeTurnTerminalStatus::Failed,
-                    Some(&detail),
-                )
-                .await;
-        }
-        outcome
+        self.continue_resumable_turn(&turn.turn_id, prompter, &mut reporter, accumulator)
+            .await
     }
 
     /// Finish a suspended turn after a terminal deferred tool (for example
     /// `complete_turn`) has been accepted by the external orchestrator.
     ///
-    /// This appends every outstanding ToolResult in original ToolUse order and
+    /// This appends every outstanding `ToolResult` in original `ToolUse` order and
     /// the accepted final assistant text, then marks the same runtime turn
     /// complete without another model request.
     pub async fn finalize_suspended_turn_with_tool_results(
@@ -1563,7 +1535,7 @@ where
 
     /// Reconstruct the latest suspended turn from the durable session
     /// checkpoint. Deferred metadata is advisory, so recovery rebuilds it from
-    /// the unmatched ToolUse blocks and leaves metadata empty.
+    /// the unmatched `ToolUse` blocks and leaves metadata empty.
     #[must_use]
     pub fn suspended_turn_snapshot(&self) -> Option<SuspendedTurn> {
         let turn = self
@@ -1768,8 +1740,9 @@ where
             let hard_input_budget = self
                 .api_client
                 .context_window_tokens()
-                .map(|window| window.saturating_mul(65) / 100)
-                .unwrap_or_else(context_compiler_max_tokens)
+                .map_or_else(context_compiler_max_tokens, |window| {
+                    window.saturating_mul(65) / 100
+                })
                 .min(context_compiler_max_tokens())
                 .max(1);
             let active_tools = self.api_client.active_tool_names();
@@ -1799,7 +1772,7 @@ where
             let compiled = compile_model_visible_context_with_budget(
                 system_prompt,
                 request_messages,
-                supplement,
+                &supplement,
                 hard_input_budget,
             )?;
             let prompt_manifest = prompt_variant.as_ref().map(|variant| {
@@ -1813,13 +1786,13 @@ where
                     16_384,
                 )
             });
-            let request = ApiRequest {
+            let mut request = ApiRequest {
                 system_prompt: compiled.system_prompt,
                 messages: compiled.messages,
                 trace: ProviderRequestTrace::turn(turn_id, accumulator.iterations),
             };
             if let Some(kernel) = self.execution_kernel.clone() {
-                kernel
+                let lineage = kernel
                     .record_context_manifest(RuntimeContextManifestInput {
                         turn_id: turn_id.to_string(),
                         iteration: accumulator.iterations,
@@ -1853,6 +1826,9 @@ where
                             "failed to commit model-visible context manifest: {error}"
                         ))
                     })?;
+                request.trace.context_manifest_id = Some(lineage.context_manifest_id);
+                request.trace.prompt_manifest_id = lineage.prompt_manifest_id;
+                request.trace.context_manifest_hash = Some(lineage.context_manifest_hash);
             }
             let events = match self
                 .api_client
@@ -2154,6 +2130,7 @@ where
         trigger: &str,
         summary_override: Option<String>,
     ) -> Result<Option<CompactionResult>, RuntimeError> {
+        crate::behavior_trace("CMP-001");
         let baseline = compact_session(&self.session, config);
         if baseline.removed_message_count == 0 {
             return Ok(None);
@@ -2195,9 +2172,11 @@ where
             .first()
             .map(crate::token_estimator::estimate_message_tokens)
             .unwrap_or_default();
-        if replacement_tokens >= source_tokens {
+        if source_tokens == 0
+            || replacement_tokens.saturating_mul(100) > source_tokens.saturating_mul(60)
+        {
             return abort(format!(
-                "framed compaction replacement was not smaller than its source window ({replacement_tokens} >= {source_tokens})"
+                "framed compaction replacement exceeded the 60% proof budget ({replacement_tokens}/{source_tokens})"
             ))
             .await;
         }
@@ -2284,7 +2263,9 @@ where
             .find(|turn| {
                 matches!(
                     turn.status,
-                    SessionTurnStatus::Running | SessionTurnStatus::Suspended
+                    SessionTurnStatus::Running
+                        | SessionTurnStatus::Suspended
+                        | SessionTurnStatus::RolledBack
                 )
             })
             .cloned()
@@ -2297,7 +2278,9 @@ where
             RuntimeTurnTerminalStatus::Cancelled => SessionTurnStatus::Cancelled,
             RuntimeTurnTerminalStatus::Suspended => SessionTurnStatus::Suspended,
         };
-        if matches!(status, RuntimeTurnTerminalStatus::Cancelled) {
+        if matches!(status, RuntimeTurnTerminalStatus::Cancelled)
+            && !matches!(turn.status, SessionTurnStatus::RolledBack)
+        {
             self.session
                 .rollback_latest_turn_started_at(turn.start_message_count)
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -2345,10 +2328,10 @@ where
         self.session
     }
 
-    /// Performs an In_Turn_Compaction check for the current turn (Req 1.1/1.2/1.3/1.6).
+    /// Performs an `In_Turn_Compaction` check for the current turn (Req 1.1/1.2/1.3/1.6).
     ///
     /// Called from the turn's reasoning loop on every iteration, this evaluates the
-    /// Auto_Compact_Threshold gate and, when crossed, compacts the session in place
+    /// `Auto_Compact_Threshold` gate and, when crossed, compacts the session in place
     /// so the current turn can continue without terminating:
     ///
     /// 1. `compact_session` performs a pure, non-committing window discovery.
@@ -2445,7 +2428,7 @@ where
     /// (`removedMessages`), `summary_tokens` (`summaryTokens`), and the retained
     /// tail (`retainedTail`, reported both as a message count and an estimated
     /// token size of the preserved window) — so downstream observability and the
-    /// Zero_Loss measurement can be reconciled against the actual compaction.
+    /// `Zero_Loss` measurement can be reconciled against the actual compaction.
     fn record_session_compacted(
         &self,
         removed_message_count: usize,
@@ -2538,6 +2521,7 @@ where
         session_tracer.record("assistant_iteration_completed", attributes);
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn execute_prepared_tool_use_outcome<R: RuntimeEventReporter>(
         &mut self,
         turn_id: &str,
@@ -2545,38 +2529,76 @@ where
         prepared: &PreparedToolUse,
         reporter: &mut R,
     ) -> Result<PreparedToolExecution, RuntimeError> {
-        if is_user_question_tool(&prepared.tool_name) {
+        if prepared.tool_name.eq_ignore_ascii_case("AskUserQuestion")
+            || prepared.tool_name.eq_ignore_ascii_case("ask_user_question")
+        {
             let Some(kernel) = self.execution_kernel.clone() else {
                 return Err(RuntimeError::new(
-                    "AskUserQuestion requires a durable execution kernel",
+                    "user questions require a durable execution kernel",
                 ));
             };
-            let input = parse_user_question_input(&prepared.effective_input)?;
-            self.authorize_tool_in_kernel(turn_id, iteration, prepared)
-                .await?;
-            let metadata = serde_json::json!({
-                "kind": "user_question",
-                "question": input.question,
-                "options": input.options,
-            })
-            .to_string();
-            let _ = kernel
-                .finish_tool(RuntimeToolOutcome {
+            let input = serde_json::from_str::<serde_json::Value>(&prepared.effective_input)
+                .map_err(|error| RuntimeError::new(format!("invalid user question: {error}")))?;
+            let question = input
+                .get("question")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| RuntimeError::new("user question is empty"))?;
+            let options = input
+                .get("options")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let request_schema_hash = stable_context_hash(&prepared.effective_input);
+            let choice_schema_hash = (!options.is_empty()).then(|| {
+                stable_context_hash(&serde_json::Value::Array(options.clone()).to_string())
+            });
+            let interaction_id = format!(
+                "interaction:{}",
+                stable_context_hash(&format!(
+                    "{}:{}",
+                    self.session.session_id, prepared.tool_use_id
+                ))
+            );
+            let owner_user_id = self
+                .session
+                .user_id
+                .clone()
+                .ok_or_else(|| RuntimeError::new("durable user question has no owner"))?;
+            let expires_at = chrono::Utc::now() + chrono::Duration::hours(24);
+            let expected_turn_revision = kernel.current_turn_revision(turn_id).await?;
+            kernel
+                .request_interaction(&RuntimeInteractionRequest {
+                    interaction_id: interaction_id.clone(),
+                    kind: agent_protocol::InteractionKind::UserQuestion,
                     turn_id: turn_id.to_string(),
                     invocation_id: prepared.tool_use_id.clone(),
-                    tool_name: prepared.tool_name.clone(),
-                    input: prepared.effective_input.clone(),
-                    output: metadata.clone(),
-                    iteration,
-                    outcome: RuntimeToolOutcomeKind::Deferred,
+                    owner_user_id,
+                    allowed_responder_ids: Vec::new(),
+                    capability_requirement: None,
+                    request_schema_hash,
+                    choice_schema_hash,
+                    display_projection: serde_json::json!({
+                        "question":question,
+                        "options":options,
+                    }),
+                    idempotency_key: format!("user-question:{}", prepared.tool_use_id),
+                    expected_turn_revision,
+                    expires_at: Some(expires_at),
                 })
                 .await?;
-            reporter.on_runtime_status("waiting_input", "turn is waiting for the user's answer");
+            reporter.on_runtime_status("waiting_user_question", "waiting for the user response");
             return Ok(PreparedToolExecution::Deferred(DeferredToolUse {
                 tool_use_id: prepared.tool_use_id.clone(),
                 tool_name: prepared.tool_name.clone(),
                 input: prepared.effective_input.clone(),
-                metadata,
+                metadata: serde_json::json!({
+                    "kind":"user_question",
+                    "interactionId":interaction_id,
+                    "expiresAt":expires_at,
+                })
+                .to_string(),
             }));
         }
         if let PermissionOutcome::AwaitingApproval { request } = &prepared.permission_outcome {
@@ -2941,6 +2963,7 @@ where
     }
 
     fn activate_tools_from_search_result(&mut self, message: &ConversationMessage) {
+        crate::behavior_trace("TOOL-002");
         let Some((tool_name, output, _)) = message_tool_result(message) else {
             return;
         };
@@ -3066,40 +3089,6 @@ where
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct RuntimeUserQuestionInput {
-    question: String,
-    #[serde(default)]
-    options: Vec<String>,
-}
-
-fn is_user_question_tool(tool_name: &str) -> bool {
-    tool_name
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect::<String>()
-        == "askuserquestion"
-}
-
-fn parse_user_question_input(input: &str) -> Result<RuntimeUserQuestionInput, RuntimeError> {
-    let mut parsed: RuntimeUserQuestionInput = serde_json::from_str(input)
-        .map_err(|error| RuntimeError::new(format!("invalid AskUserQuestion input: {error}")))?;
-    parsed.question = parsed.question.trim().to_string();
-    parsed.options = parsed
-        .options
-        .into_iter()
-        .map(|option| option.trim().to_string())
-        .filter(|option| !option.is_empty())
-        .collect();
-    if parsed.question.is_empty() || parsed.question.len() > 4_000 || parsed.options.len() > 20 {
-        return Err(RuntimeError::new(
-            "AskUserQuestion requires a non-empty question <= 4000 bytes and at most 20 options",
-        ));
-    }
-    Ok(parsed)
-}
-
 fn turn_summary_from_accumulator<C, T>(
     runtime: &ConversationRuntime<C, T>,
     accumulator: TurnAccumulator,
@@ -3200,7 +3189,7 @@ fn compact_tool_results_for_request(
             request_tool_result_chars =
                 request_tool_result_chars.saturating_add(compact_output.len());
             compacted_tool_results = compacted_tool_results.saturating_add(1);
-            request_messages.push(replace_tool_result_output(message, compact_output));
+            request_messages.push(replace_tool_result_output(message, &compact_output));
         } else {
             request_tool_result_chars = request_tool_result_chars.saturating_add(output.len());
             request_messages.push(message.clone());
@@ -3238,12 +3227,12 @@ fn is_compactable_tool_result(tool_name: &str) -> bool {
 
 fn replace_tool_result_output(
     message: &ConversationMessage,
-    compact_output: String,
+    compact_output: &str,
 ) -> ConversationMessage {
     let mut next = message.clone();
     for block in &mut next.blocks {
         if let ContentBlock::ToolResult { output, .. } = block {
-            *output = compact_output.clone();
+            compact_output.clone_into(output);
         }
     }
     next
@@ -3322,7 +3311,7 @@ fn read_file_recovery_summary(value: &Value) -> Option<String> {
         start_line.saturating_add(num_lines).saturating_sub(1)
     };
     let offset = start_line.saturating_sub(1);
-    let limit = num_lines.max(1).min(400);
+    let limit = num_lines.clamp(1, 400);
     Some(format!(
         "file={path}; lines={start_line}-{end_line}; total_lines={total_lines}; exact=read_file path={path} offset={offset} limit={limit}"
     ))
@@ -3544,15 +3533,10 @@ fn replay_assistant_events_to_reporter(
                 }
                 reporter.on_thinking_delta(delta);
             }
-            AssistantEvent::SignatureDelta(_) => {}
-            AssistantEvent::ToolUse { .. } => {
-                if in_thinking {
-                    reporter.on_thinking_end();
-                    in_thinking = false;
-                }
-            }
-            AssistantEvent::Usage(_) | AssistantEvent::PromptCache(_) => {}
-            AssistantEvent::MessageStop => {
+            AssistantEvent::SignatureDelta(_)
+            | AssistantEvent::Usage(_)
+            | AssistantEvent::PromptCache(_) => {}
+            AssistantEvent::ToolUse { .. } | AssistantEvent::MessageStop => {
                 if in_thinking {
                     reporter.on_thinking_end();
                     in_thinking = false;
@@ -3636,8 +3620,8 @@ impl ToolExecutor for StaticToolExecutor {
 mod tests {
     use super::{
         build_assistant_message, compile_model_visible_request_with_budget, message_tool_result,
-        parse_auto_compaction_threshold, should_auto_compact, ApiClient, ApiRequest,
-        AssistantEvent, CompactionHook, ConversationRuntime, DeferredApprovalDecision,
+        parse_auto_compaction_threshold, should_auto_compact, stable_context_hash, ApiClient,
+        ApiRequest, AssistantEvent, CompactionHook, ConversationRuntime, DeferredApprovalDecision,
         DeferredToolResult, PreparedCompaction, PromptCacheEvent, ResumableTurnOutcome,
         RuntimeError, StaticToolExecutor, ToolExecutionOutcome, ToolExecutionRequest, ToolExecutor,
         DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
@@ -3646,9 +3630,9 @@ mod tests {
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::execution_kernel::{
         AgentExecutionKernel, RuntimeApprovalDecision, RuntimeApprovalRequest,
-        RuntimeApprovalResolution, RuntimeContextManifestInput, RuntimeToolContract,
-        RuntimeToolIntent, RuntimeToolOutcome, RuntimeToolProjection, RuntimeTurnStart,
-        RuntimeTurnTerminalStatus,
+        RuntimeApprovalResolution, RuntimeContextManifestInput, RuntimeInteractionRequest,
+        RuntimeManifestLineage, RuntimeToolContract, RuntimeToolIntent, RuntimeToolOutcome,
+        RuntimeToolProjection, RuntimeTurnStart, RuntimeTurnTerminalStatus,
     };
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
@@ -3673,7 +3657,7 @@ mod tests {
     /// meaningfully smaller than the archived window. Production compaction
     /// must still fail closed for a replacement that grows the context.
     fn compaction_fixture_text(label: &str) -> String {
-        format!("{label}: {}", "important context ".repeat(48))
+        format!("{label}: {}", "important context ".repeat(128))
     }
 
     #[test]
@@ -3917,7 +3901,7 @@ mod tests {
         visible_messages: Vec<(String, ConversationMessage)>,
         visible_attempt_ids: Vec<String>,
         reject_visible_message: bool,
-        terminal_checkpoints: Vec<(RuntimeTurnTerminalStatus, Session)>,
+        terminal_checkpoints: Vec<(RuntimeTurnTerminalStatus, SessionTurnStatus)>,
     }
 
     struct ApprovalTestKernel {
@@ -3942,11 +3926,29 @@ mod tests {
             Ok(())
         }
 
+        async fn current_turn_revision(&self, _turn_id: &str) -> Result<u64, RuntimeError> {
+            Ok(0)
+        }
+
         async fn record_context_manifest(
             &self,
-            _input: RuntimeContextManifestInput,
-        ) -> Result<(), RuntimeError> {
-            Ok(())
+            input: RuntimeContextManifestInput,
+        ) -> Result<RuntimeManifestLineage, RuntimeError> {
+            Ok(RuntimeManifestLineage {
+                context_manifest_id: format!("context:{}:{}", input.turn_id, input.iteration),
+                prompt_manifest_id: input
+                    .prompt_manifest
+                    .as_ref()
+                    .map(|_| format!("prompt:{}:{}", input.turn_id, input.iteration)),
+                context_manifest_hash: stable_context_hash(&format!(
+                    "{}:{}",
+                    input.turn_id, input.iteration
+                )),
+                prompt_manifest_hash: input
+                    .prompt_manifest
+                    .as_ref()
+                    .map(|manifest| stable_context_hash(&format!("{manifest:?}"))),
+            })
         }
 
         async fn record_assistant_message(
@@ -4018,6 +4020,54 @@ mod tests {
             Ok(resolution.decision)
         }
 
+        async fn request_interaction(
+            &self,
+            request: &RuntimeInteractionRequest,
+        ) -> Result<agent_protocol::DurableInteraction, RuntimeError> {
+            Ok(agent_protocol::DurableInteraction {
+                interaction_id: request.interaction_id.clone(),
+                kind: request.kind,
+                state: agent_protocol::InteractionState::Pending,
+                scope: agent_protocol::InteractionScope {
+                    tenant_id: "tenant".into(),
+                    user_id: request.owner_user_id.clone(),
+                    session_id: "session".into(),
+                    turn_id: request.turn_id.clone(),
+                    invocation_id: request.invocation_id.clone(),
+                },
+                owner_user_id: request.owner_user_id.clone(),
+                allowed_responder_ids: request.allowed_responder_ids.clone(),
+                capability_requirement: request.capability_requirement.clone(),
+                request_schema_hash: request.request_schema_hash.clone(),
+                choice_schema_hash: request.choice_schema_hash.clone(),
+                display_projection: request.display_projection.clone(),
+                response_projection: None,
+                encrypted_secret_ref: None,
+                idempotency_key: request.idempotency_key.clone(),
+                expected_turn_revision: request.expected_turn_revision,
+                expires_at: request.expires_at,
+                created_event_id: None,
+                response_event_id: None,
+                consumed_event_id: None,
+            })
+        }
+
+        async fn respond_interaction(
+            &self,
+            _resolution: &crate::RuntimeInteractionResolution,
+        ) -> Result<agent_protocol::DurableInteraction, RuntimeError> {
+            Err(RuntimeError::new("test interaction was not created"))
+        }
+
+        async fn consume_interaction(
+            &self,
+            _interaction_id: &str,
+            _turn_id: &str,
+            _idempotency_key: &str,
+        ) -> Result<agent_protocol::DurableInteraction, RuntimeError> {
+            Err(RuntimeError::new("test interaction was not answered"))
+        }
+
         async fn finish_tool(
             &self,
             outcome: RuntimeToolOutcome,
@@ -4027,29 +4077,26 @@ mod tests {
             Ok(projection)
         }
 
-        async fn finish_turn(
-            &self,
-            _turn_id: &str,
-            _status: RuntimeTurnTerminalStatus,
-            _detail: Option<&str>,
-        ) -> Result<(), RuntimeError> {
-            Ok(())
-        }
-
         async fn finish_turn_with_checkpoint(
             &self,
             turn_id: &str,
             status: RuntimeTurnTerminalStatus,
-            detail: Option<&str>,
+            _detail: Option<&str>,
             session: &Session,
         ) -> Result<(), RuntimeError> {
+            let session_status = session
+                .turns
+                .iter()
+                .rev()
+                .find(|turn| turn.turn_id == turn_id)
+                .map(|turn| turn.status)
+                .ok_or_else(|| RuntimeError::new("terminal checkpoint turn missing"))?;
             self.state
                 .lock()
                 .unwrap()
                 .terminal_checkpoints
-                .push((status, session.clone()));
-            self.finish_turn(turn_id, status, detail).await?;
-            self.checkpoint_session("turn_terminal", session).await
+                .push((status, session_status));
+            Ok(())
         }
     }
 
@@ -4092,8 +4139,47 @@ mod tests {
             RuntimeTurnTerminalStatus::Cancelled
         );
         assert_eq!(
-            state.terminal_checkpoints[0].1.turns.last().unwrap().status,
+            state.terminal_checkpoints[0].1,
             SessionTurnStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn rolled_back_outer_cancellation_still_commits_a_cancelled_checkpoint() {
+        let kernel = Arc::new(ApprovalTestKernel::new());
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ApprovalApiClient { call_count: 0 },
+            CountingApprovalExecutor {
+                executions: Arc::new(AtomicUsize::new(0)),
+            },
+            PermissionPolicy::new(PermissionMode::Allow),
+            vec!["system".to_string()],
+        )
+        .with_execution_kernel(kernel.clone());
+        let turn_id = runtime.session_mut().begin_turn("cancel me").unwrap();
+        runtime.session_mut().push_user_text("cancel me").unwrap();
+        assert!(runtime.rollback_latest_turn_started_at(0).unwrap());
+
+        runtime
+            .finish_latest_kernel_turn(
+                RuntimeTurnTerminalStatus::Cancelled,
+                Some("outer coordinator cancelled"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.session().turns[0].turn_id, turn_id);
+        assert_eq!(
+            runtime.session().turns[0].status,
+            SessionTurnStatus::Cancelled
+        );
+        assert_eq!(
+            kernel.state.lock().unwrap().terminal_checkpoints,
+            vec![(
+                RuntimeTurnTerminalStatus::Cancelled,
+                SessionTurnStatus::Cancelled
+            )]
         );
     }
 

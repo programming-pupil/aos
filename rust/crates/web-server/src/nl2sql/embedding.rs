@@ -189,11 +189,11 @@ pub fn shutdown_local_embedding_model() {
 }
 
 fn embed_with_local_model(texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
-    runtime::local_embedding::embed(texts)
+    runtime::local_embedding::embed(&texts)
 }
 
 fn embed_with_local_model_background(texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
-    runtime::local_embedding::embed_background(texts)
+    runtime::local_embedding::embed_background(&texts)
 }
 
 #[derive(Clone)]

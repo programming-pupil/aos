@@ -20,9 +20,9 @@ struct StreamSessionRequest {
     #[serde(default)]
     approval: Option<StreamApprovalDecision>,
     #[serde(default)]
-    question_answer: Option<StreamQuestionAnswer>,
+    interaction: Option<StreamInteractionResponse>,
     #[serde(default)]
-    question_answers: Vec<StreamQuestionAnswer>,
+    interactions: Vec<StreamInteractionResponse>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,9 +35,10 @@ struct StreamApprovalDecision {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct StreamQuestionAnswer {
-    request_id: String,
+struct StreamInteractionResponse {
+    interaction_id: String,
     answer: String,
+    idempotency_key: String,
 }
 
 struct StreamTurnCancelOnDrop {
@@ -486,7 +487,7 @@ pub(super) async fn stream_session(
         request_documents,
         turn_options,
         approval_request,
-        question_answer_request,
+        interaction_requests,
     ) = if request.method() == axum::http::Method::POST {
         let (_, body) = request.into_parts();
         let bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
@@ -500,19 +501,25 @@ pub(super) async fn stream_session(
             Ok(p) => p,
             Err(_) => return AppError::ValidationError("invalid JSON body".into()).into_response(),
         };
+        let StreamSessionRequest {
+            message,
+            images,
+            documents,
+            turn_options,
+            approval,
+            interaction,
+            mut interactions,
+        } = parsed;
+        if let Some(interaction) = interaction {
+            interactions.push(interaction);
+        }
         (
-            parsed.message,
-            parsed.images,
-            parsed.documents,
-            parsed.turn_options,
-            parsed.approval,
-            {
-                let mut answers = parsed.question_answers;
-                if let Some(answer) = parsed.question_answer {
-                    answers.push(answer);
-                }
-                answers
-            },
+            message,
+            images,
+            documents,
+            turn_options,
+            approval,
+            interactions,
         )
     } else {
         (
@@ -525,9 +532,9 @@ pub(super) async fn stream_session(
         )
     };
 
-    if approval_request.is_some() && !question_answer_request.is_empty() {
+    if approval_request.is_some() && !interaction_requests.is_empty() {
         return AppError::ValidationError(
-            "approval and question answers cannot be submitted together".to_string(),
+            "a stream request cannot resolve an approval and a user question together".into(),
         )
         .into_response();
     }
@@ -577,75 +584,36 @@ pub(super) async fn stream_session(
         None
     };
 
-    let question_resume = if question_answer_request.is_empty() {
+    let interaction_resume = if interaction_requests.is_empty() {
         None
     } else {
-        let mut request_ids = std::collections::BTreeSet::new();
-        let mut stored_questions = Vec::with_capacity(question_answer_request.len());
-        let mut answer_inputs = Vec::with_capacity(question_answer_request.len());
-        for response in &question_answer_request {
-            let request_id = response.request_id.trim();
-            if !request_ids.insert(request_id.to_string()) {
-                return AppError::ValidationError(
-                    "question answers contain a duplicate requestId".to_string(),
-                )
-                .into_response();
-            }
-            let stored = match crate::semantic_kernel_store::get_runtime_question(
-                &state.db,
-                &claims.tenant_id,
-                &claims.sub,
-                &session_id,
-                request_id,
-            )
-            .await
-            {
-                Ok(Some(stored)) => stored,
-                Ok(None) => {
-                    return AppError::ValidationError(
-                        "question is not pending in this authenticated session".to_string(),
-                    )
-                    .into_response()
-                }
-                Err(error) => return AppError::Internal(error.to_string()).into_response(),
-            };
-            if stored.expired && stored.status == "pending" {
-                return AppError::ValidationError("question has expired".to_string())
-                    .into_response();
-            }
-            stored_questions.push(stored);
-            answer_inputs.push((request_id.to_string(), response.answer.trim().to_string()));
-        }
-        let borrowed_answers = answer_inputs
+        let answers = interaction_requests
             .iter()
-            .map(|(request_id, answer)| (request_id.as_str(), answer.as_str()))
+            .map(
+                |interaction| crate::semantic_kernel_store::RuntimeUserQuestionAnswer {
+                    interaction_id: interaction.interaction_id.trim(),
+                    answer: &interaction.answer,
+                    idempotency_key: interaction.idempotency_key.trim(),
+                },
+            )
             .collect::<Vec<_>>();
-        let answers = match crate::semantic_kernel_store::answer_runtime_questions(
+        match crate::semantic_kernel_store::respond_to_runtime_user_questions(
             &state.db,
             &claims.tenant_id,
             &claims.sub,
+            &claims.sub,
             &session_id,
-            &borrowed_answers,
+            &answers,
         )
         .await
         {
-            Ok(answers) => answers,
+            Ok(results) => Some(results),
             Err(error) => return AppError::ValidationError(error.to_string()).into_response(),
-        };
-        let results = stored_questions
-            .into_iter()
-            .zip(answers)
-            .map(|(stored, answer)| runtime::DeferredToolResult {
-                tool_use_id: stored.invocation_id,
-                output: answer,
-                is_error: false,
-            })
-            .collect();
-        Some(results)
+        }
     };
 
     // Intercept skill slash commands: `/<skill-name> args` -> `$<skill-name> args`.
-    let original_user_message = if approval_resume.is_some() || question_resume.is_some() {
+    let original_user_message = if approval_resume.is_some() || interaction_resume.is_some() {
         String::new()
     } else {
         maybe_dispatch_skill_command(&raw_message, &claims.tenant_id, &state.db)
@@ -748,7 +716,7 @@ pub(super) async fn stream_session(
     }
     let mut user_message = sanitize_pm_user_message(&session_source, user_message);
 
-    if approval_resume.is_none() && question_resume.is_none() && user_message.trim().is_empty() {
+    if approval_resume.is_none() && interaction_resume.is_none() && user_message.trim().is_empty() {
         return AppError::ValidationError("message cannot be empty".into()).into_response();
     }
 
@@ -756,7 +724,7 @@ pub(super) async fn stream_session(
     let mut chat_trace = Vec::<serde_json::Value>::new();
 
     if approval_resume.is_none()
-        && question_resume.is_none()
+        && interaction_resume.is_none()
         && session_source.eq_ignore_ascii_case("chat")
     {
         if let Some(trace) = image_context_trace_payload.take() {
@@ -836,7 +804,7 @@ pub(super) async fn stream_session(
     let message = wrap_pm_research_prompt(&session_source, user_message.clone());
 
     if approval_resume.is_none()
-        && question_resume.is_none()
+        && interaction_resume.is_none()
         && session_source.eq_ignore_ascii_case("pm")
     {
         let task_id = format!("pm-research-task-{}", uuid::Uuid::new_v4());
@@ -906,7 +874,7 @@ pub(super) async fn stream_session(
     let mut turn_policy = agent_gateway::AgentTurnOptions::default();
     let mut effective_search_mode = EffectiveChatSearchMode::Off;
     if approval_resume.is_none()
-        && question_resume.is_none()
+        && interaction_resume.is_none()
         && session_source.eq_ignore_ascii_case("chat")
     {
         let memory_instructions = chat_artifact_evidence
@@ -945,7 +913,11 @@ pub(super) async fn stream_session(
     }
 
     tokio::spawn(async move {
-        let r = if let Some(decision) = approval_resume {
+        let r = if let Some(results) = interaction_resume {
+            manager
+                .resume_turn_streaming_with_options(&session_id, results, tx, turn_policy)
+                .await
+        } else if let Some(decision) = approval_resume {
             manager
                 .resume_turn_streaming_with_approval_decisions(
                     &session_id,
@@ -953,10 +925,6 @@ pub(super) async fn stream_session(
                     tx,
                     turn_policy,
                 )
-                .await
-        } else if let Some(results) = question_resume {
-            manager
-                .resume_turn_streaming_with_options(&session_id, results, tx, turn_policy)
                 .await
         } else {
             manager
@@ -1253,7 +1221,7 @@ pub(super) async fn stream_session(
                 )
                 .await
                 .unwrap_or_default();
-                let questions = crate::semantic_kernel_store::list_runtime_questions(
+                let interactions = crate::semantic_kernel_store::list_runtime_interactions(
                     &state.db,
                     &claims.tenant_id,
                     &claims.sub,
@@ -1261,6 +1229,35 @@ pub(super) async fn stream_session(
                 )
                 .await
                 .unwrap_or_default();
+                let questions = interactions
+                    .iter()
+                    .filter(|interaction| {
+                        interaction.kind == agent_protocol::InteractionKind::UserQuestion
+                    })
+                    .map(|interaction| {
+                        let question = interaction
+                            .display_projection
+                            .get("question")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        let options = interaction
+                            .display_projection
+                            .get("options")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!([]));
+                        serde_json::json!({
+                            "requestId": interaction.interaction_id,
+                            "turnId": interaction.scope.turn_id,
+                            "invocationId": interaction.scope.invocation_id,
+                            "question": question,
+                            "options": options,
+                            "status": interaction.state,
+                            "expiresAt": interaction.expires_at,
+                            "expired": interaction.expires_at.is_some_and(|expires_at| expires_at <= chrono::Utc::now()),
+                            "idempotencyKey": interaction.idempotency_key,
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 yield axum::response::sse::Event::default()
                     .event(if questions.is_empty() { "approval_paused" } else { "question_paused" })
                     .data(serde_json::json!({

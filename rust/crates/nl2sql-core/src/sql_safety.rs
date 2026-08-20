@@ -177,7 +177,7 @@ impl Visitor for ForbiddenFunctionVisitor {
             // Strip backticks / quotes that sqlparser preserves on quoted identifiers.
             let cleaned = last_segment
                 .trim_matches(|c: char| c == '`' || c == '"' || c == '\'' || c == '[' || c == ']');
-            if BLOCKED_FUNCTIONS.iter().any(|b| *b == cleaned) {
+            if BLOCKED_FUNCTIONS.contains(&cleaned) {
                 self.found = Some(cleaned.to_string());
                 return ControlFlow::Break(());
             }

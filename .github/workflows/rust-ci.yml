@@ -12,6 +12,7 @@ on:
       - .github/scripts/check_doc_source_of_truth.py
       - scripts/check-claw-code-parity.sh
       - scripts/check-platform-sqlite-boundary.sh
+      - scripts/check-onnxruntime-contract.sh
       - scripts/generate-env.sh
       - scripts/*.ps1
       - README.md
@@ -33,6 +34,7 @@ on:
       - .github/scripts/check_doc_source_of_truth.py
       - scripts/check-claw-code-parity.sh
       - scripts/check-platform-sqlite-boundary.sh
+      - scripts/check-onnxruntime-contract.sh
       - scripts/generate-env.sh
       - scripts/*.ps1
       - README.md
@@ -59,6 +61,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  local-embedding-runtime-contract:
+    name: local embedding runtime contract
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify local embedding dependency and runtime versions
+        run: scripts/check-onnxruntime-contract.sh
+
   platform-sqlite-boundary:
     name: platform SQLite / external connector boundary
     runs-on: ubuntu-latest
@@ -66,7 +79,7 @@ jobs:
       run:
         working-directory: .
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check platform and NL2SQL database boundaries
         run: scripts/check-platform-sqlite-boundary.sh
 
@@ -77,8 +90,8 @@ jobs:
       run:
         working-directory: .
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - name: Check docs and metadata for stale branding
@@ -88,7 +101,7 @@ jobs:
     name: cargo fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -118,7 +131,7 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: ${{ startsWith(matrix.os, 'macos-') && '13.0' || '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -130,7 +143,7 @@ jobs:
     name: cargo test --workspace --all-features
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -145,7 +158,7 @@ jobs:
       run:
         working-directory: .
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -157,7 +170,7 @@ jobs:
     name: semantic kernel strict clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -180,7 +193,7 @@ jobs:
     name: cargo clippy --workspace --all-features
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -204,7 +217,7 @@ jobs:
       run:
         working-directory: .
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -221,8 +234,8 @@ jobs:
       run:
         working-directory: webui
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
           cache: npm
@@ -247,7 +260,7 @@ jobs:
       run:
         working-directory: .
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check deployment scripts
         run: bash -n scripts/generate-env.sh scripts/aos-demo-start.sh
       - name: Validate compose file

@@ -2,7 +2,7 @@
 //!
 //! The runtime owns ordering, while storage adapters own durability, fencing,
 //! capability persistence, artifact retention and projection.  Keeping this as
-//! a trait avoids coupling the generic runtime to SQLx or the web server.
+//! a trait avoids coupling the generic runtime to `SQLx` or the web server.
 
 use crate::permissions::PermissionRequest;
 use crate::session::{ConversationMessage, Session};
@@ -40,6 +40,14 @@ pub struct RuntimeContextManifestInput {
     /// snapshot body stays in the semantic-state store; the manifest carries
     /// the immutable reference so replay can load the exact state.
     pub semantic_snapshot_version: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeManifestLineage {
+    pub context_manifest_id: String,
+    pub prompt_manifest_id: Option<String>,
+    pub context_manifest_hash: String,
+    pub prompt_manifest_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,6 +266,34 @@ pub struct RuntimeApprovalResolution {
     pub invocation_id: String,
     pub decision: RuntimeApprovalDecision,
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeInteractionRequest {
+    pub interaction_id: String,
+    pub kind: agent_protocol::InteractionKind,
+    pub turn_id: String,
+    pub invocation_id: String,
+    pub owner_user_id: String,
+    pub allowed_responder_ids: Vec<String>,
+    pub capability_requirement: Option<String>,
+    pub request_schema_hash: String,
+    pub choice_schema_hash: Option<String>,
+    pub display_projection: serde_json::Value,
+    pub idempotency_key: String,
+    pub expected_turn_revision: u64,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeInteractionResolution {
+    pub interaction_id: String,
+    pub turn_id: String,
+    pub responder_user_id: String,
+    pub state: agent_protocol::InteractionState,
+    pub response_projection: Option<serde_json::Value>,
+    pub encrypted_secret_ref: Option<String>,
+    pub idempotency_key: String,
 }
 
 impl RuntimeToolIntent {
@@ -486,8 +522,13 @@ pub fn reduce_runtime_artifact(
     let retained_bytes = head.len().saturating_add(tail.len()).min(source_bytes);
     let omitted_bytes = source_bytes.saturating_sub(retained_bytes);
     let omitted_rows = total_rows.map(|rows| {
-        let retained_ratio = retained_bytes as f64 / source_bytes.max(1) as f64;
-        rows.saturating_sub((rows as f64 * retained_ratio).ceil() as u64)
+        let source_bytes = u128::try_from(source_bytes.max(1)).unwrap_or(u128::MAX);
+        let retained_bytes = u128::try_from(retained_bytes).unwrap_or(u128::MAX);
+        let retained_rows = u128::from(rows)
+            .saturating_mul(retained_bytes)
+            .saturating_add(source_bytes.saturating_sub(1))
+            / source_bytes;
+        rows.saturating_sub(u64::try_from(retained_rows).unwrap_or(u64::MAX))
     });
     let label = serde_json::to_string(&kind)
         .unwrap_or_else(|_| "\"text\"".to_string())
@@ -539,6 +580,11 @@ pub trait AgentExecutionKernel: Send + Sync {
 
     async fn start_turn(&self, input: RuntimeTurnStart) -> Result<(), RuntimeError>;
 
+    /// Read the canonical optimistic-concurrency revision for a live turn.
+    /// Interaction commands must carry this value so a stale runtime cannot
+    /// suspend or resume a turn after another writer has advanced it.
+    async fn current_turn_revision(&self, turn_id: &str) -> Result<u64, RuntimeError>;
+
     /// Load the governed semantic state that must be considered by the real
     /// provider request. Durable adapters may retrieve/rank data here, but the
     /// generic runtime remains responsible for final token-budget selection.
@@ -555,7 +601,7 @@ pub trait AgentExecutionKernel: Send + Sync {
     async fn record_context_manifest(
         &self,
         input: RuntimeContextManifestInput,
-    ) -> Result<(), RuntimeError>;
+    ) -> Result<RuntimeManifestLineage, RuntimeError>;
 
     async fn record_assistant_message(
         &self,
@@ -604,17 +650,27 @@ pub trait AgentExecutionKernel: Send + Sync {
         resolution: &RuntimeApprovalResolution,
     ) -> Result<RuntimeApprovalDecision, RuntimeError>;
 
-    /// Atomically consume a previously persisted user answer. Durable stores
-    /// must fence this transition so restart/retry cannot inject the answer or
-    /// resume the suspended turn twice.
-    async fn consume_user_question(
+    /// Create and expose any external interaction in the same transaction as
+    /// turn suspension and its committed outbox intent.
+    async fn request_interaction(
         &self,
-        _turn_id: &str,
-        _invocation_id: &str,
-        answer: &str,
-    ) -> Result<String, RuntimeError> {
-        Ok(answer.to_string())
-    }
+        request: &RuntimeInteractionRequest,
+    ) -> Result<agent_protocol::DurableInteraction, RuntimeError>;
+
+    /// Persist a response after re-checking owner, expiry and scope. Duplicate
+    /// idempotency keys return the original durable result.
+    async fn respond_interaction(
+        &self,
+        resolution: &RuntimeInteractionResolution,
+    ) -> Result<agent_protocol::DurableInteraction, RuntimeError>;
+
+    /// Atomically claim the one resume intent and consume the interaction.
+    async fn consume_interaction(
+        &self,
+        interaction_id: &str,
+        turn_id: &str,
+        idempotency_key: &str,
+    ) -> Result<agent_protocol::DurableInteraction, RuntimeError>;
 
     /// Persist the complete result as a typed artifact when needed, settle the
     /// budget and return the bounded model-visible projection.
@@ -623,17 +679,9 @@ pub trait AgentExecutionKernel: Send + Sync {
         outcome: RuntimeToolOutcome,
     ) -> Result<RuntimeToolProjection, RuntimeError>;
 
-    async fn finish_turn(
-        &self,
-        turn_id: &str,
-        status: RuntimeTurnTerminalStatus,
-        detail: Option<&str>,
-    ) -> Result<(), RuntimeError>;
-
-    /// Atomically commit the terminal turn transition and the exact recovery
-    /// checkpoint representing that transition. Durable implementations must
-    /// use one storage transaction: exposing a terminal turn with an older
-    /// checkpoint makes the next provider request unrecoverable.
+    /// Atomically settle the turn, append its terminal event and persist the
+    /// exact recovery checkpoint. Implementations must not commit any of
+    /// those effects independently.
     async fn finish_turn_with_checkpoint(
         &self,
         turn_id: &str,
@@ -653,7 +701,7 @@ mod artifact_reducer_tests {
         let preview = reduce_runtime_artifact("read_file", &output, 4_096);
         assert_eq!(preview.kind, RuntimeArtifactKind::Text);
         assert!(preview.truncated);
-        assert_eq!(preview.source_bytes as usize, output.len());
+        assert_eq!(usize::try_from(preview.source_bytes).unwrap(), output.len());
         assert_eq!(
             preview.retained_bytes + preview.omitted_bytes,
             preview.source_bytes

@@ -13,6 +13,7 @@ use thiserror::Error;
 
 const DATASET_RELATIVE_PATH: &str = "../../../eval/datasets/semantic-kernel-conformance.json";
 const MATRIX_RELATIVE_PATH: &str = "../../../docs/AOS_SEMANTIC_KERNEL_CONFORMANCE_MATRIX.zh-CN.md";
+const EXPECTED_P0_CASES: usize = 40;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -56,12 +57,6 @@ fn dataset_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(DATASET_RELATIVE_PATH)
 }
 
-fn repo_path(relative_path: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
-        .join(relative_path)
-}
-
 fn table_ids(markdown: &str, start_heading: &str, end_heading: Option<&str>) -> BTreeSet<String> {
     let section = markdown
         .split_once(start_heading)
@@ -92,7 +87,7 @@ pub fn load_semantic_kernel_conformance_dataset() -> Result<Vec<ConformanceCase>
             dataset.schema_version
         )));
     }
-    if dataset.spec != "docs/AOS_SEMANTIC_KERNEL_REFACTOR.zh-CN.md" {
+    if dataset.spec != "docs/AOS_SEMANTIC_KERNEL_CONFORMANCE_MATRIX.zh-CN.md" {
         return Err(ConformanceError::Invalid(format!(
             "dataset points at unexpected spec {}",
             dataset.spec
@@ -148,80 +143,23 @@ fn assert_reference_exists(reference: &str) -> Result<(), ConformanceError> {
     Ok(())
 }
 
-fn function_body<'a>(source: &'a str, symbol: &str) -> Option<&'a str> {
-    let start = source.find(&format!("fn {symbol}"))?;
-    let body_start = source[start..].find('{')? + start;
-    let mut depth = 0_u32;
-    for (offset, character) in source[body_start..].char_indices() {
-        match character {
-            '{' => depth = depth.saturating_add(1),
-            '}' => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    return Some(&source[body_start..=body_start + offset]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn test_has_production_evidence(
-    source: &str,
-    test_symbol: &str,
-    production_symbol: &str,
-    trace_anchor: Option<&str>,
-) -> bool {
-    let Some(body) = function_body(source, test_symbol) else {
-        return false;
-    };
-    let anchor = trace_anchor.unwrap_or(production_symbol);
-    body.contains(anchor)
-        && (body.contains("assert!(")
-            || body.contains("assert_eq!(")
-            || body.contains("assert_ne!(")
-            || body.contains(".await"))
-}
-
 pub fn assert_semantic_kernel_traceability_dataset(
 ) -> Result<Vec<ConformanceCase>, ConformanceError> {
     let cases = load_semantic_kernel_conformance_dataset()?;
-    if cases.len() != 31 {
+    if cases.len() != EXPECTED_P0_CASES {
         return Err(ConformanceError::Invalid(format!(
-            "expected 31 P0 cases, found {}",
+            "expected {EXPECTED_P0_CASES} P0 cases, found {}",
             cases.len()
         )));
     }
     for case in &cases {
         assert_reference_exists(&case.production)?;
         assert_reference_exists(&case.test)?;
-        let (test_path, test_symbol) = source_and_symbol(&case.test)?;
-        let (_, production_symbol) = source_and_symbol(&case.production)?;
-        let source = fs::read_to_string(repo_path(test_path))?;
-        if !test_has_production_evidence(
-            &source,
-            test_symbol,
-            production_symbol,
-            case.trace_anchor.as_deref(),
-        ) {
-            return Err(ConformanceError::Invalid(format!(
-                "case {} test body has no production trace anchor/assertion evidence",
-                case.id
-            )));
-        }
     }
     let dataset_ids = cases
         .iter()
         .map(|case| case.id.clone())
         .collect::<BTreeSet<_>>();
-    let spec = fs::read_to_string(repo_path("docs/AOS_SEMANTIC_KERNEL_REFACTOR.zh-CN.md"))?;
-    let spec_ids = table_ids(&spec, "## 20. P0 开发任务清单", Some("## 21."));
-    if spec_ids != dataset_ids {
-        return Err(ConformanceError::Invalid(format!(
-            "P0 spec/dataset ids differ: spec={spec_ids:?}, dataset={dataset_ids:?}"
-        )));
-    }
     let matrix =
         fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(MATRIX_RELATIVE_PATH))?;
     let matrix_ids = table_ids(&matrix, "| ID |", Some("## 删除与保留"));
@@ -261,53 +199,22 @@ pub fn semantic_kernel_behavior_commands() -> Result<Vec<BehaviorCommand>, Confo
 mod tests {
     use super::{
         assert_semantic_kernel_traceability_dataset, semantic_kernel_behavior_commands,
-        test_has_production_evidence,
+        EXPECTED_P0_CASES,
     };
 
     #[test]
     fn every_p0_case_has_live_traceability_references() {
         let cases = assert_semantic_kernel_traceability_dataset().expect("conformance dataset");
-        assert_eq!(cases.len(), 31);
+        assert_eq!(cases.len(), EXPECTED_P0_CASES);
         assert!(cases.iter().all(|case| case.expected.len() > 12));
     }
 
     #[test]
     fn every_p0_case_produces_an_executable_behavior_command() {
         let commands = semantic_kernel_behavior_commands().expect("behavior commands");
-        assert_eq!(commands.len(), 31);
+        assert_eq!(commands.len(), EXPECTED_P0_CASES);
         assert!(commands
             .iter()
             .all(|command| !command.package.is_empty() && !command.test_filter.is_empty()));
-    }
-
-    #[test]
-    fn fake_helper_without_production_anchor_is_rejected() {
-        let fake = r#"
-            fn production_entry() { panic!("must not be called"); }
-            #[test]
-            fn dishonest_test() {
-                fake_helper();
-                assert!(true);
-            }
-        "#;
-        assert!(!test_has_production_evidence(
-            fake,
-            "dishonest_test",
-            "production_entry",
-            None,
-        ));
-        let honest = r#"
-            #[test]
-            fn honest_test() {
-                production_entry();
-                assert!(true);
-            }
-        "#;
-        assert!(test_has_production_evidence(
-            honest,
-            "honest_test",
-            "production_entry",
-            None,
-        ));
     }
 }

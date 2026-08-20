@@ -32,7 +32,7 @@ describe('durable runtime question stream', () => {
         okSse(
           [
             'event: question_paused',
-            'data: {"sessionId":"session-question","runtimeTurnId":"turn-1","questions":[{"requestId":"question-1","turnId":"turn-1","invocationId":"tool-1","question":"Environment?","options":["staging","production"],"status":"pending","expiresAt":"2026-08-20T12:00:00Z","expired":false}]}',
+            'data: {"sessionId":"session-question","runtimeTurnId":"turn-1","questions":[{"requestId":"question-1","idempotencyKey":"question-request-1","turnId":"turn-1","invocationId":"tool-1","question":"Environment?","options":["staging","production"],"status":"pending","expiresAt":"2026-08-20T12:00:00Z","expired":false}]}',
             '',
           ].join('\n'),
         ),
@@ -72,9 +72,9 @@ describe('durable runtime question stream', () => {
           onError: reject,
         },
         {
-          questionAnswers: [
-            { requestId: 'question-1', answer: 'staging' },
-            { requestId: 'question-2', answer: 'today' },
+          interactions: [
+            { interactionId: 'question-1', answer: 'staging', idempotencyKey: 'answer-1' },
+            { interactionId: 'question-2', answer: 'today', idempotencyKey: 'answer-2' },
           ],
         },
       );
@@ -86,9 +86,9 @@ describe('durable runtime question stream', () => {
       images: [],
       documents: [],
       turnOptions: {},
-      questionAnswers: [
-        { requestId: 'question-1', answer: 'staging' },
-        { requestId: 'question-2', answer: 'today' },
+      interactions: [
+        { interactionId: 'question-1', answer: 'staging', idempotencyKey: 'answer-1' },
+        { interactionId: 'question-2', answer: 'today', idempotencyKey: 'answer-2' },
       ],
     });
   });

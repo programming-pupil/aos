@@ -1,4 +1,4 @@
-use super::agent_session_api::{list_session_approvals, list_session_questions};
+use super::agent_session_api::{list_session_approvals, list_session_interactions};
 use super::*;
 
 pub(super) fn get_agent_manager(state: &AppState) -> &Arc<AgentSessionManager> {
@@ -55,8 +55,8 @@ pub fn routes(state: AppState) -> Router<AppState> {
             routing_get(list_session_approvals),
         )
         .route(
-            "/sessions/{session_id}/questions",
-            routing_get(list_session_questions),
+            "/sessions/{session_id}/interactions",
+            routing_get(list_session_interactions),
         )
         .route(
             "/sessions/{session_id}/context-status",

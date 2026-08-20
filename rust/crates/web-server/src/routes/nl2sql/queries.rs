@@ -269,6 +269,7 @@ async fn verify_repair_against_canonical_intent(
     query_id: &str,
     sql: &str,
 ) -> Result<CandidateSemanticVerification> {
+    crate::behavior_trace("SQL-003");
     verify_candidate_against_canonical_intent(db, tenant_id, query_id, None, sql).await
 }
 
@@ -2187,7 +2188,12 @@ async fn execute_once(
                 username: String,
                 password: String,
             }
-            let config_val = decrypt_config(config_json, &state.data_dir)?;
+            let config_val = decrypt_config(
+                config_json,
+                &state.data_dir,
+                &claims.tenant_id,
+                data_source_id,
+            )?;
             let cfg: SqlConfig = serde_json::from_value(config_val)
                 .map_err(|_| AppError::ValidationError("invalid config".into()))?;
 
@@ -2368,7 +2374,12 @@ async fn execute_once(
                 username: String,
                 password: String,
             }
-            let config_val = decrypt_config(config_json, &state.data_dir)?;
+            let config_val = decrypt_config(
+                config_json,
+                &state.data_dir,
+                &claims.tenant_id,
+                data_source_id,
+            )?;
             let cfg: ClickHouseConfig = serde_json::from_value(config_val)
                 .map_err(|_| AppError::ValidationError("invalid clickhouse config".into()))?;
 
@@ -2509,7 +2520,12 @@ async fn execute_once(
                 #[serde(default)]
                 basic_auth: Option<bool>,
             }
-            let config_val = decrypt_config(config_json, &state.data_dir)?;
+            let config_val = decrypt_config(
+                config_json,
+                &state.data_dir,
+                &claims.tenant_id,
+                data_source_id,
+            )?;
             let cfg: TrinoConfig = serde_json::from_value(config_val)
                 .map_err(|_| AppError::ValidationError("invalid trino/presto config".into()))?;
 
@@ -2615,7 +2631,12 @@ async fn execute_once(
                 username: String,
                 password: String,
             }
-            let config_val = decrypt_config(config_json, &state.data_dir)?;
+            let config_val = decrypt_config(
+                config_json,
+                &state.data_dir,
+                &claims.tenant_id,
+                data_source_id,
+            )?;
             let cfg: PgConfig = serde_json::from_value(config_val)
                 .map_err(|_| AppError::ValidationError("invalid postgres config".into()))?;
 
@@ -2790,7 +2811,12 @@ async fn execute_once(
             })
         }
         "mongodb" => {
-            let config_val = decrypt_config(config_json, &state.data_dir)?;
+            let config_val = decrypt_config(
+                config_json,
+                &state.data_dir,
+                &claims.tenant_id,
+                data_source_id,
+            )?;
             let cfg: nl2sql_domain::datasource_config::MongoConfig =
                 serde_json::from_value(config_val).map_err(|error| {
                     AppError::ValidationError(format!("invalid MongoDB config: {error}"))
@@ -3699,10 +3725,56 @@ JOIN `hive`.`ods`.`order_item` oi ON oi.order_id = bo.order_id
             "按设备统计订单数",
             &[],
         );
+        let contract = nl2sql_core::semantic_ir::MetricContract {
+            id: "orders".into(),
+            version: 1,
+            names: vec!["orders".into(), "订单数".into()],
+            expression: nl2sql_core::semantic_ir::MetricExpressionIR::Aggregate {
+                function: "COUNT".into(),
+                expression: Box::new(nl2sql_core::semantic_ir::MetricExpressionIR::Literal(
+                    "*".into(),
+                )),
+                distinct: false,
+            },
+            denominator: None,
+            population: nl2sql_core::semantic_ir::PopulationDefinition {
+                subject: "order".into(),
+                dedup_key: None,
+                exclude_test_users: false,
+                exclude_internal_users: false,
+                valid_record_rule: None,
+            },
+            default_grain: nl2sql_core::semantic_ir::Grain::Custom("grouped".into()),
+            allowed_grains: vec![nl2sql_core::semantic_ir::Grain::Custom("grouped".into())],
+            time_column: "created_at".into(),
+            timezone: "UTC".into(),
+            mandatory_filters: vec![],
+            join_contracts: vec![],
+            invariants: vec![],
+            valid_from: "2026-01-01".into(),
+            valid_until: None,
+            owner: Some("analytics".into()),
+            evidence_refs: vec!["contract://orders/v1".into()],
+        };
+        sqlx::query(
+            "INSERT INTO metric_contracts
+                (id, tenant_id, datasource_id, source_metric_id, version, status,
+                 contract_json, lineage_json, valid_from, valid_until)
+             VALUES ('orders', 'tenant-a', 'datasource-a', NULL, 1, 'active', ?, '{}',
+                     '2026-01-01', NULL)",
+        )
+        .bind(serde_json::to_string(&contract).expect("serialize metric contract"))
+        .execute(&pool)
+        .await
+        .expect("persist metric contract");
+        super::super::semantic_audit::bind_metric_contracts(
+            &mut intent,
+            std::slice::from_ref(&contract),
+        );
         super::super::semantic_audit::bind_schema_dimensions(
             &mut intent,
             &serde_json::json!([{
-                "table_name": "task_offer",
+                "table_name": "orders",
                 "columns": [
                     {"name": "executor_device_id"},
                     {"name": "order_id"}
@@ -3722,12 +3794,12 @@ JOIN `hive`.`ods`.`order_item` oi ON oi.order_id = bo.order_id
         .expect("persist canonical intent");
 
         let preserving = "SELECT executor_device_id, COUNT(*) AS order_count \
-                          FROM task_offer GROUP BY executor_device_id";
+                          FROM orders GROUP BY executor_device_id";
         let initial_audit =
             super::super::semantic_audit::compile_canonical_intent_with_contracts_and_joins(
                 &intent,
                 preserving,
-                &[],
+                std::slice::from_ref(&contract),
                 &[],
             )
             .expect("compile initial semantic release");
@@ -3787,7 +3859,7 @@ JOIN `hive`.`ods`.`order_item` oi ON oi.order_id = bo.order_id
         .expect_err("the same repaired SQL cannot acquire a different audit outcome");
         assert!(overwrite.to_string().contains("immutable"));
 
-        let drifting = "SELECT COUNT(*) AS order_count FROM task_offer";
+        let drifting = "SELECT COUNT(*) AS order_count FROM orders";
         let error = verify_repair_against_canonical_intent(&pool, "tenant-a", "query-a", drifting)
             .await
             .expect_err("repair that drops the requested grain must be blocked");

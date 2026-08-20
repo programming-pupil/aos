@@ -4602,9 +4602,9 @@ fn have_any_provider_key_available(
         }
         for key in &configured.api_keys {
             let identity = provider_key_identity(configured.provider, key);
-            if !blocked_until
+            if blocked_until
                 .get(&identity)
-                .is_some_and(|until| *until > now)
+                .is_none_or(|until| *until <= now)
             {
                 return true;
             }
@@ -4612,9 +4612,9 @@ fn have_any_provider_key_available(
         if let Some(env_keys) = read_provider_api_keys(configured.provider) {
             for key in env_keys {
                 let identity = provider_key_identity(configured.provider, &key);
-                if !blocked_until
+                if blocked_until
                     .get(&identity)
-                    .is_some_and(|until| *until > now)
+                    .is_none_or(|until| *until <= now)
                 {
                     return true;
                 }
@@ -5064,7 +5064,7 @@ fn weather_location_label(location: &Value) -> String {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            if !parts.iter().any(|part| *part == value) {
+            if !parts.contains(&value) {
                 parts.push(value);
             }
         }
@@ -5099,7 +5099,7 @@ fn wmo_weather_description(code: i64) -> &'static str {
         66 | 67 => "freezing rain",
         71 | 73 | 75 => "snowfall",
         77 => "snow grains",
-        80 | 81 | 82 => "rain showers",
+        80..=82 => "rain showers",
         85 | 86 => "snow showers",
         95 => "thunderstorm",
         96 | 99 => "thunderstorm with hail",

@@ -47,7 +47,7 @@ const MAX_GIT_DIFF_CHARS: usize = 50_000;
 /// Neutral identity for the model family line in generated prompts.
 ///
 /// The runtime can drive multiple providers (Anthropic, OpenAI-compatible,
-/// xAI, DashScope). When the active model is not an Anthropic model, the
+/// `xAI`, `DashScope`). When the active model is not an Anthropic model, the
 /// system prompt should not claim a Claude identity.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ModelFamilyIdentity {
@@ -342,8 +342,8 @@ fn discover_instruction_files(
         ] {
             push_context_file(&mut files, candidate)?;
         }
-        push_rules_dir(&mut files, dir.join(".claw").join("rules"))?;
-        push_rules_dir(&mut files, dir.join(".claw").join("rules.local"))?;
+        push_rules_dir(&mut files, &dir.join(".claw").join("rules"))?;
+        push_rules_dir(&mut files, &dir.join(".claw").join("rules.local"))?;
         push_framework_imports(&mut files, &dir, rules_import)?;
     }
     Ok(dedupe_instruction_files(files))
@@ -393,11 +393,11 @@ fn push_context_file(files: &mut Vec<ContextFile>, path: PathBuf) -> std::io::Re
     }
 }
 
-fn push_rules_dir(files: &mut Vec<ContextFile>, dir: PathBuf) -> std::io::Result<()> {
+fn push_rules_dir(files: &mut Vec<ContextFile>, dir: &Path) -> std::io::Result<()> {
     if dir.is_file() {
         return Ok(());
     }
-    let entries = match fs::read_dir(&dir) {
+    let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
@@ -435,21 +435,21 @@ fn push_framework_imports(
 ) -> std::io::Result<()> {
     if rules_import.should_import("cursor") {
         push_context_file(files, dir.join(".cursorrules"))?;
-        push_rules_dir(files, dir.join(".cursor").join("rules"))?;
+        push_rules_dir(files, &dir.join(".cursor").join("rules"))?;
     }
     if rules_import.should_import("copilot") {
         push_context_file(files, dir.join(".github").join("copilot-instructions.md"))?;
     }
     if rules_import.should_import("windsurf") {
         push_context_file(files, dir.join(".windsurfrules"))?;
-        push_rules_dir(files, dir.join(".windsurfrules"))?;
+        push_rules_dir(files, &dir.join(".windsurfrules"))?;
     }
     if rules_import.should_import("plandex") {
         push_context_file(files, dir.join(".plandex").join("instructions.md"))?;
     }
     if rules_import.should_import("crush") {
         push_context_file(files, dir.join(".crush").join("CLAUDE.md"))?;
-        push_rules_dir(files, dir.join(".crush").join("rules"))?;
+        push_rules_dir(files, &dir.join(".crush").join("rules"))?;
     }
     Ok(())
 }

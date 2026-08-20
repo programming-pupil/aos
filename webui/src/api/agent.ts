@@ -485,6 +485,7 @@ export interface RuntimeApprovalPaused {
 
 export interface RuntimeQuestionRequest {
   requestId: string;
+  idempotencyKey: string;
   turnId: string;
   invocationId: string;
   question: string;
@@ -978,12 +979,24 @@ export const agentApi = {
       )
       .then((r) => r.data),
 
-  /** Unanswered durable questions owned by the current authenticated session user. */
-  listSessionQuestions: (sessionId: string) =>
+  /** Pending canonical interactions owned by the authenticated session user. */
+  listSessionInteractions: (sessionId: string) =>
     fastClient
-      .get<{ questions: RuntimeQuestionRequest[] }>(
-        `/agent/sessions/${encodeURIComponent(sessionId)}/questions`,
-      )
+      .get<{ interactions: Array<{
+        interaction_id: string;
+        kind: string;
+        state: string;
+        scope: {
+          turn_id: string;
+          invocation_id: string;
+        };
+        display_projection: {
+          question?: string;
+          options?: string[];
+        };
+        idempotency_key: string;
+        expires_at?: string | null;
+      }> }>(`/agent/sessions/${encodeURIComponent(sessionId)}/interactions`)
       .then((r) => r.data),
 
   /** Toggle pin state of a session */
@@ -1223,9 +1236,10 @@ export function streamAgentSession(
       decision: 'approve' | 'deny' | 'cancel';
       reason?: string;
     };
-    questionAnswers?: Array<{
-      requestId: string;
+    interactions?: Array<{
+      interactionId: string;
       answer: string;
+      idempotencyKey: string;
     }>;
     superAssistant?: {
       app?: string;
@@ -1450,7 +1464,7 @@ export function streamAgentSession(
         documents: options?.documents ?? [],
         turnOptions: options?.turnOptions ?? {},
         ...(options?.approval ? { approval: options.approval } : {}),
-        ...(options?.questionAnswers ? { questionAnswers: options.questionAnswers } : {}),
+        ...(options?.interactions ? { interactions: options.interactions } : {}),
       };
 
   // POST avoids URL length limits for long messages and hides the prompt from logs.

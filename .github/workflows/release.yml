@@ -11,6 +11,7 @@ on:
       - .github/workflows/release.yml
       - scripts/aos-package.sh
       - scripts/aos-package-windows.ps1
+      - scripts/check-onnxruntime-contract.sh
       - scripts/aos-start.sh
       - scripts/aos-start.ps1
       - scripts/aos-stop.sh
@@ -42,7 +43,10 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - name: Verify local embedding runtime contract
+        shell: bash
+        run: ./scripts/check-onnxruntime-contract.sh
       - name: Verify version and release notes
         id: version
         shell: bash
@@ -88,14 +92,14 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: ${{ startsWith(matrix.os, 'macos-') && '13.0' || '' }}
       RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: webui/package-lock.json
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: false
       - uses: Swatinem/rust-cache@v2
@@ -195,7 +199,7 @@ jobs:
           trap - EXIT
 
       - name: Upload verified package artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.artifact }}
           path: |
@@ -212,17 +216,17 @@ jobs:
     env:
       RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: webui/package-lock.json
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: false
       - uses: Swatinem/rust-cache@v2
@@ -396,7 +400,7 @@ jobs:
           }
 
       - name: Upload verified package artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-windows-x86_64
           path: |
@@ -416,9 +420,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Download verified packages
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: release

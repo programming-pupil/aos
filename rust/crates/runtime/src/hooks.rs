@@ -409,6 +409,7 @@ impl HookRunner {
     }
 
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn run_hook_event_with_context(
         &self,
         event: HookEvent,
@@ -437,7 +438,7 @@ impl HookRunner {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn run_commands(
         event: HookEvent,
         commands: &[RuntimeHookEntry],
@@ -603,7 +604,7 @@ impl HookRunner {
         result
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn run_command(
         command: &str,
         timeout_seconds: Option<u32>,

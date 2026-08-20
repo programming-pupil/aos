@@ -9,8 +9,12 @@ mod error;
 pub mod nl2sql;
 mod routes;
 mod semantic_kernel_store;
+mod semantic_memory_worker;
 mod state;
 mod telemetry;
+
+#[cfg(debug_assertions)]
+use crate::semantic_kernel_store::process_fault_point;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -40,6 +44,15 @@ pub(crate) fn sqlite_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+pub(crate) fn behavior_trace(case_id: &str) {
+    if std::env::var("AOS_BEHAVIOR_TRACE_CASE").as_deref() == Ok(case_id) {
+        static EMITTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if EMITTED.set(()).is_ok() {
+            eprintln!("AOS_PRODUCTION_TRACE\t{case_id}");
+        }
+    }
+}
+
 #[cfg(feature = "nl2sql")]
 pub fn warm_local_embedding_model(cache_dir: PathBuf) -> anyhow::Result<()> {
     crate::nl2sql::embedding::configure_local_embedding_cache_dir(cache_dir)?;
@@ -49,6 +62,884 @@ pub fn warm_local_embedding_model(cache_dir: PathBuf) -> anyhow::Result<()> {
 #[cfg(feature = "nl2sql")]
 pub fn shutdown_local_embedding_model() {
     crate::nl2sql::embedding::shutdown_local_embedding_model();
+}
+
+/// Rebuild the searchable Memory projection from canonical structured facts.
+/// A projection may be deleted and regenerated without ever becoming an
+/// authority. With `verify_hash`, every rebuilt user scope is checked against
+/// its durable projection-state hash before the command succeeds.
+pub async fn rebuild_memory_projection(
+    data_dir: PathBuf,
+    tenant_id: &str,
+    user_id: Option<&str>,
+    verify_hash: bool,
+) -> anyhow::Result<usize> {
+    let state = state::AppState::new(data_dir, Some("memory-projection-rebuild".into())).await?;
+    let users = if let Some(user_id) = user_id.filter(|value| !value.trim().is_empty()) {
+        vec![user_id.to_string()]
+    } else {
+        sqlx::query_scalar::<sqlx::Sqlite, String>(
+            "SELECT DISTINCT user_id FROM structured_memory_facts
+             WHERE tenant_id = ? ORDER BY user_id",
+        )
+        .bind(tenant_id)
+        .fetch_all(&state.db)
+        .await?
+    };
+    let mut rebuilt = 0usize;
+    for user_id in users {
+        let mut tx = state.db.begin().await?;
+        crate::semantic_kernel_store::acquire_sqlite_write_lock(&mut tx).await?;
+        let projection_hash =
+            memory_engine::SqliteMemoryTransaction::rebuild_projection_in_transaction(
+                &mut tx, tenant_id, &user_id,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        tx.commit().await?;
+        if verify_hash {
+            let stored_hash = sqlx::query_scalar::<sqlx::Sqlite, String>(
+                "SELECT projection_hash FROM memory_projection_state
+                 WHERE tenant_id = ? AND user_id = ?",
+            )
+            .bind(tenant_id)
+            .bind(&user_id)
+            .fetch_one(&state.db)
+            .await?;
+            anyhow::ensure!(
+                stored_hash == projection_hash,
+                "memory projection hash mismatch for tenant `{tenant_id}` user `{user_id}`"
+            );
+        }
+        println!(
+            "Memory projection rebuilt: tenant={tenant_id} user={user_id} hash={projection_hash}"
+        );
+        rebuilt += 1;
+    }
+    Ok(rebuilt)
+}
+
+/// Execute one black-box persistence TCK phase in a real `web-server`
+/// process. This is deliberately available only to debug builds; the
+/// integration test starts a fresh binary for `prepare`, observes its fault
+/// exit, then starts another binary against the same data directory for
+/// `recover`.
+#[cfg(debug_assertions)]
+fn process_tck_memory_draft(
+    session: &str,
+    tenant: &str,
+    user: &str,
+) -> memory_engine::MemoryFactDraft {
+    memory_engine::MemoryFactDraft {
+        fact_id: format!("{session}-fact"),
+        projection_id: format!("{session}-projection"),
+        tenant_id: tenant.into(),
+        user_id: user.into(),
+        scope: "session".into(),
+        app: "chat".into(),
+        session_id: Some(session.into()),
+        channel: "long_term_memory".into(),
+        kind: "fact".into(),
+        subject: serde_json::json!({"entityType":"user","canonicalId":user}),
+        predicate: "release_region".into(),
+        value: serde_json::json!("APAC"),
+        text: "The release region is APAC".into(),
+        evidence_id: format!("{session}-evidence"),
+        evidence_hash: "memory-source-hash".into(),
+        valid_from: None,
+        valid_until: None,
+        confidence: 1.0,
+        sensitivity: "internal".into(),
+        lifecycle: memory_engine::FactLifecycle::Candidate,
+        authority: vec!["user".into()],
+        source_event_ids: vec![format!("{session}-event")],
+        pollution_lineage: Vec::new(),
+        memory_type: "fact".into(),
+        source_type: "process_tck".into(),
+        pinned: false,
+        metadata: serde_json::json!({"case":"process-fault"}),
+        stale_at: None,
+        verified_at: None,
+        embedding_model: None,
+        embedding_dimensions: None,
+        embedding_json: None,
+    }
+}
+
+#[cfg(debug_assertions)]
+pub async fn run_semantic_kernel_process_tck(
+    data_dir: PathBuf,
+    case: String,
+    mode: String,
+) -> anyhow::Result<()> {
+    use chrono::{Duration as ChronoDuration, Utc};
+    use runtime::AgentExecutionKernel;
+
+    crate::behavior_trace("FAULT-001");
+    crate::behavior_trace("KEY-001");
+    let prepare = mode == "prepare";
+    if mode != "prepare" && mode != "recover" {
+        anyhow::bail!("unknown semantic-kernel TCK mode `{mode}`");
+    }
+    // A recovery process must be able to open the database even when the
+    // prepare process was killed after a commit boundary. Keep the original
+    // point as test metadata, but never re-trigger it during startup.
+    let expected_fault_point = std::env::var("AOS_PROCESS_FAULT_POINT").unwrap_or_default();
+    if !prepare {
+        std::env::remove_var("AOS_PROCESS_FAULT_POINT");
+    }
+    let state = state::AppState::new(data_dir.clone(), Some("semantic-kernel-tck".into())).await?;
+    let db = state.db.clone();
+    let tenant = "tck-tenant";
+    let user = "tck-user";
+    let session = format!("tck-{case}");
+    let turn = format!("{session}-turn");
+    let kernel = crate::semantic_kernel_store::RuntimeExecutionKernel::new(
+        db.clone(),
+        tenant,
+        user,
+        &session,
+    );
+    match case.as_str() {
+        "migration" => {
+            let migrations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+                .fetch_one(&db)
+                .await?;
+            anyhow::ensure!(
+                migrations >= 34,
+                "migration ledger is incomplete: {migrations}"
+            );
+            if prepare {
+                process_fault_point("migration.after_commit");
+            }
+            println!("AOS_PROCESS_RESTART_EVIDENCE\tmigration\t{migrations}");
+        }
+        "turn" => {
+            if prepare {
+                kernel
+                    .start_turn(runtime::RuntimeTurnStart {
+                        turn_id: turn.clone(),
+                        user_input: "process fault turn input".into(),
+                    })
+                    .await?;
+                let mut session_state = runtime::Session::new();
+                session_state.session_id = session.clone();
+                session_state.tenant_id = Some(tenant.into());
+                session_state.user_id = Some(user.into());
+                session_state.restore_turn(
+                    turn.clone(),
+                    "process fault turn input",
+                    0,
+                    None,
+                    runtime::SessionTurnStatus::Completed,
+                );
+                session_state
+                    .messages
+                    .push(runtime::ConversationMessage::user_text(
+                        "process fault turn input",
+                    ));
+                kernel
+                    .finish_turn_with_checkpoint(
+                        &turn,
+                        runtime::RuntimeTurnTerminalStatus::Completed,
+                        Some("process TCK"),
+                        &session_state,
+                    )
+                    .await?;
+            } else {
+                kernel.recover().await?;
+                let status: String = sqlx::query_scalar(
+                    "SELECT status FROM agent_turns WHERE tenant_id = ? AND thread_id = ? AND id = ?",
+                )
+                .bind(tenant)
+                .bind(&session)
+                .bind(&turn)
+                .fetch_one(&db)
+                .await?;
+                let checkpoints: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM execution_checkpoints WHERE tenant_id = ? AND thread_id = ?",
+                )
+                .bind(tenant)
+                .bind(&session)
+                .fetch_one(&db)
+                .await?;
+                if checkpoints == 0 {
+                    anyhow::ensure!(
+                        status == "recovery_required",
+                        "unexpected pre-commit turn status: {status}"
+                    );
+                } else {
+                    anyhow::ensure!(
+                        status == "completed",
+                        "unexpected committed turn status: {status}"
+                    );
+                    anyhow::ensure!(
+                        checkpoints == 1,
+                        "committed terminal did not keep one checkpoint"
+                    );
+                }
+                println!("AOS_PROCESS_RESTART_EVIDENCE\tturn\t{status}\t{checkpoints}");
+            }
+        }
+        case if matches!(
+            case,
+            "interaction-approval"
+                | "interaction-question"
+                | "interaction-credential"
+                | "interaction-oauth"
+        ) || case == "interaction" =>
+        {
+            let interaction_kind = match case {
+                "interaction-approval" => agent_protocol::InteractionKind::Approval,
+                "interaction-credential" => agent_protocol::InteractionKind::CredentialRequest,
+                "interaction-oauth" => agent_protocol::InteractionKind::ExternalAuthorization,
+                _ => agent_protocol::InteractionKind::UserQuestion,
+            };
+            let invocation_id = format!("{case}-invocation");
+            let interaction_id = if interaction_kind == agent_protocol::InteractionKind::Approval {
+                crate::semantic_kernel_store::tenant_scoped_record_id(
+                    "approval",
+                    tenant,
+                    &format!("{session}:{turn}:{invocation_id}"),
+                )
+            } else {
+                format!("{session}-interaction")
+            };
+            if prepare {
+                kernel
+                    .start_turn(runtime::RuntimeTurnStart {
+                        turn_id: turn.clone(),
+                        user_input: "wait for durable answer".into(),
+                    })
+                    .await?;
+                if interaction_kind == agent_protocol::InteractionKind::Approval {
+                    sqlx::query(
+                        "INSERT INTO capability_tokens
+                            (id, tenant_id, user_id, session_id, tool_name,
+                             resource_scope, action_scope, executor_scope,
+                             expires_at, remaining_uses)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, 'native',
+                                 datetime('now', '+15 minutes'), 1)
+                         ON CONFLICT(id) DO NOTHING",
+                    )
+                    .bind(format!("{interaction_id}-capability"))
+                    .bind(tenant)
+                    .bind(user)
+                    .bind(&session)
+                    .bind("process_tck_tool")
+                    .bind("process-tck-input")
+                    .bind("execute")
+                    .execute(&db)
+                    .await?;
+                    kernel
+                        .request_approval(&runtime::RuntimeApprovalRequest {
+                            turn_id: turn.clone(),
+                            invocation_id: invocation_id.clone(),
+                            tool_name: "process_tck_tool".into(),
+                            input: "process-tck-input".into(),
+                            iteration: 1,
+                            request: runtime::PermissionRequest {
+                                tool_name: "process_tck_tool".into(),
+                                input: "process-tck-input".into(),
+                                current_mode: runtime::PermissionMode::ReadOnly,
+                                required_mode: runtime::PermissionMode::WorkspaceWrite,
+                                reason: Some("process TCK approval".into()),
+                            },
+                            contract: runtime::RuntimeToolContract::test_read_only(
+                                "process_tck_tool",
+                            ),
+                        })
+                        .await?;
+                } else {
+                    kernel
+                        .request_interaction(&runtime::RuntimeInteractionRequest {
+                            interaction_id: interaction_id.clone(),
+                            kind: interaction_kind,
+                            turn_id: turn.clone(),
+                            invocation_id,
+                            owner_user_id: user.into(),
+                            allowed_responder_ids: Vec::new(),
+                            capability_requirement: None,
+                            request_schema_hash: "tck-interaction-v1".into(),
+                            choice_schema_hash: None,
+                            display_projection: serde_json::json!({"title":"TCK interaction"}),
+                            idempotency_key: format!("request-{interaction_id}"),
+                            expected_turn_revision: 0,
+                            expires_at: Some(Utc::now() + ChronoDuration::minutes(5)),
+                        })
+                        .await?;
+                }
+            } else {
+                kernel.recover().await?;
+                let pending = crate::semantic_kernel_store::list_runtime_interactions(
+                    &db, tenant, user, &session,
+                )
+                .await?;
+                let expected_pending =
+                    usize::from(!expected_fault_point.ends_with(".before_commit"));
+                anyhow::ensure!(
+                    pending.len() == expected_pending,
+                    "pending interaction recovery count mismatch: expected {expected_pending}, got {}",
+                    pending.len()
+                );
+                if pending.is_empty() {
+                    println!("AOS_PROCESS_RESTART_EVIDENCE\t{case}\trolled_back");
+                    return Ok(());
+                }
+                let response_projection = match interaction_kind {
+                    agent_protocol::InteractionKind::UserQuestion => {
+                        Some(serde_json::json!({"answer":"confirmed after restart"}))
+                    }
+                    agent_protocol::InteractionKind::Approval => {
+                        Some(serde_json::json!({"decision":"granted"}))
+                    }
+                    agent_protocol::InteractionKind::CredentialRequest => None,
+                    agent_protocol::InteractionKind::ExternalAuthorization => {
+                        Some(serde_json::json!({"authorization":"granted"}))
+                    }
+                };
+                let response_state = match interaction_kind {
+                    agent_protocol::InteractionKind::Approval => {
+                        agent_protocol::InteractionState::Granted
+                    }
+                    _ => agent_protocol::InteractionState::Responded,
+                };
+                let encrypted_secret_ref = match interaction_kind {
+                    agent_protocol::InteractionKind::CredentialRequest => {
+                        Some("secret://process-tck/credential".to_string())
+                    }
+                    _ => None,
+                };
+                let resolution = runtime::RuntimeInteractionResolution {
+                    interaction_id: interaction_id.clone(),
+                    turn_id: turn.clone(),
+                    responder_user_id: user.into(),
+                    state: response_state,
+                    response_projection,
+                    encrypted_secret_ref,
+                    idempotency_key: "answer-once".into(),
+                };
+                let answered =
+                    runtime::AgentExecutionKernel::respond_interaction(&kernel, &resolution)
+                        .await?;
+                anyhow::ensure!(
+                    answered.state == response_state,
+                    "interaction response state was not persisted"
+                );
+                let consumed = runtime::AgentExecutionKernel::consume_interaction(
+                    &kernel,
+                    &interaction_id,
+                    &turn,
+                    "answer-once",
+                )
+                .await?;
+                anyhow::ensure!(
+                    consumed.state == agent_protocol::InteractionState::Consumed,
+                    "interaction was not consumed after restart"
+                );
+                let duplicate = runtime::AgentExecutionKernel::consume_interaction(
+                    &kernel,
+                    &interaction_id,
+                    &turn,
+                    "different-replay",
+                )
+                .await;
+                anyhow::ensure!(
+                    duplicate.is_err(),
+                    "duplicate interaction resume unexpectedly succeeded"
+                );
+                let state: String = sqlx::query_scalar(
+                    "SELECT state FROM durable_interactions WHERE tenant_id = ? AND id = ?",
+                )
+                .bind(tenant)
+                .bind(&interaction_id)
+                .fetch_one(&db)
+                .await?;
+                anyhow::ensure!(
+                    state == "consumed",
+                    "interaction did not reach consumed: {state}"
+                );
+                println!("AOS_PROCESS_RESTART_EVIDENCE\t{case}\t{state}");
+            }
+        }
+        "tool" => {
+            let invocation_id = format!("{session}-tool");
+            let intent = runtime::RuntimeToolIntent::new(
+                &turn,
+                &invocation_id,
+                "read_file",
+                "README.md",
+                1,
+                true,
+                None,
+            );
+            if prepare {
+                kernel
+                    .start_turn(runtime::RuntimeTurnStart {
+                        turn_id: turn.clone(),
+                        user_input: "execute one governed tool".into(),
+                    })
+                    .await?;
+                kernel.authorize_tool(&intent).await?;
+                kernel.start_tool(&intent).await?;
+                kernel
+                    .finish_tool(runtime::RuntimeToolOutcome {
+                        turn_id: turn.clone(),
+                        invocation_id: invocation_id.clone(),
+                        tool_name: "read_file".into(),
+                        input: "README.md".into(),
+                        output: "tool output ".repeat(20_000),
+                        iteration: 1,
+                        outcome: runtime::RuntimeToolOutcomeKind::Completed,
+                    })
+                    .await?;
+            } else {
+                kernel.recover().await?;
+                let lifecycle: String = sqlx::query_scalar(
+                    "SELECT lifecycle_state FROM tool_invocations
+                     WHERE tenant_id = ? AND thread_id = ? AND turn_id = ?
+                       AND tool_name = 'read_file'",
+                )
+                .bind(tenant)
+                .bind(&session)
+                .bind(&turn)
+                .fetch_one(&db)
+                .await?;
+                let artifacts: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM artifact_objects WHERE tenant_id = ? AND owner_scope = ?",
+                )
+                .bind(tenant)
+                .bind(&session)
+                .fetch_one(&db)
+                .await?;
+                if lifecycle == "outcome_unknown" {
+                    anyhow::ensure!(artifacts == 0, "unknown tool outcome created an artifact");
+                } else {
+                    anyhow::ensure!(
+                        lifecycle == "completed",
+                        "unexpected committed tool state: {lifecycle}"
+                    );
+                    anyhow::ensure!(artifacts == 1, "committed tool outcome lost its artifact");
+                }
+                println!("AOS_PROCESS_RESTART_EVIDENCE\ttool\t{lifecycle}\t{artifacts}");
+            }
+        }
+        "compaction" => {
+            let archived = vec![
+                runtime::ConversationMessage::user_text("The release region is APAC. ".repeat(100)),
+                runtime::ConversationMessage::assistant(vec![runtime::ContentBlock::Text {
+                    text: "The hard constraint is verify before release. ".repeat(100),
+                }]),
+            ];
+            if prepare {
+                kernel
+                    .start_turn(runtime::RuntimeTurnStart {
+                        turn_id: turn.clone(),
+                        user_input: archived[0]
+                            .blocks
+                            .iter()
+                            .find_map(|block| match block {
+                                runtime::ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_default(),
+                    })
+                    .await?;
+                kernel
+                    .record_assistant_message(&turn, 1, &archived[1])
+                    .await?;
+                let packet = semantic_core::ContextPacket {
+                    objective: "compaction TCK".into(),
+                    envelope: semantic_core::ContextEnvelope::default(),
+                    blocks: Vec::new(),
+                    manifest: semantic_core::ContextManifest {
+                        max_tokens: 1024,
+                        used_tokens: 0,
+                        blocks: Vec::new(),
+                        snapshot_version: None,
+                    },
+                };
+                kernel
+                    .record_context_manifest(runtime::RuntimeContextManifestInput {
+                        turn_id: turn.clone(),
+                        iteration: 1,
+                        budget_stage: runtime::RuntimeModelBudgetStage::General,
+                        system_sections: Vec::new(),
+                        messages: archived.clone(),
+                        estimated_tokens: 2,
+                        max_input_tokens: 1024,
+                        model_version: Some("semantic-kernel-tck".into()),
+                        active_tools: Vec::new(),
+                        context_packet: packet,
+                        prompt_manifest: None,
+                        semantic_snapshot_version: None,
+                    })
+                    .await?;
+                let mut session_state = runtime::Session::new();
+                session_state.session_id = session.clone();
+                session_state.tenant_id = Some(tenant.into());
+                session_state.user_id = Some(user.into());
+                session_state.messages = archived.clone();
+                session_state
+                    .messages
+                    .push(runtime::ConversationMessage::user_text("retained tail"));
+                let result = runtime::compact_session(
+                    &session_state,
+                    runtime::CompactionConfig {
+                        preserve_recent_messages: 1,
+                        max_estimated_tokens: 0,
+                    },
+                );
+                let coverage = crate::semantic_kernel_store::ledger_coverage_for_archive(
+                    &db, tenant, &session, &archived,
+                )
+                .await?;
+                let transaction_id = crate::semantic_kernel_store::prepare_compaction_transaction(
+                    &db,
+                    tenant,
+                    user,
+                    &session,
+                    "process-tck",
+                    &coverage.event_sequences,
+                    &coverage.message_event_ids,
+                    &coverage.parent_compaction_ids,
+                    &archived,
+                    &[],
+                    &result.summary,
+                )
+                .await?;
+                crate::semantic_kernel_store::commit_compaction_transaction(
+                    &db,
+                    tenant,
+                    user,
+                    &session,
+                    "chat",
+                    &transaction_id,
+                    "process-tck",
+                    &result,
+                )
+                .await?;
+            } else {
+                kernel.recover().await?;
+                let status: Option<String> = sqlx::query_scalar(
+                    "SELECT status FROM compaction_transactions WHERE tenant_id = ? AND thread_id = ?",
+                )
+                .bind(tenant)
+                .bind(&session)
+                .fetch_optional(&db)
+                .await?;
+                // A prepare-before-commit fault rolls the insert back, so no
+                // transaction row is expected after restart. Treat that
+                // absence as the deterministic aborted state.
+                let status = status.unwrap_or_else(|| "aborted".into());
+                let artifacts: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM artifact_objects WHERE tenant_id = ? AND owner_scope = ?",
+                )
+                .bind(tenant)
+                .bind(&session)
+                .fetch_one(&db)
+                .await?;
+                if status == "aborted" {
+                    anyhow::ensure!(artifacts == 0, "faulted compaction published an artifact");
+                } else {
+                    anyhow::ensure!(
+                        status == "committed",
+                        "unexpected committed compaction state: {status}"
+                    );
+                    anyhow::ensure!(artifacts == 1, "committed compaction lost its artifact");
+                }
+                println!("AOS_PROCESS_RESTART_EVIDENCE\tcompaction\t{status}\t{artifacts}");
+            }
+        }
+        "memory" => {
+            let draft = process_tck_memory_draft(&session, tenant, user);
+            if prepare {
+                let mut repository = memory_engine::SqliteMemoryRepositoryAdapter::new(db.clone());
+                memory_engine::MemoryRepository::upsert(&mut repository, draft.clone()).await?;
+                process_fault_point("memory.repository.after_commit");
+            }
+            let facts: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM structured_memory_facts WHERE tenant_id = ? AND id = ?",
+            )
+            .bind(tenant)
+            .bind(&draft.fact_id)
+            .fetch_one(&db)
+            .await?;
+            let projections: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM agent_memory_items WHERE tenant_id = ? AND id = ?",
+            )
+            .bind(tenant)
+            .bind(&draft.projection_id)
+            .fetch_one(&db)
+            .await?;
+            anyhow::ensure!(
+                facts == projections && (facts == 0 || facts == 1),
+                "memory repository left a partial projection"
+            );
+            println!("AOS_PROCESS_RESTART_EVIDENCE\tmemory\t{facts}\t{projections}");
+        }
+        "memory-consolidation" => {
+            let draft = process_tck_memory_draft(&session, tenant, user);
+            if prepare {
+                let mut repository = memory_engine::SqliteMemoryRepositoryAdapter::new(db.clone());
+                memory_engine::MemoryRepository::upsert(&mut repository, draft.clone()).await?;
+                crate::semantic_memory_worker::run_memory_maintenance_once(
+                    &db,
+                    "process-tck-memory-worker",
+                )
+                .await?;
+            } else {
+                // A before-commit crash leaves a claimed batch whose lease is
+                // still owned by this deterministic worker ID. An after-commit
+                // crash leaves the cursor advanced. Running one maintenance
+                // iteration is correct and idempotent in both states.
+                let _ = crate::semantic_memory_worker::run_memory_maintenance_once(
+                    &db,
+                    "process-tck-memory-worker",
+                )
+                .await?;
+                let lifecycle: String = sqlx::query_scalar(
+                    "SELECT lifecycle FROM structured_memory_facts
+                     WHERE tenant_id = ? AND id = ?",
+                )
+                .bind(tenant)
+                .bind(&draft.fact_id)
+                .fetch_one(&db)
+                .await?;
+                let enabled: i64 = sqlx::query_scalar(
+                    "SELECT enabled FROM agent_memory_items
+                     WHERE tenant_id = ? AND id = ?",
+                )
+                .bind(tenant)
+                .bind(&draft.projection_id)
+                .fetch_one(&db)
+                .await?;
+                let batch_status: String = sqlx::query_scalar(
+                    "SELECT status FROM memory_consolidation_batches
+                     WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 1",
+                )
+                .bind(tenant)
+                .fetch_one(&db)
+                .await?;
+                let cursor: i64 = sqlx::query_scalar(
+                    "SELECT cursor_sequence FROM memory_consolidation_leases
+                     WHERE tenant_id = ?",
+                )
+                .bind(tenant)
+                .fetch_one(&db)
+                .await?;
+                let max_sequence: i64 = sqlx::query_scalar(
+                    "SELECT MAX(global_sequence) FROM memory_fact_events
+                     WHERE tenant_id = ?",
+                )
+                .bind(tenant)
+                .fetch_one(&db)
+                .await?;
+                anyhow::ensure!(
+                    lifecycle == "confirmed" && enabled == 1,
+                    "consolidation did not atomically publish the canonical fact and projection"
+                );
+                anyhow::ensure!(batch_status == "committed", "batch was not recovered");
+                anyhow::ensure!(
+                    cursor == max_sequence,
+                    "consolidation cursor does not match the committed event sequence"
+                );
+                println!(
+                    "AOS_PROCESS_RESTART_EVIDENCE\tmemory-consolidation\t{lifecycle}\t{batch_status}\t{cursor}"
+                );
+            }
+        }
+        "rotation" => {
+            if prepare {
+                std::env::set_var("ENCRYPTION_KEY", "11111111111111111111111111111111");
+                std::env::set_var("ENCRYPTION_KEY_ID", "old-tck");
+                std::env::remove_var("ENCRYPTION_KEY_RING");
+                let old = agent_gateway::crypto::encrypt_scoped(
+                    "rotation payload",
+                    &agent_gateway::crypto::scoped_aad(
+                        "context_manifest.raw",
+                        tenant,
+                        "rotation-manifest",
+                    ),
+                )?;
+                std::env::set_var("ENCRYPTION_KEY", "22222222222222222222222222222222");
+                std::env::set_var("ENCRYPTION_KEY_ID", "new-tck");
+                std::env::set_var(
+                    "ENCRYPTION_KEY_RING",
+                    r#"{"old-tck":"11111111111111111111111111111111"}"#,
+                );
+                sqlx::query(
+                    "INSERT INTO context_packet_manifests
+                     (id, tenant_id, thread_id, manifest_hash, manifest_json,
+                      raw_manifest_hash, raw_manifest_ciphertext, created_at)
+                     VALUES ('rotation-manifest', ?, 'rotation-session', 'hash', '{}', 'raw', ?, CURRENT_TIMESTAMP)",
+                )
+                .bind(tenant)
+                .bind(old)
+                .execute(&db)
+                .await?;
+                crate::semantic_kernel_store::rotate_encrypted_payload_batch_with_data_dir(
+                    &db, &data_dir, 20,
+                )
+                .await?;
+            } else {
+                let rotated =
+                    crate::semantic_kernel_store::rotate_encrypted_payload_batch_with_data_dir(
+                        &db, &data_dir, 20,
+                    )
+                    .await?;
+                anyhow::ensure!(rotated >= 1, "rotation did not rewrite the stale payload");
+                let certificate = crate::semantic_kernel_store::issue_key_retirement_certificate(
+                    &db, &data_dir, "old-tck", true,
+                )
+                .await?;
+                let stored: String = sqlx::query_scalar(
+                    "SELECT registry_snapshot_hash FROM key_retirement_certificates WHERE key_id = 'old-tck'",
+                )
+                .fetch_one(&db)
+                .await?;
+                anyhow::ensure!(
+                    stored == certificate,
+                    "retirement certificate hash mismatch"
+                );
+                println!("AOS_PROCESS_RESTART_EVIDENCE\trotation\t{rotated}\t{certificate}");
+            }
+        }
+        "rotation-negative" => {
+            let without_backup = crate::semantic_kernel_store::issue_key_retirement_certificate(
+                &db, &data_dir, "old-tck", false,
+            )
+            .await
+            .expect_err("retirement without backup confirmation must be rejected");
+            anyhow::ensure!(
+                without_backup
+                    .to_string()
+                    .contains("backup-policy confirmation"),
+                "wrong backup-policy rejection: {without_backup}"
+            );
+            let unknown = crate::semantic_kernel_store::issue_key_retirement_certificate(
+                &db,
+                &data_dir,
+                "unknown-tck",
+                true,
+            )
+            .await
+            .expect_err("an unknown key must be rejected");
+            anyhow::ensure!(
+                unknown
+                    .to_string()
+                    .contains("not present in the configured key ring"),
+                "wrong unknown-key rejection: {unknown}"
+            );
+            let active = crate::semantic_kernel_store::issue_key_retirement_certificate(
+                &db, &data_dir, "new-tck", true,
+            )
+            .await
+            .expect_err("the active key must be rejected");
+            anyhow::ensure!(
+                active.to_string().contains("active encryption key"),
+                "wrong active-key rejection: {active}"
+            );
+            sqlx::query(
+                "INSERT INTO context_packet_manifests
+                    (id, tenant_id, thread_id, manifest_hash, manifest_json,
+                     raw_manifest_hash, raw_manifest_ciphertext, created_at)
+                 VALUES ('rotation-legacy', ?, 'rotation-session', 'hash', '{}',
+                         'raw', 'legacy-ciphertext', CURRENT_TIMESTAMP)",
+            )
+            .bind(tenant)
+            .execute(&db)
+            .await?;
+            let unknown_ciphertext =
+                crate::semantic_kernel_store::issue_key_retirement_certificate(
+                    &db, &data_dir, "old-tck", true,
+                )
+                .await
+                .expect_err("unversioned ciphertext must block retirement");
+            anyhow::ensure!(
+                unknown_ciphertext
+                    .to_string()
+                    .contains("unknown or unversioned ciphertext"),
+                "wrong unversioned-ciphertext rejection: {unknown_ciphertext}"
+            );
+            sqlx::query("DELETE FROM context_packet_manifests WHERE id = 'rotation-legacy'")
+                .execute(&db)
+                .await?;
+            std::env::set_var("ENCRYPTION_KEY", "11111111111111111111111111111111");
+            std::env::set_var("ENCRYPTION_KEY_ID", "old-tck");
+            std::env::remove_var("ENCRYPTION_KEY_RING");
+            let old_ciphertext = agent_gateway::crypto::encrypt_scoped(
+                "retiring payload",
+                &agent_gateway::crypto::scoped_aad(
+                    "context_manifest.raw",
+                    tenant,
+                    "rotation-reference",
+                ),
+            )?;
+            std::env::set_var("ENCRYPTION_KEY", "22222222222222222222222222222222");
+            std::env::set_var("ENCRYPTION_KEY_ID", "new-tck");
+            std::env::set_var(
+                "ENCRYPTION_KEY_RING",
+                r#"{"old-tck":"11111111111111111111111111111111"}"#,
+            );
+            sqlx::query(
+                "INSERT INTO context_packet_manifests
+                    (id, tenant_id, thread_id, manifest_hash, manifest_json,
+                     raw_manifest_hash, raw_manifest_ciphertext, created_at)
+                 VALUES ('rotation-reference', ?, 'rotation-session', 'hash', '{}',
+                         'raw', ?, CURRENT_TIMESTAMP)",
+            )
+            .bind(tenant)
+            .bind(old_ciphertext)
+            .execute(&db)
+            .await?;
+            let referenced = crate::semantic_kernel_store::issue_key_retirement_certificate(
+                &db, &data_dir, "old-tck", true,
+            )
+            .await
+            .expect_err("a still-referenced old key must be rejected");
+            anyhow::ensure!(
+                referenced
+                    .to_string()
+                    .contains("still has ciphertext references"),
+                "wrong referenced-key rejection: {referenced}"
+            );
+            sqlx::query("DELETE FROM context_packet_manifests WHERE id = 'rotation-reference'")
+                .execute(&db)
+                .await?;
+            let wrong_aad_ciphertext = agent_gateway::crypto::encrypt_scoped(
+                "misbound payload",
+                &agent_gateway::crypto::scoped_aad("context_manifest.raw", tenant, "different-row"),
+            )?;
+            sqlx::query(
+                "INSERT INTO context_packet_manifests
+                    (id, tenant_id, thread_id, manifest_hash, manifest_json,
+                     raw_manifest_hash, raw_manifest_ciphertext, created_at)
+                 VALUES ('rotation-wrong-aad', ?, 'rotation-session', 'hash', '{}',
+                         'raw', ?, CURRENT_TIMESTAMP)",
+            )
+            .bind(tenant)
+            .bind(wrong_aad_ciphertext)
+            .execute(&db)
+            .await?;
+            let misbound = crate::semantic_kernel_store::issue_key_retirement_certificate(
+                &db, &data_dir, "old-tck", true,
+            )
+            .await
+            .expect_err("wrong AAD must block retirement");
+            anyhow::ensure!(
+                misbound
+                    .to_string()
+                    .contains("failed sampled scoped decrypt"),
+                "wrong sampled-decrypt rejection: {misbound}"
+            );
+            println!(
+                "AOS_PROCESS_RESTART_EVIDENCE\trotation-negative\tbackup\tunknown\tactive\tlegacy\treferenced\taad"
+            );
+        }
+        other => anyhow::bail!("unknown semantic-kernel TCK case `{other}`"),
+    }
+    Ok(())
 }
 
 /// Acquire SQLite's single-writer lock before a transaction reads state that it
@@ -204,6 +1095,113 @@ mod sqlite_baseline_tests {
         assert_eq!(api_key_profile_column_count, 1);
         assert_eq!(rd_spec_repository_ids_column_count, 1);
         pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn memory_v3_migration_preserves_canonical_facts_and_quarantines_projection_only_rows() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open Memory migration fixture");
+        migrate_through(&pool, 33).await;
+        for (id, content) in [
+            ("canonical-projection", "owner confirmed timezone UTC"),
+            ("projection-only", "unverified model guess"),
+        ] {
+            sqlx::query(
+                "INSERT INTO agent_memory_items
+                   (id, tenant_id, user_id, scope, app, session_key, memory_type,
+                    content, content_hash, source_type, confidence, enabled,
+                    embedding_model, embedding_dimensions, embedding_json)
+                 VALUES (?, 'tenant-memory', 'user-memory', 'global', 'chat', '',
+                         'preference', ?, ?, 'legacy', 0.9, 1,
+                         'stale-model', 2, '[0.1,0.2]')",
+            )
+            .bind(id)
+            .bind(content)
+            .bind(format!("hash:{id}"))
+            .execute(&pool)
+            .await
+            .expect("seed Memory projection");
+        }
+        sqlx::query(
+            "INSERT INTO structured_memory_facts
+               (id, tenant_id, user_id, scope, app, channel, kind, subject_json,
+                predicate, value_json, text, evidence_id, evidence_hash,
+                observed_at, confidence, sensitivity, current,
+                projection_memory_id, candidate_json)
+             VALUES ('canonical-fact', 'tenant-memory', 'user-memory', 'global',
+                     'chat', 'continuity', 'preference', '{\"kind\":\"user\"}',
+                     'user.timezone', '{\"value\":\"UTC\"}',
+                     'owner confirmed timezone UTC', 'owner-answer',
+                     'hash:canonical-projection', CURRENT_TIMESTAMP, 1.0,
+                     'internal', 1, 'canonical-projection', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed canonical Memory fact");
+
+        sqlx::migrate!("./sqlite-migrations")
+            .run(&pool)
+            .await
+            .expect("upgrade Memory fixture to v3");
+
+        let facts = sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT projection_memory_id, lifecycle, current
+             FROM structured_memory_facts
+             WHERE tenant_id = 'tenant-memory' ORDER BY projection_memory_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read migrated facts");
+        assert_eq!(
+            facts,
+            vec![
+                ("canonical-projection".into(), "confirmed".into(), 1),
+                ("projection-only".into(), "candidate".into(), 0),
+            ]
+        );
+        let rows = sqlx::query_as::<_, (String, String, Option<String>, i64)>(
+            "SELECT fact.lifecycle, fact.candidate_json, item.embedding_json,
+                    EXISTS (
+                      SELECT 1 FROM memory_embedding_rebuild_outbox AS rebuild
+                      WHERE rebuild.fact_id = fact.id
+                    )
+             FROM structured_memory_facts AS fact
+             INNER JOIN agent_memory_items AS item
+               ON item.id = fact.projection_memory_id
+             WHERE fact.tenant_id = 'tenant-memory'
+             ORDER BY fact.projection_memory_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read Memory migration effects");
+        for (_, candidate_json, embedding_json, _) in &rows {
+            serde_json::from_str::<memory_engine::MemoryFactDraft>(candidate_json)
+                .expect("migration must emit a reducer-compatible canonical fact");
+            assert!(
+                embedding_json.is_none(),
+                "unversioned vector must be invalidated"
+            );
+        }
+        assert_eq!(
+            rows[0].3, 1,
+            "confirmed fact must be queued for re-embedding"
+        );
+        assert_eq!(
+            rows[1].3, 0,
+            "candidate fact must not enter retrieval indexing"
+        );
+        let events: Vec<(String, String)> = sqlx::query_as(
+            "SELECT operation, lifecycle FROM memory_fact_events
+             WHERE tenant_id = 'tenant-memory' ORDER BY global_sequence",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read canonical migration events");
+        assert!(events.contains(&("confirmed".into(), "confirmed".into())));
+        assert!(events.contains(&("candidate_created".into(), "candidate".into())));
     }
 
     #[tokio::test]
@@ -370,8 +1368,8 @@ mod sqlite_baseline_tests {
                 .await
                 .expect("count current migration ledger");
             assert!(
-                migration_count >= 39,
-                "upgrade fixture must apply the current durable schema migrations"
+                migration_count >= 40,
+                "upgrade fixture must apply every current durable schema migration"
             );
             pool.close().await;
         }

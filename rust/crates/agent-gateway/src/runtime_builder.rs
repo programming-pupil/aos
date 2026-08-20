@@ -60,7 +60,6 @@ const RD_READ_FILE_DEFAULT_LIMIT: usize = 400;
 const RD_GREP_SEARCH_DEFAULT_HEAD_LIMIT: usize = 100;
 const MEMORY_TOOL_SEARCH_LIMIT_DEFAULT: usize = 6;
 const MEMORY_TOOL_READ_MAX_CHARS: usize = 50_000;
-const MEMORY_DEVELOPER_SUMMARY_MAX_CHARS: usize = 4_000;
 const MEMORY_SEMANTIC_WEIGHT: f64 = 0.68;
 const MEMORY_LEXICAL_WEIGHT: f64 = 0.22;
 const MEMORY_RECENCY_WEIGHT: f64 = 0.05;
@@ -790,6 +789,7 @@ impl ProviderRequestLineageRecorder {
         stage: &str,
         request: &MessageRequest,
     ) -> std::result::Result<String, RuntimeError> {
+        crate::behavior_trace("PROMPT-002");
         let request_json = serde_json::to_vec(request).map_err(|error| {
             RuntimeError::new(format!("cannot serialize provider request: {error}"))
         })?;
@@ -798,13 +798,6 @@ impl ProviderRequestLineageRecorder {
             RuntimeError::new(format!("cannot serialize provider tool schema: {error}"))
         })?;
         let tool_schema_hash = hex::encode(sha2::Sha256::digest(tool_schema_json.as_bytes()));
-        let tool_schema_ciphertext =
-            crate::crypto::encrypt(&tool_schema_json).map_err(|error| {
-                RuntimeError::new(format!("cannot protect provider tool schema: {error}"))
-            })?;
-        let tool_count = request.tools.as_ref().map_or(0_i64, |tools| {
-            i64::try_from(tools.len()).unwrap_or(i64::MAX)
-        });
         let extra_body_hash = request.extra_body.as_ref().map(|extra_body| {
             hex::encode(sha2::Sha256::digest(
                 serde_json::to_vec(extra_body).unwrap_or_default(),
@@ -824,113 +817,161 @@ impl ProviderRequestLineageRecorder {
             .begin()
             .await
             .map_err(|error| RuntimeError::new(error.to_string()))?;
-        let context_manifest = match (&trace.turn_id, trace.iteration) {
-            (Some(turn_id), Some(iteration)) => Some(
-                sqlx::query_as::<sqlx::Sqlite, (String, String)>(
-                    "SELECT id, manifest_hash FROM context_packet_manifests
-                     WHERE tenant_id = ? AND thread_id = ? AND turn_id = ? AND iteration = ?",
-                )
-                .bind(&self.tenant_id)
-                .bind(&self.session_id)
-                .bind(turn_id)
-                .bind(i64::try_from(iteration).unwrap_or(i64::MAX))
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?
-                .ok_or_else(|| {
-                    RuntimeError::new(
-                        "provider dispatch blocked: exact context manifest is missing",
-                    )
-                })?,
-            ),
-            _ => None,
-        };
-        let tool_manifest_id = format!(
-            "tool-manifest:{}",
-            hex::encode(sha2::Sha256::digest(
-                format!(
-                    "{}:{}:{}:{}",
-                    self.tenant_id, self.session_id, trace.request_group_id, tool_schema_hash
-                )
-                .as_bytes()
-            ))
-        );
-        sqlx::query::<sqlx::Sqlite>(
-            "INSERT INTO tool_schema_manifests
-                (id, tenant_id, session_id, turn_id, iteration, schema_hash,
-                 schema_ciphertext, tool_count, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-             ON CONFLICT(id) DO NOTHING",
-        )
-        .bind(&tool_manifest_id)
-        .bind(&self.tenant_id)
-        .bind(&self.session_id)
-        .bind(&trace.turn_id)
-        .bind(trace.iteration.and_then(|value| i64::try_from(value).ok()))
-        .bind(&tool_schema_hash)
-        .bind(&tool_schema_ciphertext)
-        .bind(tool_count)
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| RuntimeError::new(error.to_string()))?;
-        let prompt_manifest_id = if let Some((context_manifest_id, context_hash)) =
-            context_manifest.as_ref()
-        {
-            let stable_prefix_hash = hex::encode(sha2::Sha256::digest(
-                request.system.as_deref().unwrap_or_default().as_bytes(),
+        let context_manifest_id = if let Some(id) = trace.context_manifest_id.as_ref() {
+            id.clone()
+        } else if trace.turn_id.is_some() {
+            return Err(RuntimeError::new(
+                "provider dispatch is missing its immutable context manifest ID",
             ));
-            let task_packet_hash = hex::encode(sha2::Sha256::digest(
-                serde_json::to_vec(&request.messages).unwrap_or_default(),
+        } else {
+            let raw_context = serde_json::json!({
+                "schemaVersion":"background-provider-context-v1",
+                "requestGroupId":trace.request_group_id,
+                "model":request.model,
+                "system":request.system,
+                "messages":request.messages,
+            });
+            let raw_context_bytes = serde_json::to_vec(&raw_context).map_err(|error| {
+                RuntimeError::new(format!("cannot serialize background context: {error}"))
+            })?;
+            let raw_context_hash = hex::encode(sha2::Sha256::digest(&raw_context_bytes));
+            let (redacted_context, _) = runtime::protect_sensitive_json(
+                &raw_context,
+                runtime::configured_data_protection_mode(),
+            );
+            let redacted_hash = hex::encode(sha2::Sha256::digest(
+                serde_json::to_vec(&redacted_context).unwrap_or_default(),
             ));
-            let manifest_id = format!(
-                "wire-prompt:{}",
+            let id = format!(
+                "background-context:{}",
                 hex::encode(sha2::Sha256::digest(
                     format!(
-                        "{context_manifest_id}:{stable_prefix_hash}:{task_packet_hash}:{tool_schema_hash}:{}",
-                        request.model
+                        "{}\0{}\0{}\0{}",
+                        self.tenant_id, self.session_id, trace.request_group_id, raw_context_hash
                     )
                     .as_bytes()
                 ))
             );
-            let manifest_json = json!({
-                "schemaVersion": "wire-prompt-manifest-v1",
-                "contextManifestId": context_manifest_id,
-                "contextManifestHash": context_hash,
-                "stablePrefixHash": stable_prefix_hash,
-                "taskPacketHash": task_packet_hash,
-                "toolSchemaManifestId": tool_manifest_id,
-                "toolSchemaHash": tool_schema_hash,
-                "model": request.model,
-            });
+            let aad = crate::crypto::scoped_aad("context_manifest.raw", &self.tenant_id, &id);
+            let ciphertext =
+                crate::crypto::encrypt_scoped(&String::from_utf8_lossy(&raw_context_bytes), &aad)
+                    .map_err(|error| {
+                    RuntimeError::new(format!("cannot protect background context: {error}"))
+                })?;
             sqlx::query::<sqlx::Sqlite>(
-                "INSERT INTO prompt_manifests
-                    (id, tenant_id, thread_id, turn_id, run_id, prompt_id, version,
-                     variant, model, stable_prefix_hash, task_packet_hash,
-                     tool_schema_hash, context_manifest_id, input_budget, output_budget,
-                     trust_policy_version, eval_suite, manifest_json, created_at)
-                 VALUES (?, ?, ?, ?, ?, 'provider-wire', 'v1', 'attempt-specific', ?, ?, ?, ?, ?,
-                         0, ?, 'wire-lineage-v1', 'provider-dispatch', ?, CURRENT_TIMESTAMP)
+                "INSERT INTO context_packet_manifests
+                    (id, tenant_id, thread_id, turn_id, snapshot_version,
+                     manifest_hash, manifest_json, model_version, created_at,
+                     raw_manifest_hash, raw_manifest_ciphertext)
+                 VALUES (?, ?, ?, NULL, 1, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
                  ON CONFLICT(id) DO NOTHING",
             )
-            .bind(&manifest_id)
+            .bind(&id)
             .bind(&self.tenant_id)
             .bind(&self.session_id)
-            .bind(&trace.turn_id)
-            .bind(&trace.request_group_id)
+            .bind(redacted_hash)
+            .bind(redacted_context.to_string())
             .bind(&request.model)
-            .bind(&stable_prefix_hash)
-            .bind(&task_packet_hash)
-            .bind(&tool_schema_hash)
-            .bind(context_manifest_id)
-            .bind(i64::from(request.max_tokens))
-            .bind(manifest_json.to_string())
+            .bind(raw_context_hash)
+            .bind(ciphertext)
             .execute(&mut *tx)
             .await
             .map_err(|error| RuntimeError::new(error.to_string()))?;
-            Some(manifest_id)
-        } else {
-            None
+            id
         };
+        let context = sqlx::query_as::<sqlx::Sqlite, (Option<String>, Option<String>)>(
+            "SELECT turn_id, raw_manifest_hash FROM context_packet_manifests
+             WHERE id = ? AND tenant_id = ? AND thread_id = ?",
+        )
+        .bind(&context_manifest_id)
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| RuntimeError::new(error.to_string()))?
+        .ok_or_else(|| RuntimeError::new("provider context manifest does not exist"))?;
+        if context.0.as_deref() != trace.turn_id.as_deref()
+            || trace
+                .context_manifest_hash
+                .as_ref()
+                .is_some_and(|expected| context.1.as_deref() != Some(expected.as_str()))
+        {
+            return Err(RuntimeError::new(
+                "provider context manifest scope or hash does not match the request trace",
+            ));
+        }
+        let prompt_manifest_id = if let Some(id) = trace.prompt_manifest_id.as_ref() {
+            id.clone()
+        } else if trace.turn_id.is_some() {
+            return Err(RuntimeError::new(
+                "provider dispatch is missing its immutable prompt manifest ID",
+            ));
+        } else {
+            let id = format!(
+                "background-prompt:{}",
+                hex::encode(sha2::Sha256::digest(
+                    format!(
+                        "{}\0{}\0{}\0{}",
+                        self.tenant_id, self.session_id, trace.request_group_id, request_hash
+                    )
+                    .as_bytes()
+                ))
+            );
+            let system_hash = hex::encode(sha2::Sha256::digest(
+                request.system.as_deref().unwrap_or_default().as_bytes(),
+            ));
+            sqlx::query::<sqlx::Sqlite>(
+                "INSERT INTO prompt_manifests
+                    (id, tenant_id, thread_id, turn_id, run_id, prompt_id,
+                     version, variant, model, stable_prefix_hash, task_packet_hash,
+                     tool_schema_hash, context_manifest_id, input_budget, output_budget,
+                     trust_policy_version, eval_suite, manifest_json)
+                 VALUES (?, ?, ?, NULL, ?, 'background-provider', '1', ?, ?, ?, ?, ?, ?,
+                         0, ?, 'background-provider-policy-v1', 'provider-replay-v1', ?)
+                 ON CONFLICT(id) DO NOTHING",
+            )
+            .bind(&id)
+            .bind(&self.tenant_id)
+            .bind(&self.session_id)
+            .bind(&trace.request_group_id)
+            .bind(stage)
+            .bind(&request.model)
+            .bind(system_hash)
+            .bind(&request_hash)
+            .bind(&tool_schema_hash)
+            .bind(&context_manifest_id)
+            .bind(i64::from(request.max_tokens))
+            .bind(
+                serde_json::json!({
+                    "schemaVersion":"background-prompt-manifest-v1",
+                    "requestGroupId":trace.request_group_id,
+                    "stage":stage,
+                })
+                .to_string(),
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+            id
+        };
+        let prompt_context = sqlx::query_as::<sqlx::Sqlite, (String, Option<String>)>(
+            "SELECT context_manifest_id, turn_id FROM prompt_manifests
+             WHERE id = ? AND tenant_id = ? AND thread_id = ?",
+        )
+        .bind(&prompt_manifest_id)
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| RuntimeError::new(error.to_string()))?
+        .ok_or_else(|| RuntimeError::new("provider prompt manifest does not exist"))?;
+        if prompt_context.0 != context_manifest_id
+            || prompt_context.1.as_deref() != trace.turn_id.as_deref()
+        {
+            return Err(RuntimeError::new(
+                "provider prompt and context manifests have different lineage",
+            ));
+        }
         let latest = sqlx::query_as::<sqlx::Sqlite, (String, i64)>(
             "SELECT id, attempt_index FROM provider_request_attempts
              WHERE tenant_id = ? AND session_id = ? AND request_group_id = ?
@@ -945,6 +986,37 @@ impl ProviderRequestLineageRecorder {
         let attempt_index = latest.as_ref().map_or(1_i64, |(_, index)| index + 1);
         let parent_attempt_id = latest.map(|(id, _)| id);
         let id = uuid::Uuid::new_v4().to_string();
+        let provider_kind = format!("{:?}", provider.provider_kind());
+        let tool_manifest_id = format!(
+            "tool-manifest:{}",
+            hex::encode(sha2::Sha256::digest(
+                format!("{}\0{}\0{}", self.tenant_id, id, tool_schema_hash).as_bytes()
+            ))
+        );
+        let wire_manifest_id = format!(
+            "wire-manifest:{}",
+            hex::encode(sha2::Sha256::digest(
+                format!("{}\0{}\0{}", self.tenant_id, id, request_hash).as_bytes()
+            ))
+        );
+        let capability_profile_version = "provider-capabilities-v1";
+        let retry_reason = (attempt_index > 1).then(|| stage.to_string());
+        let attempt_schema_ciphertext = crate::crypto::encrypt_scoped(
+            &tool_schema_json,
+            &crate::crypto::scoped_aad("provider_attempt.tool_schema", &self.tenant_id, &id),
+        )
+        .map_err(|error| {
+            RuntimeError::new(format!("cannot protect provider tool schema: {error}"))
+        })?;
+        let manifest_schema_ciphertext = crate::crypto::encrypt_scoped(
+            &tool_schema_json,
+            &crate::crypto::scoped_aad("tool_manifest.schema", &self.tenant_id, &tool_manifest_id),
+        )
+        .map_err(|error| {
+            RuntimeError::new(format!(
+                "cannot protect final tool manifest schema: {error}"
+            ))
+        })?;
         sqlx::query::<sqlx::Sqlite>(
             "INSERT INTO provider_request_attempts
                 (id, tenant_id, user_id, session_id, turn_id, iteration,
@@ -952,9 +1024,11 @@ impl ProviderRequestLineageRecorder {
                  model, api_key_id, base_url_hash, search_stage, request_hash,
                  tool_schema_hash, tool_schema_ciphertext, native_search_mode,
                  reasoning_effort, extra_body_hash, max_output_tokens, stream, status,
-                 context_manifest_id, prompt_manifest_id, tool_manifest_id)
+                 context_manifest_id, prompt_manifest_id, tool_manifest_id,
+                 wire_manifest_id, capability_profile_version, retry_reason,
+                 cache_status)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                     'dispatched', ?, ?, ?)",
+                     'dispatched', ?, ?, ?, ?, ?, ?, 'miss')",
         )
         .bind(&id)
         .bind(&self.tenant_id)
@@ -965,23 +1039,75 @@ impl ProviderRequestLineageRecorder {
         .bind(&trace.request_group_id)
         .bind(&trace.context_manifest_key)
         .bind(attempt_index)
-        .bind(parent_attempt_id)
-        .bind(format!("{:?}", provider.provider_kind()))
+        .bind(&parent_attempt_id)
+        .bind(&provider_kind)
         .bind(&request.model)
         .bind(key_id)
-        .bind(base_url_hash)
+        .bind(&base_url_hash)
         .bind(stage)
-        .bind(request_hash)
-        .bind(tool_schema_hash)
-        .bind(tool_schema_ciphertext)
+        .bind(&request_hash)
+        .bind(&tool_schema_hash)
+        .bind(&attempt_schema_ciphertext)
         .bind(native_search_mode)
         .bind(&request.reasoning_effort)
         .bind(extra_body_hash)
         .bind(i64::from(request.max_tokens))
         .bind(i64::from(request.stream))
-        .bind(context_manifest.as_ref().map(|(id, _)| id.as_str()))
-        .bind(prompt_manifest_id.as_deref())
+        .bind(&context_manifest_id)
+        .bind(&prompt_manifest_id)
         .bind(&tool_manifest_id)
+        .bind(&wire_manifest_id)
+        .bind(capability_profile_version)
+        .bind(&retry_reason)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| RuntimeError::new(error.to_string()))?;
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO tool_manifests
+                (id, tenant_id, session_id, turn_id, context_manifest_id,
+                 prompt_manifest_id, provider_kind, model, canonical_schema_hash,
+                 schema_ciphertext, permission_policy_version, tool_search_revision)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'gateway-permission-toolsearch-v1', ?)",
+        )
+        .bind(&tool_manifest_id)
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(&trace.turn_id)
+        .bind(&context_manifest_id)
+        .bind(&prompt_manifest_id)
+        .bind(&provider_kind)
+        .bind(&request.model)
+        .bind(&tool_schema_hash)
+        .bind(&manifest_schema_ciphertext)
+        .bind(&trace.context_manifest_key)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| RuntimeError::new(error.to_string()))?;
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO wire_attempt_manifests
+                (id, tenant_id, session_id, turn_id, attempt_id,
+                 context_manifest_id, prompt_manifest_id, tool_manifest_id,
+                 provider_kind, model, endpoint_hash, capability_profile_version,
+                 request_hash, wire_tool_schema_hash, parent_attempt_id,
+                 retry_reason, cache_status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'miss')",
+        )
+        .bind(&wire_manifest_id)
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(&trace.turn_id)
+        .bind(&id)
+        .bind(&context_manifest_id)
+        .bind(&prompt_manifest_id)
+        .bind(&tool_manifest_id)
+        .bind(&provider_kind)
+        .bind(&request.model)
+        .bind(&base_url_hash)
+        .bind(capability_profile_version)
+        .bind(&request_hash)
+        .bind(&tool_schema_hash)
+        .bind(&parent_attempt_id)
+        .bind(&retry_reason)
         .execute(&mut *tx)
         .await
         .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -1011,7 +1137,71 @@ impl ProviderRequestLineageRecorder {
                 (status, Some(class.to_string()))
             }
         };
-        sqlx::query(
+        let artifact_payload = match result {
+            Ok(events) => serde_json::json!({"ok":true,"events":events}),
+            Err(_) => serde_json::json!({"ok":false,"errorClass":error_class}),
+        };
+        let artifact_bytes = serde_json::to_vec(&artifact_payload).map_err(|error| {
+            RuntimeError::new(format!(
+                "cannot serialize provider replay artifact: {error}"
+            ))
+        })?;
+        let artifact_hash = hex::encode(sha2::Sha256::digest(&artifact_bytes));
+        let artifact_id = format!("provider-attempt-artifact:{attempt_id}");
+        let artifact_ciphertext = crate::crypto::encrypt_scoped(
+            &String::from_utf8_lossy(&artifact_bytes),
+            &crate::crypto::scoped_aad("provider_attempt.stream", &self.tenant_id, &artifact_id),
+        )
+        .map_err(|error| {
+            RuntimeError::new(format!("cannot protect provider replay artifact: {error}"))
+        })?;
+        let stream_event_count = result.as_ref().map_or(0_i64, |events| {
+            i64::try_from(events.len()).unwrap_or(i64::MAX)
+        });
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let existing_artifact = sqlx::query_as::<sqlx::Sqlite, (String, String)>(
+            "SELECT terminal_status, payload_hash FROM provider_attempt_artifacts
+             WHERE tenant_id = ? AND session_id = ? AND attempt_id = ?",
+        )
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(attempt_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| RuntimeError::new(error.to_string()))?;
+        if let Some((existing_status, existing_hash)) = existing_artifact {
+            if existing_status == status && existing_hash == artifact_hash {
+                tx.rollback()
+                    .await
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                return Ok(());
+            }
+            return Err(RuntimeError::new(
+                "provider attempt received a conflicting duplicate or late terminal outcome",
+            ));
+        }
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO provider_attempt_artifacts
+                (id, tenant_id, session_id, attempt_id, terminal_status,
+                 stream_event_count, payload_hash, payload_ciphertext)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&artifact_id)
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(attempt_id)
+        .bind(status)
+        .bind(stream_event_count)
+        .bind(&artifact_hash)
+        .bind(artifact_ciphertext)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let update = sqlx::query(
             "UPDATE provider_request_attempts
              SET status = ?, error_class = ?, completed_at = CURRENT_TIMESTAMP
              WHERE id = ? AND tenant_id = ? AND session_id = ? AND status = 'dispatched'",
@@ -1021,9 +1211,17 @@ impl ProviderRequestLineageRecorder {
         .bind(attempt_id)
         .bind(&self.tenant_id)
         .bind(&self.session_id)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(|error| RuntimeError::new(error.to_string()))?;
+        if update.rows_affected() != 1 {
+            return Err(RuntimeError::new(
+                "provider attempt terminal settlement lost its dispatched-state fence",
+            ));
+        }
+        tx.commit()
+            .await
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
         Ok(())
     }
 }
@@ -3588,6 +3786,7 @@ impl ApiClient for GatewayApiClient {
     }
 
     fn activate_tool_candidates(&mut self, tool_names: &[String]) {
+        crate::behavior_trace("TOOL-002");
         let available = self.tool_registry.actual_tool_names();
         for name in tool_names {
             if available.iter().any(|candidate| {
@@ -7234,8 +7433,11 @@ async fn gateway_embed_memory_text_best_effort(
         return None;
     }
     let input = gateway_compact_text(text, 2_000);
-    let result =
-        tokio::task::spawn_blocking(move || runtime::local_embedding::embed(vec![input])).await;
+    let result = tokio::task::spawn_blocking(move || {
+        let texts = vec![input];
+        runtime::local_embedding::embed(&texts)
+    })
+    .await;
     match result {
         Ok(Ok(mut vectors)) => vectors.pop().map(|vector| GatewayMemoryEmbedding {
             model: runtime::local_embedding::MODEL.to_string(),
@@ -7855,7 +8057,7 @@ async fn gateway_list_unified_memory_items(
             .push_bind(&context.tenant_id)
             .push(" AND user_id = ")
             .push_bind(&context.user_id)
-            .push(" AND (source_type <> 'compaction' OR EXISTS (SELECT 1 FROM structured_memory_facts fact WHERE fact.projection_memory_id = agent_memory_items.id AND fact.tenant_id = agent_memory_items.tenant_id AND fact.current = 1))")
+            .push(" AND EXISTS (SELECT 1 FROM structured_memory_facts fact WHERE fact.projection_memory_id = agent_memory_items.id AND fact.tenant_id = agent_memory_items.tenant_id AND fact.user_id = agent_memory_items.user_id AND fact.lifecycle = 'confirmed' AND fact.current = 1)")
             .push(" AND session_id = ")
             .push_bind(session_id);
         if !include_disabled {
@@ -7881,7 +8083,7 @@ async fn gateway_list_unified_memory_items(
             .push_bind(&context.tenant_id)
             .push(" AND user_id = ")
             .push_bind(&context.user_id)
-            .push(" AND (source_type <> 'compaction' OR EXISTS (SELECT 1 FROM structured_memory_facts fact WHERE fact.projection_memory_id = agent_memory_items.id AND fact.tenant_id = agent_memory_items.tenant_id AND fact.current = 1))")
+            .push(" AND EXISTS (SELECT 1 FROM structured_memory_facts fact WHERE fact.projection_memory_id = agent_memory_items.id AND fact.tenant_id = agent_memory_items.tenant_id AND fact.user_id = agent_memory_items.user_id AND fact.lifecycle = 'confirmed' AND fact.current = 1)")
             .push(" AND session_id IS NULL");
         if !include_disabled {
             query.push(" AND enabled = 1");
@@ -7935,7 +8137,7 @@ async fn gateway_list_unified_memory_items(
             .push_bind(&context.tenant_id)
             .push(" AND user_id = ")
             .push_bind(&context.user_id);
-        query.push(" AND (source_type <> 'compaction' OR EXISTS (SELECT 1 FROM structured_memory_facts fact WHERE fact.projection_memory_id = agent_memory_items.id AND fact.tenant_id = agent_memory_items.tenant_id AND fact.current = 1))");
+        query.push(" AND EXISTS (SELECT 1 FROM structured_memory_facts fact WHERE fact.projection_memory_id = agent_memory_items.id AND fact.tenant_id = agent_memory_items.tenant_id AND fact.user_id = agent_memory_items.user_id AND fact.lifecycle = 'confirmed' AND fact.current = 1)");
         if let Some(scope) = scope {
             query.push(" AND scope = ").push_bind(scope);
         }
@@ -7959,74 +8161,6 @@ async fn gateway_list_unified_memory_items(
         .map(|row| gateway_memory_row_to_item(row, None, &context.tenant_id, &context.user_id))
         .filter(|item| !gateway_memory_is_sensitive(&item.content))
         .collect())
-}
-
-async fn gateway_list_legacy_memory_items(
-    context: &GatewayMemoryContext,
-    app: Option<&str>,
-    session_id: Option<&str>,
-    limit: usize,
-) -> Vec<GatewayMemoryItem> {
-    let mut items = Vec::new();
-    if app.is_none_or(|value| value.eq_ignore_ascii_case("chat") || value == "shared") {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, memory_type, content, source, CAST(confidence AS DOUBLE) AS confidence,
-                   pinned, enabled, CAST(updated_at AS TEXT) AS updated_at
-            FROM chat_memories
-            WHERE tenant_id = ? AND user_id = ? AND enabled = 1
-            ORDER BY pinned DESC, updated_at DESC
-            LIMIT ?
-            "#,
-        )
-        .bind(&context.tenant_id)
-        .bind(&context.user_id)
-        .bind(limit as i64)
-        .fetch_all(&context.db)
-        .await
-        .unwrap_or_default();
-        items.extend(rows.iter().map(|row| {
-            gateway_memory_row_to_item(
-                row,
-                Some("chat_memories"),
-                &context.tenant_id,
-                &context.user_id,
-            )
-        }));
-    }
-    if app.is_none_or(|value| value.eq_ignore_ascii_case("pm") || value == "shared") {
-        if let Some(session_id) = session_id {
-            let rows = sqlx::query(
-                r#"
-                SELECT id, session_id, memory_type, content, source, CAST(confidence AS DOUBLE) AS confidence,
-                       pinned, enabled, CAST(updated_at AS TEXT) AS updated_at
-                FROM pm_session_memories
-                WHERE tenant_id = ? AND user_id = ? AND session_id = ? AND enabled = 1
-                ORDER BY pinned DESC, updated_at DESC
-                LIMIT ?
-                "#,
-            )
-            .bind(&context.tenant_id)
-            .bind(&context.user_id)
-            .bind(session_id)
-            .bind(limit as i64)
-            .fetch_all(&context.db)
-            .await
-            .unwrap_or_default();
-            items.extend(rows.iter().map(|row| {
-                gateway_memory_row_to_item(
-                    row,
-                    Some("pm_session_memories"),
-                    &context.tenant_id,
-                    &context.user_id,
-                )
-            }));
-        }
-    }
-    items
-        .into_iter()
-        .filter(|item| !gateway_memory_is_sensitive(&item.content))
-        .collect()
 }
 
 async fn gateway_memory_list(
@@ -8056,7 +8190,6 @@ async fn gateway_memory_list(
     let mut items =
         gateway_list_unified_memory_items(context, scope, app, session_id, include_disabled, limit)
             .await?;
-    items.extend(gateway_list_legacy_memory_items(context, app, session_id, limit).await);
     if scope.is_none_or(|value| value.eq_ignore_ascii_case("session")) {
         items.extend(gateway_list_context_archive_items(context, session_id, limit).await);
         items.extend(gateway_list_session_checkpoint_archive_items(
@@ -8124,7 +8257,6 @@ async fn gateway_memory_search(
         .unwrap_or(false);
     let mut items =
         gateway_list_unified_memory_items(context, scope, app, session_id, false, 300).await?;
-    items.extend(gateway_list_legacy_memory_items(context, app, session_id, 200).await);
     if scope.is_none_or(|value| value.eq_ignore_ascii_case("session")) {
         items.extend(gateway_list_context_archive_items(context, session_id, 300).await);
         items.extend(gateway_list_session_checkpoint_archive_items(context, 300));
@@ -8216,9 +8348,8 @@ async fn gateway_resolve_memory_path(
     path: &str,
 ) -> std::result::Result<Option<String>, String> {
     if path == "MEMORY.md" {
-        let mut items =
+        let items =
             gateway_list_unified_memory_items(context, None, None, None, false, 200).await?;
-        items.extend(gateway_list_legacy_memory_items(context, None, None, 200).await);
         return Ok(Some(gateway_render_memory_items_markdown(
             "MEMORY.md",
             &items,
@@ -8319,7 +8450,7 @@ async fn gateway_resolve_memory_path(
         .strip_prefix("pm/")
         .and_then(|value| value.strip_suffix(".md"))
     {
-        let mut items = gateway_list_unified_memory_items(
+        let items = gateway_list_unified_memory_items(
             context,
             None,
             Some("pm"),
@@ -8328,9 +8459,6 @@ async fn gateway_resolve_memory_path(
             200,
         )
         .await?;
-        items.extend(
-            gateway_list_legacy_memory_items(context, Some("pm"), Some(session_id), 200).await,
-        );
         return Ok(Some(gateway_render_memory_items_markdown(path, &items)));
     }
     if let Some(memory_id) = path.strip_prefix("ad_hoc/notes/") {
@@ -8339,6 +8467,13 @@ async fn gateway_resolve_memory_path(
             r#"
             SELECT content FROM agent_memory_items
             WHERE tenant_id = ? AND user_id = ? AND id = ? AND enabled = 1
+              AND EXISTS (
+                SELECT 1 FROM structured_memory_facts AS fact
+                WHERE fact.projection_memory_id = agent_memory_items.id
+                  AND fact.tenant_id = agent_memory_items.tenant_id
+                  AND fact.user_id = agent_memory_items.user_id
+                  AND fact.lifecycle = 'confirmed' AND fact.current = 1
+              )
             LIMIT 1
             "#,
         )
@@ -8410,54 +8545,6 @@ async fn gateway_memory_read(
     .map_err(|e| format!("failed to serialize memory.read output: {e}"))
 }
 
-async fn gateway_memory_summary_for_instructions(context: &GatewayMemoryContext) -> String {
-    let rows = sqlx::query(
-        r#"
-        SELECT app, scope, session_id, summary, CAST(updated_at AS TEXT) AS updated_at
-        FROM agent_memory_summaries
-        WHERE tenant_id = ? AND user_id = ?
-          AND (app = ? OR app = 'shared')
-          AND (session_id = ? OR session_id IS NULL)
-        ORDER BY
-          CASE WHEN session_id = ? THEN 0 ELSE 1 END,
-          updated_at DESC
-        LIMIT 8
-        "#,
-    )
-    .bind(&context.tenant_id)
-    .bind(&context.user_id)
-    .bind(&context.app)
-    .bind(&context.session_id)
-    .bind(&context.session_id)
-    .fetch_all(&context.db)
-    .await
-    .unwrap_or_default();
-
-    let mut out = String::new();
-    for row in rows {
-        if !out.is_empty() {
-            out.push_str("\n\n");
-        }
-        let app = row.get::<String, _>("app");
-        let scope = row.get::<String, _>("scope");
-        let session = row
-            .get::<Option<String>, _>("session_id")
-            .unwrap_or_else(|| "global".to_string());
-        let updated_at = row.get::<String, _>("updated_at");
-        let summary = gateway_compact_text(
-            &row.get::<String, _>("summary"),
-            MEMORY_DEVELOPER_SUMMARY_MAX_CHARS / 2,
-        );
-        out.push_str(&format!(
-            "- {app}/{scope}/{session} updated {updated_at}: {summary}"
-        ));
-        if out.chars().count() >= MEMORY_DEVELOPER_SUMMARY_MAX_CHARS {
-            break;
-        }
-    }
-    gateway_compact_text(&out, MEMORY_DEVELOPER_SUMMARY_MAX_CHARS)
-}
-
 async fn build_gateway_memory_developer_instructions(
     context: &GatewayMemoryContext,
 ) -> Option<String> {
@@ -8483,12 +8570,6 @@ async fn build_gateway_memory_developer_instructions(
         }
     }
 
-    let summary = gateway_memory_summary_for_instructions(context).await;
-    let summary = if summary.trim().is_empty() {
-        "(no rolling memory summary available yet)".to_string()
-    } else {
-        summary
-    };
     Some(format!(
         r#"## Memory
 
@@ -8500,7 +8581,6 @@ Decision boundary:
 - If unsure and the task is complex, do a lightweight memory search before the main work.
 
 Memory layout:
-- {base}/memory_summary.md is summarized below; do not read it again unless exact lines are needed.
 - {base}/MEMORY.md is the searchable registry for global/app memories.
 - {base}/sessions/{session}.md contains session-scoped memories.
 - {base}/pm/{session}.md contains PM session/business memories.
@@ -8508,15 +8588,14 @@ Memory layout:
 - {base}/ad_hoc/notes/<memory_id>.md contains explicit user-approved notes.
 
 Quick memory pass:
-1. Skim MEMORY_SUMMARY and extract relevant keywords.
-2. Use memory_search with those keywords; keep lookup lightweight, normally 4-6 calls or fewer.
-3. Use memory_read only for the few paths that are clearly relevant.
-4. If no relevant memory is found, stop memory lookup and answer normally.
+1. Use memory_search with task-specific keywords; keep lookup lightweight, normally 4-6 calls or fewer.
+2. Use memory_read only for the few paths that are clearly relevant.
+3. If no relevant memory is found, stop memory lookup and answer normally.
 
 Exact-history recovery:
 - When the user asks to recall, reproduce, continue, modify, or inspect earlier exact content, prefer memory_search first and then memory_read any matching context_archives path before answering.
 - If an archive read is truncated, continue reading adjacent line ranges rather than guessing missing SQL/data/code.
-- Summaries are only orientation; context_archives are the source of truth for exact prior content.
+- Context archives and canonical fact evidence are the source of truth for exact prior content.
 
 Rules:
 - Never present memory-derived facts as confirmed-current if they may have drifted; say briefly when relying on unverified older memory.
@@ -8524,13 +8603,9 @@ Rules:
 - Use memory_note only after an explicit user request to remember, forget, or update something.
 - Do not emit raw citation blocks or hidden memory mechanics in the final answer; AOS records structured memory citations from tool outputs.
 
-========= MEMORY_SUMMARY BEGINS =========
-{summary}
-========= MEMORY_SUMMARY ENDS =========
 "#,
         base = context.virtual_base_path(),
         session = context.session_id,
-        summary = summary,
     ))
 }
 
@@ -8577,78 +8652,6 @@ You have a Codex-like, user-isolated workspace with `/uploads`, `/projects`, `/s
 Freely iterate tree/find -> rg -> read/open -> change terms -> inspect adjacent context. Prefer exact workspace reads over summaries before reproducing or modifying prior SQL/data/code. Never invent paths or resource ids and never ask for another user's identity.
 "#
     .to_string()
-}
-
-async fn persist_gateway_structured_memory(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    context: &GatewayMemoryContext,
-    item_id: &str,
-    scope: &str,
-    app: &str,
-    session_id: Option<&str>,
-    memory_type: &str,
-    content: &str,
-    pinned: bool,
-) -> std::result::Result<(), String> {
-    let content_hash = gateway_content_hash(content);
-    let session_key = session_id.unwrap_or_default();
-    let id = format!(
-        "structured-memory:{}",
-        content_hash_for_structured_gateway(&format!(
-            "{}:{}:{}:{}:{}:{}:{}",
-            context.tenant_id, context.user_id, scope, app, session_key, memory_type, content_hash
-        ))
-    );
-    let subject_json = serde_json::json!({
-        "memoryType": memory_type,
-        "sessionId": session_id,
-        "sourceType": "explicit_user",
-    })
-    .to_string();
-    sqlx::query(
-        "INSERT INTO structured_memory_facts
-            (id, tenant_id, user_id, scope, app, session_id, channel, kind,
-             subject_json, predicate, value_json, text, evidence_id, evidence_hash,
-             observed_at, confidence, sensitivity, current, projection_memory_id,
-             candidate_json, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'long_term_memory', ?, ?, ?, ?, ?, ?, ?,
-                 CURRENT_TIMESTAMP, 1.0, 'internal', 1, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-         ON CONFLICT(id) DO UPDATE SET
-             text = excluded.text, value_json = excluded.value_json,
-             current = 1, projection_memory_id = excluded.projection_memory_id,
-             updated_at = CURRENT_TIMESTAMP",
-    )
-    .bind(&id)
-    .bind(&context.tenant_id)
-    .bind(&context.user_id)
-    .bind(scope)
-    .bind(app)
-    .bind(session_id)
-    .bind(memory_type)
-    .bind(&subject_json)
-    .bind(memory_type)
-    .bind(serde_json::Value::String(content.to_string()).to_string())
-    .bind(content)
-    .bind(format!("memory:{item_id}"))
-    .bind(&content_hash)
-    .bind(item_id)
-    .bind(
-        serde_json::json!({
-            "projectionMemoryId": item_id,
-            "pinned": pinned,
-            "sourceType": "explicit_user",
-        })
-        .to_string(),
-    )
-    .execute(&mut **tx)
-    .await
-    .map_err(|error| format!("failed to persist structured memory: {error}"))?;
-    Ok(())
-}
-
-fn content_hash_for_structured_gateway(value: &str) -> String {
-    use sha2::{Digest, Sha256};
-    hex::encode(Sha256::digest(value.as_bytes()))
 }
 
 async fn gateway_memory_note(
@@ -8698,84 +8701,60 @@ async fn gateway_memory_note(
         .get("pinned")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let id = uuid::Uuid::new_v4().to_string();
-    let metadata_json = serde_json::to_string(&serde_json::json!({
+    let content_hash = gateway_content_hash(&content);
+    let logical_id = gateway_content_hash(&format!(
+        "{}\0{}\0{}\0{}\0{}\0{}\0{}",
+        context.tenant_id, context.user_id, scope, app, session_key, memory_type, content_hash
+    ));
+    let id = format!("memory-projection:{logical_id}");
+    let fact_id = format!("memory-fact:{logical_id}");
+    let metadata = serde_json::json!({
         "source": "runtime_memory_tool",
         "tool": "memory_note",
-    }))
-    .map_err(|e| format!("failed to serialize memory metadata: {e}"))?;
-    let mut tx = context
-        .db
-        .begin()
-        .await
-        .map_err(|error| format!("failed to begin memory transaction: {error}"))?;
-    sqlx::query("SELECT 1")
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| format!("failed to acquire memory transaction: {error}"))?;
-    sqlx::query(
-        r#"
-        INSERT INTO agent_memory_items
-          (id, tenant_id, user_id, scope, app, session_id, session_key, memory_type, content, content_hash,
-           source_type, confidence, pinned, enabled, metadata_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'explicit_user', 1.0, ?, 1, json(?))
-        ON CONFLICT DO UPDATE SET
-          updated_at = CURRENT_TIMESTAMP,
-          confidence = MAX(confidence, excluded.confidence),
-          pinned = MAX(pinned, excluded.pinned),
-          enabled = 1,
-          metadata_json = COALESCE(excluded.metadata_json, metadata_json)
-        "#,
-    )
-    .bind(&id)
-    .bind(&context.tenant_id)
-    .bind(&context.user_id)
-    .bind(&scope)
-    .bind(&app)
-    .bind(&session_id)
-    .bind(&session_key)
-    .bind(&memory_type)
-    .bind(&content)
-    .bind(gateway_content_hash(&content))
-    .bind(if pinned { 1 } else { 0 })
-    .bind(metadata_json)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| format!("failed to save memory note: {e}"))?;
-    let saved_id = sqlx::query_scalar::<_, String>(
-        r#"
-        SELECT id
-        FROM agent_memory_items
-        WHERE tenant_id = ? AND user_id = ? AND scope = ? AND app = ?
-          AND session_key = ? AND memory_type = ? AND content_hash = ?
-        LIMIT 1
-        "#,
-    )
-    .bind(&context.tenant_id)
-    .bind(&context.user_id)
-    .bind(&scope)
-    .bind(&app)
-    .bind(&session_key)
-    .bind(&memory_type)
-    .bind(gateway_content_hash(&content))
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| format!("failed to reload memory note: {e}"))?;
-    persist_gateway_structured_memory(
-        &mut tx,
-        context,
-        &saved_id,
-        &scope,
-        &app,
-        session_id.as_deref(),
-        &memory_type,
-        &content,
+    });
+    let draft = memory_engine::MemoryFactDraft {
+        fact_id,
+        projection_id: id.clone(),
+        tenant_id: context.tenant_id.clone(),
+        user_id: context.user_id.clone(),
+        scope: scope.clone(),
+        app: app.clone(),
+        session_id: session_id.clone(),
+        channel: "long_term_memory".into(),
+        kind: memory_type.clone(),
+        subject: serde_json::json!({
+            "memoryType":memory_type,
+            "sessionId":session_id,
+            "sourceType":"explicit_user",
+        }),
+        predicate: memory_type.clone(),
+        value: serde_json::Value::String(content.clone()),
+        text: content.clone(),
+        evidence_id: format!("user-memory-note:{id}"),
+        evidence_hash: content_hash,
+        valid_from: None,
+        valid_until: None,
+        confidence: 1.0,
+        sensitivity: "internal".into(),
+        lifecycle: memory_engine::FactLifecycle::Confirmed,
+        authority: vec!["user".into()],
+        source_event_ids: Vec::new(),
+        pollution_lineage: Vec::new(),
+        memory_type: memory_type.clone(),
+        source_type: "explicit_user".into(),
         pinned,
-    )
-    .await?;
-    tx.commit()
+        metadata,
+        stale_at: None,
+        verified_at: None,
+        embedding_model: None,
+        embedding_dimensions: None,
+        embedding_json: None,
+    };
+    let mut repository = memory_engine::SqliteMemoryRepositoryAdapter::new(context.db.clone());
+    memory_engine::MemoryRepository::upsert(&mut repository, draft)
         .await
-        .map_err(|error| format!("failed to commit memory note: {error}"))?;
+        .map_err(|error| format!("failed to save memory note: {error}"))?;
+    let saved_id = id;
     serde_json::to_string_pretty(&serde_json::json!({
         "ok": true,
         "id": saved_id,
@@ -11507,7 +11486,8 @@ mod tests {
             "CREATE TABLE structured_memory_facts (
                 id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, user_id TEXT NOT NULL,
                 scope TEXT NOT NULL, app TEXT NOT NULL, session_id TEXT,
-                projection_memory_id TEXT, current INTEGER NOT NULL DEFAULT 1)",
+                projection_memory_id TEXT, lifecycle TEXT NOT NULL,
+                current INTEGER NOT NULL DEFAULT 1)",
         )
         .execute(&db)
         .await
@@ -11546,6 +11526,20 @@ mod tests {
             .execute(&db)
             .await
             .expect("insert gateway memory fixture");
+            sqlx::query(
+                "INSERT INTO structured_memory_facts
+                   (id, tenant_id, user_id, scope, app, session_id,
+                    projection_memory_id, lifecycle, current)
+                 VALUES (?, 'tenant-test', 'user-test', ?, 'chat', ?, ?,
+                         'confirmed', 1)",
+            )
+            .bind(format!("fact:{id}"))
+            .bind(scope)
+            .bind(session_id)
+            .bind(id)
+            .execute(&db)
+            .await
+            .expect("insert gateway canonical fact fixture");
         }
         GatewayMemoryContext {
             db,
@@ -11560,6 +11554,17 @@ mod tests {
     #[tokio::test]
     async fn gateway_unified_memory_list_combines_current_session_and_global_rows() {
         let context = gateway_memory_test_context().await;
+        sqlx::query(
+            "INSERT INTO agent_memory_items
+               (id, tenant_id, user_id, scope, app, session_id, memory_type,
+                content, source_type, confidence, pinned, enabled, updated_at)
+             VALUES ('projection-only', 'tenant-test', 'user-test', 'global',
+                     'chat', NULL, 'note', 'must not be recalled', 'legacy',
+                     1.0, 1, 1, '2026-08-10 04:00:00')",
+        )
+        .execute(&context.db)
+        .await
+        .unwrap();
         let items = gateway_list_unified_memory_items(
             &context,
             None,
@@ -11812,11 +11817,16 @@ mod tests {
               stream INTEGER NOT NULL,
               status TEXT NOT NULL,
               error_class TEXT,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              completed_at TEXT,
               context_manifest_id TEXT,
               prompt_manifest_id TEXT,
               tool_manifest_id TEXT,
-              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-              completed_at TEXT,
+              wire_manifest_id TEXT,
+              capability_profile_version TEXT,
+              retry_reason TEXT,
+              cache_key_hash TEXT,
+              cache_status TEXT,
               UNIQUE(tenant_id, session_id, request_group_id, attempt_index)
             )
             "#,
@@ -11824,50 +11834,23 @@ mod tests {
         .execute(&db)
         .await
         .expect("create provider attempt table");
-        sqlx::query(
-            "CREATE TABLE context_packet_manifests (
-                id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, thread_id TEXT NOT NULL,
-                turn_id TEXT, iteration INTEGER, manifest_hash TEXT NOT NULL
-            )",
-        )
-        .execute(&db)
-        .await
-        .expect("create context manifest table");
-        sqlx::query(
-            "CREATE TABLE tool_schema_manifests (
-                id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, session_id TEXT NOT NULL,
-                turn_id TEXT, iteration INTEGER, schema_hash TEXT NOT NULL,
-                schema_ciphertext TEXT NOT NULL, tool_count INTEGER NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )",
-        )
-        .execute(&db)
-        .await
-        .expect("create tool manifest table");
-        sqlx::query(
-            "CREATE TABLE prompt_manifests (
-                id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, thread_id TEXT NOT NULL,
-                turn_id TEXT, run_id TEXT NOT NULL, prompt_id TEXT NOT NULL,
-                version TEXT NOT NULL, variant TEXT NOT NULL, model TEXT NOT NULL,
-                stable_prefix_hash TEXT NOT NULL, task_packet_hash TEXT NOT NULL,
-                tool_schema_hash TEXT NOT NULL, context_manifest_id TEXT NOT NULL,
-                input_budget INTEGER NOT NULL, output_budget INTEGER NOT NULL,
-                trust_policy_version TEXT NOT NULL, eval_suite TEXT NOT NULL,
-                manifest_json TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )",
-        )
-        .execute(&db)
-        .await
-        .expect("create prompt manifest table");
-        sqlx::query(
-            "INSERT INTO context_packet_manifests
-                (id, tenant_id, thread_id, turn_id, iteration, manifest_hash)
-             VALUES ('context-lineage', 'tenant-lineage', 'session-lineage',
-                     'turn-lineage', 7, 'context-hash')",
-        )
-        .execute(&db)
-        .await
-        .expect("seed exact context manifest");
+        for statement in [
+            "CREATE TABLE context_packet_manifests (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, thread_id TEXT NOT NULL, turn_id TEXT, snapshot_version INTEGER, manifest_hash TEXT NOT NULL, manifest_json TEXT NOT NULL, model_version TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, raw_manifest_hash TEXT, raw_manifest_ciphertext TEXT)",
+            "CREATE TABLE prompt_manifests (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, thread_id TEXT NOT NULL, turn_id TEXT, run_id TEXT NOT NULL, prompt_id TEXT NOT NULL, version TEXT NOT NULL, variant TEXT NOT NULL, model TEXT NOT NULL, stable_prefix_hash TEXT NOT NULL, task_packet_hash TEXT NOT NULL, tool_schema_hash TEXT NOT NULL, context_manifest_id TEXT NOT NULL, input_budget INTEGER NOT NULL, output_budget INTEGER NOT NULL, trust_policy_version TEXT NOT NULL, eval_suite TEXT NOT NULL, manifest_json TEXT)",
+            "CREATE TABLE tool_manifests (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, turn_id TEXT, context_manifest_id TEXT NOT NULL, prompt_manifest_id TEXT, provider_kind TEXT NOT NULL, model TEXT NOT NULL, canonical_schema_hash TEXT NOT NULL, schema_ciphertext TEXT NOT NULL, permission_policy_version TEXT NOT NULL, tool_search_revision TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE wire_attempt_manifests (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, turn_id TEXT, attempt_id TEXT NOT NULL UNIQUE, context_manifest_id TEXT NOT NULL, prompt_manifest_id TEXT, tool_manifest_id TEXT NOT NULL, provider_kind TEXT NOT NULL, model TEXT NOT NULL, endpoint_hash TEXT, capability_profile_version TEXT NOT NULL, request_hash TEXT NOT NULL, wire_tool_schema_hash TEXT NOT NULL, parent_attempt_id TEXT, retry_reason TEXT, cache_key_hash TEXT, cache_status TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE provider_attempt_artifacts (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, attempt_id TEXT NOT NULL UNIQUE, terminal_status TEXT NOT NULL, stream_event_count INTEGER NOT NULL, payload_hash TEXT NOT NULL, payload_ciphertext TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)",
+        ] {
+            sqlx::query(statement).execute(&db).await.unwrap();
+        }
+        sqlx::query("INSERT INTO context_packet_manifests (id, tenant_id, thread_id, turn_id, snapshot_version, manifest_hash, manifest_json, raw_manifest_hash) VALUES ('context-lineage', 'tenant-lineage', 'session-lineage', 'turn-lineage', 1, 'redacted-hash', '{}', 'context-hash')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO prompt_manifests (id, tenant_id, thread_id, turn_id, run_id, prompt_id, version, variant, model, stable_prefix_hash, task_packet_hash, tool_schema_hash, context_manifest_id, input_budget, output_budget, trust_policy_version, eval_suite) VALUES ('prompt-lineage', 'tenant-lineage', 'session-lineage', 'turn-lineage', 'run-lineage', 'test', '1', 'test', 'gpt-lineage', 'stable', 'task', 'tools', 'context-lineage', 1000, 512, 'test', 'test')")
+            .execute(&db)
+            .await
+            .unwrap();
         let config = UserRuntimeConfig {
             db: Some(db.clone()),
             user_id: "user-lineage".to_string(),
@@ -11909,7 +11892,10 @@ mod tests {
             .request_lineage
             .as_ref()
             .expect("provider lineage recorder");
-        let trace = runtime::ProviderRequestTrace::turn("turn-lineage", 7);
+        let mut trace = runtime::ProviderRequestTrace::turn("turn-lineage", 7);
+        trace.context_manifest_id = Some("context-lineage".into());
+        trace.context_manifest_hash = Some("context-hash".into());
+        trace.prompt_manifest_id = Some("prompt-lineage".into());
         let request = MessageRequest {
             model: "gpt-lineage".to_string(),
             max_tokens: 512,
@@ -12017,7 +12003,7 @@ mod tests {
         assert_eq!(rows[0].get::<String, _>("status"), "timed_out");
         assert_eq!(
             rows[1].get::<Option<String>, _>("parent_attempt_id"),
-            Some(first_id)
+            Some(first_id.clone())
         );
         assert_eq!(rows[1].get::<String, _>("status"), "failed");
         assert_eq!(
@@ -12056,9 +12042,118 @@ mod tests {
         );
         let encrypted_schema: String = rows[0].get("tool_schema_ciphertext");
         assert_eq!(
-            crate::crypto::decrypt(&encrypted_schema).expect("decrypt recorded tool schema"),
+            crate::crypto::decrypt_scoped(
+                &encrypted_schema,
+                &crate::crypto::scoped_aad(
+                    "provider_attempt.tool_schema",
+                    "tenant-lineage",
+                    &first_id,
+                ),
+            )
+            .expect("decrypt recorded tool schema"),
             serde_json::to_string(&request.tools).expect("serialize expected tool schema")
         );
+
+        let lineage_rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+            "SELECT attempt.context_manifest_id, attempt.prompt_manifest_id,
+                    attempt.tool_manifest_id, attempt.wire_manifest_id,
+                    wire.wire_tool_schema_hash
+             FROM provider_request_attempts AS attempt
+             INNER JOIN wire_attempt_manifests AS wire ON wire.attempt_id = attempt.id
+             WHERE attempt.request_group_id = ? ORDER BY attempt.attempt_index",
+        )
+        .bind(&trace.request_group_id)
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(lineage_rows.len(), 3);
+        assert!(lineage_rows.iter().all(|row| {
+            row.0 == "context-lineage"
+                && row.1 == "prompt-lineage"
+                && !row.2.is_empty()
+                && !row.3.is_empty()
+                && row.4 == rows[0].get::<String, _>("tool_schema_hash")
+        }));
+        let artifacts: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT terminal_status, stream_event_count, payload_ciphertext
+             FROM provider_attempt_artifacts AS artifact
+             INNER JOIN provider_request_attempts AS attempt
+               ON attempt.id = artifact.attempt_id
+             ORDER BY attempt.attempt_index",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(artifacts.len(), 3);
+        assert_eq!(artifacts[0].0, "timed_out");
+        assert_eq!(artifacts[2].0, "completed");
+        assert_eq!(artifacts[2].1, 1);
+        let completed_artifact_id: String = sqlx::query_scalar(
+            "SELECT id FROM provider_attempt_artifacts
+             WHERE tenant_id = 'tenant-lineage' AND terminal_status = 'completed'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(crate::crypto::decrypt_scoped(
+            &artifacts[2].2,
+            &crate::crypto::scoped_aad(
+                "provider_attempt.stream",
+                "tenant-lineage",
+                &completed_artifact_id,
+            ),
+        )
+        .unwrap()
+        .contains("done"));
+
+        let background = runtime::ProviderRequestTrace::background("capability-probe");
+        run_recorded_provider_attempt(
+            Some(recorder),
+            &background,
+            &client.provider,
+            Some("primary-key"),
+            "capability_probe",
+            &request,
+            async { Ok(vec![AssistantEvent::MessageStop]) },
+        )
+        .await
+        .unwrap();
+        let background_lineage: (String, String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT attempt.context_manifest_id, attempt.prompt_manifest_id,
+                        context.turn_id, prompt.turn_id
+                 FROM provider_request_attempts AS attempt
+                 INNER JOIN context_packet_manifests AS context
+                   ON context.id = attempt.context_manifest_id
+                 INNER JOIN prompt_manifests AS prompt
+                   ON prompt.id = attempt.prompt_manifest_id
+                 WHERE attempt.request_group_id = ?",
+        )
+        .bind(&background.request_group_id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(!background_lineage
+            .0
+            .starts_with("background-context:background:"));
+        assert!(!background_lineage.1.is_empty());
+        assert_eq!((background_lineage.2, background_lineage.3), (None, None));
+        let background_attempt_id: String = sqlx::query_scalar(
+            "SELECT id FROM provider_request_attempts WHERE request_group_id = ?",
+        )
+        .bind(&background.request_group_id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let identical_terminal = Ok(vec![AssistantEvent::MessageStop]);
+        recorder
+            .finish_attempt(&background_attempt_id, &identical_terminal)
+            .await
+            .expect("identical terminal replay is idempotent");
+        let conflicting_terminal = Err(RuntimeError::new("late provider failure"));
+        assert!(recorder
+            .finish_attempt(&background_attempt_id, &conflicting_terminal)
+            .await
+            .is_err());
     }
 
     #[test]

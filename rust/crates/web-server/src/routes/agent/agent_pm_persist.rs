@@ -389,6 +389,7 @@ pub(super) async fn persist_pm_evidence_graph(
     turn: &TurnResult,
     quality: &PmAnswerQualityDto,
 ) -> Result<(), sqlx::Error> {
+    crate::behavior_trace("PM-005");
     let tool_hits = build_pm_tool_evidence_hits(&turn.tool_calls);
     let mut url_hit_map = std::collections::HashMap::<String, PmToolEvidenceHit>::new();
     for hit in tool_hits {
@@ -1793,14 +1794,49 @@ mod tests {
         .bind("%matching-tool-hit%")
         .fetch_one(&db)
         .await
-        .expect("load confirmed assertion");
-        assert_eq!(matching_status, "confirmed");
+        .expect("load single-source assertion");
+        assert_eq!(
+            matching_status, "proposed",
+            "one tool result cannot confirm a high-impact research claim"
+        );
+
+        let corroborating_url = "https://independent.example.net/roi";
+        let mut corroborated_quality = quality_with_claim(claim, url);
+        corroborated_quality.evidence_tree[0]
+            .evidences
+            .push(PmEvidenceLeafDto {
+                url: corroborating_url.into(),
+                domain: "independent.example.net".into(),
+                excerpt: "model-proposed excerpt must not be trusted".into(),
+            });
+        persist_pm_evidence_graph(
+            &db,
+            "tenant",
+            "corroborated-tool-hits",
+            &turn_with_tool_calls(vec![
+                web_search_tool(url, "ROI 12.5% 在 7 天内下降，主要受留存变化影响。"),
+                web_search_tool(corroborating_url, "独立样本显示 ROI 12.5% 在 7 天内下降。"),
+            ]),
+            &corroborated_quality,
+        )
+        .await
+        .expect("independently corroborated evidence is admitted");
+        let corroborated_status: String = sqlx::query_scalar(
+            "SELECT status FROM semantic_assertions
+             WHERE tenant_id = ? AND scope_json LIKE ?",
+        )
+        .bind("tenant")
+        .bind("%corroborated-tool-hits%")
+        .fetch_one(&db)
+        .await
+        .expect("load corroborated assertion");
+        assert_eq!(corroborated_status, "confirmed");
         let snapshot_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM semantic_snapshots
              WHERE tenant_id = ? AND scope = ?",
         )
         .bind("tenant")
-        .bind("pm-evidence:tenant:matching-tool-hit")
+        .bind("pm-evidence:tenant:corroborated-tool-hits")
         .fetch_one(&db)
         .await
         .expect("count reducer snapshots");

@@ -130,6 +130,7 @@ fn learned_token_limits() -> &'static Mutex<HashMap<LearnedTokenLimitKey, Learne
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+#[allow(clippy::struct_excessive_bools)]
 struct LearnedUnsupportedParameters {
     reasoning_effort: bool,
     max_tokens: bool,
@@ -1120,7 +1121,7 @@ impl ResponsesMessageStream {
             }
 
             if self.done {
-                self.pending.extend(self.state.finish()?);
+                self.pending.extend(self.state.finish());
                 if let Some(event) = self.pending.pop_front() {
                     return Ok(Some(event));
                 }
@@ -1129,7 +1130,7 @@ impl ResponsesMessageStream {
 
             if let Some(chunk) = self.response.chunk().await? {
                 for event in self.parser.push(&chunk)? {
-                    self.pending.extend(self.state.ingest_event(event)?);
+                    self.pending.extend(self.state.ingest_event(&event)?);
                 }
             } else {
                 if self.parser.parsed_events == 0 {
@@ -1181,19 +1182,16 @@ impl ResponsesSseParser {
 
         while let Some(frame) = next_sse_frame(&mut self.buffer) {
             let summary = summarize_sse_frame(&frame);
-            match parse_responses_sse_frame(&frame, &self.provider, &self.model)? {
-                Some(event) => {
-                    self.parsed_events += 1;
-                    events.push(event);
+            if let Some(event) = parse_responses_sse_frame(&frame, &self.provider, &self.model)? {
+                self.parsed_events += 1;
+                events.push(event);
+            } else {
+                self.ignored_frames += 1;
+                if summary.contains("data=[DONE]") {
+                    self.done_frames += 1;
                 }
-                None => {
-                    self.ignored_frames += 1;
-                    if summary.contains("data=[DONE]") {
-                        self.done_frames += 1;
-                    }
-                    if self.ignored_samples.len() < 3 {
-                        self.ignored_samples.push(summary);
-                    }
+                if self.ignored_samples.len() < 3 {
+                    self.ignored_samples.push(summary);
                 }
             }
         }
@@ -1257,7 +1255,8 @@ impl ResponsesStreamState {
         }
     }
 
-    fn ingest_event(&mut self, event: ResponsesStreamEvent) -> Result<Vec<StreamEvent>, ApiError> {
+    #[allow(clippy::too_many_lines)]
+    fn ingest_event(&mut self, event: &ResponsesStreamEvent) -> Result<Vec<StreamEvent>, ApiError> {
         let mut out = Vec::new();
         match event.event_type.as_str() {
             "response.created" | "response.in_progress" => {
@@ -1305,14 +1304,14 @@ impl ResponsesStreamState {
             }
             "response.output_item.added" => {
                 self.capture_response_output_item_metadata(&event.payload);
-                out.extend(self.ingest_response_output_item(&event.payload)?);
+                out.extend(self.ingest_response_output_item(&event.payload));
             }
             "response.function_call_arguments.delta" => {
-                out.extend(self.ingest_function_call_delta(&event.payload)?);
+                out.extend(self.ingest_function_call_delta(&event.payload));
             }
             "response.function_call_arguments.done" | "response.output_item.done" => {
                 self.capture_response_output_item_metadata(&event.payload);
-                out.extend(self.finish_function_call_from_payload(&event.payload)?);
+                out.extend(self.finish_function_call_from_payload(&event.payload));
             }
             "response.completed" => {
                 self.capture_response_metadata(&event.payload);
@@ -1332,7 +1331,7 @@ impl ResponsesStreamState {
                     }
                 }
                 self.completed = true;
-                out.extend(self.finish()?);
+                out.extend(self.finish());
             }
             "response.failed" | "response.incomplete" => {
                 self.capture_response_metadata(&event.payload);
@@ -1362,21 +1361,18 @@ impl ResponsesStreamState {
         Ok(out)
     }
 
-    fn ingest_response_output_item(
-        &mut self,
-        payload: &Value,
-    ) -> Result<Vec<StreamEvent>, ApiError> {
+    fn ingest_response_output_item(&mut self, payload: &Value) -> Vec<StreamEvent> {
         let Some(item) = payload.get("item") else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
         if item.get("type").and_then(Value::as_str) != Some("function_call") {
-            return Ok(Vec::new());
+            return Vec::new();
         }
         let index = payload
             .get("output_index")
             .and_then(Value::as_u64)
             .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or_else(|| self.function_calls.len() as u32);
+            .unwrap_or(self.function_calls.len() as u32);
         let state = self.function_calls.entry(index).or_default();
         state.id = item
             .get("id")
@@ -1399,10 +1395,7 @@ impl ResponsesStreamState {
         self.start_function_call_if_ready(index)
     }
 
-    fn ingest_function_call_delta(
-        &mut self,
-        payload: &Value,
-    ) -> Result<Vec<StreamEvent>, ApiError> {
+    fn ingest_function_call_delta(&mut self, payload: &Value) -> Vec<StreamEvent> {
         let index = payload
             .get("output_index")
             .and_then(Value::as_u64)
@@ -1415,10 +1408,7 @@ impl ResponsesStreamState {
         self.function_call_delta_if_started(index)
     }
 
-    fn finish_function_call_from_payload(
-        &mut self,
-        payload: &Value,
-    ) -> Result<Vec<StreamEvent>, ApiError> {
+    fn finish_function_call_from_payload(&mut self, payload: &Value) -> Vec<StreamEvent> {
         let index = payload
             .get("output_index")
             .and_then(Value::as_u64)
@@ -1542,14 +1532,14 @@ impl ResponsesStreamState {
         }
     }
 
-    fn finish(&mut self) -> Result<Vec<StreamEvent>, ApiError> {
+    fn finish(&mut self) -> Vec<StreamEvent> {
         let mut out = Vec::new();
         out.extend(self.ensure_message_started());
         out.extend(self.stop_reasoning_block());
         out.extend(self.stop_text_block());
         let indexes: Vec<u32> = self.function_calls.keys().copied().collect();
         for index in indexes {
-            out.extend(self.stop_function_call_if_ready(index)?);
+            out.extend(self.stop_function_call_if_ready(index));
         }
         if self.completed {
             out.push(StreamEvent::MessageDelta(MessageDeltaEvent {
@@ -1562,17 +1552,17 @@ impl ResponsesStreamState {
             out.push(StreamEvent::MessageStop(MessageStopEvent {}));
             self.completed = false;
         }
-        Ok(out)
+        out
     }
 
-    fn start_function_call_if_ready(&mut self, index: u32) -> Result<Vec<StreamEvent>, ApiError> {
+    fn start_function_call_if_ready(&mut self, index: u32) -> Vec<StreamEvent> {
         let mut out = self.stop_reasoning_block();
         let index_offset = self.tool_call_block_index_offset();
         let Some(state) = self.function_calls.get_mut(&index) else {
-            return Ok(out);
+            return out;
         };
         if state.started || state.name.is_none() {
-            return Ok(out);
+            return out;
         }
         state.started = true;
         out.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
@@ -1587,17 +1577,17 @@ impl ResponsesStreamState {
                 input: json!({}),
             },
         }));
-        Ok(out)
+        out
     }
 
-    fn function_call_delta_if_started(&mut self, index: u32) -> Result<Vec<StreamEvent>, ApiError> {
-        let mut out = self.start_function_call_if_ready(index)?;
+    fn function_call_delta_if_started(&mut self, index: u32) -> Vec<StreamEvent> {
+        let mut out = self.start_function_call_if_ready(index);
         let index_offset = self.tool_call_block_index_offset();
         let Some(state) = self.function_calls.get_mut(&index) else {
-            return Ok(out);
+            return out;
         };
         if !state.started || state.emitted_len >= state.arguments.len() {
-            return Ok(out);
+            return out;
         }
         let delta = state.arguments[state.emitted_len..].to_string();
         state.emitted_len = state.arguments.len();
@@ -1607,14 +1597,14 @@ impl ResponsesStreamState {
                 partial_json: delta,
             },
         }));
-        Ok(out)
+        out
     }
 
-    fn stop_function_call_if_ready(&mut self, index: u32) -> Result<Vec<StreamEvent>, ApiError> {
-        let mut out = self.function_call_delta_if_started(index)?;
+    fn stop_function_call_if_ready(&mut self, index: u32) -> Vec<StreamEvent> {
+        let mut out = self.function_call_delta_if_started(index);
         let index_offset = self.tool_call_block_index_offset();
         let Some(state) = self.function_calls.get_mut(&index) else {
-            return Ok(out);
+            return out;
         };
         if state.started && !state.stopped {
             state.stopped = true;
@@ -1622,7 +1612,7 @@ impl ResponsesStreamState {
                 index: index + index_offset,
             }));
         }
-        Ok(out)
+        out
     }
 
     fn capture_response_metadata(&mut self, payload: &Value) {
@@ -1803,25 +1793,22 @@ impl OpenAiSseParser {
 
         while let Some(frame) = next_sse_frame(&mut self.buffer) {
             let summary = summarize_sse_frame(&frame);
-            match parse_sse_frame(&frame, &self.provider, &self.model)? {
-                Some(event) => {
-                    self.parsed_chunks += 1;
-                    tracing::debug!(
-                        "SSE frame parsed: {} bytes → ChatCompletionChunk id={} choices={}",
-                        frame.len(),
-                        event.id,
-                        event.choices.len()
-                    );
-                    events.push(event);
+            if let Some(event) = parse_sse_frame(&frame, &self.provider, &self.model)? {
+                self.parsed_chunks += 1;
+                tracing::debug!(
+                    "SSE frame parsed: {} bytes → ChatCompletionChunk id={} choices={}",
+                    frame.len(),
+                    event.id,
+                    event.choices.len()
+                );
+                events.push(event);
+            } else {
+                self.ignored_frames += 1;
+                if summary.contains("data=[DONE]") {
+                    self.done_frames += 1;
                 }
-                None => {
-                    self.ignored_frames += 1;
-                    if summary.contains("data=[DONE]") {
-                        self.done_frames += 1;
-                    }
-                    if self.ignored_samples.len() < 3 {
-                        self.ignored_samples.push(summary);
-                    }
+                if self.ignored_samples.len() < 3 {
+                    self.ignored_samples.push(summary);
                 }
             }
         }
@@ -2582,7 +2569,7 @@ fn translate_assistant_message(message: &InputMessage, model: &str) -> Vec<Value
         }
     }
     let needs_reasoning = model_requires_reasoning_content_in_history(model);
-    if text.is_empty() && tool_calls.is_empty() && !(needs_reasoning && !reasoning.is_empty()) {
+    if (reasoning.is_empty() || !needs_reasoning) && tool_calls.is_empty() && text.is_empty() {
         Vec::new()
     } else {
         let mut msg = serde_json::json!({
@@ -2693,10 +2680,9 @@ fn translate_non_assistant_message(message: &InputMessage) -> Vec<Value> {
                 parts.push(doc_part);
                 has_media = true;
             }
-            InputContentBlock::ToolUse { .. } => {}
-            // Thinking blocks only appear on assistant messages; ignore on
-            // non-assistant roles.
-            InputContentBlock::Thinking { .. } => {}
+            // Tool-use and thinking blocks only appear on assistant messages;
+            // ignore them on non-assistant roles.
+            InputContentBlock::ToolUse { .. } | InputContentBlock::Thinking { .. } => {}
         }
     }
 
@@ -3234,9 +3220,7 @@ fn recent_history_for_responses_web_search(
     messages: &[InputMessage],
     latest_user_index: Option<usize>,
 ) -> Option<String> {
-    let Some(latest_index) = latest_user_index else {
-        return None;
-    };
+    let latest_index = latest_user_index?;
     let mut selected = Vec::new();
     for (index, message) in messages
         .iter()
@@ -3515,11 +3499,11 @@ fn log_responses_web_search_payload(
         .unwrap_or("");
     let max_output_tokens = payload
         .get("max_output_tokens")
-        .and_then(|value| value.as_u64())
+        .and_then(Value::as_u64)
         .unwrap_or_default();
     let stream = payload
         .get("stream")
-        .and_then(|value| value.as_bool())
+        .and_then(Value::as_bool)
         .unwrap_or(false);
     let web_search_options_present = payload.get("web_search_options").is_some();
     tracing::info!(
@@ -3702,6 +3686,7 @@ fn responses_annotation_value_to_metadata(
     }))
 }
 
+#[allow(clippy::too_many_lines)]
 fn normalize_responses_response(
     model: &str,
     response: ResponsesApiResponse,
@@ -3757,8 +3742,7 @@ fn normalize_responses_response(
                     input: item
                         .arguments
                         .as_deref()
-                        .map(parse_tool_arguments)
-                        .unwrap_or_else(|| json!({})),
+                        .map_or_else(|| json!({}), parse_tool_arguments),
                 });
             }
         }
@@ -4099,9 +4083,9 @@ pub fn responses_endpoint(base_url: &str) -> String {
     }
 }
 
-/// DeepSeek exposes provider-native Responses API web search only for the
-/// official Flash runtime. Other DeepSeek models and OpenAI-compatible hosts
-/// must keep using their explicit AOS search tools until they declare support.
+/// `DeepSeek` exposes provider-native `Responses API` web search only for the
+/// official `Flash` runtime. Other `DeepSeek` models and OpenAI-compatible hosts
+/// must keep using their explicit `AOS` search tools until they declare support.
 #[must_use]
 pub fn supports_official_deepseek_responses_web_search(model: &str, base_url: &str) -> bool {
     let canonical_model = model
@@ -4116,7 +4100,7 @@ pub fn supports_official_deepseek_responses_web_search(model: &str, base_url: &s
     is_official_deepseek_base_url(base_url)
 }
 
-/// Official DeepSeek V4 chat-completions accepts an explicit
+/// Official `DeepSeek V4` chat-completions accepts an explicit
 /// `thinking: { type: "disabled" }` control. Execution-oriented callers can
 /// use this to reserve their deadline for a concise tool/SQL result while
 /// leaving thinking enabled for planning and synthesis turns.
@@ -5215,7 +5199,7 @@ mod tests {
             let parsed = parse_responses_sse_frame(frame, "OpenAI", "gpt-5.5")
                 .expect("frame parses")
                 .expect("event");
-            events.extend(state.ingest_event(parsed).expect("state ingests"));
+            events.extend(state.ingest_event(&parsed).expect("state ingests"));
         }
 
         let text = events
@@ -5265,7 +5249,7 @@ mod tests {
             let parsed = parse_responses_sse_frame(frame, "OpenAI", "gpt-5.5")
                 .expect("frame parses")
                 .expect("event");
-            events.extend(state.ingest_event(parsed).expect("state ingests"));
+            events.extend(state.ingest_event(&parsed).expect("state ingests"));
         }
 
         let body = events
@@ -5322,19 +5306,16 @@ mod tests {
             let parsed = parse_responses_sse_frame(frame, "OpenAI", "gpt-5.5")
                 .expect("frame parses")
                 .expect("event");
-            events.extend(state.ingest_event(parsed).expect("state ingests"));
+            events.extend(state.ingest_event(&parsed).expect("state ingests"));
         }
 
-        assert!(matches!(
-            events.iter().find(|event| matches!(
-                event,
-                StreamEvent::ContentBlockStart(ContentBlockStartEvent {
-                    content_block: OutputContentBlock::ToolUse { name, .. },
-                    ..
-                }) if name == "lookup_local"
-            )),
-            Some(_)
-        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                content_block: OutputContentBlock::ToolUse { name, .. },
+                ..
+            }) if name == "lookup_local"
+        )));
         let args = events
             .iter()
             .filter_map(|event| match event {

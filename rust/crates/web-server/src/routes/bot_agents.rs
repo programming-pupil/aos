@@ -31,11 +31,11 @@ use crate::routes::bot_agents_router::{
     router_enabled_capabilities, rule_router_target,
 };
 pub use crate::routes::bot_agents_types::{
-    capability_binding_parts, clean_opt, default_capability_bindings, first_capability_key,
-    BotAgentCapabilityInfo, BotAgentChannelInfo, BotAgentInfo, BotMessageLogInfo,
-    CapabilityBindingInput, ChannelListQuery, CreateAgentRequest, CreateChannelRequest,
-    ListResponse, LogListQuery, TestChannelRequest, UpdateAgentRequest, UpdateChannelRequest,
-    WebhookQuery,
+    capability_binding_parts, clean_opt, decrypt_bot_channel_secret, default_capability_bindings,
+    encrypt_bot_channel_secret, first_capability_key, BotAgentCapabilityInfo, BotAgentChannelInfo,
+    BotAgentInfo, BotChannelSecretKind, BotMessageLogInfo, CapabilityBindingInput,
+    ChannelListQuery, CreateAgentRequest, CreateChannelRequest, ListResponse, LogListQuery,
+    TestChannelRequest, UpdateAgentRequest, UpdateChannelRequest, WebhookQuery,
 };
 use crate::routes::hooks::{run_lifecycle_hooks, HookEventType};
 use crate::routes::PaginationParams;
@@ -4591,9 +4591,16 @@ async fn load_bot_attachment_access(
     .fetch_optional(state.control_db())
     .await?
     .ok_or_else(|| AppError::NotFound("Bot attachment channel not found".to_string()))?;
+    let outbound_token = decrypt_bot_channel_secret(
+        row.get("outbound_token"),
+        tenant_id,
+        channel_id,
+        BotChannelSecretKind::OutboundToken,
+    )
+    .map_err(|error| AppError::Internal(format!("Bot channel secret decrypt failed: {error}")))?;
     Ok(BotAttachmentAccess {
         platform: row.get::<String, _>("platform").trim().to_ascii_lowercase(),
-        outbound_token: row.get("outbound_token"),
+        outbound_token,
         config: parse_json_opt(row.get("config_json")),
     })
 }
@@ -7673,6 +7680,34 @@ async fn create_channel(
     let platform = normalize_platform(&req.platform);
     let inbound_mode = normalize_inbound_mode(req.inbound_mode)?;
     validate_platform_inbound_mode(&platform, &inbound_mode)?;
+    let inbound_secret = encrypt_bot_channel_secret(
+        req.inbound_secret,
+        &claims.tenant_id,
+        &id,
+        BotChannelSecretKind::InboundSecret,
+    )
+    .map_err(|error| AppError::Internal(format!("Bot channel secret encrypt failed: {error}")))?;
+    let outbound_token = encrypt_bot_channel_secret(
+        req.outbound_token,
+        &claims.tenant_id,
+        &id,
+        BotChannelSecretKind::OutboundToken,
+    )
+    .map_err(|error| AppError::Internal(format!("Bot channel secret encrypt failed: {error}")))?;
+    let outbound_signing_secret = encrypt_bot_channel_secret(
+        req.outbound_signing_secret,
+        &claims.tenant_id,
+        &id,
+        BotChannelSecretKind::OutboundSigningSecret,
+    )
+    .map_err(|error| AppError::Internal(format!("Bot channel secret encrypt failed: {error}")))?;
+    let signing_secret = encrypt_bot_channel_secret(
+        req.signing_secret,
+        &claims.tenant_id,
+        &id,
+        BotChannelSecretKind::SigningSecret,
+    )
+    .map_err(|error| AppError::Internal(format!("Bot channel secret encrypt failed: {error}")))?;
     sqlx::query::<sqlx::Sqlite>(
         r"
         INSERT INTO bot_agent_channels
@@ -7688,11 +7723,11 @@ async fn create_channel(
     .bind(req.name.trim())
     .bind(req.enabled.unwrap_or(true))
     .bind(inbound_mode)
-    .bind(clean_opt(req.inbound_secret))
+    .bind(inbound_secret)
     .bind(clean_opt(req.outbound_webhook_url))
-    .bind(clean_opt(req.outbound_token))
-    .bind(clean_opt(req.outbound_signing_secret))
-    .bind(clean_opt(req.signing_secret))
+    .bind(outbound_token)
+    .bind(outbound_signing_secret)
+    .bind(signing_secret)
     .bind(json_opt(req.config_json))
     .execute(state.control_db())
     .await?;
@@ -7743,6 +7778,35 @@ async fn update_channel(
     let effective_inbound_mode = inbound_mode.as_deref().unwrap_or(&current.1);
     validate_platform_inbound_mode(effective_platform, effective_inbound_mode)?;
 
+    let inbound_secret = encrypt_bot_channel_secret(
+        req.inbound_secret,
+        &claims.tenant_id,
+        &id,
+        BotChannelSecretKind::InboundSecret,
+    )
+    .map_err(|error| AppError::Internal(format!("Bot channel secret encrypt failed: {error}")))?;
+    let outbound_token = encrypt_bot_channel_secret(
+        req.outbound_token,
+        &claims.tenant_id,
+        &id,
+        BotChannelSecretKind::OutboundToken,
+    )
+    .map_err(|error| AppError::Internal(format!("Bot channel secret encrypt failed: {error}")))?;
+    let outbound_signing_secret = encrypt_bot_channel_secret(
+        req.outbound_signing_secret,
+        &claims.tenant_id,
+        &id,
+        BotChannelSecretKind::OutboundSigningSecret,
+    )
+    .map_err(|error| AppError::Internal(format!("Bot channel secret encrypt failed: {error}")))?;
+    let signing_secret = encrypt_bot_channel_secret(
+        req.signing_secret,
+        &claims.tenant_id,
+        &id,
+        BotChannelSecretKind::SigningSecret,
+    )
+    .map_err(|error| AppError::Internal(format!("Bot channel secret encrypt failed: {error}")))?;
+
     sqlx::query::<sqlx::Sqlite>(
         r"
         UPDATE bot_agent_channels
@@ -7763,11 +7827,11 @@ async fn update_channel(
     .bind(name)
     .bind(req.enabled)
     .bind(inbound_mode)
-    .bind(clean_opt(req.inbound_secret))
+    .bind(inbound_secret)
     .bind(clean_opt(req.outbound_webhook_url))
-    .bind(clean_opt(req.outbound_token))
-    .bind(clean_opt(req.outbound_signing_secret))
-    .bind(clean_opt(req.signing_secret))
+    .bind(outbound_token)
+    .bind(outbound_signing_secret)
+    .bind(signing_secret)
     .bind(json_opt(req.config_json))
     .bind(&claims.tenant_id)
     .bind(&id)
@@ -7917,7 +7981,7 @@ async fn inbound_webhook(
 ) -> Result<Json<Value>> {
     let row = sqlx::query::<sqlx::Sqlite>(
         r"
-        SELECT c.enabled, c.platform, c.inbound_mode, c.inbound_secret,
+        SELECT c.tenant_id, c.enabled, c.platform, c.inbound_mode, c.inbound_secret,
                a.enabled AS agent_enabled
         FROM bot_agent_channels c
         INNER JOIN bot_agents a ON a.tenant_id = c.tenant_id AND a.id = c.agent_id
@@ -7933,7 +7997,14 @@ async fn inbound_webhook(
     let agent_enabled: bool = row.get("agent_enabled");
     let platform: String = row.get("platform");
     let inbound_mode: String = row.get("inbound_mode");
-    let inbound_secret: Option<String> = row.get("inbound_secret");
+    let tenant_id: String = row.get("tenant_id");
+    let inbound_secret = decrypt_bot_channel_secret(
+        row.get("inbound_secret"),
+        &tenant_id,
+        &channel_id,
+        BotChannelSecretKind::InboundSecret,
+    )
+    .map_err(|error| AppError::Internal(format!("Bot channel secret decrypt failed: {error}")))?;
 
     if !channel_enabled || !agent_enabled {
         return Err(AppError::Forbidden);
@@ -7964,7 +8035,7 @@ async fn inbound_webhook_verify(
 ) -> Result<String> {
     let row = sqlx::query::<sqlx::Sqlite>(
         r"
-        SELECT c.enabled, c.platform, c.inbound_mode, c.inbound_secret,
+        SELECT c.tenant_id, c.enabled, c.platform, c.inbound_mode, c.inbound_secret,
                a.enabled AS agent_enabled
         FROM bot_agent_channels c
         INNER JOIN bot_agents a ON a.tenant_id = c.tenant_id AND a.id = c.agent_id
@@ -7980,7 +8051,14 @@ async fn inbound_webhook_verify(
     let agent_enabled: bool = row.get("agent_enabled");
     let platform: String = row.get("platform");
     let inbound_mode: String = row.get("inbound_mode");
-    let inbound_secret: Option<String> = row.get("inbound_secret");
+    let tenant_id: String = row.get("tenant_id");
+    let inbound_secret = decrypt_bot_channel_secret(
+        row.get("inbound_secret"),
+        &tenant_id,
+        &channel_id,
+        BotChannelSecretKind::InboundSecret,
+    )
+    .map_err(|error| AppError::Internal(format!("Bot channel secret decrypt failed: {error}")))?;
     if !channel_enabled || !agent_enabled {
         return Err(AppError::Forbidden);
     }

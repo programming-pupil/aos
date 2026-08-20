@@ -26,6 +26,8 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+"$ROOT_DIR/scripts/check-onnxruntime-contract.sh"
+
 if [ "$SKIP_BUILD" != "1" ]; then
   "$ROOT_DIR/install.sh" --release
 fi
@@ -56,7 +58,7 @@ cp "$ROOT_DIR/docs/INSTALL.md" \
   "$ROOT_DIR/docs/AOS_ENGINEERING_DESIGN_CENTER.zh-CN.md" \
   "$ROOT_DIR/docs/OPEN_SOURCE_TEST_GUIDE.zh-CN.md" \
   "$ROOT_DIR/docs/AOS_SEMANTIC_KERNEL_IMPLEMENTATION.md" \
-  "$ROOT_DIR/docs/AOS_SEMANTIC_KERNEL_REFACTOR.zh-CN.md" \
+  "$ROOT_DIR/docs/AOS_SEMANTIC_KERNEL_CONFORMANCE_MATRIX.zh-CN.md" \
   "$stage/docs/"
 cp "$ROOT_DIR/docs/evals/BOT_GATEWAY_COMPLETE_TEST_GUIDE.zh-CN.md" \
   "$ROOT_DIR/docs/evals/DATA_ATTRIBUTION_COMPLETE_TEST_GUIDE.zh-CN.md" \

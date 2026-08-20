@@ -349,6 +349,7 @@ impl MessageStream {
         }
     }
 
+    #[must_use]
     pub fn provider_metadata(&self) -> Option<serde_json::Value> {
         match self {
             Self::OpenAiResponses(stream) => stream.provider_metadata(),

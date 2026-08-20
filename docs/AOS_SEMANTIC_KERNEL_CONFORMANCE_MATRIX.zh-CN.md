@@ -1,6 +1,6 @@
 # AOS 语义内核一致性矩阵
 
-> 规格：`docs/AOS_SEMANTIC_KERNEL_REFACTOR.zh-CN.md`
+> 规格：AOS 语义内核生产契约与行为验收标准
 > 数据集：`eval/datasets/semantic-kernel-conformance.json`
 > 判定原则：生产符号存在、触发路径可达、行为断言通过，三者缺一不可。
 
@@ -9,7 +9,7 @@
 - `automated_behavior_verified`：生产调用路径和自动化行为测试均已接通。
 - `capability_negotiated`：统一协议已接通；executor 支持的动作必须真实执行，不支持的动作必须持久化并明确拒绝。
 - `mechanism_verified_effect_pending`：机制与测量链路已验证，准确率/召回率/延迟等数值仍需固定环境实测。
-- `pending_blind_review`：真实 adapter、trace、盲评配对已具备，但没有完成同模型/工具/预算的人工盲评，不声明竞品领先。
+- `pending_blind_review`：真实 adapter、trace、盲评配对已具备，但没有完成同模型、工具和预算的人工盲评，不声明效果领先。
 
 | ID | 行为触发与关键断言 | 状态 |
 | --- | --- | --- |
@@ -24,26 +24,35 @@
 | SEC-001 | child capability 只能取交集，过期、扩权、重复使用全部 fail closed | automated_behavior_verified |
 | SEC-002 | raw/model/client/telemetry 独立投影，source hash 保留且 secret 不泄漏 | automated_behavior_verified |
 | PROMPT-001 | provider 调用前记录 prompt/tool/context hash、预算和 snapshot lineage，不落原始 prompt | automated_behavior_verified |
+| PROMPT-002 | retry/fallback 的每个 provider attempt 都持久化独立的 prompt/context/tool/wire hash、父 attempt 和原因；不匹配时 dispatch 前拒绝 | automated_behavior_verified |
 | CORE-001 | Assertion/Decision/Evidence/Snapshot 可确定性校验，不依赖 LLM | automated_behavior_verified |
 | CORE-002 | 重复、乱序、冲突、supersession 重放保持幂等且不覆盖旧版本 | automated_behavior_verified |
 | CORE-003 | checkpoint/replacement source coverage 完整且敏感字段受保护 | automated_behavior_verified |
 | MEM-001 | 生产 Compaction Hook 执行双通道抽取、secret admission、持久化、cursor 与 checkpoint；continuity/long-term 均真实落库 | automated_behavior_verified |
 | MEM-002 | 新旧事实 consolidation 保留 conflict/supersession，当前检索不静默返回过期事实 | automated_behavior_verified |
 | MEM-003 | 普通 Memory upsert 的 structured fact 与 searchable projection 原子提交；注入 structured 写失败时两者都回滚 | automated_behavior_verified |
+| MEM-004 | Memory 生产写入口只能通过统一 Repository/Transaction；canonical fact、projection 和 event 原子提交或完整回滚 | automated_behavior_verified |
+| TCK-001 | SQLite 参考 adapter 与内存 adapter 运行同一公开 Repository contract 并产生一致状态和 projection hash | automated_behavior_verified |
 | CMP-001 | replacement 不小于源窗口或边界不稳定时 fail closed，原文 archive 保留 | automated_behavior_verified |
+| CMP-002 | 三次嵌套压缩只绑定 exact archive window，parent DAG 可展开；重叠、缺失父节点和 cycle 均拒绝 | automated_behavior_verified |
+| INTERACTION-001 | durable interaction 的 create/suspend/event/outbox 同事务；故障无半成品，重复 idempotency 不重复 dispatch | automated_behavior_verified |
+| CHECKPOINT-001 | terminal/checkpoint 唯一提交 API 拒绝 scope/status 漂移和重复 terminal，保持 turn、checkpoint、ledger 一致 | automated_behavior_verified |
 | CTX-001 | 超预算历史进入真实 runtime turn 后，provider 只能收到 Context Compiler 选择后的 request | automated_behavior_verified |
 | PM-001 | Planner 完整 Requirement Delta 跨轮持久化；重复 event 幂等，假设/决策/实验演进保留 event 历史并更新物化 state | automated_behavior_verified |
-| PM-002 | 下一问按信息价值排序而非固定问卷 | mechanism_verified_effect_pending |
+| PM-002 | 生产 PM 路径用同领域成熟回答、真实 decision change、剩余不确定性和用户耗时校准下一问；模型自报概率不能覆盖观测校准 | mechanism_verified_effect_pending |
 | PM-003 | URL 存在但数字、单位、方向冲突时拒绝 evidence admission | automated_behavior_verified |
 | PM-004 | 最终交付必须再次读取 durable state；未验证高影响假设只能产出 Requirement Brief，不能伪装为可评审 PRD | automated_behavior_verified |
+| PM-005 | 无工具或语义不匹配证据不能确认；单一 Tool 对高影响 claim 只到 proposed，独立双源满足 authority policy 后才 confirmed | automated_behavior_verified |
 | SQL-001 | NL 先编译 canonical IR，同一 IR 同时注入 generator 并驱动 post-SQL verifier，禁止从 SQL 重猜 intent | automated_behavior_verified |
 | SQL-002 | Metric/Join Contract 只读取当前 tenant 的有效版本并保留 lineage | automated_behavior_verified |
 | SQL-003 | 执行阶段每个修复 SQL 都重新读取首次持久化的 canonical IR；范围保持才记录 `Release` 并重试，grain/metric/time/join 漂移先审计再拒绝 | automated_behavior_verified |
 | SQL-004 | correction 仅能绑定本人真实查询，只有 datasource owner/admin 可批准；批准/撤销有 append-only 审计，confidence 只使用同 scope 标注并输出 ECE/Brier | mechanism_verified_effect_pending |
 | SQL-005 | 逻辑维度绑定唯一 schema 列后，canonical IR 首次持久化即不可变；直接重写和后置 semantic-audit 重写同 ID 均 fail closed | automated_behavior_verified |
 | EVAL-001 | probe 不包含目标事实，压缩后按隐藏答案和真实证据评分 | mechanism_verified_effect_pending |
-| EVAL-002 | 180-case manifest、真实 AOS/Codex adapter、raw trace、盲评隐藏键可复现 | pending_blind_review |
+| EVAL-002 | 180-case manifest、真实执行 adapter、raw trace、盲评隐藏键可复现 | pending_blind_review |
 | EVAL-003 | provider partial/hang/timeout/late/crash fixture 校验 request hash 与 assert_consumed | automated_behavior_verified |
+| FAULT-001 | 真实进程在事务 before/after commit 被终止并用同一数据库恢复，验证唯一 canonical 状态和原子 projection | automated_behavior_verified |
+| KEY-001 | registry 全覆盖、旧 key 引用归零、scoped decrypt 与备份条件全部满足后才允许签发退役证书 | automated_behavior_verified |
 
 ## 删除与保留
 
@@ -51,4 +60,4 @@
 
 ## 仍需外部实证的发布门槛
 
-以下数值不能由本地单元测试替代：Memory recall/false-memory、PM omission/support precision、NL2SQL semantic accuracy/ECE/Brier、Attribution causal overclaim、工具 schema token 降幅、p95 延迟、AOS/Codex/DSH 同条件盲评胜率。运行结果必须保留 case 清单、模型、工具、权限、预算、trace 和人工盲评状态；在完成前统一标记为 `pending_blind_review`，禁止写成“已领先”。
+以下数值不能由本地单元测试替代：Memory recall/false-memory、PM omission/support precision、NL2SQL semantic accuracy/ECE/Brier、Attribution causal overclaim、工具 schema token 降幅、p95 延迟和同条件盲评胜率。运行结果必须保留 case 清单、模型、工具、权限、预算、trace 和人工盲评状态；在完成前统一标记为 `pending_blind_review`，禁止写成“已领先”。

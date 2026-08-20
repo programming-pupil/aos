@@ -20,6 +20,7 @@ pub struct SemanticKernelBridge {
 }
 
 impl SemanticKernelBridge {
+    #[must_use]
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
@@ -27,7 +28,7 @@ impl SemanticKernelBridge {
             evidence: EvidenceLedger::default(),
             snapshot: SemanticSnapshot::default(),
             memory: InMemoryMemoryRepository::default(),
-            reducer: SemanticReducer::default(),
+            reducer: SemanticReducer,
         }
     }
     pub fn append_user_message(
@@ -59,11 +60,11 @@ impl SemanticKernelBridge {
                 .map_or(1, |r| r.len() as u64 + 1),
         );
         self.execution
-            .append(writer, event)
+            .append(&writer, event)
             .map_err(|e| e.to_string())?;
         Ok(())
     }
-    pub fn ingest_memory(&mut self, extraction: DualChannelExtraction) -> Result<usize, String> {
+    pub fn ingest_memory(&mut self, extraction: &DualChannelExtraction) -> Result<usize, String> {
         if !self.enabled {
             return Ok(0);
         }

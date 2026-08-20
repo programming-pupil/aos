@@ -12,8 +12,9 @@ mod types;
 
 pub use compaction::{CompactionCandidate, CompactionError, CompactionValidator};
 pub use context::{
-    ContextBlock, ContextCompiler, ContextEnvelope, ContextError, ContextOutputContract,
-    ContextPacket, ContextReference, ContextSelection, ContextTrust, PromptLayer,
+    ContextBlock, ContextBlockManifest, ContextCompiler, ContextEnvelope, ContextError,
+    ContextManifest, ContextOutputContract, ContextPacket, ContextReference, ContextSelection,
+    ContextTrust, PromptLayer,
 };
 pub use evidence::{
     EvidenceAuthority, EvidenceLedger, EvidenceLedgerError, EvidenceRef, EvidenceSourceType,
@@ -21,6 +22,15 @@ pub use evidence::{
 };
 pub use reducer::{ReductionError, ReductionOutcome, SemanticReducer};
 pub use types::*;
+
+pub(crate) fn behavior_trace(case_id: &str) {
+    if std::env::var("AOS_BEHAVIOR_TRACE_CASE").as_deref() == Ok(case_id) {
+        static EMITTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if EMITTED.set(()).is_ok() {
+            eprintln!("AOS_PRODUCTION_TRACE\t{case_id}");
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -35,7 +45,7 @@ mod tests {
             subject: EntityRef::new("user", "u1"),
             predicate: "theme".into(),
             value: TypedValue::String(value.into()),
-            qualifiers: Default::default(),
+            qualifiers: std::collections::BTreeMap::default(),
             valid_time: None,
             observed_at: Utc::now(),
             status: AssertionStatus::Proposed,
@@ -59,7 +69,7 @@ mod tests {
 
     #[test]
     fn reducer_is_idempotent_and_preserves_old_versions() {
-        let reducer = SemanticReducer::default();
+        let reducer = SemanticReducer;
         let mut snapshot = SemanticSnapshot::default();
         let mut evidence = EvidenceLedger::default();
         for id in ["e1", "e2"] {
@@ -107,7 +117,7 @@ mod tests {
 
     #[test]
     fn reducer_rejects_missing_evidence_and_conflicts_without_overwriting() {
-        let reducer = SemanticReducer::default();
+        let reducer = SemanticReducer;
         let mut snapshot = SemanticSnapshot::default();
         let mut no_evidence = assertion("a1", "dark", "missing");
         no_evidence.source_refs.clear();
@@ -157,7 +167,7 @@ mod tests {
 
     #[test]
     fn reducer_demotes_model_self_confirmation_for_assertions_and_decisions() {
-        let reducer = SemanticReducer::default();
+        let reducer = SemanticReducer;
         let mut evidence = EvidenceLedger::default();
         let model_evidence = EvidenceRef {
             evidence_id: "model-evidence".into(),
@@ -226,80 +236,79 @@ mod tests {
     }
 
     #[test]
-    fn reducer_applies_risk_and_authority_matrix() {
-        let reducer = SemanticReducer::default();
-        let tool_evidence = EvidenceRef {
-            evidence_id: "tool-evidence".into(),
-            source_type: EvidenceSourceType::ToolResult,
-            source_locator: "tool://lookup".into(),
-            content_hash: "tool-hash".into(),
-            event_seq: Some(1),
+    fn high_impact_authority_requires_owner_or_two_independent_sources() {
+        fn tool_evidence(id: &str, locator: &str, hash: &str) -> EvidenceRef {
+            EvidenceRef {
+                evidence_id: id.into(),
+                source_type: EvidenceSourceType::ToolResult,
+                source_locator: locator.into(),
+                content_hash: hash.into(),
+                event_seq: None,
+                byte_or_line_range: None,
+                collected_at: Utc::now(),
+                authority: EvidenceAuthority::Tool,
+            }
+        }
+
+        let first = tool_evidence("tool-1", "https://source.example/report", "hash-1");
+        let same_origin = tool_evidence("tool-2", "https://source.example/report", "hash-1");
+        let independent = tool_evidence("tool-3", "warehouse://signed/metric", "hash-3");
+        let owner = EvidenceRef {
+            evidence_id: "owner-1".into(),
+            source_type: EvidenceSourceType::Message,
+            source_locator: "session://owner/turn-1".into(),
+            content_hash: "owner-hash".into(),
+            event_seq: None,
             byte_or_line_range: None,
             collected_at: Utc::now(),
-            authority: EvidenceAuthority::Tool,
-        };
-        let owner_evidence = EvidenceRef {
-            evidence_id: "owner-evidence".into(),
-            content_hash: "owner-hash".into(),
             authority: EvidenceAuthority::Owner,
-            ..tool_evidence.clone()
         };
-        let mut evidence = EvidenceLedger::default();
-        evidence.append(tool_evidence.clone()).unwrap();
-        evidence.append(owner_evidence.clone()).unwrap();
-
-        let mut secret = assertion("secret", "credential", "tool-evidence");
-        secret.status = AssertionStatus::Confirmed;
-        secret.sensitivity = Sensitivity::Secret;
-        secret.source_refs = vec![tool_evidence.clone()];
-        let demoted = reducer
-            .apply(
-                &SemanticSnapshot::default(),
-                ProposedStateDelta::UpsertAssertion(secret),
-                &evidence,
-            )
-            .unwrap();
-        assert_eq!(
-            demoted.snapshot.assertions["secret"].status,
-            AssertionStatus::Proposed
-        );
-
-        let decision = |id: &str, rationale: EvidenceRef| DecisionRecord {
-            id: id.into(),
-            scope: AssertionScope::Session("s".into()),
-            question: "Ship?".into(),
-            decision: "yes".into(),
-            alternatives: vec![],
-            rationale: vec![rationale],
-            constraints: vec![],
-            acceptance_criteria: vec![],
-            owner: Some(EntityRef::new("user", "owner")),
-            status: DecisionStatus::Accepted,
-            valid_time: None,
-            version: 1,
+        let mut ledger = EvidenceLedger::default();
+        for evidence in [&first, &same_origin, &independent, &owner] {
+            ledger.append(evidence.clone()).unwrap();
+        }
+        let reducer = SemanticReducer;
+        let candidate = |id: &str, refs: Vec<EvidenceRef>| {
+            let mut value = assertion(id, "ROI declined", &refs[0].evidence_id);
+            value.subject = EntityRef::new("research_claim", "roi-trend");
+            value.status = AssertionStatus::Confirmed;
+            value.source_refs = refs;
+            value
         };
-        let tool_decision = reducer
-            .apply(
-                &SemanticSnapshot::default(),
-                ProposedStateDelta::UpsertDecision(decision("tool-decision", tool_evidence)),
-                &evidence,
-            )
-            .unwrap();
-        assert_eq!(
-            tool_decision.snapshot.decisions["tool-decision"].status,
-            DecisionStatus::Proposed
-        );
-        let owner_decision = reducer
-            .apply(
-                &SemanticSnapshot::default(),
-                ProposedStateDelta::UpsertDecision(decision("owner-decision", owner_evidence)),
-                &evidence,
-            )
-            .unwrap();
-        assert_eq!(
-            owner_decision.snapshot.decisions["owner-decision"].status,
-            DecisionStatus::Accepted
-        );
+
+        for (id, refs) in [
+            ("single-tool", vec![first.clone()]),
+            ("same-origin", vec![first.clone(), same_origin]),
+        ] {
+            let result = reducer
+                .apply(
+                    &SemanticSnapshot::default(),
+                    ProposedStateDelta::UpsertAssertion(candidate(id, refs)),
+                    &ledger,
+                )
+                .unwrap();
+            assert_eq!(
+                result.snapshot.assertions[id].status,
+                AssertionStatus::Proposed
+            );
+        }
+
+        for (id, refs) in [
+            ("independent-tools", vec![first, independent]),
+            ("owner-confirmed", vec![owner]),
+        ] {
+            let result = reducer
+                .apply(
+                    &SemanticSnapshot::default(),
+                    ProposedStateDelta::UpsertAssertion(candidate(id, refs)),
+                    &ledger,
+                )
+                .unwrap();
+            assert_eq!(
+                result.snapshot.assertions[id].status,
+                AssertionStatus::Confirmed
+            );
+        }
     }
 
     #[test]
@@ -318,7 +327,7 @@ mod tests {
             })
             .unwrap();
         assert!(evidence.validate_source_coverage(&[2]).is_ok());
-        let packet = ContextCompiler::default()
+        let packet = ContextCompiler
             .compile(
                 ContextSelection {
                     objective: "answer".into(),
@@ -334,7 +343,7 @@ mod tests {
 
     #[test]
     fn model_context_selection_drops_oldest_recent_blocks_under_budget() {
-        let compiler = ContextCompiler::default();
+        let compiler = ContextCompiler;
         let packet = compiler
             .compile_for_model(
                 ContextSelection {
