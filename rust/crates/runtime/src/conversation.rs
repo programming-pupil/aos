@@ -1196,11 +1196,19 @@ where
         }
         reporter.on_turn_started(&turn_id);
         self.record_turn_started(&user_input);
-        self.session.push_user_text(user_input).map_err(|error| {
-            let runtime_error = RuntimeError::new(error.to_string());
+        if let Err(error) = self.session.push_user_text(user_input) {
             self.complete_session_turn(&turn_id, SessionTurnStatus::Failed);
-            runtime_error
-        })?;
+            let runtime_error = RuntimeError::new(error.to_string());
+            let detail = format!("runtime turn failed before model execution: {runtime_error}");
+            self.finish_turn_in_kernel(&turn_id, RuntimeTurnTerminalStatus::Failed, Some(&detail))
+                .await
+                .map_err(|finish_error| {
+                    RuntimeError::new(format!(
+                        "{runtime_error}; durable failure checkpoint also failed: {finish_error}"
+                    ))
+                })?;
+            return Err(runtime_error);
+        }
 
         let outcome = self
             .continue_resumable_turn(
@@ -3906,12 +3914,21 @@ mod tests {
 
     struct ApprovalTestKernel {
         state: Mutex<ApprovalKernelState>,
+        session_dir_to_block_on_start: Option<PathBuf>,
     }
 
     impl ApprovalTestKernel {
         fn new() -> Self {
             Self {
                 state: Mutex::new(ApprovalKernelState::default()),
+                session_dir_to_block_on_start: None,
+            }
+        }
+
+        fn blocking_session_dir_on_start(path: PathBuf) -> Self {
+            Self {
+                state: Mutex::new(ApprovalKernelState::default()),
+                session_dir_to_block_on_start: Some(path),
             }
         }
     }
@@ -3923,6 +3940,18 @@ mod tests {
         }
 
         async fn start_turn(&self, _input: RuntimeTurnStart) -> Result<(), RuntimeError> {
+            if let Some(path) = &self.session_dir_to_block_on_start {
+                fs::remove_dir_all(path).map_err(|error| {
+                    RuntimeError::new(format!(
+                        "failed to inject session persistence failure: {error}"
+                    ))
+                })?;
+                fs::write(path, b"blocks the former session directory").map_err(|error| {
+                    RuntimeError::new(format!(
+                        "failed to inject session persistence failure: {error}"
+                    ))
+                })?;
+            }
             Ok(())
         }
 
@@ -6499,6 +6528,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_message_persistence_failure_checkpoints_failed_kernel_turn() {
+        let session_dir = temp_session_path("failed-user-message");
+        fs::create_dir_all(&session_dir).expect("temporary session directory should be created");
+        let session_path = session_dir.join("session.jsonl");
+        let kernel = Arc::new(ApprovalTestKernel::blocking_session_dir_on_start(
+            session_dir.clone(),
+        ));
+        let mut runtime = ConversationRuntime::new(
+            Session::new().with_persistence_path(session_path),
+            ApprovalApiClient { call_count: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_execution_kernel(kernel.clone());
+
+        let error = runtime
+            .run_turn("hello", None, ())
+            .await
+            .expect_err("the user message persistence failure should abort the turn");
+
+        assert!(!error.to_string().is_empty());
+        assert_eq!(runtime.api_client_mut().call_count, 0);
+        assert!(runtime.session().messages.is_empty());
+        assert_eq!(
+            runtime.session().turns.last().map(|turn| turn.status),
+            Some(SessionTurnStatus::Failed)
+        );
+        assert_eq!(
+            kernel.state.lock().unwrap().terminal_checkpoints,
+            vec![(RuntimeTurnTerminalStatus::Failed, SessionTurnStatus::Failed)]
+        );
+        assert!(session_dir.is_file());
+        fs::remove_file(session_dir).expect("temporary persistence blocker should be removed");
+    }
+
+    #[tokio::test]
     async fn run_turn_propagates_api_errors() {
         struct FailingApi;
 
@@ -6513,13 +6579,15 @@ mod tests {
         }
 
         // given
+        let kernel = Arc::new(ApprovalTestKernel::new());
         let mut runtime = ConversationRuntime::new(
             Session::new(),
             FailingApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
-        );
+        )
+        .with_execution_kernel(kernel.clone());
 
         // when
         let error = runtime
@@ -6529,6 +6597,14 @@ mod tests {
 
         // then
         assert_eq!(error.to_string(), "upstream failed");
+        assert_eq!(
+            runtime.session().turns.last().map(|turn| turn.status),
+            Some(SessionTurnStatus::Failed)
+        );
+        assert_eq!(
+            kernel.state.lock().unwrap().terminal_checkpoints,
+            vec![(RuntimeTurnTerminalStatus::Failed, SessionTurnStatus::Failed)]
+        );
     }
 
     // Feature: codex-parity-gaps, Property 5: 压缩失败降级——记录并以未压缩上下文继续

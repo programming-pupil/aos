@@ -50,7 +50,7 @@ fn build_session(contents: &[String]) -> Session {
         .iter()
         .enumerate()
         .map(|(index, text)| {
-            let text = format!("{text}: {}", "important context ".repeat(48));
+            let text = format!("{text}: {}", "important context ".repeat(128));
             if index % 2 == 0 {
                 ConversationMessage::user_text(text)
             } else {
