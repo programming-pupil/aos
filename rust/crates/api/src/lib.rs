@@ -28,6 +28,7 @@ pub use prompt_cache::{
 pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
 pub use providers::openai_compat::{
     chat_completions_endpoint, embeddings_endpoint, images_generations_endpoint,
+    responses_compact_endpoint, responses_compact_request_from_message_request,
     supports_official_deepseek_responses_web_search,
     supports_official_deepseek_v4_thinking_control, OpenAiCompatClient, OpenAiCompatConfig,
 };
@@ -42,7 +43,8 @@ pub use types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     ImageSourceType, InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent,
     MessageRequest, MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock,
-    StreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
+    ResponsesCompactOutputItem, ResponsesCompactRequest, ResponsesCompactResult, StreamEvent,
+    ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 
 pub use telemetry::{

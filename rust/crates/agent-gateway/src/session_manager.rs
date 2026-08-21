@@ -464,6 +464,7 @@ fn is_internal_transient_source(source: &str) -> bool {
     source.starts_with("pm_internal")
         || source.starts_with("rd_internal")
         || source.starts_with("bot_internal")
+        || source.starts_with("agent_team_internal")
 }
 
 fn is_hidden_runtime_source(source: &str) -> bool {
@@ -776,8 +777,10 @@ pub struct ManualCompactionResult {
     pub session_id: String,
     pub trigger: String,
     pub strategy: String,
-    pub provider_native_supported: bool,
-    pub provider_native_used: bool,
+    pub provider_compaction_endpoint_supported: bool,
+    pub provider_compaction_endpoint_called: bool,
+    pub provider_compaction_output_applied: bool,
+    pub provider_compaction_fallback_reason: Option<String>,
     pub summary: String,
     pub summary_tokens: usize,
     pub removed_message_count: usize,
@@ -1214,6 +1217,67 @@ impl AgentSessionManager {
         })
     }
 
+    /// Copy only the immutable, completed-turn prefix of a parent into an idle
+    /// child runtime. The child keeps its own session identity, kernel, budget,
+    /// permissions and future turns; in-progress parent state is never shared.
+    pub async fn install_completed_turn_prefix(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<()> {
+        let mut prefix = self
+            .get_session_messages(parent_session_id, Some(tenant_id), Some(user_id))
+            .await
+            .ok_or_else(|| GatewayError::SessionNotFound(parent_session_id.to_string()))?;
+        let completed_end = prefix
+            .turns
+            .iter()
+            .rev()
+            .find(|turn| {
+                matches!(
+                    turn.status,
+                    runtime::SessionTurnStatus::Completed
+                        | runtime::SessionTurnStatus::Failed
+                        | runtime::SessionTurnStatus::Cancelled
+                )
+            })
+            .and_then(|turn| turn.end_message_count)
+            .unwrap_or(0)
+            .min(prefix.messages.len());
+        prefix.messages.truncate(completed_end);
+        prefix.turns.clear();
+        prefix.prompt_history.clear();
+        prefix.session_id = child_session_id.to_string();
+        prefix.tenant_id = Some(tenant_id.to_string());
+        prefix.user_id = Some(user_id.to_string());
+
+        let mut sessions = self.sessions.write().await;
+        let child = sessions
+            .get_mut(child_session_id)
+            .ok_or_else(|| GatewayError::SessionNotFound(child_session_id.to_string()))?;
+        if child.tenant_id != tenant_id || child.user_id != user_id {
+            return Err(GatewayError::Unauthorized);
+        }
+        if !matches!(child.state, SessionState::Idle) {
+            return Err(GatewayError::SessionBusy);
+        }
+        let mut runtime = child
+            .built
+            .take_runtime_arc()
+            .ok_or(GatewayError::SessionBusy)?;
+        let Some(runtime_mut) = Arc::get_mut(&mut runtime) else {
+            child.built.return_runtime(runtime);
+            return Err(GatewayError::RuntimeExecution(
+                "child runtime is unexpectedly shared while installing fork prefix".into(),
+            ));
+        };
+        runtime_mut.restore_session(prefix);
+        child.built.return_runtime(runtime);
+        Ok(())
+    }
+
     /// Run a turn in an existing session.
     ///
     /// Returns the turn result.
@@ -1612,8 +1676,18 @@ impl AgentSessionManager {
                 strategy: Some(compaction.strategy.clone()),
                 summary_tokens: Some(compaction.summary_tokens),
                 retained_tail_tokens: Some(compaction.retained_tail_tokens),
-                provider_native_supported: Some(compaction.provider_native_supported),
-                provider_native_used: Some(compaction.provider_native_used),
+                provider_compaction_endpoint_supported: Some(
+                    compaction.provider_compaction_endpoint_supported,
+                ),
+                provider_compaction_endpoint_called: Some(
+                    compaction.provider_compaction_endpoint_called,
+                ),
+                provider_compaction_output_applied: Some(
+                    compaction.provider_compaction_output_applied,
+                ),
+                provider_compaction_fallback_reason: compaction
+                    .provider_compaction_fallback_reason
+                    .clone(),
             })
             .or_else(|| {
                 events.iter().find_map(|e| {
@@ -1630,8 +1704,10 @@ impl AgentSessionManager {
                             strategy: None,
                             summary_tokens: None,
                             retained_tail_tokens: None,
-                            provider_native_supported: None,
-                            provider_native_used: None,
+                            provider_compaction_endpoint_supported: None,
+                            provider_compaction_endpoint_called: None,
+                            provider_compaction_output_applied: None,
+                            provider_compaction_fallback_reason: None,
                         })
                     } else {
                         None
@@ -2428,8 +2504,18 @@ impl AgentSessionManager {
                         strategy: Some(compaction.strategy.clone()),
                         summary_tokens: Some(compaction.summary_tokens),
                         retained_tail_tokens: Some(compaction.retained_tail_tokens),
-                        provider_native_supported: Some(compaction.provider_native_supported),
-                        provider_native_used: Some(compaction.provider_native_used),
+                        provider_compaction_endpoint_supported: Some(
+                            compaction.provider_compaction_endpoint_supported,
+                        ),
+                        provider_compaction_endpoint_called: Some(
+                            compaction.provider_compaction_endpoint_called,
+                        ),
+                        provider_compaction_output_applied: Some(
+                            compaction.provider_compaction_output_applied,
+                        ),
+                        provider_compaction_fallback_reason: compaction
+                            .provider_compaction_fallback_reason
+                            .clone(),
                     })
                     .or_else(|| {
                         turn_summary.auto_compaction.as_ref().map(|c| {
@@ -2441,8 +2527,10 @@ impl AgentSessionManager {
                                 strategy: None,
                                 summary_tokens: None,
                                 retained_tail_tokens: None,
-                                provider_native_supported: None,
-                                provider_native_used: None,
+                                provider_compaction_endpoint_supported: None,
+                                provider_compaction_endpoint_called: None,
+                                provider_compaction_output_applied: None,
+                                provider_compaction_fallback_reason: None,
                             }
                         })
                     });
@@ -4117,26 +4205,32 @@ async fn compact_runtime_for_continuity(
     }
     let mut selected_summary = baseline.summary.clone();
     let mut strategy = continuity_compaction_strategy();
-    let mut provider_native_used = false;
+    let mut provider_compaction_endpoint_called = false;
+    let mut provider_compaction_output_applied = false;
+    let mut provider_compaction_fallback_reason = None;
     if let Some(bridge) = native_compaction_bridge {
-        match compact_session_with_provider_native(runtime, bridge, &selected_summary).await {
-            Ok(Some(summary)) if !summary.trim().is_empty() => {
-                selected_summary = summary;
-                strategy = bridge
-                    .mode
-                    .as_deref()
-                    .map(|mode| format!("provider_native_compaction:{mode}"))
-                    .unwrap_or_else(|| "provider_native_compaction".to_string());
-                provider_native_used = true;
-            }
-            Ok(_) => {
-                tracing::warn!(
-                    session_id,
-                    trigger,
-                    "provider-native compaction returned empty summary; falling back to AOS compaction"
-                );
+        match compact_session_with_provider_native(runtime, bridge, trigger).await {
+            Ok(outcome) => {
+                provider_compaction_endpoint_called = outcome.endpoint_called;
+                provider_compaction_output_applied = outcome.output_applied;
+                provider_compaction_fallback_reason = outcome.fallback_reason;
+                if let Some(summary) = outcome.summary.filter(|value| !value.trim().is_empty()) {
+                    selected_summary = summary;
+                    strategy = format!("provider_compaction:{}", bridge.protocol.as_str());
+                } else {
+                    tracing::warn!(
+                        session_id,
+                        trigger,
+                        normalized_output_count = outcome.normalized_output_count,
+                        fallback_reason = ?provider_compaction_fallback_reason,
+                        "provider compaction output cannot be safely installed; falling back to AOS compaction"
+                    );
+                }
             }
             Err(error) => {
+                provider_compaction_endpoint_called = true;
+                provider_compaction_fallback_reason =
+                    Some("responses_compact_v1_request_failed".to_string());
                 tracing::warn!(
                     session_id,
                     trigger,
@@ -4146,13 +4240,15 @@ async fn compact_runtime_for_continuity(
             }
         }
     } else if provider_native_supported {
-        tracing::debug!(
+        provider_compaction_fallback_reason =
+            Some("declared_provider_compaction_adapter_unavailable".to_string());
+        tracing::warn!(
             session_id,
             trigger,
-            "provider-native compaction capability declared but no bridge is configured; using AOS model/deterministic compaction path"
+            "provider compaction was reported supported without an active endpoint adapter; using AOS compaction"
         );
     }
-    if !provider_native_used && model_summary_compaction_enabled() {
+    if !provider_compaction_output_applied && model_summary_compaction_enabled() {
         match summarize_session_for_compaction(runtime, &selected_summary).await {
             Ok(summary) if !summary.trim().is_empty() => {
                 selected_summary = summary;
@@ -4191,8 +4287,10 @@ async fn compact_runtime_for_continuity(
         session_id: session_id.to_string(),
         trigger: trigger.to_string(),
         strategy,
-        provider_native_supported,
-        provider_native_used,
+        provider_compaction_endpoint_supported: provider_native_supported,
+        provider_compaction_endpoint_called,
+        provider_compaction_output_applied,
+        provider_compaction_fallback_reason,
         summary: compact_result.formatted_summary,
         summary_tokens: estimate_text_tokens_for_runtime(provider, model, &compact_result.summary),
         removed_message_count: compact_result.removed_message_count,
@@ -4236,8 +4334,10 @@ async fn record_turn_compaction(
             metadata_json: Some(serde_json::json!({
                 "memoryRefsPolicy": "refs_only",
                 "source": "agent_gateway_turn",
-                "providerNativeCompactionSupported": compaction.provider_native_supported.unwrap_or(false),
-                "providerNativeCompactionUsed": compaction.provider_native_used.unwrap_or(false),
+                "providerCompactionEndpointSupported": compaction.provider_compaction_endpoint_supported.unwrap_or(false),
+                "providerCompactionEndpointCalled": compaction.provider_compaction_endpoint_called.unwrap_or(false),
+                "providerCompactionOutputApplied": compaction.provider_compaction_output_applied.unwrap_or(false),
+                "providerCompactionFallbackReason": compaction.provider_compaction_fallback_reason,
                 "contextArchiveCount": archive_count,
             })),
         })

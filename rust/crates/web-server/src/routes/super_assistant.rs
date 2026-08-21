@@ -15981,23 +15981,44 @@ mod dual_channel_extraction_tests {
         .unwrap();
         for (index, message) in messages.iter().enumerate() {
             let event_id = format!("fixture:{thread_id}:{index}");
-            let (event_type, raw) = match message.blocks.as_slice() {
+            let (kind, event_type, raw_value) = match message.blocks.as_slice() {
                 [ContentBlock::Text { text }] if message.role == runtime::MessageRole::User => (
+                    "turn_started",
                     "runtime.turn_started",
-                    serde_json::json!({"userInput": text}).to_string(),
+                    serde_json::json!({"userInput": text}),
                 ),
                 _ => (
+                    "assistant_message",
                     "runtime.assistant_message",
-                    serde_json::json!({"message": message}).to_string(),
+                    serde_json::json!({"message": message}),
                 ),
             };
-            let hash = memory_engine::stable_source_hash(&raw);
+            let raw = raw_value.to_string();
+            let mut event = agent_protocol::AgentEventEnvelope::new(
+                thread_id,
+                Some(turn_id),
+                None,
+                format!("pre-surface-fixture:{thread_id}:{index}"),
+                agent_protocol::AgentEventV1::Domain(agent_protocol::DomainEvent {
+                    domain: "runtime".into(),
+                    kind: kind.into(),
+                    payload: raw_value,
+                }),
+                u64::try_from(next_sequence).unwrap(),
+            );
+            event.event_id = event_id.clone();
+            event.batch_id = format!("fixture-batch:{thread_id}:{index}");
+            event.actor = agent_protocol::EventActor::Worker {
+                id: "pre-surface-test-fixture".into(),
+            };
+            event.payload_hash = event.compute_payload_hash().unwrap();
+            let payload_json = serde_json::to_string(&event).unwrap();
             sqlx::query(
                 "INSERT INTO agent_event_ledger
                     (event_id, tenant_id, thread_id, turn_id, sequence, batch_id,
                      schema_version, event_type, payload_json, payload_hash,
                      durable, occurred_at, raw_payload_ciphertext)
-                     VALUES (?, ?, ?, ?, ?, ?, 1, ?, '{}', ?, 1,
+                     VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 1,
                          CURRENT_TIMESTAMP, ?)",
             )
             .bind(&event_id)
@@ -16007,7 +16028,8 @@ mod dual_channel_extraction_tests {
             .bind(next_sequence)
             .bind(format!("fixture-batch:{thread_id}:{index}"))
             .bind(event_type)
-            .bind(hash)
+            .bind(payload_json)
+            .bind(&event.payload_hash)
             .bind(
                 agent_gateway::crypto::encrypt_scoped(
                     &raw,

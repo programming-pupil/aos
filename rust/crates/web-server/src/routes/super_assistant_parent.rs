@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use crate::auth::Claims;
 use crate::error::{AppError, Result};
@@ -846,6 +846,51 @@ pub(crate) async fn cancel_parent_turn(
                 );
             }
             let _ = state.agent_manager().cancel_running_turn(&session_id).await;
+            let team_children = crate::agent_team::request_descendant_cancellation(
+                &state.db,
+                &claims.tenant_id,
+                &session_id,
+            )
+            .await?;
+            for child_thread_id in team_children {
+                let control_id = crate::semantic_kernel_store::record_child_control(
+                    &state.db,
+                    &claims.tenant_id,
+                    &child_thread_id,
+                    "cancel",
+                    Some("parent turn cancellation propagated to agent team descendant"),
+                )
+                .await?;
+                let live_signal = state
+                    .agent_manager()
+                    .cancel_running_turn(&child_thread_id)
+                    .await
+                    .unwrap_or(false);
+                crate::agent_team::mark_member_status(
+                    &state.db,
+                    &claims.tenant_id,
+                    &child_thread_id,
+                    "idle",
+                    None,
+                )
+                .await?;
+                let result = json!({"status":"cancelled","liveSignal":live_signal});
+                let _ = crate::semantic_kernel_store::settle_child_control(
+                    &state.db,
+                    &claims.tenant_id,
+                    &control_id,
+                    "applied",
+                    Some(&result),
+                )
+                .await;
+                let _ = crate::semantic_kernel_store::record_child_settlement(
+                    &state.db,
+                    &claims.tenant_id,
+                    &child_thread_id,
+                    "cancelled",
+                )
+                .await;
+            }
             let subtasks = sqlx::query::<sqlx::Sqlite>(
                 "SELECT id, engine, external_task_id FROM super_assistant_subtasks
                  WHERE tenant_id = ? AND user_id = ? AND parent_turn_id = ?
@@ -3629,6 +3674,737 @@ fn promotable_super_adversarial_summary(
     Some(summary.to_string())
 }
 
+#[derive(Debug, Deserialize)]
+struct SpawnAgentInput {
+    task: String,
+    name: Option<String>,
+    context: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentMessageInput {
+    target: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListAgentsInput {
+    path_prefix: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WaitAgentInput {
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InterruptAgentInput {
+    target: String,
+}
+
+fn agent_team_blocked_deferred_tools() -> Vec<String> {
+    [
+        "web_search",
+        "deep_research_start",
+        "super_adversarial_start",
+        "nl2sql_analyze",
+        "data_attribution_start",
+        "subtask_status",
+        "subtask_read_artifact",
+        "subtask_cancel",
+        "task_list",
+        "task_get",
+        "task_timeline",
+        "task_explain_blocker",
+        "task_open_result",
+        "task_subscribe",
+        "task_unsubscribe",
+        "task_cancel",
+        "task_retry",
+        "task_pause",
+        "task_resume",
+        "task_provide_input",
+        "task_approve",
+        "task_reject",
+        "task_share",
+        "task_watch_rule_list",
+        "task_watch_rule_create",
+        "complete_turn",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn launch_agent_team_worker(state: AppState, claims: Claims, child_thread_id: String) {
+    tokio::spawn(async move {
+        let result = run_agent_team_worker(&state, &claims, &child_thread_id).await;
+        if let Err(error) = result {
+            tracing::error!(
+                tenant_id = %claims.tenant_id,
+                child_thread_id,
+                error = %error,
+                "durable agent team worker failed"
+            );
+            let interrupted =
+                crate::agent_team::member_status(&state.db, &claims.tenant_id, &child_thread_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some("interrupt_requested");
+            if interrupted {
+                let _ = crate::agent_team::mark_member_status(
+                    &state.db,
+                    &claims.tenant_id,
+                    &child_thread_id,
+                    "idle",
+                    None,
+                )
+                .await;
+            } else if crate::agent_team::requeue_unacknowledged_mailbox(
+                &state.db,
+                &claims.tenant_id,
+                &child_thread_id,
+            )
+            .await
+            .unwrap_or(false)
+            {
+                launch_agent_team_worker(state.clone(), claims.clone(), child_thread_id.clone());
+            } else {
+                let _ = crate::agent_team::mark_member_status(
+                    &state.db,
+                    &claims.tenant_id,
+                    &child_thread_id,
+                    "failed",
+                    Some(&error.to_string()),
+                )
+                .await;
+            }
+        } else if crate::agent_team::member_status(&state.db, &claims.tenant_id, &child_thread_id)
+            .await
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("queued")
+        {
+            // The durable global permit may be temporarily full. Keep one
+            // replaceable waiter for this queued member and retry after a team
+            // lifecycle notification or a bounded lease-expiry interval.
+            let _ = crate::agent_team::wait_for_change(
+                &state.db,
+                &claims.tenant_id,
+                &child_thread_id,
+                10_000,
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            launch_agent_team_worker(state, claims, child_thread_id);
+        }
+    });
+}
+
+pub(crate) fn start_agent_team_recovery(state: AppState) {
+    tokio::spawn(async move {
+        let members = match crate::agent_team::reclaim_startup_workers(&state.db).await {
+            Ok(members) => members,
+            Err(error) => {
+                tracing::error!(error = %error, "failed to reclaim durable agent team workers");
+                return;
+            }
+        };
+        for member in members {
+            let claims = Claims {
+                sub: member.owner_user_id,
+                email: "agent-team-recovery@localhost".to_string(),
+                role: "system".to_string(),
+                tenant_id: member.tenant_id,
+                exp: i64::MAX,
+                iat: 0,
+            };
+            launch_agent_team_worker(state.clone(), claims, member.thread_id);
+        }
+    });
+}
+
+fn completed_agent_team_result(
+    session: &runtime::Session,
+    expected_user_input: &str,
+) -> Option<String> {
+    let turn = session.turns.iter().rev().find(|turn| {
+        turn.user_input == expected_user_input
+            && matches!(turn.status, runtime::SessionTurnStatus::Completed)
+    })?;
+    let end = turn.end_message_count?.min(session.messages.len());
+    let text = session.messages[turn.start_message_count.min(end)..end]
+        .iter()
+        .filter(|message| message.role == runtime::MessageRole::Assistant)
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            runtime::ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.trim()),
+            runtime::ContentBlock::Text { .. }
+            | runtime::ContentBlock::ToolUse { .. }
+            | runtime::ContentBlock::ToolResult { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+async fn run_agent_team_worker(
+    state: &AppState,
+    claims: &Claims,
+    child_thread_id: &str,
+) -> Result<()> {
+    let lease_owner = format!("agent-team-worker-{}", uuid::Uuid::new_v4());
+    if !crate::agent_team::claim_worker(&state.db, &claims.tenant_id, child_thread_id, &lease_owner)
+        .await?
+    {
+        return Ok(());
+    }
+    let heartbeat_db = state.db.clone();
+    let heartbeat_tenant = claims.tenant_id.clone();
+    let heartbeat_thread = child_thread_id.to_string();
+    let heartbeat_owner = lease_owner.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(30));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match crate::agent_team::renew_worker_lease(
+                &heartbeat_db,
+                &heartbeat_tenant,
+                &heartbeat_thread,
+                &heartbeat_owner,
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => {
+                    tracing::warn!(
+                        tenant_id = %heartbeat_tenant,
+                        child_thread_id = %heartbeat_thread,
+                        error = %error,
+                        "agent team worker lease heartbeat failed"
+                    );
+                }
+            }
+        }
+    });
+    let delivery =
+        crate::agent_team::consume_mailbox(&state.db, &claims.tenant_id, child_thread_id).await?;
+    let mailbox_turn_id = delivery.delivery_id;
+    let messages = delivery.messages;
+    if crate::agent_team::mailbox_result_was_delivered(
+        &state.db,
+        &claims.tenant_id,
+        child_thread_id,
+        &mailbox_turn_id,
+    )
+    .await?
+    {
+        crate::agent_team::acknowledge_mailbox_turn(
+            &state.db,
+            &claims.tenant_id,
+            child_thread_id,
+            &mailbox_turn_id,
+        )
+        .await?;
+        crate::agent_team::acknowledge_pending_mailbox(
+            &state.db,
+            &claims.tenant_id,
+            child_thread_id,
+            &mailbox_turn_id,
+        )
+        .await?;
+        crate::agent_team::mark_member_status(
+            &state.db,
+            &claims.tenant_id,
+            child_thread_id,
+            "completed",
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+    if messages.is_empty() {
+        crate::agent_team::mark_member_status(
+            &state.db,
+            &claims.tenant_id,
+            child_thread_id,
+            "idle",
+            None,
+        )
+        .await?;
+        return Ok(());
+    }
+    let user_input = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| format!("Agent team task {}:\n{}", index + 1, message))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let user_input = format!("Agent team delivery id: {mailbox_turn_id}\n\n{user_input}");
+    let manager = state.agent_manager().clone();
+    let session_snapshot = manager
+        .get_session_messages(child_thread_id, Some(&claims.tenant_id), Some(&claims.sub))
+        .await;
+    let recovered_result = session_snapshot
+        .as_ref()
+        .and_then(|session| completed_agent_team_result(session, &user_input));
+    let suspended_delivery = session_snapshot.as_ref().is_some_and(|session| {
+        session.turns.iter().rev().any(|turn| {
+            turn.user_input == user_input
+                && matches!(turn.status, runtime::SessionTurnStatus::Suspended)
+        })
+    });
+    let interrupted_turn_id = session_snapshot.as_ref().and_then(|session| {
+        session.turns.iter().rev().find_map(|turn| {
+            (turn.user_input == user_input
+                && matches!(
+                    turn.status,
+                    runtime::SessionTurnStatus::Running | runtime::SessionTurnStatus::Failed
+                ))
+            .then(|| turn.turn_id.clone())
+        })
+    });
+    let result_text = if let Some(result) = recovered_result {
+        result
+    } else {
+        let (sender, mut receiver) = mpsc::channel::<AgentEvent>(256);
+        let drain = tokio::spawn(async move { while receiver.recv().await.is_some() {} });
+        let options = AgentTurnOptions {
+            blocked_tools: agent_team_blocked_deferred_tools(),
+            enable_deferred_tools: true,
+            system_instructions: vec![
+                "You are a durable child agent. Complete the assigned task in your independent context. Use agent-team tools for bounded delegation or communication. Return one concise, self-contained result to your parent; do not call complete_turn."
+                    .to_string(),
+            ],
+            ..AgentTurnOptions::default()
+        };
+        let mut outcome = if suspended_delivery {
+            let suspended = manager
+                .suspended_turn_snapshot(child_thread_id, &claims.tenant_id, &claims.sub)
+                .await
+                .map_err(super_assistant_gateway_error)?
+                .ok_or_else(|| {
+                    AppError::Conflict(
+                        "durable Agent Team turn is marked suspended but has no resumable snapshot"
+                            .to_string(),
+                    )
+                })?;
+            let mut results = Vec::with_capacity(suspended.deferred_tools.len());
+            for tool in &suspended.deferred_tools {
+                results.push(
+                    resolve_agent_team_control_tool(state, claims, child_thread_id, tool).await,
+                );
+            }
+            manager
+                .resume_turn_streaming_with_options(
+                    child_thread_id,
+                    results,
+                    sender.clone(),
+                    options.clone(),
+                )
+                .await
+                .map_err(super_assistant_gateway_error)?
+        } else {
+            if let Some(turn_id) = interrupted_turn_id.as_deref() {
+                manager
+                    .rollback_turn_by_id(child_thread_id, &claims.tenant_id, &claims.sub, turn_id)
+                    .await
+                    .map_err(super_assistant_gateway_error)?;
+            }
+            manager
+                .run_turn_streaming_with_options(
+                    child_thread_id,
+                    user_input,
+                    sender.clone(),
+                    options.clone(),
+                )
+                .await
+                .map_err(super_assistant_gateway_error)?
+        };
+        const MAX_AGENT_TEAM_CONTROL_ROUNDS: usize = 32;
+        let mut control_rounds = usize::from(suspended_delivery);
+        let result = loop {
+            match outcome {
+                AgentTurnRunOutcome::Completed(result) => break result.text,
+                AgentTurnRunOutcome::Suspended(suspended) => {
+                    control_rounds = control_rounds.saturating_add(1);
+                    if control_rounds > MAX_AGENT_TEAM_CONTROL_ROUNDS {
+                        return Err(AppError::Conflict(
+                            "agent team worker exceeded its bounded control-round budget"
+                                .to_string(),
+                        ));
+                    }
+                    let mut results = Vec::with_capacity(suspended.deferred_tools.len());
+                    for tool in &suspended.deferred_tools {
+                        results.push(
+                            resolve_agent_team_control_tool(state, claims, child_thread_id, tool)
+                                .await,
+                        );
+                    }
+                    outcome = manager
+                        .resume_turn_streaming_with_options(
+                            child_thread_id,
+                            results,
+                            sender.clone(),
+                            options.clone(),
+                        )
+                        .await
+                        .map_err(super_assistant_gateway_error)?;
+                }
+            }
+        };
+        drop(sender);
+        let _ = drain.await;
+        result
+    };
+    let members =
+        crate::agent_team::list_members(&state.db, &claims.tenant_id, child_thread_id, None)
+            .await?;
+    let parent_thread_id = members
+        .iter()
+        .find(|member| member.thread_id == child_thread_id)
+        .and_then(|member| member.parent_thread_id.clone());
+    if let Some(parent_thread_id) = parent_thread_id {
+        crate::agent_team::deliver_message(
+            &state.db,
+            &claims.tenant_id,
+            &claims.sub,
+            child_thread_id,
+            &parent_thread_id,
+            &result_text,
+            false,
+            &format!("agent-result:{mailbox_turn_id}"),
+        )
+        .await?;
+    }
+    let acknowledged = crate::agent_team::acknowledge_mailbox_turn(
+        &state.db,
+        &claims.tenant_id,
+        child_thread_id,
+        &mailbox_turn_id,
+    )
+    .await?;
+    if acknowledged == 0 {
+        return Err(AppError::Conflict(
+            "agent team mailbox acknowledgement lost its delivery claim".to_string(),
+        ));
+    }
+    crate::agent_team::acknowledge_pending_mailbox(
+        &state.db,
+        &claims.tenant_id,
+        child_thread_id,
+        &mailbox_turn_id,
+    )
+    .await?;
+    crate::agent_team::mark_member_status(
+        &state.db,
+        &claims.tenant_id,
+        child_thread_id,
+        "completed",
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn spawn_agent_control(
+    state: &AppState,
+    claims: &Claims,
+    caller_thread_id: &str,
+    raw_input: &str,
+    idempotency_key: &str,
+) -> Result<Value> {
+    let request: SpawnAgentInput = serde_json::from_str(raw_input).map_err(|error| {
+        AppError::ValidationError(format!("invalid spawn_agent input: {error}"))
+    })?;
+    if let Some(existing) = crate::agent_team::find_spawn_by_key(
+        &state.db,
+        &claims.tenant_id,
+        caller_thread_id,
+        idempotency_key,
+    )
+    .await?
+    {
+        launch_agent_team_worker(state.clone(), claims.clone(), existing.clone());
+        return Ok(json!({"threadId": existing, "deduplicated": true}));
+    }
+    let parent = state
+        .agent_manager()
+        .get_owned_session(caller_thread_id, &claims.tenant_id, &claims.sub)
+        .await
+        .ok_or_else(|| AppError::NotFound("parent agent session is unavailable".into()))?;
+    let context_mode = request.context.as_deref().unwrap_or("fresh");
+    if !matches!(context_mode, "fresh" | "fork") {
+        return Err(AppError::ValidationError(
+            "spawn_agent context must be fresh or fork".into(),
+        ));
+    }
+    let name = request.name.unwrap_or_else(|| {
+        format!(
+            "agent-{}",
+            idempotency_key
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .take(8)
+                .collect::<String>()
+        )
+    });
+    let selected_model = parent.model.as_str();
+    let child = state
+        .agent_manager()
+        .create_internal_session_in_workspace(
+            &claims.sub,
+            &claims.tenant_id,
+            parent.workspace.clone(),
+            Some(selected_model),
+            "agent_team_internal",
+            Some("chat"),
+            None,
+        )
+        .await
+        .map_err(super_assistant_gateway_error)?;
+    if context_mode == "fork" {
+        if let Err(error) = state
+            .agent_manager()
+            .install_completed_turn_prefix(
+                caller_thread_id,
+                &child.session_id,
+                &claims.tenant_id,
+                &claims.sub,
+            )
+            .await
+        {
+            let _ = state
+                .agent_manager()
+                .destroy_session(&child.session_id)
+                .await;
+            return Err(super_assistant_gateway_error(error));
+        }
+    }
+    let registration = crate::agent_team::register_spawn(
+        &state.db,
+        &claims.tenant_id,
+        &claims.sub,
+        caller_thread_id,
+        &child.session_id,
+        &name,
+        &request.task,
+        context_mode,
+        Some(selected_model),
+        idempotency_key,
+    )
+    .await;
+    let registration = match registration {
+        Ok(registration) => registration,
+        Err(error) => {
+            let _ = state
+                .agent_manager()
+                .destroy_session(&child.session_id)
+                .await;
+            return Err(error.into());
+        }
+    };
+    if registration.existing && registration.child_thread_id != child.session_id {
+        let _ = state
+            .agent_manager()
+            .destroy_session(&child.session_id)
+            .await;
+    }
+    launch_agent_team_worker(
+        state.clone(),
+        claims.clone(),
+        registration.child_thread_id.clone(),
+    );
+    Ok(json!({
+        "teamId": registration.team_id,
+        "threadId": registration.child_thread_id,
+        "name": name,
+        "context": context_mode,
+        "model": selected_model,
+        "deduplicated": registration.existing,
+        "status": "queued",
+    }))
+}
+
+async fn resolve_agent_team_control_tool(
+    state: &AppState,
+    claims: &Claims,
+    caller_thread_id: &str,
+    tool: &DeferredToolUse,
+) -> DeferredToolResult {
+    let result: Result<Value> = async {
+        match tool.tool_name.as_str() {
+            "spawn_agent" => {
+                spawn_agent_control(
+                    state,
+                    claims,
+                    caller_thread_id,
+                    &tool.input,
+                    &tool.tool_use_id,
+                )
+                .await
+            }
+            "send_message" | "followup_task" => {
+                let request: AgentMessageInput =
+                    serde_json::from_str(&tool.input).map_err(|error| {
+                        AppError::ValidationError(format!(
+                            "invalid {} input: {error}",
+                            tool.tool_name
+                        ))
+                    })?;
+                let wake = tool.tool_name == "followup_task";
+                let output = crate::agent_team::deliver_message(
+                    &state.db,
+                    &claims.tenant_id,
+                    &claims.sub,
+                    caller_thread_id,
+                    &request.target,
+                    &request.message,
+                    wake,
+                    &tool.tool_use_id,
+                )
+                .await?;
+                if wake {
+                    if let Some(target) = output.get("target").and_then(Value::as_str) {
+                        launch_agent_team_worker(state.clone(), claims.clone(), target.to_string());
+                    }
+                }
+                Ok(output)
+            }
+            "list_agents" => {
+                let request: ListAgentsInput =
+                    serde_json::from_str(&tool.input).map_err(|error| {
+                        AppError::ValidationError(format!("invalid list_agents input: {error}"))
+                    })?;
+                crate::agent_team::ensure_root_member(
+                    &state.db,
+                    &claims.tenant_id,
+                    &claims.sub,
+                    caller_thread_id,
+                )
+                .await?;
+                Ok(json!({
+                    "agents": crate::agent_team::list_members(
+                        &state.db,
+                        &claims.tenant_id,
+                        caller_thread_id,
+                        request.path_prefix.as_deref(),
+                    )
+                    .await?
+                }))
+            }
+            "wait_agent" => {
+                let request: WaitAgentInput =
+                    serde_json::from_str(&tool.input).map_err(|error| {
+                        AppError::ValidationError(format!("invalid wait_agent input: {error}"))
+                    })?;
+                crate::agent_team::ensure_root_member(
+                    &state.db,
+                    &claims.tenant_id,
+                    &claims.sub,
+                    caller_thread_id,
+                )
+                .await?;
+                let output = crate::agent_team::wait_for_change(
+                    &state.db,
+                    &claims.tenant_id,
+                    caller_thread_id,
+                    request.timeout_ms.unwrap_or(30_000),
+                )
+                .await?;
+                let mailbox_ids = output
+                    .get("mailbox")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| item.get("id").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                if !mailbox_ids.is_empty() {
+                    crate::agent_team::claim_pending_mailbox_items(
+                        &state.db,
+                        &claims.tenant_id,
+                        caller_thread_id,
+                        &tool.tool_use_id,
+                        &mailbox_ids,
+                    )
+                    .await?;
+                }
+                Ok(output)
+            }
+            "interrupt_agent" => {
+                let request: InterruptAgentInput =
+                    serde_json::from_str(&tool.input).map_err(|error| {
+                        AppError::ValidationError(format!("invalid interrupt_agent input: {error}"))
+                    })?;
+                let target = crate::agent_team::interrupt_member(
+                    &state.db,
+                    &claims.tenant_id,
+                    caller_thread_id,
+                    &request.target,
+                )
+                .await?;
+                let control_id = crate::semantic_kernel_store::record_child_control(
+                    &state.db,
+                    &claims.tenant_id,
+                    &target,
+                    "interrupt",
+                    Some("agent_team_interrupt"),
+                )
+                .await?;
+                let interrupted = state
+                    .agent_manager()
+                    .cancel_running_turn(&target)
+                    .await
+                    .map_err(super_assistant_gateway_error)?;
+                if !interrupted {
+                    crate::agent_team::mark_member_status(
+                        &state.db,
+                        &claims.tenant_id,
+                        &target,
+                        "idle",
+                        None,
+                    )
+                    .await?;
+                }
+                let _ = crate::semantic_kernel_store::settle_child_control(
+                    &state.db,
+                    &claims.tenant_id,
+                    &control_id,
+                    "applied",
+                    Some(&json!({"interrupted": interrupted})),
+                )
+                .await;
+                Ok(json!({"target": target, "interrupted": interrupted}))
+            }
+            other => Err(AppError::ValidationError(format!(
+                "unsupported agent team control tool: {other}"
+            ))),
+        }
+    }
+    .await;
+    match result {
+        Ok(value) => DeferredToolResult {
+            tool_use_id: tool.tool_use_id.clone(),
+            output: serialize_bounded_tool_result(&value),
+            is_error: false,
+        },
+        Err(error) => DeferredToolResult {
+            tool_use_id: tool.tool_use_id.clone(),
+            output: json!({"error": error.to_string()}).to_string(),
+            is_error: true,
+        },
+    }
+}
+
 async fn resolve_parent_tool(
     state: &AppState,
     claims: &Claims,
@@ -3644,6 +4420,16 @@ async fn resolve_parent_tool(
         "subtask_status" => subtask_status(state, claims, input, &tool.input).await,
         "subtask_read_artifact" => subtask_read_artifact(state, claims, input, &tool.input).await,
         "subtask_cancel" => subtask_cancel(state, claims, input, &tool.input).await,
+        "spawn_agent" | "send_message" | "followup_task" | "list_agents" | "wait_agent"
+        | "interrupt_agent" => {
+            let result =
+                resolve_agent_team_control_tool(state, claims, &input.session_id, tool).await;
+            if result.is_error {
+                Err(AppError::ValidationError(result.output))
+            } else {
+                serde_json::from_str(&result.output).map_err(AppError::Json)
+            }
+        }
         "task_list"
         | "task_get"
         | "task_timeline"
@@ -8023,6 +8809,13 @@ async fn persist_parent_final(
     }
     let committed_events =
         commit_parent_final(state, claims, input, &committed_result, elapsed).await?;
+    crate::agent_team::acknowledge_pending_mailbox(
+        &state.db,
+        &claims.tenant_id,
+        &input.session_id,
+        &input.turn_id,
+    )
+    .await?;
     let newly_committed = !committed_events.is_empty();
     for (seq, event_type, data) in committed_events {
         broadcast_committed_super_assistant_event(

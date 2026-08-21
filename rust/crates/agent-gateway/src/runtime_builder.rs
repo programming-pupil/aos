@@ -291,17 +291,42 @@ struct NativeWebSearchCapability {
     extra_body: serde_json::Map<String, Value>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderCompactionProtocol {
+    ModelSummary,
+    ResponsesCompactV1,
+    ResponsesCompactV2,
+}
+
+impl ProviderCompactionProtocol {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ModelSummary => "model_summary",
+            Self::ResponsesCompactV1 => "responses_compact_v1",
+            Self::ResponsesCompactV2 => "responses_compact_v2",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "model_summary" | "summary" | "chat_summary" => Some(Self::ModelSummary),
+            "responses_compact_v1" | "responses_v1" | "v1" => Some(Self::ResponsesCompactV1),
+            "responses_compact_v2" | "responses_v2" | "v2" => Some(Self::ResponsesCompactV2),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ProviderNativeCompactionBridge {
-    pub enabled: bool,
-    pub mode: Option<String>,
-    pub summary_prompt: Option<String>,
+    pub protocol: ProviderCompactionProtocol,
     pub extra_body: serde_json::Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct NativeCompactionCapability {
-    supported: bool,
+    declared_protocol: Option<ProviderCompactionProtocol>,
     bridge: Option<ProviderNativeCompactionBridge>,
 }
 
@@ -321,76 +346,66 @@ impl NativeCompactionCapability {
                 return Self::from_value(capability);
             }
         }
-        capability_bool(
-            value,
-            &[
-                "providerNativeCompaction",
-                "provider_native_compaction",
-                "nativeCompaction",
-                "native_compaction",
-                "remoteCompaction",
-                "remote_compaction",
-                "responsesCompaction",
-                "responses_compaction",
-            ],
-        )
-        .map(|enabled| Self {
-            supported: enabled,
-            bridge: None,
-        })
+        None
     }
 
     fn from_value(value: &Value) -> Option<Self> {
         match value {
-            Value::Bool(enabled) => Some(Self {
-                supported: *enabled,
+            // Historical booleans represented AOS's chat-summary bridge. Keep
+            // accepting them, but never advertise them as native endpoint
+            // support.
+            Value::Bool(enabled) => (*enabled).then_some(Self {
+                declared_protocol: Some(ProviderCompactionProtocol::ModelSummary),
                 bridge: None,
             }),
+            Value::String(mode) => Self::from_protocol(mode, &serde_json::Map::new()),
             Value::Object(_) => {
                 let enabled = capability_bool(value, &["enabled", "enable"]).unwrap_or(false);
                 if !enabled {
-                    return Some(Self {
-                        supported: false,
-                        bridge: None,
-                    });
+                    return None;
                 }
                 let mut extra_body = serde_json::Map::new();
                 for candidate_key in ["extraBody", "extra_body"] {
                     if let Some(obj) = value.get(candidate_key).and_then(Value::as_object) {
                         for (key, item) in obj {
-                            if is_allowed_extra_body_key(key) {
+                            if matches!(
+                                key.as_str(),
+                                "reasoning" | "service_tier" | "prompt_cache_key" | "text"
+                            ) {
                                 extra_body.insert(key.clone(), item.clone());
                             }
                         }
                     }
                 }
-                let bridge_enabled = capability_bool(
-                    value,
-                    &[
-                        "bridgeEnabled",
-                        "bridge_enabled",
-                        "useBridge",
-                        "use_bridge",
-                        "enabled",
-                    ],
-                )
-                .unwrap_or(false);
-                let bridge = bridge_enabled.then(|| ProviderNativeCompactionBridge {
-                    enabled: true,
-                    mode: capability_string(value, &["mode", "strategy"]),
-                    summary_prompt: capability_string(
-                        value,
-                        &["summaryPrompt", "summary_prompt", "prompt"],
-                    ),
-                    extra_body,
-                });
-                Some(Self {
-                    supported: true,
-                    bridge,
-                })
+                if let Some(item) = value.get("serviceTier") {
+                    extra_body.insert("service_tier".to_string(), item.clone());
+                }
+                if let Some(item) = value.get("promptCacheKey") {
+                    extra_body.insert("prompt_cache_key".to_string(), item.clone());
+                }
+                let protocol = capability_string(value, &["protocol", "mode", "strategy"])
+                    .unwrap_or_else(|| "model_summary".to_string());
+                Self::from_protocol(&protocol, &extra_body)
             }
             _ => None,
         }
+    }
+
+    fn from_protocol(protocol: &str, extra_body: &serde_json::Map<String, Value>) -> Option<Self> {
+        let protocol = ProviderCompactionProtocol::parse(protocol)?;
+        // V2 is intentionally declaration-only until AOS has a verified v2
+        // trigger/metadata continuation contract. It must not be exposed as an
+        // active adapter merely because an operator typed `v2` in config.
+        let bridge = (protocol == ProviderCompactionProtocol::ResponsesCompactV1).then(|| {
+            ProviderNativeCompactionBridge {
+                protocol,
+                extra_body: extra_body.clone(),
+            }
+        });
+        Some(Self {
+            declared_protocol: Some(protocol),
+            bridge,
+        })
     }
 }
 
@@ -781,6 +796,190 @@ struct ProviderRequestLineageRecorder {
 }
 
 impl ProviderRequestLineageRecorder {
+    async fn begin_compaction_attempt(
+        &self,
+        trigger: &str,
+        provider: &ProviderClient,
+        request: &api::ResponsesCompactRequest,
+    ) -> std::result::Result<String, RuntimeError> {
+        let request_bytes = serde_json::to_vec(request).map_err(|error| {
+            RuntimeError::new(format!(
+                "cannot serialize provider compaction request: {error}"
+            ))
+        })?;
+        let request_hash = hex::encode(sha2::Sha256::digest(&request_bytes));
+        let endpoint_hash = hex::encode(sha2::Sha256::digest(
+            api::responses_compact_endpoint(provider.base_url()).as_bytes(),
+        ));
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        sqlx::query::<sqlx::Sqlite>(
+            "UPDATE aos_setup_lock SET lock_id = lock_id WHERE lock_id = 1",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| RuntimeError::new(error.to_string()))?;
+        sqlx::query::<sqlx::Sqlite>(
+            "UPDATE provider_compaction_attempts
+             SET status = 'failed', error_class = 'worker_restarted',
+                 fallback_reason = 'previous_compaction_attempt_lost_its_worker',
+                 completed_at = CURRENT_TIMESTAMP
+             WHERE tenant_id = ? AND session_id = ? AND trigger = ?
+               AND status = 'dispatched'",
+        )
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(trigger)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let latest = sqlx::query_as::<sqlx::Sqlite, (String, i64)>(
+            "SELECT id, attempt_index FROM provider_compaction_attempts
+             WHERE tenant_id = ? AND session_id = ? AND trigger = ?
+             ORDER BY attempt_index DESC LIMIT 1",
+        )
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(trigger)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let attempt_index = latest.as_ref().map_or(1_i64, |(_, index)| index + 1);
+        let parent_attempt_id = latest.map(|(id, _)| id);
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO provider_compaction_attempts
+                (id, tenant_id, user_id, session_id, trigger, protocol,
+                 provider_kind, model, endpoint_hash, request_hash,
+                 attempt_index, parent_attempt_id, status)
+             VALUES (?, ?, ?, ?, ?, 'responses_compact_v1', ?, ?, ?, ?, ?, ?, 'dispatched')",
+        )
+        .bind(&id)
+        .bind(&self.tenant_id)
+        .bind(&self.user_id)
+        .bind(&self.session_id)
+        .bind(trigger)
+        .bind(format!("{:?}", provider.provider_kind()))
+        .bind(&request.model)
+        .bind(endpoint_hash)
+        .bind(request_hash)
+        .bind(attempt_index)
+        .bind(parent_attempt_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| RuntimeError::new(error.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        Ok(id)
+    }
+
+    async fn finish_compaction_success(
+        &self,
+        attempt_id: &str,
+        result: &api::ResponsesCompactResult,
+        output_applied: bool,
+        fallback_reason: Option<&str>,
+    ) -> std::result::Result<(), RuntimeError> {
+        let output_json = serde_json::to_string(&result.output).map_err(|error| {
+            RuntimeError::new(format!(
+                "cannot serialize normalized compaction output: {error}"
+            ))
+        })?;
+        let retained = result
+            .output
+            .iter()
+            .filter(|item| {
+                !matches!(
+                    item.item_type.as_str(),
+                    "compaction" | "compaction_summary" | "context_compaction"
+                )
+            })
+            .collect::<Vec<_>>();
+        let retained_json = serde_json::to_string(&retained).map_err(|error| {
+            RuntimeError::new(format!(
+                "cannot serialize retained compaction items: {error}"
+            ))
+        })?;
+        let output_hash = hex::encode(sha2::Sha256::digest(output_json.as_bytes()));
+        let retained_hash = hex::encode(sha2::Sha256::digest(retained_json.as_bytes()));
+        let output_ciphertext = crate::crypto::encrypt_scoped(
+            &output_json,
+            &crate::crypto::scoped_aad("provider_compaction.output", &self.tenant_id, attempt_id),
+        )
+        .map_err(|error| RuntimeError::new(format!("cannot protect compaction output: {error}")))?;
+        let retained_ciphertext = crate::crypto::encrypt_scoped(
+            &retained_json,
+            &crate::crypto::scoped_aad("provider_compaction.retained", &self.tenant_id, attempt_id),
+        )
+        .map_err(|error| {
+            RuntimeError::new(format!("cannot protect retained compaction items: {error}"))
+        })?;
+        let update = sqlx::query(
+            "UPDATE provider_compaction_attempts
+             SET status = 'completed', normalized_output_hash = ?,
+                 normalized_output_ciphertext = ?, retained_items_hash = ?,
+                 retained_items_ciphertext = ?, output_applied = ?, fallback_reason = ?,
+                 completed_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND tenant_id = ? AND session_id = ? AND status = 'dispatched'",
+        )
+        .bind(output_hash)
+        .bind(output_ciphertext)
+        .bind(retained_hash)
+        .bind(retained_ciphertext)
+        .bind(i64::from(output_applied))
+        .bind(fallback_reason)
+        .bind(attempt_id)
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .execute(&self.db)
+        .await
+        .map_err(|error| RuntimeError::new(error.to_string()))?;
+        if update.rows_affected() != 1 {
+            return Err(RuntimeError::new(
+                "provider compaction attempt lost its dispatched-state fence",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn finish_compaction_failure(
+        &self,
+        attempt_id: &str,
+        status: &str,
+        error_class: &str,
+        fallback_reason: &str,
+    ) -> std::result::Result<(), RuntimeError> {
+        let status = if status == "timed_out" {
+            "timed_out"
+        } else {
+            "failed"
+        };
+        let update = sqlx::query(
+            "UPDATE provider_compaction_attempts
+             SET status = ?, error_class = ?, fallback_reason = ?, completed_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND tenant_id = ? AND session_id = ? AND status = 'dispatched'",
+        )
+        .bind(status)
+        .bind(error_class)
+        .bind(fallback_reason)
+        .bind(attempt_id)
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .execute(&self.db)
+        .await
+        .map_err(|error| RuntimeError::new(error.to_string()))?;
+        if update.rows_affected() != 1 {
+            return Err(RuntimeError::new(
+                "provider compaction failure lost its dispatched-state fence",
+            ));
+        }
+        Ok(())
+    }
+
     async fn begin_attempt(
         &self,
         trace: &runtime::ProviderRequestTrace,
@@ -1651,11 +1850,12 @@ fn provider_supports_default_native_web_search(provider: &ProviderClient, model:
     true
 }
 
-fn has_native_compaction(capabilities: &ModelCapabilities) -> bool {
+fn has_native_compaction_adapter(capabilities: &ModelCapabilities) -> bool {
     capabilities
         .native_compaction
         .as_ref()
-        .is_some_and(|capability| capability.supported)
+        .and_then(|capability| capability.bridge.as_ref())
+        .is_some_and(|bridge| bridge.protocol == ProviderCompactionProtocol::ResponsesCompactV1)
 }
 
 fn native_compaction_bridge(
@@ -1665,7 +1865,14 @@ fn native_compaction_bridge(
         .native_compaction
         .as_ref()
         .and_then(|capability| capability.bridge.clone())
-        .filter(|bridge| bridge.enabled)
+}
+
+fn declared_compaction_protocol(capabilities: &ModelCapabilities) -> Option<&'static str> {
+    capabilities
+        .native_compaction
+        .as_ref()
+        .and_then(|capability| capability.declared_protocol)
+        .map(ProviderCompactionProtocol::as_str)
 }
 
 async fn run_recorded_provider_attempt<F>(
@@ -2468,8 +2675,14 @@ fn build_gateway_session_runtime_context(
         has_native_web_search(capabilities).to_string(),
     );
     metadata.insert(
-        "native_compaction_capable".to_string(),
-        has_native_compaction(capabilities).to_string(),
+        "native_compaction_adapter_declared".to_string(),
+        has_native_compaction_adapter(capabilities).to_string(),
+    );
+    metadata.insert(
+        "compaction_protocol_declared".to_string(),
+        declared_compaction_protocol(capabilities)
+            .unwrap_or("deterministic")
+            .to_string(),
     );
     metadata.insert(
         "scenario_scoped".to_string(),
@@ -4290,65 +4503,164 @@ pub(crate) async fn summarize_session_for_compaction(
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderNativeCompactionOutcome {
+    pub endpoint_called: bool,
+    pub output_applied: bool,
+    pub summary: Option<String>,
+    pub fallback_reason: Option<String>,
+    pub normalized_output_count: usize,
+}
+
+fn plaintext_summary_from_compact_output(result: &api::ResponsesCompactResult) -> Option<String> {
+    result.output.iter().find_map(|item| {
+        if item.item_type != "compaction_summary" {
+            return None;
+        }
+        ["summary", "text"]
+            .into_iter()
+            .find_map(|key| item.raw.get(key).and_then(Value::as_str))
+            .map(sanitize_compaction_summary)
+            .filter(|summary| !summary.trim().is_empty())
+    })
+}
+
 pub(crate) async fn compact_session_with_provider_native(
     runtime: &mut ConversationRuntime<GatewayApiClient, GatewayToolExecutor>,
     bridge: &ProviderNativeCompactionBridge,
-    deterministic_summary: &str,
-) -> Result<Option<String>> {
-    let transcript = render_compaction_transcript(runtime.session(), 36_000);
-    if transcript.trim().is_empty() {
-        return Ok(None);
+    trigger: &str,
+) -> Result<ProviderNativeCompactionOutcome> {
+    if bridge.protocol != ProviderCompactionProtocol::ResponsesCompactV1 {
+        return Ok(ProviderNativeCompactionOutcome {
+            endpoint_called: false,
+            output_applied: false,
+            summary: None,
+            fallback_reason: Some("unsupported_provider_compaction_protocol".to_string()),
+            normalized_output_count: 0,
+        });
     }
-    let prompt = bridge.summary_prompt.clone().unwrap_or_else(|| {
-        "You are a provider-native context compaction engine. Produce a concise continuation summary for an AI assistant session. Preserve user goals, decisions, constraints, files/tools referenced, unresolved work, and facts needed to continue. Do not include secrets. Do not answer the user's task. Return only the summary text.".to_string()
-    });
-    let request = MessageRequest {
-        model: runtime.api_client_mut().model.clone(),
-        max_tokens: 4_096,
-        messages: vec![InputMessage::user_text(format!(
-            "Create a durable continuation summary for the earlier conversation.\n\nDeterministic fallback summary:\n{deterministic_summary}\n\nTranscript excerpt:\n{transcript}"
-        ))],
-        system: Some(prompt),
-        tools: None,
-        tool_choice: None,
-        stream: false,
-        temperature: Some(0.0),
-        top_p: None,
-        frequency_penalty: None,
-        presence_penalty: None,
-        stop: None,
-        reasoning_effort: None,
-        include_reasoning: None,
-        use_max_completion_tokens: runtime.api_client_mut().capabilities.use_max_completion_tokens,
-        extra_body: (!bridge.extra_body.is_empty()).then(|| bridge.extra_body.clone()),
+    let messages = convert_messages(&runtime.session().messages);
+    if messages.is_empty() {
+        return Ok(ProviderNativeCompactionOutcome {
+            endpoint_called: false,
+            output_applied: false,
+            summary: None,
+            fallback_reason: Some("empty_provider_visible_history".to_string()),
+            normalized_output_count: 0,
+        });
+    }
+    let system = (!runtime.system_prompt_sections().is_empty())
+        .then(|| runtime.system_prompt_sections().join("\n\n"));
+    let (provider, recorder, request) = {
+        let api_client = runtime.api_client_mut();
+        let request = MessageRequest {
+            model: api_client.model.clone(),
+            max_tokens: 1,
+            messages,
+            system,
+            tools: Some(api_client.filter_tool_specs()),
+            tool_choice: None,
+            stream: false,
+            reasoning_effort: api_client.reasoning_effort.clone(),
+            include_reasoning: api_client.capabilities.include_reasoning,
+            use_max_completion_tokens: api_client.capabilities.use_max_completion_tokens,
+            extra_body: (!bridge.extra_body.is_empty()).then(|| bridge.extra_body.clone()),
+            ..Default::default()
+        };
+        (
+            api_client.provider.clone(),
+            api_client.request_lineage.clone(),
+            api::responses_compact_request_from_message_request(&request),
+        )
+    };
+    if !provider.supports_responses_compact_v1() {
+        return Ok(ProviderNativeCompactionOutcome {
+            endpoint_called: false,
+            output_applied: false,
+            summary: None,
+            fallback_reason: Some("provider_has_no_responses_compact_v1_adapter".to_string()),
+            normalized_output_count: 0,
+        });
+    }
+    let attempt_id = match recorder.as_ref() {
+        Some(recorder) => Some(
+            recorder
+                .begin_compaction_attempt(trigger, &provider, &request)
+                .await
+                .map_err(GatewayError::Runtime)?,
+        ),
+        None => None,
     };
     let response = timeout(
         Duration::from_secs(COMPACTION_SUMMARY_TIMEOUT_SECS),
-        runtime.api_client_mut().provider.send_message(&request),
+        provider.compact_responses(&request),
     )
-    .await
-    .map_err(|_| {
-        GatewayError::RuntimeExecution(format!(
-            "provider-native compaction timed out after {COMPACTION_SUMMARY_TIMEOUT_SECS}s"
-        ))
-    })?
-    .map_err(GatewayError::Api)?;
-    let summary = response
-        .content
-        .into_iter()
-        .filter_map(|block| match block {
-            OutputContentBlock::Text { text } => Some(text),
-            OutputContentBlock::Thinking { .. }
-            | OutputContentBlock::ToolUse { .. }
-            | OutputContentBlock::RedactedThinking { .. } => None,
-        })
-        .collect::<String>();
-    let cleaned = sanitize_compaction_summary(&summary);
-    if cleaned.trim().is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(cleaned))
+    .await;
+    let result = match response {
+        Err(_) => {
+            if let (Some(recorder), Some(attempt_id)) = (recorder.as_ref(), attempt_id.as_deref()) {
+                recorder
+                    .finish_compaction_failure(
+                        attempt_id,
+                        "timed_out",
+                        "provider_timeout",
+                        "responses_compact_v1_timeout",
+                    )
+                    .await
+                    .map_err(GatewayError::Runtime)?;
+            }
+            return Err(GatewayError::RuntimeExecution(format!(
+                "responses compact v1 timed out after {COMPACTION_SUMMARY_TIMEOUT_SECS}s"
+            )));
+        }
+        Ok(Err(error)) => {
+            let failure_class = error.safe_failure_class();
+            if let (Some(recorder), Some(attempt_id)) = (recorder.as_ref(), attempt_id.as_deref()) {
+                recorder
+                    .finish_compaction_failure(
+                        attempt_id,
+                        "failed",
+                        failure_class,
+                        "responses_compact_v1_provider_error",
+                    )
+                    .await
+                    .map_err(GatewayError::Runtime)?;
+            }
+            return Err(GatewayError::Api(error));
+        }
+        Ok(Ok(result)) => result,
+    };
+    let summary = plaintext_summary_from_compact_output(&result);
+    let output_applied = summary.is_some();
+    let fallback_reason = (!output_applied).then(|| {
+        if result
+            .output
+            .iter()
+            .any(|item| matches!(item.item_type.as_str(), "compaction" | "context_compaction"))
+        {
+            "opaque_provider_items_require_responses_continuation_adapter".to_string()
+        } else {
+            "provider_output_has_no_plaintext_compaction_summary".to_string()
+        }
+    });
+    if let (Some(recorder), Some(attempt_id)) = (recorder.as_ref(), attempt_id.as_deref()) {
+        recorder
+            .finish_compaction_success(
+                attempt_id,
+                &result,
+                output_applied,
+                fallback_reason.as_deref(),
+            )
+            .await
+            .map_err(GatewayError::Runtime)?;
     }
+    Ok(ProviderNativeCompactionOutcome {
+        endpoint_called: true,
+        output_applied,
+        summary,
+        fallback_reason,
+        normalized_output_count: result.output.len(),
+    })
 }
 
 fn render_compaction_transcript(session: &Session, max_chars: usize) -> String {
@@ -5615,7 +5927,7 @@ fn workspace_tool_definitions() -> Vec<RuntimeToolDefinition> {
     definitions
 }
 
-const DEFERRED_PARENT_TOOL_NAMES: [&str; 26] = [
+const DEFERRED_PARENT_TOOL_NAMES: [&str; 32] = [
     "web_search",
     "deep_research_start",
     "super_adversarial_start",
@@ -5641,6 +5953,12 @@ const DEFERRED_PARENT_TOOL_NAMES: [&str; 26] = [
     "task_share",
     "task_watch_rule_list",
     "task_watch_rule_create",
+    "spawn_agent",
+    "send_message",
+    "followup_task",
+    "list_agents",
+    "wait_agent",
+    "interrupt_agent",
     "complete_turn",
 ];
 
@@ -5787,6 +6105,85 @@ fn deferred_parent_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "type": "object",
                 "properties": { "taskId": { "type": "string" } },
                 "required": ["taskId"],
+                "additionalProperties": false
+            }),
+            required_permission: read_only,
+        },
+        RuntimeToolDefinition {
+            name: "spawn_agent".to_string(),
+            description: Some(
+                "Spawn a durable child agent with an independent session, inherited permission scope and persistent mailbox. Use fresh context by default; fork copies only the parent's completed immutable prefix."
+                    .to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string", "minLength": 1, "maxLength": 16000 },
+                    "name": { "type": "string", "minLength": 1, "maxLength": 64 },
+                    "context": { "type": "string", "enum": ["fresh", "fork"] }
+                },
+                "required": ["task"],
+                "additionalProperties": false
+            }),
+            required_permission: read_only,
+        },
+        RuntimeToolDefinition {
+            name: "send_message".to_string(),
+            description: Some("Durably deliver a quiet mailbox message to a team agent without waking an idle or completed agent.".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string" },
+                    "message": { "type": "string", "minLength": 1, "maxLength": 16000 }
+                },
+                "required": ["target", "message"],
+                "additionalProperties": false
+            }),
+            required_permission: read_only,
+        },
+        RuntimeToolDefinition {
+            name: "followup_task".to_string(),
+            description: Some("Durably deliver follow-up work and wake the target agent for a new turn when it is idle or completed.".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string" },
+                    "message": { "type": "string", "minLength": 1, "maxLength": 16000 }
+                },
+                "required": ["target", "message"],
+                "additionalProperties": false
+            }),
+            required_permission: read_only,
+        },
+        RuntimeToolDefinition {
+            name: "list_agents".to_string(),
+            description: Some("List the durable team roster and current lifecycle state, optionally filtered by name or thread prefix.".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "pathPrefix": { "type": "string" } },
+                "additionalProperties": false
+            }),
+            required_permission: read_only,
+        },
+        RuntimeToolDefinition {
+            name: "wait_agent".to_string(),
+            description: Some("Wait for a team status or mailbox change without busy polling. Returns immediately when no peer can make progress.".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "timeoutMs": { "type": "integer", "minimum": 10, "maximum": 60000 }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: read_only,
+        },
+        RuntimeToolDefinition {
+            name: "interrupt_agent".to_string(),
+            description: Some("Request interruption of a target agent's current turn while preserving its unconsumed mailbox.".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "target": { "type": "string" } },
+                "required": ["target"],
                 "additionalProperties": false
             }),
             required_permission: read_only,
@@ -9906,6 +10303,9 @@ impl RuntimeBuilder {
             );
         }
 
+        let native_compaction_bridge = native_compaction_bridge(&primary_capabilities)
+            .filter(|_| api_client.provider.supports_responses_compact_v1());
+        let supports_native_compaction = native_compaction_bridge.is_some();
         let mut runtime = ConversationRuntime::new_with_features(
             session,
             api_client,
@@ -9972,8 +10372,8 @@ impl RuntimeBuilder {
                 permission_mode: format!("{:?}", self.config.permission_mode),
                 model: effective_model,
             },
-            supports_native_compaction: has_native_compaction(&primary_capabilities),
-            native_compaction_bridge: native_compaction_bridge(&primary_capabilities),
+            supports_native_compaction,
+            native_compaction_bridge,
             context_window_tokens,
         })
     }
@@ -13175,18 +13575,46 @@ mod tests {
 
     #[test]
     fn native_compaction_capability_is_explicit_and_model_name_agnostic() {
-        let enabled = ModelCapabilities::from_json(Some(&serde_json::json!({
+        let legacy_summary = ModelCapabilities::from_json(Some(&serde_json::json!({
             "providerNativeCompaction": true
         })));
-        assert!(has_native_compaction(&enabled));
+        assert!(!has_native_compaction_adapter(&legacy_summary));
+        assert_eq!(
+            declared_compaction_protocol(&legacy_summary),
+            Some("model_summary")
+        );
+
+        let responses_v1 = ModelCapabilities::from_json(Some(&serde_json::json!({
+            "providerNativeCompaction": {
+                "enabled": true,
+                "protocol": "responses_compact_v1"
+            }
+        })));
+        assert!(has_native_compaction_adapter(&responses_v1));
+        assert_eq!(
+            declared_compaction_protocol(&responses_v1),
+            Some("responses_compact_v1")
+        );
+
+        let responses_v2 = ModelCapabilities::from_json(Some(&serde_json::json!({
+            "providerNativeCompaction": {
+                "enabled": true,
+                "protocol": "responses_compact_v2"
+            }
+        })));
+        assert!(!has_native_compaction_adapter(&responses_v2));
+        assert_eq!(
+            declared_compaction_protocol(&responses_v2),
+            Some("responses_compact_v2")
+        );
 
         let disabled = ModelCapabilities::from_json(Some(&serde_json::json!({
             "providerNativeCompaction": false
         })));
-        assert!(!has_native_compaction(&disabled));
+        assert!(!has_native_compaction_adapter(&disabled));
 
         let absent = ModelCapabilities::from_json(Some(&serde_json::json!({})));
-        assert!(!has_native_compaction(&absent));
+        assert!(!has_native_compaction_adapter(&absent));
     }
 
     #[test]

@@ -57,6 +57,29 @@ pub enum AppError {
     ExplainCacheExpired(String),
 }
 
+impl From<crate::semantic_kernel_store::SemanticStoreError> for AppError {
+    fn from(error: crate::semantic_kernel_store::SemanticStoreError) -> Self {
+        use crate::semantic_kernel_store::SemanticStoreError;
+        match error {
+            SemanticStoreError::InvalidEvent(message) => Self::ValidationError(message),
+            SemanticStoreError::StaleWriter { thread_id } => {
+                Self::Conflict(format!("stale writer lease for thread {thread_id}"))
+            }
+            SemanticStoreError::Sequence {
+                thread_id,
+                expected,
+                actual,
+            } => Self::Conflict(format!(
+                "ledger sequence conflict for thread {thread_id}: expected {expected}, got {actual}"
+            )),
+            SemanticStoreError::Database(error) => Self::Database(error),
+            corruption @ SemanticStoreError::Corruption { .. } => {
+                Self::Internal(corruption.to_string())
+            }
+        }
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message) = match &self {

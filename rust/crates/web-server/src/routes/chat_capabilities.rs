@@ -23,6 +23,10 @@ struct ChatCapabilityResponse {
     file_rag: FileRagCapability,
     multimodal: MultimodalCapability,
     memory: MemoryCapability,
+    canonical_surface: RuntimeCapabilityStatus,
+    sandbox: RuntimeCapabilityStatus,
+    agent_team: RuntimeCapabilityStatus,
+    provider_compaction: ProviderCompactionCapability,
 }
 
 #[derive(Debug, Serialize)]
@@ -102,6 +106,29 @@ struct MultimodalCapability {
 struct MemoryCapability {
     enabled: bool,
     default_mode: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeCapabilityStatus {
+    configured: bool,
+    supported: bool,
+    active: bool,
+    enforcement: &'static str,
+    unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderCompactionCapability {
+    configured: bool,
+    supported: bool,
+    active: bool,
+    protocol: Option<String>,
+    endpoint_called: bool,
+    output_applied: bool,
+    fallback_reason: Option<String>,
+    unavailable_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,6 +285,101 @@ async fn configured_model_capabilities_json(
     })
 }
 
+fn configured_compaction_protocol(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    let capability = [
+        "providerNativeCompaction",
+        "provider_native_compaction",
+        "nativeCompaction",
+        "native_compaction",
+        "responsesCompaction",
+        "responses_compaction",
+    ]
+    .iter()
+    .find_map(|key| value.get(*key))?;
+    match capability {
+        Value::Bool(true) => Some("model_summary".to_string()),
+        Value::String(protocol) => Some(protocol.trim().to_ascii_lowercase()),
+        Value::Object(object) => {
+            let enabled = object
+                .get("enabled")
+                .or_else(|| object.get("enable"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            enabled.then(|| {
+                object
+                    .get("protocol")
+                    .or_else(|| object.get("mode"))
+                    .or_else(|| object.get("strategy"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("model_summary")
+                    .trim()
+                    .to_ascii_lowercase()
+            })
+        }
+        _ => None,
+    }
+}
+
+async fn provider_compaction_capability(
+    state: &AppState,
+    tenant_id: &str,
+    model: &str,
+) -> ProviderCompactionCapability {
+    let capabilities = configured_model_capabilities_json(state, tenant_id, model).await;
+    let protocol = configured_compaction_protocol(capabilities.as_ref());
+    let configured = protocol.is_some();
+    let supported = protocol.as_deref() == Some("responses_compact_v1");
+    let provider_model = model
+        .split_once('/')
+        .map_or(model, |(_, provider_model)| provider_model);
+    let latest = sqlx::query(
+        "SELECT status, output_applied, fallback_reason
+         FROM provider_compaction_attempts
+         WHERE tenant_id = ? AND model IN (?, ?) AND protocol = 'responses_compact_v1'
+         ORDER BY created_at DESC, attempt_index DESC LIMIT 1",
+    )
+    .bind(tenant_id)
+    .bind(model)
+    .bind(provider_model)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+    let endpoint_called = latest.is_some();
+    let active = latest
+        .as_ref()
+        .is_some_and(|row| sqlx::Row::get::<String, _>(row, "status") == "completed");
+    let output_applied = latest
+        .as_ref()
+        .is_some_and(|row| sqlx::Row::get::<i64, _>(row, "output_applied") != 0);
+    let fallback_reason = latest
+        .as_ref()
+        .and_then(|row| sqlx::Row::get::<Option<String>, _>(row, "fallback_reason"));
+    let unavailable_reason = if !configured {
+        Some("model capability does not declare provider compaction".to_string())
+    } else if !supported {
+        Some("only responses_compact_v1 has a verified AOS adapter".to_string())
+    } else if !active {
+        Some(
+            "the configured /responses/compact endpoint has not completed a verified attempt"
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    ProviderCompactionCapability {
+        configured,
+        supported,
+        active,
+        protocol,
+        endpoint_called,
+        output_applied,
+        fallback_reason,
+        unavailable_reason,
+    }
+}
+
 async fn get_chat_capabilities(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -332,6 +454,10 @@ async fn get_chat_capabilities(
     let token_override =
         configured_model_capability_override(&state, &claims.tenant_id, selected_model).await;
     let model_capabilities = api::model_capabilities(selected_model, token_override);
+    let provider_compaction =
+        provider_compaction_capability(&state, &claims.tenant_id, selected_model).await;
+    let sandbox_supported =
+        runtime::sandbox_backend_capability() == runtime::sandbox::EnforcementCapability::Full;
 
     Json(ChatCapabilityResponse {
         reasoning: ReasoningCapability {
@@ -397,6 +523,40 @@ async fn get_chat_capabilities(
             enabled: true,
             default_mode: "auto",
         },
+        canonical_surface: RuntimeCapabilityStatus {
+            configured: true,
+            supported: true,
+            active: true,
+            enforcement: "append_only_fold_and_dispatch_hash",
+            unavailable_reason: None,
+        },
+        sandbox: RuntimeCapabilityStatus {
+            configured: true,
+            supported: sandbox_supported,
+            active: sandbox_supported,
+            enforcement: if sandbox_supported {
+                "bwrap_prlimit_full"
+            } else {
+                "fail_closed"
+            },
+            unavailable_reason: (!sandbox_supported).then(|| {
+                "bwrap+prlimit filesystem/network/resource probe failed; shell execution is unavailable"
+                    .to_string()
+            }),
+        },
+        agent_team: RuntimeCapabilityStatus {
+            configured: true,
+            supported: true,
+            // Ordinary Chat does not expose the control tools. The unified
+            // Super Assistant parent/child runtime is the active surface.
+            active: false,
+            enforcement: "super_assistant_parent_scope",
+            unavailable_reason: Some(
+                "Agent Team tools are active only in the unified Super Assistant runtime"
+                    .to_string(),
+            ),
+        },
+        provider_compaction,
     })
 }
 

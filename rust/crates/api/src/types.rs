@@ -50,6 +50,94 @@ pub struct MessageRequest {
     pub extra_body: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
+/// Canonical unary request for the provider `/responses/compact` endpoint.
+///
+/// This deliberately does not reuse [`MessageRequest`]. Remote compaction has
+/// a different wire contract and returns provider-normalized response items,
+/// not an assistant chat message. Keeping the types separate prevents a
+/// summary-prompt chat call from being reported as provider-native
+/// compaction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResponsesCompactRequest {
+    pub model: String,
+    pub input: Vec<Value>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub instructions: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Value>>,
+    #[serde(default)]
+    pub parallel_tool_calls: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<Value>,
+}
+
+impl ResponsesCompactRequest {
+    /// Apply the same outbound data-protection boundary used for ordinary
+    /// model calls. Provider-normalized item shapes stay intact while their
+    /// string/JSON payloads are protected recursively.
+    #[must_use]
+    pub fn protect_sensitive_content(
+        &self,
+        mode: runtime::DataProtectionMode,
+    ) -> (Self, runtime::DataProtectionReport) {
+        let mut request = self.clone();
+        let mut report = runtime::DataProtectionReport::default();
+        let (input, input_report) =
+            runtime::protect_sensitive_json(&Value::Array(request.input.clone()), mode);
+        if let Value::Array(input) = input {
+            request.input = input;
+        }
+        report.merge(&input_report);
+        let protected = runtime::protect_sensitive_text(&request.instructions, mode);
+        request.instructions = protected.value;
+        report.merge(&protected.report);
+        if let Some(tools) = request.tools.as_mut() {
+            let (protected, tools_report) =
+                runtime::protect_sensitive_json(&Value::Array(tools.clone()), mode);
+            if let Value::Array(protected) = protected {
+                *tools = protected;
+            }
+            report.merge(&tools_report);
+        }
+        for value in [&mut request.reasoning, &mut request.text]
+            .into_iter()
+            .flatten()
+        {
+            let (protected, value_report) = runtime::protect_sensitive_json(value, mode);
+            *value = protected;
+            report.merge(&value_report);
+        }
+        (request, report)
+    }
+}
+
+/// A validated provider-normalized item returned by `/responses/compact`.
+/// `raw` is retained byte-semantically so opaque compaction metadata is never
+/// flattened into prose or silently discarded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResponsesCompactOutputItem {
+    pub item_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    pub raw: Value,
+}
+
+/// Normalized result of the dedicated remote-compaction endpoint.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResponsesCompactResult {
+    pub output: Vec<ResponsesCompactOutputItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
 #[must_use]
 pub(crate) fn is_reserved_extra_body_key(key: &str) -> bool {
     let normalized = key.trim().to_ascii_lowercase();

@@ -908,6 +908,10 @@ pub(crate) async fn run_pm_chat_completion(
     let mut last_error: Option<String> = None;
     for entry in &candidates {
         match run_pm_completion_with_key(
+            &state.db,
+            tenant_id,
+            user_id,
+            "pm:chat",
             entry,
             &model,
             api_messages.clone(),
@@ -1020,8 +1024,13 @@ pub(crate) async fn run_chat_completion_with_registry(
     }
 
     let mut last_error: Option<String> = None;
+    let dispatch_db = registry.database();
     for entry in &candidates {
         match run_pm_completion_with_key(
+            &dispatch_db,
+            tenant_id,
+            "system",
+            "pm:registry-completion",
             entry,
             &model,
             api_messages.clone(),
@@ -1089,6 +1098,10 @@ fn effective_model_for_entry(entry: &agent_gateway::ApiKeyEntry, model_fallback:
 }
 
 pub(crate) async fn run_pm_completion_with_key(
+    db: &sqlx::SqlitePool,
+    tenant_id: &str,
+    user_id: &str,
+    authority: &str,
     entry: &agent_gateway::ApiKeyEntry,
     model_fallback: &str,
     api_messages: Vec<api::InputMessage>,
@@ -1110,6 +1123,13 @@ pub(crate) async fn run_pm_completion_with_key(
             entry.id
         ))
     })?;
+    let provider = crate::governed_provider::GovernedProviderClient::new(
+        provider,
+        db.clone(),
+        tenant_id,
+        user_id,
+        authority,
+    );
     let api_req = api::MessageRequest {
         model: effective_model.clone(),
         max_tokens,
@@ -1169,6 +1189,10 @@ pub(crate) async fn run_pm_completion_with_key(
 }
 
 async fn run_pm_stream_completion_with_key(
+    db: &sqlx::SqlitePool,
+    tenant_id: &str,
+    user_id: &str,
+    authority: &str,
     entry: &agent_gateway::ApiKeyEntry,
     model_fallback: &str,
     api_messages: Vec<api::InputMessage>,
@@ -1189,6 +1213,13 @@ async fn run_pm_stream_completion_with_key(
             entry.id
         ))
     })?;
+    let provider = crate::governed_provider::GovernedProviderClient::new(
+        provider,
+        db.clone(),
+        tenant_id,
+        user_id,
+        authority,
+    );
     let api_req = api::MessageRequest {
         model: effective_model.clone(),
         max_tokens,
@@ -4712,6 +4743,10 @@ async fn run_material_job_generation(
                 content: serde_json::json!(prompt),
             }]);
             run_pm_stream_completion_with_key(
+                &state.db,
+                &tenant_id,
+                &user_id,
+                "pm:material-ppt",
                 entry,
                 &selected_model,
                 api_messages,
@@ -4737,6 +4772,10 @@ async fn run_material_job_generation(
                 content: serde_json::json!(base_prompt.clone()),
             }]);
             run_pm_completion_with_key(
+                &state.db,
+                &tenant_id,
+                &user_id,
+                "pm:material-text",
                 entry,
                 &selected_model,
                 api_messages,

@@ -1,10 +1,12 @@
 //! Web Server — HTTP/WebSocket API layer for the enterprise `WebUI`.
 
+mod agent_team;
 mod auth;
 mod auth_middleware;
 mod config;
 mod email;
 mod error;
+mod governed_provider;
 #[cfg(feature = "nl2sql")]
 pub mod nl2sql;
 mod routes;
@@ -2201,6 +2203,7 @@ pub async fn serve_with_options(
         )
         .expect("failed to build agent session manager");
         state.agent_manager = Some(agent_manager.clone());
+        routes::super_assistant_parent::start_agent_team_recovery(state.clone());
         log_startup_phase(phase_started, "agent_manager_build");
     }
 

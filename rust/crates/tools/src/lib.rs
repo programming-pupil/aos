@@ -674,13 +674,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "command": { "type": "string" },
                     "timeout": { "type": "integer", "minimum": 1 },
-                    "description": { "type": "string" },
-                    "run_in_background": { "type": "boolean" },
-                    "dangerouslyDisableSandbox": { "type": "boolean" },
-                    "namespaceRestrictions": { "type": "boolean" },
-                    "isolateNetwork": { "type": "boolean" },
-                    "filesystemMode": { "type": "string", "enum": ["off", "workspace-only", "allow-list"] },
-                    "allowedMounts": { "type": "array", "items": { "type": "string" } }
+                    "description": { "type": "string" }
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -1670,6 +1664,18 @@ fn execute_tool_with_enforcer(
         "bash" => {
             // Parse input to get the command for permission classification
             let bash_input: BashCommandInput = from_value(input)?;
+            if bash_input.run_in_background.is_some()
+                || bash_input.dangerously_disable_sandbox.is_some()
+                || bash_input.namespace_restrictions.is_some()
+                || bash_input.isolate_network.is_some()
+                || bash_input.filesystem_mode.is_some()
+                || bash_input.allowed_mounts.is_some()
+            {
+                return Err(
+                    "bash sandbox policy and background lifecycle are operator-controlled; model tool input may only provide command, timeout, and description"
+                        .to_string(),
+                );
+            }
             let classified_mode = classify_bash_permission(&bash_input.command);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
             run_bash(bash_input)
@@ -11415,6 +11421,36 @@ mod tests {
     }
 
     #[test]
+    fn model_bash_surface_cannot_disable_sandbox_or_start_unmanaged_background_work() {
+        let bash = super::mvp_tool_specs()
+            .into_iter()
+            .find(|spec| spec.name == "bash")
+            .expect("bash tool definition");
+        let properties = bash.input_schema["properties"]
+            .as_object()
+            .expect("bash properties");
+        for forbidden in [
+            "run_in_background",
+            "dangerouslyDisableSandbox",
+            "namespaceRestrictions",
+            "isolateNetwork",
+            "filesystemMode",
+            "allowedMounts",
+        ] {
+            assert!(!properties.contains_key(forbidden));
+        }
+        for malicious in [
+            json!({"command":"printf safe", "dangerouslyDisableSandbox":true}),
+            json!({"command":"printf safe", "filesystemMode":"off"}),
+            json!({"command":"printf safe", "run_in_background":true}),
+        ] {
+            let error = super::execute_tool_with_enforcer(None, "bash", &malicious)
+                .expect_err("model-controlled execution policy must fail closed");
+            assert!(error.contains("operator-controlled"));
+        }
+    }
+
+    #[test]
     fn powershell_permission_classifier_rejects_compound_commands() {
         assert_eq!(
             super::classify_powershell_permission("Get-Content Cargo.toml"),
@@ -14625,6 +14661,24 @@ mod tests {
 
     #[test]
     fn bash_tool_reports_success_exit_failure_timeout_and_background() {
+        if runtime::sandbox_backend_capability() != runtime::EnforcementCapability::Full {
+            for input in [
+                json!({ "command": "printf 'hello'" }),
+                json!({ "command": "printf 'oops' >&2; exit 7" }),
+                json!({ "command": "sleep 1", "timeout": 10 }),
+            ] {
+                let error = execute_tool("bash", &input)
+                    .expect_err("an unavailable sandbox must fail closed before execution");
+                assert!(error.contains("sandbox runner unavailable"), "{error}");
+            }
+            let background_error = execute_tool(
+                "bash",
+                &json!({ "command": "sleep 1", "run_in_background": true }),
+            )
+            .expect_err("model input must not control unmanaged background lifecycle");
+            assert!(background_error.contains("operator-controlled"));
+            return;
+        }
         let success = execute_tool("bash", &json!({ "command": "printf 'hello'" }))
             .expect("bash should succeed");
         let success_output: serde_json::Value = serde_json::from_str(&success).expect("json");
@@ -14650,14 +14704,12 @@ mod tests {
             .expect("stderr")
             .contains("Command exceeded timeout"));
 
-        let background = execute_tool(
+        let background_error = execute_tool(
             "bash",
             &json!({ "command": "sleep 1", "run_in_background": true }),
         )
-        .expect("bash background should succeed");
-        let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
-        assert!(background_output["backgroundTaskId"].as_str().is_some());
-        assert_eq!(background_output["noOutputExpected"], true);
+        .expect_err("model input must not control unmanaged background lifecycle");
+        assert!(background_error.contains("operator-controlled"));
     }
 
     #[test]
@@ -14732,8 +14784,17 @@ mod tests {
         let output = execute_tool(
             "bash",
             &json!({ "command": "printf 'targeted ok'; cargo test -p runtime stale_branch" }),
-        )
-        .expect("targeted commands should still execute");
+        );
+
+        if runtime::sandbox_backend_capability() != runtime::EnforcementCapability::Full {
+            let error = output
+                .expect_err("targeted commands must not bypass an unavailable sandbox backend");
+            assert!(error.contains("sandbox runner unavailable"), "{error}");
+            std::env::set_current_dir(&original_dir).expect("restore cwd");
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+        let output = output.expect("targeted commands should still execute");
         let output_json: serde_json::Value = serde_json::from_str(&output).expect("json");
         assert_ne!(
             output_json["returnCodeInterpretation"],
@@ -15427,9 +15488,15 @@ printf 'pwsh:%s' "$1"
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let registry = super::GlobalToolRegistry::builtin();
-        let result = registry
-            .execute("bash", &json!({ "command": "printf 'ok'" }))
-            .expect("bash should succeed without enforcer");
+        let result = registry.execute("bash", &json!({ "command": "printf 'ok'" }));
+        if runtime::sandbox_backend_capability() != runtime::EnforcementCapability::Full {
+            let error = result.expect_err(
+                "absence of a permission enforcer must not disable sandbox fail-closed behavior",
+            );
+            assert!(error.contains("sandbox runner unavailable"), "{error}");
+            return;
+        }
+        let result = result.expect("bash should succeed without enforcer in a probed sandbox");
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["stdout"], "ok");
     }

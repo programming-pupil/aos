@@ -314,9 +314,13 @@ pub struct CompactionRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retained_tail_tokens: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_native_supported: Option<bool>,
+    pub provider_compaction_endpoint_supported: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_native_used: Option<bool>,
+    pub provider_compaction_endpoint_called: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_compaction_output_applied: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_compaction_fallback_reason: Option<String>,
 }
 
 /// Internal result of `run_streaming_turn_streaming` — the turn summary plus accumulated

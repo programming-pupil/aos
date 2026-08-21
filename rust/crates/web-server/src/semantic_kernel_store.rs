@@ -7,9 +7,10 @@
 //! so live progress and history are projections of one durable stream.
 
 use agent_protocol::{
-    AgentEventEnvelope, AgentEventV1, ChildSettlement, ChildThreadEvent, DomainEvent,
-    DurableInteraction, EventActor, InteractionKind, InteractionResponse, InteractionScope,
-    InteractionState,
+    fold_surface, hash_model_messages, validate_model_messages, AgentEventEnvelope, AgentEventV1,
+    CanonicalSurface, ChildSettlement, ChildThreadEvent, DomainEvent, DurableInteraction,
+    EventActor, InteractionKind, InteractionResponse, InteractionScope, InteractionState,
+    ModelSurfaceMessage, SurfaceBlock, SurfaceMessage, SurfaceOperation, SurfaceRole,
 };
 use chrono::{Duration, Utc};
 use nl2sql_core::semantic_ir::{
@@ -1566,6 +1567,65 @@ pub(crate) async fn record_child_spawn_in_transaction(
     Ok(())
 }
 
+/// Transfer a newly-created child's temporary semantic-kernel spawn slot to
+/// the durable Agent Team permit authority. The child lineage and delegated
+/// capability remain valid for future follow-up turns; only the one-shot
+/// reservation used to make creation atomic is released. Agent Team runtime
+/// concurrency is then governed exclusively by `agent_concurrency_permits`.
+pub(crate) async fn transfer_child_slot_to_agent_team_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    tenant_id: &str,
+    parent_thread_id: &str,
+    child_thread_id: &str,
+) -> Result<(), SemanticStoreError> {
+    let released = sqlx::query::<Sqlite>(
+        "UPDATE resource_budget_entries
+         SET state = 'released', committed_amount = 1
+         WHERE tenant_id = ? AND owner_scope = ? AND reservation_id = ?
+           AND dimension = 'child_slots' AND state = 'reserved'",
+    )
+    .bind(tenant_id)
+    .bind(parent_thread_id)
+    .bind(format!("child:{child_thread_id}"))
+    .execute(&mut **tx)
+    .await?;
+    if released.rows_affected() != 1 {
+        return Err(SemanticStoreError::InvalidEvent(
+            "child slot transfer is missing its spawn reservation".into(),
+        ));
+    }
+    sqlx::query::<Sqlite>(
+        "UPDATE resource_budget_accounts
+         SET available = available + 1, reserved = MAX(reserved - 1, 0)
+         WHERE tenant_id = ? AND owner_scope = ? AND dimension = 'child_slots'",
+    )
+    .bind(tenant_id)
+    .bind(parent_thread_id)
+    .execute(&mut **tx)
+    .await?;
+    let parent_token_id = sqlx::query_scalar::<Sqlite, String>(
+        "SELECT parent_token_id FROM capability_tokens
+         WHERE tenant_id = ? AND child_scope = ? AND parent_token_id IS NOT NULL
+         LIMIT 1",
+    )
+    .bind(tenant_id)
+    .bind(child_thread_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    sqlx::query::<Sqlite>(
+        "UPDATE capability_tokens
+         SET remaining_uses = MIN(remaining_uses + 1, ?)
+         WHERE id = ? AND tenant_id = ? AND revoked_at IS NULL
+           AND julianday(expires_at) > julianday('now')",
+    )
+    .bind(DEFAULT_CHILD_SLOT_BUDGET)
+    .bind(parent_token_id)
+    .bind(tenant_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 async fn record_child_spawn(
     db: &SqlitePool,
@@ -2095,6 +2155,302 @@ async fn append_child_thread_event_in_transaction(
     Ok(())
 }
 
+fn surface_role_from_runtime(role: runtime::MessageRole) -> SurfaceRole {
+    match role {
+        runtime::MessageRole::System => SurfaceRole::System,
+        runtime::MessageRole::User => SurfaceRole::User,
+        runtime::MessageRole::Assistant => SurfaceRole::Assistant,
+        runtime::MessageRole::Tool => SurfaceRole::Tool,
+    }
+}
+
+fn surface_role_from_api(role: &str) -> Result<SurfaceRole, SemanticStoreError> {
+    match role.trim().to_ascii_lowercase().as_str() {
+        "system" | "developer" => Ok(SurfaceRole::System),
+        "user" => Ok(SurfaceRole::User),
+        "assistant" => Ok(SurfaceRole::Assistant),
+        "tool" => Ok(SurfaceRole::Tool),
+        value => Err(SemanticStoreError::InvalidEvent(format!(
+            "unsupported canonical surface role: {value}"
+        ))),
+    }
+}
+
+fn protected_runtime_message(
+    message: &runtime::ConversationMessage,
+) -> Result<runtime::ConversationMessage, SemanticStoreError> {
+    let value = serde_json::to_value(message)
+        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+    let protected =
+        runtime::protect_sensitive_json(&value, runtime::configured_data_protection_mode()).0;
+    serde_json::from_value(protected)
+        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))
+}
+
+fn runtime_surface_message(
+    message_id: impl Into<String>,
+    message: &runtime::ConversationMessage,
+) -> Result<SurfaceMessage, SemanticStoreError> {
+    let message = protected_runtime_message(message)?;
+    let mut blocks =
+        Vec::with_capacity(message.blocks.len() + usize::from(message.thinking.is_some()));
+    if let Some(thinking) = message.thinking.filter(|value| !value.is_empty()) {
+        blocks.push(SurfaceBlock::Thinking {
+            thinking,
+            signature: message.thinking_signature,
+        });
+    }
+    blocks.extend(message.blocks.into_iter().map(|block| match block {
+        runtime::ContentBlock::Text { text } => SurfaceBlock::Text { text },
+        runtime::ContentBlock::ToolUse { id, name, input } => SurfaceBlock::ToolCall {
+            invocation_id: id,
+            tool_name: name,
+            input,
+        },
+        runtime::ContentBlock::ToolResult {
+            tool_use_id,
+            tool_name,
+            output,
+            is_error,
+        } => SurfaceBlock::ToolResult {
+            invocation_id: tool_use_id,
+            tool_name,
+            output,
+            is_error,
+        },
+    }));
+    Ok(SurfaceMessage {
+        message_id: message_id.into(),
+        role: surface_role_from_runtime(message.role),
+        blocks,
+    })
+}
+
+fn api_surface_message(
+    message_id: impl Into<String>,
+    message: &api::InputMessage,
+) -> Result<SurfaceMessage, SemanticStoreError> {
+    let blocks = message
+        .content
+        .iter()
+        .map(|block| match block {
+            api::InputContentBlock::Text { text } => SurfaceBlock::Text { text: text.clone() },
+            api::InputContentBlock::Thinking {
+                thinking,
+                signature,
+            } => SurfaceBlock::Thinking {
+                thinking: thinking.clone(),
+                signature: signature.clone(),
+            },
+            api::InputContentBlock::Image {
+                media_type,
+                source_type,
+                data,
+            } => SurfaceBlock::Image {
+                media_type: media_type.clone(),
+                source_type: source_type.as_str().to_string(),
+                data: data.clone(),
+            },
+            api::InputContentBlock::Document {
+                media_type,
+                source_type,
+                data,
+                name,
+            } => SurfaceBlock::Document {
+                media_type: media_type.clone(),
+                source_type: source_type.as_str().to_string(),
+                data: data.clone(),
+                name: name.clone(),
+            },
+            api::InputContentBlock::ToolUse { id, name, input } => SurfaceBlock::ToolCall {
+                invocation_id: id.clone(),
+                tool_name: name.clone(),
+                input: input.to_string(),
+            },
+            api::InputContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => SurfaceBlock::ToolResult {
+                invocation_id: tool_use_id.clone(),
+                tool_name: String::new(),
+                output: serde_json::to_string(content).unwrap_or_default(),
+                is_error: *is_error,
+            },
+        })
+        .collect();
+    Ok(SurfaceMessage {
+        message_id: message_id.into(),
+        role: surface_role_from_api(&message.role)?,
+        blocks,
+    })
+}
+
+fn protected_api_messages(
+    messages: &[api::InputMessage],
+) -> Result<Vec<api::InputMessage>, SemanticStoreError> {
+    let value = serde_json::to_value(messages)
+        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+    let protected =
+        runtime::protect_sensitive_json(&value, runtime::configured_data_protection_mode()).0;
+    serde_json::from_value(protected)
+        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))
+}
+
+fn api_message_from_surface(
+    message: &ModelSurfaceMessage,
+) -> Result<api::InputMessage, SemanticStoreError> {
+    let role = match message.role {
+        SurfaceRole::System => "system",
+        SurfaceRole::User => "user",
+        SurfaceRole::Assistant => "assistant",
+        SurfaceRole::Tool => "tool",
+    }
+    .to_string();
+    let content = message
+        .blocks
+        .iter()
+        .map(|block| match block {
+            SurfaceBlock::Text { text } => Ok(api::InputContentBlock::Text { text: text.clone() }),
+            SurfaceBlock::Thinking {
+                thinking,
+                signature,
+            } => Ok(api::InputContentBlock::Thinking {
+                thinking: thinking.clone(),
+                signature: signature.clone(),
+            }),
+            SurfaceBlock::Image {
+                media_type,
+                source_type,
+                data,
+            } => Ok(api::InputContentBlock::Image {
+                media_type: media_type.clone(),
+                source_type: if source_type == "url" {
+                    api::ImageSourceType::Url
+                } else {
+                    api::ImageSourceType::Base64
+                },
+                data: data.clone(),
+            }),
+            SurfaceBlock::Document {
+                media_type,
+                source_type,
+                data,
+                name,
+            } => Ok(api::InputContentBlock::Document {
+                media_type: media_type.clone(),
+                source_type: if source_type == "url" {
+                    api::ImageSourceType::Url
+                } else {
+                    api::ImageSourceType::Base64
+                },
+                data: data.clone(),
+                name: name.clone(),
+            }),
+            SurfaceBlock::ToolCall {
+                invocation_id,
+                tool_name,
+                input,
+            } => Ok(api::InputContentBlock::ToolUse {
+                id: invocation_id.clone(),
+                name: tool_name.clone(),
+                input: serde_json::from_str(input).unwrap_or(serde_json::Value::Null),
+            }),
+            SurfaceBlock::ToolResult {
+                invocation_id,
+                output,
+                is_error,
+                ..
+            } => {
+                let content = serde_json::from_str::<Vec<api::ToolResultContentBlock>>(output)
+                    .unwrap_or_else(|_| {
+                        vec![api::ToolResultContentBlock::Text {
+                            text: output.clone(),
+                        }]
+                    });
+                Ok(api::InputContentBlock::ToolResult {
+                    tool_use_id: invocation_id.clone(),
+                    content,
+                    is_error: *is_error,
+                })
+            }
+        })
+        .collect::<Result<Vec<_>, SemanticStoreError>>()?;
+    Ok(api::InputMessage { role, content })
+}
+
+async fn load_canonical_surface_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    tenant_id: &str,
+    thread_id: &str,
+) -> Result<CanonicalSurface, SemanticStoreError> {
+    let rows = sqlx::query::<Sqlite>(
+        "SELECT sequence, event_id, payload_json, payload_hash
+         FROM agent_event_ledger
+         WHERE tenant_id = ? AND thread_id = ?
+         ORDER BY sequence ASC",
+    )
+    .bind(tenant_id)
+    .bind(thread_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut events = Vec::with_capacity(rows.len());
+    for (index, row) in rows.into_iter().enumerate() {
+        let expected_sequence = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+        let row_sequence = u64::try_from(row.try_get::<i64, _>("sequence")?).map_err(|_| {
+            SemanticStoreError::Corruption {
+                sequence: expected_sequence,
+                kind: "negative_sequence".into(),
+            }
+        })?;
+        if row_sequence != expected_sequence {
+            return Err(SemanticStoreError::Corruption {
+                sequence: row_sequence,
+                kind: format!("sequence_gap_expected_{expected_sequence}"),
+            });
+        }
+        let event: AgentEventEnvelope =
+            serde_json::from_str(&row.try_get::<String, _>("payload_json")?).map_err(|error| {
+                SemanticStoreError::Corruption {
+                    sequence: row_sequence,
+                    kind: format!("invalid_envelope:{error}"),
+                }
+            })?;
+        let row_event_id = row.try_get::<String, _>("event_id")?;
+        let row_payload_hash = row.try_get::<String, _>("payload_hash")?;
+        if event.sequence != row_sequence
+            || event.thread_id != thread_id
+            || event.event_id != row_event_id
+            || event.payload_hash != row_payload_hash
+            || event.verify_hash().is_err()
+        {
+            return Err(SemanticStoreError::Corruption {
+                sequence: row_sequence,
+                kind: "envelope_or_hash_mismatch".into(),
+            });
+        }
+        events.push(event);
+    }
+    fold_surface(&events).map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))
+}
+
+fn assert_surface_request(
+    surface: &CanonicalSurface,
+    expected: &[ModelSurfaceMessage],
+) -> Result<(), SemanticStoreError> {
+    validate_model_messages(expected)
+        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+    let request_hash = hash_model_messages(expected)
+        .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+    if request_hash != surface.model_messages_hash || expected != surface.model_messages() {
+        return Err(SemanticStoreError::InvalidEvent(format!(
+            "canonical surface/request mismatch: surface={} request={request_hash}",
+            surface.model_messages_hash
+        )));
+    }
+    Ok(())
+}
+
 /// SQLite-backed execution kernel used by every gateway runtime.  This is the
 /// authority for new turns and tool side effects; JSONL remains an exact
 /// compatibility archive and is rebuilt from this ledger when needed.
@@ -2134,6 +2490,378 @@ impl RuntimeExecutionKernel {
             .await
     }
 
+    /// Append new ordinary-chat input to the durable ledger and return the
+    /// exact canonical provider request. Existing sessions accept either one
+    /// delta message or a full history whose prefix exactly equals the folded
+    /// surface; divergent client-side histories fail closed.
+    pub(crate) async fn prepare_chat_request(
+        &self,
+        request_id: &str,
+        incoming: &[api::InputMessage],
+        model: &str,
+    ) -> Result<Vec<api::InputMessage>, SemanticStoreError> {
+        if request_id.trim().is_empty() || incoming.is_empty() {
+            return Err(SemanticStoreError::InvalidEvent(
+                "chat request id and messages are required".into(),
+            ));
+        }
+        let incoming = protected_api_messages(incoming)?;
+        let mut tx = self.db.begin().await?;
+        acquire_sqlite_write_lock(&mut tx).await?;
+        ensure_runtime_thread_row(&mut tx, &self.tenant_id, &self.user_id, &self.session_id)
+            .await?;
+        let terminal_exists = sqlx::query_scalar::<Sqlite, i64>(
+            "SELECT COUNT(*) FROM agent_event_ledger
+             WHERE tenant_id = ? AND thread_id = ? AND idempotency_key = ?",
+        )
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(format!("chat-terminal:{request_id}"))
+        .fetch_one(&mut *tx)
+        .await?;
+        if terminal_exists > 0 {
+            return Err(SemanticStoreError::InvalidEvent(
+                "chat request is already terminal; read the canonical session instead of redispatching"
+                    .into(),
+            ));
+        }
+        let before =
+            load_canonical_surface_in_transaction(&mut tx, &self.tenant_id, &self.session_id)
+                .await?;
+        let before_messages = before.model_messages();
+        let incoming_surface = incoming
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                api_surface_message(format!("chat:{request_id}:input:{index}"), message)
+                    .map(|message| message.model_view())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let append_start = if before_messages.is_empty() || incoming.len() == 1 {
+            0
+        } else if incoming_surface.starts_with(&before_messages) {
+            before_messages.len()
+        } else {
+            return Err(SemanticStoreError::InvalidEvent(
+                "client chat history diverges from the canonical session surface".into(),
+            ));
+        };
+        let dispatch_key = format!("chat-dispatch:{request_id}");
+        if append_start == incoming.len() {
+            let payload_json = sqlx::query_scalar::<Sqlite, String>(
+                "SELECT payload_json FROM agent_event_ledger
+                 WHERE tenant_id = ? AND thread_id = ? AND idempotency_key = ?",
+            )
+            .bind(&self.tenant_id)
+            .bind(&self.session_id)
+            .bind(&dispatch_key)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                SemanticStoreError::InvalidEvent(
+                    "chat request did not append a user message and has no committed dispatch"
+                        .into(),
+                )
+            })?;
+            let event: AgentEventEnvelope = serde_json::from_str(&payload_json)
+                .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+            let AgentEventV1::Domain(domain) = event.event else {
+                return Err(SemanticStoreError::InvalidEvent(
+                    "chat dispatch idempotency key references a non-domain event".into(),
+                ));
+            };
+            let stored_model = domain
+                .payload
+                .get("model")
+                .and_then(serde_json::Value::as_str);
+            let stored_messages_hash = domain
+                .payload
+                .get("requestMessagesHash")
+                .and_then(serde_json::Value::as_str);
+            if stored_model != Some(model)
+                || stored_messages_hash != Some(before.model_messages_hash.as_str())
+            {
+                return Err(SemanticStoreError::InvalidEvent(
+                    "chat request retry does not match its committed provider request".into(),
+                ));
+            }
+            assert_surface_request(&before, &incoming_surface)?;
+            tx.commit().await?;
+            return before_messages
+                .iter()
+                .map(api_message_from_surface)
+                .collect();
+        }
+        let appended = &incoming[append_start..];
+        if appended.len() != 1 || !appended[0].role.eq_ignore_ascii_case("user") {
+            return Err(SemanticStoreError::InvalidEvent(
+                "each chat request must append exactly one user message; system, assistant, and tool history are server-authoritative"
+                    .into(),
+            ));
+        }
+        let turn_id = format!("chat:{request_id}");
+        for (index, message) in incoming.iter().enumerate().skip(append_start) {
+            let surface_message =
+                api_surface_message(format!("chat:{request_id}:input:{index}"), message)?;
+            self.append_domain_event_with_surface_in_transaction(
+                &mut tx,
+                Some(&turn_id),
+                &format!("chat-input:{request_id}:{index}"),
+                "chat_input",
+                serde_json::json!({
+                    "requestId": request_id,
+                    "index": index,
+                    "message": message,
+                }),
+                format!("chat-input:{request_id}:{index}"),
+                Some(SurfaceOperation::Append {
+                    message: surface_message,
+                }),
+            )
+            .await?;
+        }
+        let surface =
+            load_canonical_surface_in_transaction(&mut tx, &self.tenant_id, &self.session_id)
+                .await?;
+        let canonical_messages = surface.model_messages();
+        assert_surface_request(&surface, &canonical_messages)?;
+        if let Some(payload_json) = sqlx::query_scalar::<Sqlite, String>(
+            "SELECT payload_json FROM agent_event_ledger
+             WHERE tenant_id = ? AND thread_id = ? AND idempotency_key = ?",
+        )
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(&dispatch_key)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            let event: AgentEventEnvelope = serde_json::from_str(&payload_json)
+                .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+            let AgentEventV1::Domain(domain) = event.event else {
+                return Err(SemanticStoreError::InvalidEvent(
+                    "chat dispatch idempotency key references a non-domain event".into(),
+                ));
+            };
+            let stored_model = domain
+                .payload
+                .get("model")
+                .and_then(serde_json::Value::as_str);
+            let stored_messages_hash = domain
+                .payload
+                .get("requestMessagesHash")
+                .and_then(serde_json::Value::as_str);
+            if stored_model != Some(model)
+                || stored_messages_hash != Some(surface.model_messages_hash.as_str())
+            {
+                return Err(SemanticStoreError::InvalidEvent(
+                    "chat request retry does not match its committed provider request".into(),
+                ));
+            }
+            tx.commit().await?;
+            return canonical_messages
+                .iter()
+                .map(api_message_from_surface)
+                .collect();
+        }
+        self.append_domain_event_in_transaction(
+            &mut tx,
+            Some(&turn_id),
+            &format!("chat-dispatch:{request_id}"),
+            "model_request_committed",
+            serde_json::json!({
+                "requestId": request_id,
+                "model": model,
+                "ledgerTailSequence": surface.ledger_tail_sequence,
+                "surfaceHash": surface.surface_hash,
+                "requestMessagesHash": surface.model_messages_hash,
+            }),
+            dispatch_key,
+        )
+        .await?;
+        tx.commit().await?;
+        canonical_messages
+            .iter()
+            .map(api_message_from_surface)
+            .collect()
+    }
+
+    pub(crate) async fn import_legacy_chat_messages(
+        &self,
+        messages: &[api::InputMessage],
+    ) -> Result<(), SemanticStoreError> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let messages = protected_api_messages(messages)?;
+        let source_hash = sha256_bytes(
+            serde_json::to_string(&messages)
+                .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?
+                .as_bytes(),
+        );
+        let mut tx = self.db.begin().await?;
+        acquire_sqlite_write_lock(&mut tx).await?;
+        ensure_runtime_thread_row(&mut tx, &self.tenant_id, &self.user_id, &self.session_id)
+            .await?;
+        let existing =
+            load_canonical_surface_in_transaction(&mut tx, &self.tenant_id, &self.session_id)
+                .await?;
+        if !existing.nodes.is_empty() {
+            tx.commit().await?;
+            return Ok(());
+        }
+        for (index, message) in messages.iter().enumerate() {
+            self.append_domain_event_with_surface_in_transaction(
+                &mut tx,
+                None,
+                &format!("legacy-chat-import:{source_hash}:{index}"),
+                "legacy_import",
+                serde_json::json!({
+                    "source": "chat_jsonl",
+                    "sourceHash": source_hash,
+                    "index": index,
+                    "message": message,
+                }),
+                format!("legacy-chat-import:{source_hash}:{index}"),
+                Some(SurfaceOperation::Append {
+                    message: api_surface_message(
+                        format!("legacy-chat:{source_hash}:{index}"),
+                        message,
+                    )?,
+                }),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn record_chat_assistant(
+        &self,
+        request_id: &str,
+        text: &str,
+    ) -> Result<(), SemanticStoreError> {
+        let turn_id = format!("chat:{request_id}");
+        let message = runtime::ConversationMessage {
+            role: runtime::MessageRole::Assistant,
+            blocks: vec![runtime::ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            thinking: None,
+            thinking_signature: None,
+            usage: None,
+        };
+        let surface_message =
+            runtime_surface_message(format!("chat:{request_id}:assistant"), &message)?;
+        let mut tx = self.db.begin().await?;
+        acquire_sqlite_write_lock(&mut tx).await?;
+        self.append_domain_event_with_surface_in_transaction(
+            &mut tx,
+            Some(&turn_id),
+            &format!("chat-assistant:{request_id}"),
+            "assistant_message",
+            serde_json::json!({
+                "requestId": request_id,
+                "message": serde_json::to_value(&message)
+                    .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?,
+            }),
+            format!("chat-assistant:{request_id}"),
+            Some(SurfaceOperation::Append {
+                message: surface_message,
+            }),
+        )
+        .await?;
+        self.append_domain_event_in_transaction(
+            &mut tx,
+            Some(&turn_id),
+            &format!("chat-terminal:{request_id}"),
+            "turn_completed",
+            serde_json::json!({"requestId": request_id, "status": "completed"}),
+            format!("chat-terminal:{request_id}"),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn record_chat_failure(
+        &self,
+        request_id: &str,
+        detail: &str,
+    ) -> Result<(), SemanticStoreError> {
+        self.append_domain(
+            &format!("chat:{request_id}"),
+            &format!("chat-terminal:{request_id}"),
+            "turn_failed",
+            serde_json::json!({"requestId": request_id, "status": "failed", "detail": detail}),
+            format!("chat-terminal:{request_id}"),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub(crate) async fn load_chat_messages(
+        &self,
+    ) -> Result<Vec<api::InputMessage>, SemanticStoreError> {
+        let mut tx = self.db.begin().await?;
+        if let Some((owner, status)) = sqlx::query_as::<Sqlite, (String, String)>(
+            "SELECT owner_user_id, status FROM agent_threads WHERE id = ? AND tenant_id = ?",
+        )
+        .bind(&self.session_id)
+        .bind(&self.tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            if owner != self.user_id {
+                return Err(SemanticStoreError::InvalidEvent(
+                    "chat session belongs to a different owner".into(),
+                ));
+            }
+            if matches!(status.as_str(), "deleted" | "corrupt") {
+                return Err(SemanticStoreError::InvalidEvent(format!(
+                    "chat session is unavailable in {status} state"
+                )));
+            }
+        }
+        let surface =
+            load_canonical_surface_in_transaction(&mut tx, &self.tenant_id, &self.session_id)
+                .await?;
+        tx.commit().await?;
+        surface
+            .model_messages()
+            .iter()
+            .map(api_message_from_surface)
+            .collect()
+    }
+
+    pub(crate) async fn delete_chat_session(&self) -> Result<(), SemanticStoreError> {
+        let mut tx = self.db.begin().await?;
+        acquire_sqlite_write_lock(&mut tx).await?;
+        let row = sqlx::query_as::<Sqlite, (String, String)>(
+            "SELECT tenant_id, owner_user_id FROM agent_threads WHERE id = ?",
+        )
+        .bind(&self.session_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((tenant_id, owner_user_id)) = row {
+            if tenant_id != self.tenant_id || owner_user_id != self.user_id {
+                return Err(SemanticStoreError::InvalidEvent(
+                    "chat session deletion crossed tenant or owner scope".into(),
+                ));
+            }
+            sqlx::query::<Sqlite>(
+                "UPDATE agent_threads SET status = 'deleted', updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ? AND tenant_id = ? AND owner_user_id = ?",
+            )
+            .bind(&self.session_id)
+            .bind(&self.tenant_id)
+            .bind(&self.user_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn append_domain_event(
         &self,
         turn_id: Option<&str>,
@@ -2167,6 +2895,29 @@ impl RuntimeExecutionKernel {
         payload: serde_json::Value,
         idempotency_key: String,
     ) -> Result<u64, SemanticStoreError> {
+        self.append_domain_event_with_surface_in_transaction(
+            tx,
+            turn_id,
+            item_id,
+            kind,
+            payload,
+            idempotency_key,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn append_domain_event_with_surface_in_transaction(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        turn_id: Option<&str>,
+        item_id: &str,
+        kind: &str,
+        payload: serde_json::Value,
+        idempotency_key: String,
+        surface_op: Option<SurfaceOperation>,
+    ) -> Result<u64, SemanticStoreError> {
         append_runtime_domain_event_in_transaction(
             tx,
             &self.tenant_id,
@@ -2177,6 +2928,7 @@ impl RuntimeExecutionKernel {
             kind,
             payload,
             idempotency_key,
+            surface_op,
         )
         .await
     }
@@ -2192,6 +2944,7 @@ async fn append_runtime_domain_event_in_transaction(
     kind: &str,
     payload: serde_json::Value,
     idempotency_key: String,
+    surface_op: Option<SurfaceOperation>,
 ) -> Result<u64, SemanticStoreError> {
     let recovery_payload_raw = payload.to_string();
     let recovery_payload_hash = hex::encode(sha2::Sha256::digest(recovery_payload_raw.as_bytes()));
@@ -2200,15 +2953,30 @@ async fn append_runtime_domain_event_in_transaction(
         ensure_runtime_turn(tx, tenant_id, session_id, turn_id).await?;
     }
     let writer = acquire_writer(tx, tenant_id, session_id, "runtime-kernel").await?;
-    let existing = sqlx::query_scalar::<Sqlite, i64>(
-            "SELECT sequence FROM agent_event_ledger WHERE tenant_id = ? AND thread_id = ? AND idempotency_key = ?",
+    let existing = sqlx::query_as::<Sqlite, (i64, String)>(
+            "SELECT sequence, payload_json FROM agent_event_ledger WHERE tenant_id = ? AND thread_id = ? AND idempotency_key = ?",
         )
         .bind(tenant_id)
         .bind(session_id)
         .bind(&idempotency_key)
         .fetch_optional(&mut **tx)
         .await?;
-    if let Some(sequence) = existing {
+    if let Some((sequence, payload_json)) = existing {
+        let existing_event: AgentEventEnvelope = serde_json::from_str(&payload_json)
+            .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+        let same_payload = matches!(
+            &existing_event.event,
+            AgentEventV1::Domain(domain)
+                if domain.domain == "runtime"
+                    && domain.kind == kind
+                    && domain.payload.get("_recoveryPayloadHash").and_then(serde_json::Value::as_str)
+                        == Some(recovery_payload_hash.as_str())
+        );
+        if !same_payload || existing_event.surface_op != surface_op {
+            return Err(SemanticStoreError::InvalidEvent(
+                "idempotency key reused with a different runtime event".into(),
+            ));
+        }
         return u64::try_from(sequence)
             .map_err(|_| SemanticStoreError::InvalidEvent("negative sequence".into()));
     }
@@ -2256,6 +3024,7 @@ async fn append_runtime_domain_event_in_transaction(
     event.actor = EventActor::Worker {
         id: "runtime-kernel".into(),
     };
+    event.surface_op = surface_op;
     event.idempotency_key = Some(idempotency_key);
     event.payload_hash = event
         .compute_payload_hash()
@@ -2281,6 +3050,30 @@ async fn append_runtime_domain_event_in_transaction(
     .execute(&mut **tx)
     .await?;
     Ok(sequence)
+}
+
+pub(crate) async fn append_agent_team_domain_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    tenant_id: &str,
+    owner_user_id: &str,
+    thread_id: &str,
+    kind: &str,
+    payload: serde_json::Value,
+    idempotency_key: String,
+) -> Result<u64, SemanticStoreError> {
+    append_runtime_domain_event_in_transaction(
+        tx,
+        tenant_id,
+        owner_user_id,
+        thread_id,
+        None,
+        &format!("agent-team:{kind}:{idempotency_key}"),
+        kind,
+        payload,
+        idempotency_key,
+        None,
+    )
+    .await
 }
 
 async fn ensure_runtime_thread(
@@ -2310,8 +3103,8 @@ async fn ensure_runtime_thread_row(
     .bind(user_id)
     .execute(&mut **tx)
     .await?;
-    let owner = sqlx::query_as::<Sqlite, (String, String)>(
-        "SELECT tenant_id, owner_user_id FROM agent_threads WHERE id = ?",
+    let owner = sqlx::query_as::<Sqlite, (String, String, String)>(
+        "SELECT tenant_id, owner_user_id, status FROM agent_threads WHERE id = ?",
     )
     .bind(session_id)
     .fetch_one(&mut **tx)
@@ -2320,6 +3113,12 @@ async fn ensure_runtime_thread_row(
         return Err(SemanticStoreError::InvalidEvent(
             "runtime thread id belongs to a different tenant or owner".into(),
         ));
+    }
+    if matches!(owner.2.as_str(), "deleted" | "corrupt") {
+        return Err(SemanticStoreError::InvalidEvent(format!(
+            "runtime thread is not writable in {} state",
+            owner.2
+        )));
     }
     Ok(())
 }
@@ -2715,7 +3514,25 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                     .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
                 }
             }
-            self.append_domain_event_in_transaction(
+            let interrupted_surface = runtime_surface_message(
+                format!("tool-recovery:{invocation_id}"),
+                &runtime::ConversationMessage {
+                    role: runtime::MessageRole::Tool,
+                    blocks: vec![runtime::ContentBlock::ToolResult {
+                        tool_use_id: invocation_id.clone(),
+                        tool_name: tool_name.clone(),
+                        output:
+                            "Tool execution was interrupted by process restart; outcome is unknown."
+                                .into(),
+                        is_error: true,
+                    }],
+                    thinking: None,
+                    thinking_signature: None,
+                    usage: None,
+                },
+            )
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            self.append_domain_event_with_surface_in_transaction(
                 &mut tx,
                 Some(&turn_id),
                 &format!("tool-recovery:{invocation_id}"),
@@ -2727,6 +3544,9 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                     "reason": "process_restart",
                 }),
                 format!("tool-recovery:{invocation_id}"),
+                Some(SurfaceOperation::Append {
+                    message: interrupted_surface,
+                }),
             )
             .await
             .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
@@ -2741,16 +3561,42 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         &self,
         input: runtime::RuntimeTurnStart,
     ) -> Result<(), runtime::RuntimeError> {
-        self.append_domain(
-            &input.turn_id,
+        let message = runtime::ConversationMessage {
+            role: runtime::MessageRole::User,
+            blocks: vec![runtime::ContentBlock::Text {
+                text: input.user_input.clone(),
+            }],
+            thinking: None,
+            thinking_signature: None,
+            usage: None,
+        };
+        let surface_message =
+            runtime_surface_message(format!("turn:{}:user", input.turn_id), &message)
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        acquire_sqlite_write_lock(&mut tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        self.append_domain_event_with_surface_in_transaction(
+            &mut tx,
+            Some(&input.turn_id),
             &format!("turn-start:{}", input.turn_id),
             "turn_started",
             serde_json::json!({"userInput": input.user_input}),
             format!("turn-start:{}", input.turn_id),
+            Some(SurfaceOperation::Append {
+                message: surface_message,
+            }),
         )
         .await
-        .map(|_| ())
-        .map_err(|e| runtime::RuntimeError::new(e.to_string()))
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))
     }
 
     async fn current_turn_revision(&self, turn_id: &str) -> Result<u64, runtime::RuntimeError> {
@@ -2933,6 +3779,33 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             &self.tenant_id,
             &format!("{}:{}", input.turn_id, input.iteration),
         );
+        let mut expected_surface_messages = input
+            .system_sections
+            .iter()
+            .enumerate()
+            .map(|(index, section)| SurfaceMessage {
+                message_id: format!("{id}:system:{index}"),
+                role: SurfaceRole::System,
+                blocks: vec![SurfaceBlock::Text {
+                    text: runtime::protect_sensitive_text(
+                        section,
+                        runtime::configured_data_protection_mode(),
+                    )
+                    .value,
+                }],
+            })
+            .collect::<Vec<_>>();
+        for (index, message) in input.messages.iter().enumerate() {
+            expected_surface_messages.push(
+                runtime_surface_message(format!("{id}:message:{index}"), message)
+                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?,
+            );
+        }
+        if expected_surface_messages.is_empty() {
+            return Err(runtime::RuntimeError::new(
+                "model-visible context surface cannot be empty",
+            ));
+        }
         let prompt_row_id = input.prompt_manifest.as_ref().map(|_| {
             tenant_scoped_record_id(
                 "runtime-prompt",
@@ -3206,7 +4079,56 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                 ));
             }
         }
-        self.append_domain_event_in_transaction(
+        let existing_context_event = sqlx::query_scalar::<Sqlite, String>(
+            "SELECT payload_json FROM agent_event_ledger
+             WHERE tenant_id = ? AND thread_id = ? AND idempotency_key = ?",
+        )
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(format!("context:{id}"))
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let surface_op = if let Some(payload_json) = existing_context_event {
+            let event: AgentEventEnvelope = serde_json::from_str(&payload_json)
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            match event.surface_op {
+                Some(SurfaceOperation::Replace {
+                    messages,
+                    source_event_sequences,
+                }) if messages == expected_surface_messages => SurfaceOperation::Replace {
+                    messages,
+                    source_event_sequences,
+                },
+                _ => {
+                    return Err(runtime::RuntimeError::new(
+                        "context manifest id was reused with a different canonical surface",
+                    ));
+                }
+            }
+        } else {
+            let before =
+                load_canonical_surface_in_transaction(&mut tx, &self.tenant_id, &self.session_id)
+                    .await
+                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            let mut source_event_sequences = before
+                .nodes
+                .iter()
+                .map(|node| node.event_sequence)
+                .collect::<Vec<_>>();
+            source_event_sequences.sort_unstable();
+            source_event_sequences.dedup();
+            if source_event_sequences.is_empty() {
+                return Err(runtime::RuntimeError::new(
+                    "context manifest has no canonical input surface to replace",
+                ));
+            }
+            SurfaceOperation::Replace {
+                messages: expected_surface_messages.clone(),
+                source_event_sequences,
+            }
+        };
+        self.append_domain_event_with_surface_in_transaction(
             &mut tx,
             Some(&input.turn_id),
             &id,
@@ -3220,9 +4142,20 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                 "manifest": raw_manifest_value,
             }),
             format!("context:{id}"),
+            Some(surface_op),
         )
         .await
         .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let folded =
+            load_canonical_surface_in_transaction(&mut tx, &self.tenant_id, &self.session_id)
+                .await
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let expected_model_messages = expected_surface_messages
+            .iter()
+            .map(SurfaceMessage::model_view)
+            .collect::<Vec<_>>();
+        assert_surface_request(&folded, &expected_model_messages)
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
         tx.commit()
             .await
             .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
@@ -3242,6 +4175,9 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         iteration: usize,
         message: &runtime::ConversationMessage,
     ) -> Result<(), runtime::RuntimeError> {
+        let surface_message =
+            runtime_surface_message(format!("assistant:{turn_id}:{iteration}"), message)
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
         let mut tx = self
             .db
             .begin()
@@ -3259,7 +4195,7 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             message,
         )
         .await?;
-        self.append_domain_event_in_transaction(
+        self.append_domain_event_with_surface_in_transaction(
             &mut tx,
             Some(turn_id),
             &format!("assistant:{}:{}", turn_id, iteration),
@@ -3272,6 +4208,9 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                 }
             }),
             format!("assistant:{}:{}", turn_id, iteration),
+            Some(SurfaceOperation::Append {
+                message: surface_message,
+            }),
         )
         .await
         .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
@@ -3285,7 +4224,18 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         message_id: &str,
         message: &runtime::ConversationMessage,
     ) -> Result<(), runtime::RuntimeError> {
-        self.append_domain_event(
+        let surface_message = runtime_surface_message(format!("visible:{message_id}"), message)
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        acquire_sqlite_write_lock(&mut tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        self.append_domain_event_with_surface_in_transaction(
+            &mut tx,
             None,
             &format!("visible-message:{message_id}"),
             "visible_message",
@@ -3294,10 +4244,15 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                     .unwrap_or_else(|_| serde_json::json!({"debug":format!("{message:?}")})),
             }),
             format!("visible-message:{message_id}"),
+            Some(SurfaceOperation::Append {
+                message: surface_message,
+            }),
         )
         .await
-        .map(|_| ())
-        .map_err(|error| runtime::RuntimeError::new(error.to_string()))
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))
     }
 
     async fn authorize_tool(
@@ -4599,7 +5554,27 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             }
         }
         let outcome_state = format!("{:?}", outcome.outcome).to_ascii_lowercase();
-        self.append_domain_event_in_transaction(
+        let tool_surface_message = runtime_surface_message(
+            format!("tool-outcome:{}:{outcome_state}", outcome.invocation_id),
+            &runtime::ConversationMessage {
+                role: runtime::MessageRole::Tool,
+                blocks: vec![runtime::ContentBlock::ToolResult {
+                    tool_use_id: outcome.invocation_id.clone(),
+                    tool_name: outcome.tool_name.clone(),
+                    output: model_output.clone(),
+                    is_error: !matches!(
+                        outcome.outcome,
+                        runtime::RuntimeToolOutcomeKind::Completed
+                            | runtime::RuntimeToolOutcomeKind::Deferred
+                    ),
+                }],
+                thinking: None,
+                thinking_signature: None,
+                usage: None,
+            },
+        )
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        self.append_domain_event_with_surface_in_transaction(
             &mut tx,
             Some(&outcome.turn_id),
             &format!("tool-outcome:{}:{outcome_state}", outcome.invocation_id),
@@ -4614,6 +5589,9 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                 "modelOutput": model_output,
             }),
             format!("tool-outcome:{}:{outcome_state}", outcome.invocation_id),
+            Some(SurfaceOperation::Append {
+                message: tool_surface_message,
+            }),
         )
         .await
         .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
@@ -5045,6 +6023,7 @@ pub(crate) async fn create_memory_conflict_question_in_transaction(
             "candidateFactId":candidate_fact_id,
         }),
         event_key.clone(),
+        None,
     )
     .await?;
     let created_event_id = sqlx::query_scalar::<Sqlite, String>(
@@ -7318,8 +8297,74 @@ pub(crate) async fn commit_compaction_transaction(
         .turns
         .last()
         .map(|turn| turn.turn_id.as_str());
+    let mut before_surface =
+        load_canonical_surface_in_transaction(&mut transaction, tenant_id, thread_id).await?;
+    if before_surface.nodes.is_empty() {
+        // One-time migration for sessions created before canonical surface
+        // operations existed. The import is explicit and hash/idempotency
+        // stable; it is never presented as a native live event.
+        if result.archived_messages.is_empty() {
+            return Err(SemanticStoreError::InvalidEvent(
+                "legacy compaction has no messages that can seed a canonical surface".into(),
+            ));
+        }
+        for (index, message) in result.archived_messages.iter().enumerate() {
+            let message_hash = sha256_bytes(
+                serde_json::to_string(message)
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+            kernel
+                .append_domain_event_with_surface_in_transaction(
+                    &mut transaction,
+                    turn_id,
+                    &format!("legacy-import:{transaction_id}:{index}"),
+                    "legacy_import",
+                    serde_json::json!({
+                        "source": "pre_surface_compaction_archive",
+                        "sourceHash": message_hash,
+                        "message": message,
+                    }),
+                    format!("legacy-import:{transaction_id}:{index}:{message_hash}"),
+                    Some(SurfaceOperation::Append {
+                        message: runtime_surface_message(
+                            format!("legacy-import:{transaction_id}:{index}"),
+                            message,
+                        )?,
+                    }),
+                )
+                .await?;
+        }
+        before_surface =
+            load_canonical_surface_in_transaction(&mut transaction, tenant_id, thread_id).await?;
+    }
+    let mut current_surface_sequences = before_surface
+        .nodes
+        .iter()
+        .map(|node| node.event_sequence)
+        .collect::<Vec<_>>();
+    current_surface_sequences.sort_unstable();
+    current_surface_sequences.dedup();
+    debug_assert!(!current_surface_sequences.is_empty());
+    let replacement_surface = result
+        .compacted_session
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            runtime_surface_message(
+                format!("compaction:{transaction_id}:message:{index}"),
+                message,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if replacement_surface.is_empty() {
+        return Err(SemanticStoreError::InvalidEvent(
+            "compaction produced an empty canonical replacement".into(),
+        ));
+    }
     let sequence = kernel
-        .append_domain_event_in_transaction(
+        .append_domain_event_with_surface_in_transaction(
             &mut transaction,
             turn_id,
             &checkpoint_id,
@@ -7333,8 +8378,21 @@ pub(crate) async fn commit_compaction_transaction(
                 "session": replacement,
             }),
             format!("session-checkpoint:{replacement_hash}"),
+            Some(SurfaceOperation::Replace {
+                messages: replacement_surface.clone(),
+                source_event_sequences: current_surface_sequences,
+            }),
         )
         .await?;
+    let compacted_surface =
+        load_canonical_surface_in_transaction(&mut transaction, tenant_id, thread_id).await?;
+    assert_surface_request(
+        &compacted_surface,
+        &replacement_surface
+            .iter()
+            .map(SurfaceMessage::model_view)
+            .collect::<Vec<_>>(),
+    )?;
     let checkpoint_projection = runtime::protect_sensitive_json(
         &result
             .compacted_session
@@ -10271,27 +11329,48 @@ mod tests {
         for (index, message) in messages.iter().enumerate() {
             let sequence = u64::try_from(index + 1).unwrap();
             let event_id = format!("message-event-{index}");
-            let (event_type, raw) = match message.blocks.as_slice() {
+            let (kind, event_type, raw_value) = match message.blocks.as_slice() {
                 [runtime::ContentBlock::Text { text }]
                     if message.role == runtime::MessageRole::User =>
                 {
                     (
+                        "turn_started",
                         "runtime.turn_started",
-                        serde_json::json!({"userInput": text}).to_string(),
+                        serde_json::json!({"userInput": text}),
                     )
                 }
                 _ => (
+                    "assistant_message",
                     "runtime.assistant_message",
-                    serde_json::json!({"message": message}).to_string(),
+                    serde_json::json!({"message": message}),
                 ),
             };
-            let raw_hash = sha256_bytes(raw.as_bytes());
+            let raw = raw_value.to_string();
+            let mut event = AgentEventEnvelope::new(
+                thread_id,
+                Some(turn_id),
+                None,
+                format!("pre-surface-message-{index}"),
+                AgentEventV1::Domain(DomainEvent {
+                    domain: "runtime".into(),
+                    kind: kind.into(),
+                    payload: raw_value,
+                }),
+                sequence,
+            );
+            event.event_id = event_id.clone();
+            event.batch_id = format!("batch-{index}");
+            event.actor = EventActor::Worker {
+                id: "pre-surface-test-fixture".into(),
+            };
+            event.payload_hash = event.compute_payload_hash().unwrap();
+            let payload_json = serde_json::to_string(&event).unwrap();
             sqlx::query(
                 "INSERT INTO agent_event_ledger
                     (event_id, tenant_id, thread_id, turn_id, sequence, batch_id,
                      schema_version, event_type, payload_json, payload_hash,
                      durable, occurred_at, raw_payload_ciphertext)
-                     VALUES (?, ?, ?, ?, ?, ?, 1, ?, '{}', ?, 1,
+                     VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 1,
                          CURRENT_TIMESTAMP, ?)",
             )
             .bind(&event_id)
@@ -10301,7 +11380,8 @@ mod tests {
             .bind(i64::try_from(sequence).unwrap())
             .bind(format!("batch-{index}"))
             .bind(event_type)
-            .bind(&raw_hash)
+            .bind(payload_json)
+            .bind(&event.payload_hash)
             .bind(
                 agent_gateway::crypto::encrypt_scoped(
                     &raw,
@@ -10362,27 +11442,48 @@ mod tests {
         let mut event_ids = Vec::new();
         for (index, message) in messages.iter().enumerate() {
             let event_id = format!("{prefix}-event-{index}");
-            let (event_type, raw) = match message.blocks.as_slice() {
+            let (kind, event_type, raw_value) = match message.blocks.as_slice() {
                 [runtime::ContentBlock::Text { text }]
                     if message.role == runtime::MessageRole::User =>
                 {
                     (
+                        "turn_started",
                         "runtime.turn_started",
-                        serde_json::json!({"userInput": text}).to_string(),
+                        serde_json::json!({"userInput": text}),
                     )
                 }
                 _ => (
+                    "assistant_message",
                     "runtime.assistant_message",
-                    serde_json::json!({"message": message}).to_string(),
+                    serde_json::json!({"message": message}),
                 ),
             };
-            let raw_hash = sha256_bytes(raw.as_bytes());
+            let raw = raw_value.to_string();
+            let mut event = AgentEventEnvelope::new(
+                thread_id,
+                Some(turn_id),
+                None,
+                format!("pre-surface-{prefix}-{index}"),
+                AgentEventV1::Domain(DomainEvent {
+                    domain: "runtime".into(),
+                    kind: kind.into(),
+                    payload: raw_value,
+                }),
+                u64::try_from(sequence).unwrap(),
+            );
+            event.event_id = event_id.clone();
+            event.batch_id = format!("{prefix}-batch-{index}");
+            event.actor = EventActor::Worker {
+                id: "pre-surface-test-fixture".into(),
+            };
+            event.payload_hash = event.compute_payload_hash().unwrap();
+            let payload_json = serde_json::to_string(&event).unwrap();
             sqlx::query(
                 "INSERT INTO agent_event_ledger
                     (event_id, tenant_id, thread_id, turn_id, sequence, batch_id,
                      schema_version, event_type, payload_json, payload_hash,
                      durable, occurred_at, raw_payload_ciphertext)
-                     VALUES (?, ?, ?, ?, ?, ?, 1, ?, '{}', ?, 1,
+                     VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 1,
                          CURRENT_TIMESTAMP, ?)",
             )
             .bind(&event_id)
@@ -10392,7 +11493,8 @@ mod tests {
             .bind(sequence)
             .bind(format!("{prefix}-batch-{index}"))
             .bind(event_type)
-            .bind(&raw_hash)
+            .bind(payload_json)
+            .bind(&event.payload_hash)
             .bind(
                 agent_gateway::crypto::encrypt_scoped(
                     &raw,
@@ -14847,6 +15949,20 @@ mod tests {
 
         let first = RuntimeExecutionKernel::new(db.clone(), "tenant", "user", "session");
         let second = RuntimeExecutionKernel::new(db.clone(), "tenant", "user", "session");
+        first
+            .start_turn(runtime::RuntimeTurnStart {
+                turn_id: "turn-a".into(),
+                user_input: "query".into(),
+            })
+            .await
+            .unwrap();
+        second
+            .start_turn(runtime::RuntimeTurnStart {
+                turn_id: "turn-b".into(),
+                user_input: "query".into(),
+            })
+            .await
+            .unwrap();
         let manifest = |kernel: RuntimeExecutionKernel, turn_id: &'static str| async move {
             kernel
                 .record_context_manifest(runtime::RuntimeContextManifestInput {
@@ -15781,6 +16897,116 @@ mod tests {
         assert_eq!(interaction_count, 0);
         assert_eq!(event_count, 0);
         assert_eq!(turn_status, "running");
+    }
+
+    #[tokio::test]
+    async fn ordinary_chat_uses_one_durable_canonical_surface_and_rejects_shadow_history() {
+        let db = db().await;
+        let kernel =
+            RuntimeExecutionKernel::new(db.clone(), "tenant-chat", "owner-chat", "session-chat");
+        let user = api::InputMessage {
+            role: "user".into(),
+            content: vec![api::InputContentBlock::Text {
+                text: "first question".into(),
+            }],
+        };
+
+        let first = kernel
+            .prepare_chat_request("request-1", std::slice::from_ref(&user), "model-a")
+            .await
+            .unwrap();
+        assert_eq!(first, vec![user.clone()]);
+
+        // A retry before the terminal event is allowed to redispatch, but the
+        // stable request id must not append a duplicate user message.
+        let retry = kernel
+            .prepare_chat_request("request-1", std::slice::from_ref(&user), "model-a")
+            .await
+            .unwrap();
+        assert_eq!(retry, first);
+        let input_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_event_ledger
+             WHERE tenant_id = 'tenant-chat' AND thread_id = 'session-chat'
+               AND event_type = 'runtime.chat_input'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(input_events, 1);
+
+        let changed_retry = api::InputMessage {
+            role: "user".into(),
+            content: vec![api::InputContentBlock::Text {
+                text: "silently changed retry".into(),
+            }],
+        };
+        let collision = kernel
+            .prepare_chat_request("request-1", &[changed_retry], "model-a")
+            .await
+            .expect_err("one request id cannot be reused with different content");
+        assert!(collision.to_string().contains("idempotency"));
+
+        kernel
+            .record_chat_assistant("request-1", "first answer")
+            .await
+            .unwrap();
+        let canonical = kernel.load_chat_messages().await.unwrap();
+        assert_eq!(canonical.len(), 2);
+        assert_eq!(canonical[0], user);
+        assert_eq!(canonical[1].role, "assistant");
+
+        let terminal_retry = kernel
+            .prepare_chat_request("request-1", &[canonical[0].clone()], "model-a")
+            .await
+            .expect_err("a terminal request must never be redispatched");
+        assert!(terminal_retry.to_string().contains("already terminal"));
+
+        let divergent_history = vec![
+            api::InputMessage {
+                role: "user".into(),
+                content: vec![api::InputContentBlock::Text {
+                    text: "invented client history".into(),
+                }],
+            },
+            api::InputMessage {
+                role: "user".into(),
+                content: vec![api::InputContentBlock::Text {
+                    text: "second question".into(),
+                }],
+            },
+        ];
+        let divergence = kernel
+            .prepare_chat_request("request-2", &divergent_history, "model-a")
+            .await
+            .expect_err("client-side shadow history must fail closed");
+        assert!(divergence.to_string().contains("diverges"));
+
+        let second_user = api::InputMessage {
+            role: "user".into(),
+            content: vec![api::InputContentBlock::Text {
+                text: "second question".into(),
+            }],
+        };
+        let second = kernel
+            .prepare_chat_request("request-2", std::slice::from_ref(&second_user), "model-a")
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 3);
+        assert_eq!(second[2], second_user);
+        let full_history_retry = kernel
+            .prepare_chat_request("request-2", &second, "model-a")
+            .await
+            .expect("a full canonical history retry must be idempotent before terminal commit");
+        assert_eq!(full_history_retry, second);
+        let second_input_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_event_ledger
+             WHERE tenant_id = 'tenant-chat' AND thread_id = 'session-chat'
+               AND event_type = 'runtime.chat_input'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(second_input_events, 2);
     }
 
     #[tokio::test]

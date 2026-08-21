@@ -1,8 +1,12 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{atomic::AtomicBool, Arc};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+pub use crate::sandbox_backend::{ConfinedOutput, EnforcementCapability};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -81,6 +85,31 @@ pub struct LinuxSandboxCommand {
     pub program: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+}
+
+#[must_use]
+pub fn sandbox_backend_capability() -> EnforcementCapability {
+    crate::sandbox_backend::capability()
+}
+
+pub fn execute_confined_command(
+    workspace_root: &Path,
+    sandbox_cwd: &Path,
+    command: &str,
+    timeout: Duration,
+    cancellation: Arc<AtomicBool>,
+    writable_workspace: bool,
+    writable_paths: &[PathBuf],
+) -> Result<ConfinedOutput, String> {
+    crate::sandbox_backend::execute(
+        workspace_root,
+        sandbox_cwd,
+        command,
+        timeout,
+        cancellation,
+        writable_workspace,
+        writable_paths,
+    )
 }
 
 impl SandboxConfig {
@@ -162,30 +191,27 @@ pub fn resolve_sandbox_status(config: &SandboxConfig, cwd: &Path) -> SandboxStat
 #[must_use]
 pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) -> SandboxStatus {
     let container = detect_container_environment();
-    let namespace_supported = cfg!(target_os = "linux") && unshare_user_namespace_works();
-    let network_supported = namespace_supported;
-    // The current `unshare` launcher creates namespaces but does not bind a
-    // restricted root or install a Landlock policy. HOME/TMPDIR environment
-    // variables are not filesystem isolation and must never be reported as
-    // such. A bwrap/Landlock implementation can flip these fields only after a
-    // real escape probe succeeds.
-    let filesystem_supported = false;
-    let filesystem_active = false;
+    let backend_full = sandbox_backend_capability() == EnforcementCapability::Full;
+    let namespace_supported = backend_full;
+    let network_supported = backend_full;
+    let filesystem_supported = backend_full;
     let mut fallback_reasons = Vec::new();
 
     if request.enabled && request.namespace_restrictions && !namespace_supported {
         fallback_reasons
-            .push("namespace isolation unavailable (requires Linux with `unshare`)".to_string());
+            .push("namespace isolation unavailable (bwrap/prlimit probe failed)".to_string());
     }
     if request.enabled && request.network_isolation && !network_supported {
         fallback_reasons
-            .push("network isolation unavailable (requires Linux with `unshare`)".to_string());
+            .push("network isolation unavailable (bwrap/prlimit probe failed)".to_string());
     }
     if request.enabled && request.filesystem_mode != FilesystemIsolationMode::Off {
-        fallback_reasons.push(
-            "filesystem isolation unavailable (the unshare launcher does not enforce mount or Landlock policy)"
-                .to_string(),
-        );
+        if !filesystem_supported {
+            fallback_reasons.push(
+                "filesystem isolation unavailable (bwrap/prlimit enforcement probe failed)"
+                    .to_string(),
+            );
+        }
     }
     if request.enabled
         && request.filesystem_mode == FilesystemIsolationMode::AllowList
@@ -199,6 +225,7 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
         && (!request.network_isolation || network_supported)
         && (request.filesystem_mode == FilesystemIsolationMode::Off || filesystem_supported);
     let active = request.enabled && supported;
+    let filesystem_active = active && request.filesystem_mode != FilesystemIsolationMode::Off;
 
     let allowed_mounts = normalize_mounts(&request.allowed_mounts, cwd);
 
@@ -227,44 +254,78 @@ pub fn build_linux_sandbox_command(
     cwd: &Path,
     status: &SandboxStatus,
 ) -> Option<LinuxSandboxCommand> {
-    if !cfg!(target_os = "linux")
-        || !status.enabled
-        || (!status.namespace_active && !status.network_active)
-    {
+    if !status.active {
         return None;
     }
-
-    let mut args = vec![
-        "--user".to_string(),
-        "--map-root-user".to_string(),
-        "--mount".to_string(),
-        "--ipc".to_string(),
-        "--pid".to_string(),
-        "--uts".to_string(),
-        "--fork".to_string(),
-    ];
-    if status.network_active {
-        args.push("--net".to_string());
-    }
-    args.push("sh".to_string());
-    args.push("-lc".to_string());
-    args.push(command.to_string());
-
-    let sandbox_home = cwd.join(".sandbox-home");
-    let sandbox_tmp = cwd.join(".sandbox-tmp");
-    let mut env = vec![
-        ("HOME".to_string(), sandbox_home.display().to_string()),
-        ("TMPDIR".to_string(), sandbox_tmp.display().to_string()),
-    ];
-    if let Ok(path) = env::var("PATH") {
-        env.push(("PATH".to_string(), path));
-    }
-
-    Some(LinuxSandboxCommand {
-        program: "unshare".to_string(),
-        args,
-        env,
+    let writable_workspace = status.filesystem_mode != FilesystemIsolationMode::AllowList;
+    let writable_paths = if status.filesystem_mode == FilesystemIsolationMode::AllowList {
+        status
+            .allowed_mounts
+            .iter()
+            .filter_map(|mount| {
+                Path::new(mount)
+                    .strip_prefix(cwd)
+                    .ok()
+                    .map(Path::to_path_buf)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    crate::sandbox_backend::build_launcher(
+        cwd,
+        Path::new("/workspace"),
+        command,
+        Duration::from_secs(600),
+        writable_workspace,
+        &writable_paths,
+    )
+    .map(|launcher| LinuxSandboxCommand {
+        program: launcher.program,
+        args: launcher.args,
+        env: Vec::new(),
     })
+}
+
+/// Build the canonical OS-enforced launcher for an arbitrary workspace child.
+/// Unlike the legacy convenience wrapper above, this keeps the workspace root
+/// and command cwd distinct so Agent Runtime, foreground shell, and managed
+/// workers all use the same backend contract.
+pub fn build_confined_command_launcher(
+    workspace_root: &Path,
+    cwd: &Path,
+    command: &str,
+    timeout: Duration,
+    writable_workspace: bool,
+    writable_paths: &[PathBuf],
+) -> Result<LinuxSandboxCommand, String> {
+    if sandbox_backend_capability() != EnforcementCapability::Full {
+        return Err("sandbox backend is unavailable; command was not executed".into());
+    }
+    let canonical_root = workspace_root
+        .canonicalize()
+        .map_err(|error| format!("sandbox workspace is unavailable: {error}"))?;
+    let canonical_cwd = cwd
+        .canonicalize()
+        .map_err(|error| format!("sandbox cwd is unavailable: {error}"))?;
+    let relative_cwd = canonical_cwd
+        .strip_prefix(&canonical_root)
+        .map_err(|_| "sandbox cwd escapes the workspace".to_string())?;
+    let sandbox_cwd = Path::new("/workspace").join(relative_cwd);
+    crate::sandbox_backend::build_launcher(
+        &canonical_root,
+        &sandbox_cwd,
+        command,
+        timeout,
+        writable_workspace,
+        writable_paths,
+    )
+    .map(|launcher| LinuxSandboxCommand {
+        program: launcher.program,
+        args: launcher.args,
+        env: Vec::new(),
+    })
+    .ok_or_else(|| "sandbox launcher could not be constructed; command was not executed".into())
 }
 
 fn normalize_mounts(mounts: &[String], cwd: &Path) -> Vec<String> {
@@ -281,32 +342,6 @@ fn normalize_mounts(mounts: &[String], cwd: &Path) -> Vec<String> {
         })
         .map(|path| path.display().to_string())
         .collect()
-}
-
-fn command_exists(command: &str) -> bool {
-    env::var_os("PATH")
-        .is_some_and(|paths| env::split_paths(&paths).any(|path| path.join(command).exists()))
-}
-
-/// Check whether `unshare --user` actually works on this system.
-/// On some CI environments (e.g. GitHub Actions), the binary exists but
-/// user namespaces are restricted, causing silent failures.
-fn unshare_user_namespace_works() -> bool {
-    use std::sync::OnceLock;
-    static RESULT: OnceLock<bool> = OnceLock::new();
-    *RESULT.get_or_init(|| {
-        if !command_exists("unshare") {
-            return false;
-        }
-        std::process::Command::new("unshare")
-            .args(["--user", "--map-root-user", "true"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    })
 }
 
 #[cfg(test)]
@@ -383,9 +418,9 @@ mod tests {
         if let Some(launcher) =
             build_linux_sandbox_command("printf hi", Path::new("/workspace"), &status)
         {
-            assert_eq!(launcher.program, "unshare");
-            assert!(launcher.args.iter().any(|arg| arg == "--mount"));
-            assert!(launcher.args.iter().any(|arg| arg == "--net") == status.network_active);
+            assert_eq!(launcher.program, "prlimit");
+            assert!(launcher.args.iter().any(|arg| arg == "bwrap"));
+            assert!(launcher.args.iter().any(|arg| arg == "--unshare-all"));
         }
     }
 
@@ -400,13 +435,16 @@ mod tests {
         );
         let status = super::resolve_sandbox_status_for_request(&request, Path::new("/workspace"));
 
-        assert!(!status.filesystem_supported);
-        assert!(!status.filesystem_active);
-        assert!(!status.supported);
-        assert!(!status.active);
-        assert!(status
-            .fallback_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("does not enforce mount or Landlock")));
+        let full = super::sandbox_backend_capability() == super::EnforcementCapability::Full;
+        assert_eq!(status.filesystem_supported, full);
+        assert_eq!(status.filesystem_active, full);
+        assert_eq!(status.supported, full);
+        assert_eq!(status.active, full);
+        if !full {
+            assert!(status
+                .fallback_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("enforcement probe failed")));
+        }
     }
 }

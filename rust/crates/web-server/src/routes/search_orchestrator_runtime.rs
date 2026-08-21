@@ -993,6 +993,9 @@ pub async fn execute_unified_search(
             if native_available {
                 let native_timeout_secs = native_search_timeout_secs(&request.scenario);
                 let native = execute_native_model_search(
+                    &state.db,
+                    &request.tenant_id,
+                    &request.user_id,
                     native_runtime,
                     &query,
                     max_results,
@@ -1048,6 +1051,9 @@ pub async fn execute_unified_search(
                         max_results,
                     );
                     let retry = execute_native_model_search_with_prompt(
+                        &state.db,
+                        &request.tenant_id,
+                        &request.user_id,
                         native_runtime,
                         &query,
                         max_results,
@@ -1641,6 +1647,9 @@ fn build_native_diversified_retry_prompt(
 }
 
 async fn execute_native_model_search(
+    db: &sqlx::SqlitePool,
+    tenant_id: &str,
+    user_id: &str,
     runtime: &UnifiedNativeSearchRuntime,
     query: &str,
     max_results: usize,
@@ -1648,6 +1657,9 @@ async fn execute_native_model_search(
     scenario: &str,
 ) -> LayerExecution {
     execute_native_model_search_with_prompt(
+        db,
+        tenant_id,
+        user_id,
         runtime,
         query,
         max_results,
@@ -1660,6 +1672,9 @@ async fn execute_native_model_search(
 }
 
 async fn execute_native_model_search_with_prompt(
+    db: &sqlx::SqlitePool,
+    tenant_id: &str,
+    user_id: &str,
     runtime: &UnifiedNativeSearchRuntime,
     query: &str,
     max_results: usize,
@@ -1714,6 +1729,13 @@ async fn execute_native_model_search_with_prompt(
             };
         }
     };
+    let provider = crate::governed_provider::GovernedProviderClient::new(
+        provider,
+        db.clone(),
+        tenant_id,
+        user_id,
+        format!("search:{stage_name}"),
+    );
     let request = api::MessageRequest {
         model: runtime.model.clone(),
         max_tokens: 2048,
@@ -2264,7 +2286,7 @@ async fn execute_native_model_search_with_prompt(
 }
 
 async fn execute_responses_native_stream_search(
-    provider: &api::ProviderClient,
+    provider: &crate::governed_provider::GovernedProviderClient,
     request: &api::MessageRequest,
     query: &str,
     max_results: usize,
@@ -2371,7 +2393,7 @@ async fn execute_responses_native_stream_search(
 }
 
 async fn execute_chat_native_stream_search(
-    provider: &api::ProviderClient,
+    provider: &crate::governed_provider::GovernedProviderClient,
     request: &api::MessageRequest,
     query: &str,
     max_results: usize,

@@ -98,8 +98,10 @@ pub(super) async fn compact_session_context(
     let metadata = serde_json::json!({
         "messageCountAfter": result.message_count_after,
         "memoryRefsPolicy": "refs_only",
-        "providerNativeCompactionSupported": result.provider_native_supported,
-        "providerNativeCompactionUsed": result.provider_native_used,
+        "providerCompactionEndpointSupported": result.provider_compaction_endpoint_supported,
+        "providerCompactionEndpointCalled": result.provider_compaction_endpoint_called,
+        "providerCompactionOutputApplied": result.provider_compaction_output_applied,
+        "providerCompactionFallbackReason": result.provider_compaction_fallback_reason,
         "event": "context.compaction.completed",
     });
     let window_id = get_agent_manager(&state)
@@ -206,8 +208,10 @@ pub(super) async fn compact_session_context(
         "removedMessageCount": result.removed_message_count,
         "retainedTailTokens": result.retained_tail_tokens,
         "messageCountAfter": result.message_count_after,
-        "providerNativeCompactionSupported": result.provider_native_supported,
-        "providerNativeCompactionUsed": result.provider_native_used,
+        "providerCompactionEndpointSupported": result.provider_compaction_endpoint_supported,
+        "providerCompactionEndpointCalled": result.provider_compaction_endpoint_called,
+        "providerCompactionOutputApplied": result.provider_compaction_output_applied,
+        "providerCompactionFallbackReason": result.provider_compaction_fallback_reason,
         "usedMemoryRefs": [],
         "zeroLoss": zero_loss,
     }))

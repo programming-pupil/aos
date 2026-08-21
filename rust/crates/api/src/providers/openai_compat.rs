@@ -13,7 +13,8 @@ use crate::types::{
     is_reserved_extra_body_key, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
     ContentBlockStopEvent, InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent,
     MessageRequest, MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock,
-    StreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
+    ResponsesCompactOutputItem, ResponsesCompactRequest, ResponsesCompactResult, StreamEvent,
+    ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 
 use super::{Provider, ProviderFuture};
@@ -771,6 +772,54 @@ impl OpenAiCompatClient {
             }
             return Ok(normalized);
         }
+    }
+
+    /// Execute the dedicated unary `/responses/compact` protocol.
+    ///
+    /// The output is intentionally returned as provider-normalized items. An
+    /// opaque `compaction` item is not a plaintext summary and callers must not
+    /// flatten it into a chat message unless their continuation transport can
+    /// replay that exact item.
+    pub async fn compact_responses(
+        &self,
+        request: &ResponsesCompactRequest,
+    ) -> Result<ResponsesCompactResult, ApiError> {
+        if request.input.is_empty() {
+            return Err(ApiError::InvalidSseFrame(
+                "responses compact request has no input items",
+            ));
+        }
+        let request_url = responses_compact_endpoint(&self.base_url);
+        let response = self
+            .http
+            .post(&request_url)
+            .header("content-type", "application/json")
+            .bearer_auth(&self.api_key)
+            .json(request)
+            .send()
+            .await
+            .map_err(ApiError::from)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Self::read_error_from_response(status, response).await);
+        }
+        let request_id = request_id_from_headers(response.headers());
+        let body = response.text().await.map_err(ApiError::from)?;
+        let payload =
+            serde_json::from_str::<ResponsesCompactApiResponse>(&body).map_err(|error| {
+                ApiError::json_deserialize(self.config.provider_name, &request.model, &body, error)
+            })?;
+        let output = payload
+            .output
+            .into_iter()
+            .map(normalize_responses_compact_item)
+            .collect::<Result<Vec<_>, _>>()?;
+        if output.is_empty() {
+            return Err(ApiError::InvalidSseFrame(
+                "responses compact response has no output items",
+            ));
+        }
+        Ok(ResponsesCompactResult { output, request_id })
     }
 
     pub async fn stream_responses_web_search_message(
@@ -2892,6 +2941,144 @@ fn responses_tool_definition(tool: &ToolDefinition) -> Value {
     definition
 }
 
+/// Convert the provider-neutral AOS message request into the exact item-based
+/// request accepted by `/responses/compact`.
+///
+/// Tool calls/results remain separate response items so their invocation IDs
+/// survive provider normalization. The ordinary chat-completions request
+/// builder is intentionally not reused.
+#[must_use]
+pub fn responses_compact_request_from_message_request(
+    request: &MessageRequest,
+) -> ResponsesCompactRequest {
+    let mut input = Vec::new();
+    for message in &request.messages {
+        let content_type = if message.role == "assistant" {
+            "output_text"
+        } else {
+            "input_text"
+        };
+        let mut content = Vec::new();
+        let mut calls = Vec::new();
+        let mut results = Vec::new();
+        for block in &message.content {
+            match block {
+                InputContentBlock::Text { text } if !text.is_empty() => {
+                    content.push(json!({"type": content_type, "text": text}));
+                }
+                InputContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                    // AOS may hold provider-neutral reasoning without an OpenAI
+                    // encrypted reasoning envelope. Preserve it as explicit
+                    // message content for compaction instead of inventing an
+                    // invalid `reasoning` response item.
+                    content.push(json!({
+                        "type": content_type,
+                        "text": format!("<reasoning>\n{thinking}\n</reasoning>")
+                    }));
+                }
+                InputContentBlock::ToolUse { id, name, input } => {
+                    calls.push(json!({
+                        "type": "function_call",
+                        "call_id": id,
+                        "name": name,
+                        "arguments": input.to_string(),
+                    }));
+                }
+                InputContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => {
+                    results.push(json!({
+                        "type": "function_call_output",
+                        "call_id": tool_use_id,
+                        "output": flatten_tool_result_content(content),
+                    }));
+                }
+                InputContentBlock::Image {
+                    media_type,
+                    source_type,
+                    data,
+                } => {
+                    let image_url = match source_type {
+                        crate::types::ImageSourceType::Url => data.clone(),
+                        crate::types::ImageSourceType::Base64 => {
+                            format!("data:{media_type};base64,{data}")
+                        }
+                    };
+                    content.push(json!({"type": "input_image", "image_url": image_url}));
+                }
+                InputContentBlock::Document {
+                    media_type,
+                    source_type,
+                    data,
+                    name,
+                } => {
+                    let file_data = match source_type {
+                        crate::types::ImageSourceType::Url => data.clone(),
+                        crate::types::ImageSourceType::Base64 => {
+                            format!("data:{media_type};base64,{data}")
+                        }
+                    };
+                    let mut item = json!({"type": "input_file", "file_data": file_data});
+                    if let Some(name) = name {
+                        item["filename"] = Value::String(name.clone());
+                    }
+                    content.push(item);
+                }
+                InputContentBlock::Text { .. } | InputContentBlock::Thinking { .. } => {}
+            }
+        }
+        if !content.is_empty() {
+            input.push(json!({
+                "type": "message",
+                "role": message.role,
+                "content": content,
+            }));
+        }
+        input.extend(calls);
+        input.extend(results);
+    }
+    let tools = request.tools.as_ref().map(|tools| {
+        tools
+            .iter()
+            .map(responses_tool_definition)
+            .collect::<Vec<_>>()
+    });
+    let mut reasoning = request
+        .reasoning_effort
+        .as_ref()
+        .map(|effort| json!({"effort": effort}));
+    let mut service_tier = None;
+    let mut prompt_cache_key = None;
+    let mut text = None;
+    if let Some(extra) = request.extra_body.as_ref() {
+        if let Some(value) = extra.get("reasoning") {
+            reasoning = Some(value.clone());
+        }
+        service_tier = extra
+            .get("service_tier")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        prompt_cache_key = extra
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        text = extra.get("text").cloned();
+    }
+    ResponsesCompactRequest {
+        model: strip_routing_prefix(&request.model).to_string(),
+        input,
+        instructions: request.system.clone().unwrap_or_default(),
+        tools,
+        parallel_tool_calls: true,
+        reasoning,
+        service_tier,
+        prompt_cache_key,
+        text,
+    }
+}
+
 fn openai_tool_choice(tool_choice: &ToolChoice) -> Value {
     match tool_choice {
         ToolChoice::Auto => Value::String("auto".to_string()),
@@ -3576,6 +3763,36 @@ struct ResponsesApiResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct ResponsesCompactApiResponse {
+    output: Vec<Value>,
+}
+
+fn normalize_responses_compact_item(value: Value) -> Result<ResponsesCompactOutputItem, ApiError> {
+    let Some(object) = value.as_object() else {
+        return Err(ApiError::InvalidSseFrame(
+            "responses compact output item is not an object",
+        ));
+    };
+    let Some(item_type) = object.get("type").and_then(Value::as_str) else {
+        return Err(ApiError::InvalidSseFrame(
+            "responses compact output item has no type",
+        ));
+    };
+    Ok(ResponsesCompactOutputItem {
+        item_type: item_type.to_string(),
+        id: object
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        role: object
+            .get("role")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        raw: value,
+    })
+}
+
+#[derive(Debug, Deserialize)]
 struct ResponsesUsage {
     #[serde(default)]
     input_tokens: Option<u32>,
@@ -4083,6 +4300,22 @@ pub fn responses_endpoint(base_url: &str) -> String {
     }
 }
 
+/// Resolve the dedicated remote-compaction endpoint without ever routing it
+/// through `/chat/completions` or the ordinary `/responses` endpoint.
+#[must_use]
+pub fn responses_compact_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/responses/compact") {
+        trimmed.to_string()
+    } else if let Some(prefix) = trimmed.strip_suffix("/chat/completions") {
+        format!("{prefix}/responses/compact")
+    } else if let Some(prefix) = trimmed.strip_suffix("/responses") {
+        format!("{prefix}/responses/compact")
+    } else {
+        format!("{trimmed}/responses/compact")
+    }
+}
+
 /// `DeepSeek` exposes provider-native `Responses API` web search only for the
 /// official `Flash` runtime. Other `DeepSeek` models and OpenAI-compatible hosts
 /// must keep using their explicit `AOS` search tools until they declare support.
@@ -4323,9 +4556,10 @@ mod tests {
         adapt_responses_web_search_request_for_provider, build_chat_completion_request,
         build_responses_web_search_request, chat_completions_endpoint, images_generations_endpoint,
         is_reasoning_model, normalize_finish_reason, normalize_response,
-        normalize_responses_response, openai_tool_choice, parse_responses_sse_frame,
-        parse_tool_arguments, response_exhausted_in_reasoning, responses_endpoint,
-        supports_official_deepseek_responses_web_search,
+        normalize_responses_compact_item, normalize_responses_response, openai_tool_choice,
+        parse_responses_sse_frame, parse_tool_arguments, response_exhausted_in_reasoning,
+        responses_compact_endpoint, responses_compact_request_from_message_request,
+        responses_endpoint, supports_official_deepseek_responses_web_search,
         supports_official_deepseek_v4_thinking_control, ChatChoice, ChatCompletionChunk,
         ChatCompletionResponse, ChatMessage, ChunkChoice, ChunkDelta, OpenAiCompatClient,
         OpenAiCompatConfig, ResponsesApiResponse, ResponsesStreamState, StreamState,
@@ -4716,6 +4950,18 @@ mod tests {
             responses_endpoint("https://proxy.example.com/v1/responses"),
             "https://proxy.example.com/v1/responses"
         );
+        assert_eq!(
+            responses_compact_endpoint("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/responses/compact"
+        );
+        assert_eq!(
+            responses_compact_endpoint("https://api.openai.com/v1/chat/completions"),
+            "https://api.openai.com/v1/responses/compact"
+        );
+        assert_eq!(
+            responses_compact_endpoint("https://proxy.example.com/v1/responses"),
+            "https://proxy.example.com/v1/responses/compact"
+        );
         assert!(supports_official_deepseek_responses_web_search(
             "deepseek-v4-flash",
             "https://api.deepseek.com/v1"
@@ -4752,6 +4998,57 @@ mod tests {
             images_generations_endpoint("https://api.openai.com/v1/images/generations"),
             "https://api.openai.com/v1/images/generations"
         );
+    }
+
+    #[test]
+    fn responses_compact_request_preserves_message_and_tool_item_boundaries() {
+        let request = MessageRequest {
+            model: "openai/gpt-5.5".to_string(),
+            max_tokens: 4_096,
+            system: Some("system instructions".to_string()),
+            messages: vec![
+                InputMessage::user_text("inspect the repository"),
+                InputMessage {
+                    role: "assistant".to_string(),
+                    content: vec![InputContentBlock::ToolUse {
+                        id: "call-1".to_string(),
+                        name: "read_file".to_string(),
+                        input: json!({"path":"README.md"}),
+                    }],
+                },
+                InputMessage::user_tool_result("call-1", "contents", false),
+            ],
+            tools: Some(vec![ToolDefinition {
+                name: "read_file".to_string(),
+                description: Some("read a file".to_string()),
+                input_schema: json!({"type":"object"}),
+            }]),
+            reasoning_effort: Some("high".to_string()),
+            ..Default::default()
+        };
+        let compact = responses_compact_request_from_message_request(&request);
+        assert_eq!(compact.model, "gpt-5.5");
+        assert_eq!(compact.instructions, "system instructions");
+        assert_eq!(compact.input[0]["type"], "message");
+        assert_eq!(compact.input[1]["type"], "function_call");
+        assert_eq!(compact.input[1]["call_id"], "call-1");
+        assert_eq!(compact.input[2]["type"], "function_call_output");
+        assert_eq!(compact.input[2]["call_id"], "call-1");
+        assert_eq!(compact.reasoning, Some(json!({"effort":"high"})));
+        assert!(compact.tools.is_some());
+    }
+
+    #[test]
+    fn responses_compact_output_keeps_opaque_item_verbatim() {
+        let raw = json!({
+            "id": "cmp_1",
+            "type": "compaction",
+            "encrypted_content": "opaque-provider-state"
+        });
+        let normalized = normalize_responses_compact_item(raw.clone()).unwrap();
+        assert_eq!(normalized.item_type, "compaction");
+        assert_eq!(normalized.id.as_deref(), Some("cmp_1"));
+        assert_eq!(normalized.raw, raw);
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {

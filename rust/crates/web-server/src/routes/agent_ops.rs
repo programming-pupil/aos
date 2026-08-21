@@ -87,7 +87,52 @@ pub fn bot_platform_contracts() -> Vec<agent_ops_adapters::BotPlatformContract> 
 }
 
 pub fn runtime_contracts() -> Vec<agent_ops_adapters::RuntimeContract> {
-    agent_ops_adapters::runtime_contracts()
+    let mut contracts = agent_ops_adapters::runtime_contracts();
+    let configured_mode = std::env::var("AOS_AGENT_RUNTIME_ISOLATION_MODE")
+        .unwrap_or_else(|_| "local_process".to_string());
+    let sandbox_supported =
+        runtime::sandbox_backend_capability() == runtime::sandbox::EnforcementCapability::Full;
+    let docker_binary_supported = std::process::Command::new("docker")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    for contract in &mut contracts {
+        match contract.key {
+            "local_process" => {
+                contract.configured = configured_mode == "local_process";
+                contract.supported = sandbox_supported;
+                contract.active = contract.configured && contract.supported;
+                contract.enforcement = if sandbox_supported {
+                    "bwrap_prlimit_full"
+                } else {
+                    "unavailable"
+                };
+                contract.unavailable_reason = (!sandbox_supported).then(|| {
+                    "bwrap+prlimit filesystem/network/resource probe failed; host-shell fallback is disabled"
+                        .to_string()
+                });
+            }
+            "docker_sandbox" => {
+                contract.configured = configured_mode == "docker_sandbox";
+                contract.supported = docker_binary_supported;
+                // A binary-presence check cannot prove daemon, image, mount,
+                // and network enforcement. Activation remains request-time and
+                // is never advertised from configuration alone.
+                contract.active = false;
+                contract.unavailable_reason = Some(if docker_binary_supported {
+                    "Docker daemon/image enforcement is verified when a runtime command starts"
+                        .to_string()
+                } else {
+                    "Docker CLI is unavailable".to_string()
+                });
+            }
+            _ => {}
+        }
+    }
+    contracts
 }
 
 pub fn watchdog_action_contracts() -> Vec<agent_ops_adapters::WatchDogActionContract> {

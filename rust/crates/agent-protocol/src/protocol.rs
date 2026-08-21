@@ -179,6 +179,11 @@ pub struct AgentEventEnvelope {
     pub occurred_at: DateTime<Utc>,
     pub actor: EventActor,
     pub event: AgentEventV1,
+    /// Optional canonical model-surface mutation carried by every
+    /// message-producing event. It is skipped for legacy/non-message events so
+    /// pre-surface v1 payload hashes remain byte-for-byte verifiable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_op: Option<crate::SurfaceOperation>,
     pub idempotency_key: Option<String>,
     pub source_event_ids: Vec<EventId>,
     pub semantic_snapshot_version: Option<u64>,
@@ -208,6 +213,7 @@ impl AgentEventEnvelope {
             occurred_at: Utc::now(),
             actor: EventActor::System,
             event,
+            surface_op: None,
             idempotency_key: None,
             source_event_ids: Vec::new(),
             semantic_snapshot_version: None,
@@ -232,6 +238,8 @@ impl AgentEventEnvelope {
             sequence: u64,
             actor: &'a EventActor,
             event: &'a AgentEventV1,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            surface_op: &'a Option<crate::SurfaceOperation>,
             idempotency_key: &'a Option<String>,
             source_event_ids: &'a [EventId],
             semantic_snapshot_version: Option<u64>,
@@ -247,6 +255,7 @@ impl AgentEventEnvelope {
             sequence: self.sequence,
             actor: &self.actor,
             event: &self.event,
+            surface_op: &self.surface_op,
             idempotency_key: &self.idempotency_key,
             source_event_ids: &self.source_event_ids,
             semantic_snapshot_version: self.semantic_snapshot_version,

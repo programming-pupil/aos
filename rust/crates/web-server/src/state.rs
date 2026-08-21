@@ -227,6 +227,14 @@ impl AppState {
             .await?;
         sqlx::migrate!("./sqlite-migrations").run(&db).await?;
         crate::semantic_kernel_store::process_fault_point("migration.after_commit");
+        let recovered_dispatches =
+            crate::governed_provider::recover_incomplete_dispatches(&db).await?;
+        if recovered_dispatches > 0 {
+            tracing::warn!(
+                recovered_dispatches,
+                "recovered model dispatches left non-terminal by the previous process"
+            );
+        }
         let internal_process_tck = cfg!(debug_assertions)
             && std::env::var("AOS_INTERNAL_PROCESS_TCK").as_deref() == Ok("1");
         if !internal_process_tck {

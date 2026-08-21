@@ -361,6 +361,13 @@ pub(crate) async fn build_stream_image_summary(
             scenario,
         )
         .await?;
+    let provider = crate::governed_provider::GovernedProviderClient::new(
+        provider,
+        state.db.clone(),
+        tenant_id,
+        user_id,
+        format!("agent:image-summary:{scenario}"),
+    );
 
     let question = if user_message.trim().is_empty() {
         "请基于上传图片提炼关键事实并回答。".to_string()

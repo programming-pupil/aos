@@ -70,6 +70,18 @@ pub struct BashCommandOutput {
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     let cwd = env::current_dir()?;
     let sandbox_status = sandbox_status_for_input(&input, &cwd);
+    if sandbox_status.enabled && !sandbox_status.active {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "sandbox runner unavailable; command was not executed: {}",
+                sandbox_status
+                    .fallback_reason
+                    .as_deref()
+                    .unwrap_or("requested enforcement is unavailable")
+            ),
+        ));
+    }
 
     if input.run_in_background.unwrap_or(false) {
         let mut child = prepare_command(&input.command, &cwd, &sandbox_status, false);
@@ -224,11 +236,13 @@ fn prepare_tokio_command(
         prepared.args(launcher.args);
         prepared.current_dir(cwd);
         prepared.envs(launcher.env);
+        prepared.kill_on_drop(true);
         return prepared;
     }
 
     let mut prepared = TokioCommand::new("sh");
     prepared.arg("-lc").arg(command).current_dir(cwd);
+    prepared.kill_on_drop(true);
     if sandbox_status.filesystem_active {
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
@@ -248,7 +262,7 @@ mod tests {
 
     #[test]
     fn executes_simple_command() {
-        let output = execute_bash(BashCommandInput {
+        let result = execute_bash(BashCommandInput {
             command: String::from("printf 'hello'"),
             timeout: Some(10_000),
             description: None,
@@ -258,12 +272,19 @@ mod tests {
             isolate_network: Some(false),
             filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
             allowed_mounts: None,
-        })
-        .expect("bash command should execute");
-
-        assert_eq!(output.stdout, "hello");
-        assert!(!output.interrupted);
-        assert!(output.sandbox_status.is_some());
+        });
+        if crate::sandbox::sandbox_backend_capability()
+            == crate::sandbox::EnforcementCapability::Full
+        {
+            let output = result.expect("bash command should execute in the probed sandbox");
+            assert_eq!(output.stdout, "hello");
+            assert!(!output.interrupted);
+            assert!(output.sandbox_status.is_some());
+        } else {
+            let error = result.expect_err("unsupported sandbox must fail closed");
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(error.to_string().contains("command was not executed"));
+        }
     }
 
     #[test]

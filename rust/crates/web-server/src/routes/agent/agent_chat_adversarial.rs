@@ -3834,6 +3834,13 @@ async fn call_adversarial_model(
             runtime.model
         ))
     })?;
+    let provider = crate::governed_provider::GovernedProviderClient::new(
+        provider,
+        state.db.clone(),
+        tenant_id,
+        user_id,
+        format!("agent:adversarial:{run_id}:{}", context.phase),
+    );
     let request = api::MessageRequest {
         model: runtime.model.clone(),
         max_tokens: 8192,

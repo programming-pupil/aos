@@ -158,7 +158,7 @@ pub struct EmbeddingProfiles {
 #[derive(Debug, Clone)]
 pub struct ChatTenantConfig {
     /// The resolved API client, ready to use.
-    pub client: api::ProviderClient,
+    pub client: crate::governed_provider::GovernedProviderClient,
     /// The model name used (from DB key's model field or default_model).
     pub model: String,
     /// ID of the API key in DB that was used (None for env-fallback).
@@ -671,7 +671,13 @@ pub async fn resolve_chat_config_candidates_db_only(
                     effective_model,
                     entry.capabilities_json.as_ref(),
                 );
-                let client = client.with_token_limits(context_limit, output_limit);
+                let client = crate::governed_provider::GovernedProviderClient::new(
+                    client.with_token_limits(context_limit, output_limit),
+                    config_registry.database(),
+                    tenant_id,
+                    user_id,
+                    format!("nl2sql:{}", scenario.unwrap_or("default")),
+                );
                 candidates.push(ChatTenantConfig {
                     client,
                     model: effective_model.clone(),
@@ -744,7 +750,13 @@ pub async fn resolve_chat_config_candidates(
                         effective_model,
                         entry.capabilities_json.as_ref(),
                     );
-                    let client = client.with_token_limits(context_limit, output_limit);
+                    let client = crate::governed_provider::GovernedProviderClient::new(
+                        client.with_token_limits(context_limit, output_limit),
+                        config_registry.database(),
+                        tenant_id,
+                        user_id,
+                        format!("nl2sql:{}", scenario.unwrap_or("default")),
+                    );
                     tracing::info!(
                         tenant_id = %tenant_id,
                         key_id = %entry.id,
@@ -788,7 +800,13 @@ pub async fn resolve_chat_config_candidates(
         let client = api::ProviderClient::from_model(default_model)
             .map_err(|e| format!("failed to create LLM client from env: {}", e))?;
         let (context_limit, output_limit) = authoritative_model_token_limits(default_model, None);
-        let client = client.with_token_limits(context_limit, output_limit);
+        let client = crate::governed_provider::GovernedProviderClient::new(
+            client.with_token_limits(context_limit, output_limit),
+            config_registry.database(),
+            tenant_id,
+            user_id,
+            format!("nl2sql:{}", scenario.unwrap_or("default")),
+        );
         tracing::info!(
             tenant_id = %tenant_id,
             model = %default_model,

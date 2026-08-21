@@ -3,7 +3,10 @@ use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
 use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
 use crate::providers::{self, ProviderKind};
-use crate::types::{MessageRequest, MessageResponse, StreamEvent, Usage};
+use crate::types::{
+    MessageRequest, MessageResponse, ResponsesCompactRequest, ResponsesCompactResult, StreamEvent,
+    Usage,
+};
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
@@ -267,6 +270,29 @@ impl ProviderClient {
                 "responses web_search streaming is only available for OpenAI-compatible providers",
             )),
         }
+    }
+
+    /// Call the OpenAI-compatible `/responses/compact` endpoint. Anthropic and
+    /// xAI variants fail explicitly rather than falling back to a summary
+    /// prompt, because that fallback has different semantics.
+    pub async fn compact_responses(
+        &self,
+        request: &ResponsesCompactRequest,
+    ) -> Result<ResponsesCompactResult, ApiError> {
+        let (request, protection) =
+            request.protect_sensitive_content(runtime::configured_data_protection_mode());
+        log_outbound_protection(self.provider_kind(), &request.model, &protection);
+        match self {
+            Self::OpenAi(client) => client.compact_responses(&request).await,
+            Self::Anthropic(_) | Self::Xai(_) => Err(ApiError::InvalidSseFrame(
+                "responses compact is only available for OpenAI-compatible providers",
+            )),
+        }
+    }
+
+    #[must_use]
+    pub const fn supports_responses_compact_v1(&self) -> bool {
+        matches!(self, Self::OpenAi(_))
     }
 }
 

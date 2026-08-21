@@ -39,6 +39,7 @@ pub mod recovery_recipes;
 mod remote;
 mod report_schema;
 pub mod sandbox;
+mod sandbox_backend;
 mod session;
 pub mod session_control;
 pub use session_control::SessionStore;
@@ -209,7 +210,8 @@ pub use report_schema::{
 };
 pub use sandbox::{
     build_linux_sandbox_command, detect_container_environment, detect_container_environment_from,
-    resolve_sandbox_status, resolve_sandbox_status_for_request, ContainerEnvironment,
+    execute_confined_command, resolve_sandbox_status, resolve_sandbox_status_for_request,
+    sandbox_backend_capability, ConfinedOutput, ContainerEnvironment, EnforcementCapability,
     FilesystemIsolationMode, LinuxSandboxCommand, SandboxConfig, SandboxDetectionInputs,
     SandboxRequest, SandboxStatus,
 };

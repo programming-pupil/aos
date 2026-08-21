@@ -100,6 +100,13 @@ pub(super) async fn run_rd_completion_with_options(
                 continue;
             }
         };
+        let provider = crate::governed_provider::GovernedProviderClient::new(
+            provider,
+            state.db.clone(),
+            tenant_id,
+            user_id,
+            "rd:completion",
+        );
         let req = api::MessageRequest {
             model: model.clone(),
             max_tokens: max_tokens.min(rd_output_limit_for_model(&entry)),

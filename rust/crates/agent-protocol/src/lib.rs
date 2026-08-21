@@ -12,6 +12,7 @@ mod interactions;
 mod ledger;
 mod lifecycle;
 mod protocol;
+mod surface;
 
 pub use budget::{
     BudgetDimension, BudgetError, BudgetLedger, BudgetPurpose, BudgetReservation, BudgetState,
@@ -31,6 +32,11 @@ pub use interactions::{
 pub use ledger::{AppendReceipt, CorruptionKind, EventLedger, LedgerError, LedgerRecord};
 pub use lifecycle::{LifecycleError, ToolLifecycle, ToolLifecycleState};
 pub use protocol::*;
+pub use surface::{
+    fold_surface, hash_model_messages, validate_model_messages, CanonicalSurface,
+    ModelSurfaceMessage, SurfaceBlock, SurfaceError, SurfaceMessage, SurfaceNode, SurfaceOperation,
+    SurfaceRole,
+};
 
 /// Emit a gated marker used by the conformance gate to prove that a test
 /// exercised the production contract.  It is inert unless the gate sets the

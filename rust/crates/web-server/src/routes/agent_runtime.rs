@@ -363,7 +363,13 @@ pub async fn run_runtime_command(
     }
 
     let process_id = uuid::Uuid::new_v4().to_string();
-    let launch_plan = runtime_launch_plan(&session, &input.cwd, &input.command, &process_id)?;
+    let launch_plan = runtime_launch_plan(
+        &session,
+        &input.cwd,
+        &input.command,
+        &process_id,
+        input.timeout_secs,
+    )?;
     sqlx::query(
         r"
         INSERT INTO agent_runtime_processes
@@ -407,7 +413,8 @@ pub async fn run_runtime_command(
         .args(&launch_plan.args)
         .current_dir(&launch_plan.host_cwd)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     #[cfg(unix)]
     {
         command.process_group(0);
@@ -470,9 +477,12 @@ pub async fn run_runtime_command(
             error.to_string(),
         ),
         Err(_) => {
-            if let Some(pgid) = pid {
-                kill_process_group_best_effort(pgid);
-            }
+            let _ = kill_runtime_session_process_group(
+                &state.db,
+                &input.tenant_id,
+                &input.runtime_session_id,
+            )
+            .await;
             (
                 RUNTIME_PROCESS_STATUS_TIMED_OUT.to_string(),
                 None,
@@ -1065,6 +1075,23 @@ fn ensure_workspace_child_safe(workspace_root: &Path, child: &Path) -> Result<()
             "runtime command cwd escapes runtime workspace".to_string(),
         ));
     }
+    let canonical_root = workspace_root.canonicalize().map_err(|error| {
+        AppError::ValidationError(format!("runtime workspace is unavailable: {error}"))
+    })?;
+    let mut existing = child;
+    while !existing.exists() {
+        existing = existing.parent().ok_or_else(|| {
+            AppError::ValidationError("runtime path has no existing workspace ancestor".into())
+        })?;
+    }
+    let canonical_existing = existing.canonicalize().map_err(|error| {
+        AppError::ValidationError(format!("runtime path cannot be resolved safely: {error}"))
+    })?;
+    if !canonical_existing.starts_with(&canonical_root) {
+        return Err(AppError::ValidationError(
+            "runtime path escapes the workspace through a symbolic link".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -1096,16 +1123,37 @@ fn runtime_launch_plan(
     cwd: &Path,
     command: &str,
     process_id: &str,
+    timeout_secs: u64,
 ) -> Result<RuntimeLaunchPlan> {
     match session.isolation_mode.as_str() {
-        RUNTIME_ISOLATION_LOCAL_PROCESS => Ok(RuntimeLaunchPlan {
-            program: "sh".to_string(),
-            args: vec!["-lc".to_string(), command.to_string()],
-            host_cwd: cwd.to_path_buf(),
-            env_redacted_json: json!({
-                "isolationMode": RUNTIME_ISOLATION_LOCAL_PROCESS
-            }),
-        }),
+        RUNTIME_ISOLATION_LOCAL_PROCESS => {
+            let workspace_root = PathBuf::from(&session.workspace_root);
+            let launcher = runtime::sandbox::build_confined_command_launcher(
+                &workspace_root,
+                cwd,
+                command,
+                Duration::from_secs(timeout_secs.max(1)),
+                true,
+                &[],
+            )
+            .map_err(|error| {
+                AppError::Unimplemented(format!(
+                    "local Agent Runtime requires the probed bwrap+prlimit sandbox backend: {error}"
+                ))
+            })?;
+            Ok(RuntimeLaunchPlan {
+                program: launcher.program,
+                args: launcher.args,
+                host_cwd: workspace_root,
+                env_redacted_json: json!({
+                    "isolationMode": RUNTIME_ISOLATION_LOCAL_PROCESS,
+                    "sandboxBackend": "bwrap_prlimit",
+                    "sandboxEnforcement": "full",
+                    "networkIsolated": true,
+                    "filesystemBoundary": "workspace"
+                }),
+            })
+        }
         RUNTIME_ISOLATION_DOCKER_SANDBOX => docker_launch_plan(session, cwd, command, process_id),
         other => Err(AppError::ValidationError(format!(
             "unsupported runtime isolation mode: {other}"
@@ -1568,25 +1616,42 @@ async fn kill_runtime_session_process_group(
             .get::<Option<i64>, _>("process_group_id")
             .or_else(|| row.get::<Option<i64>, _>("pid"));
         if let Some(pgid) = pgid {
-            kill_process_group_best_effort(pgid);
+            signal_process_group_best_effort(pgid, "-TERM");
         }
         if let Some(container_name) = runtime_process_container_name(row.get("env_redacted_json")) {
             kill_docker_container_best_effort(&container_name);
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let rows = sqlx::query(
+        "SELECT process_group_id, pid FROM agent_runtime_processes
+         WHERE tenant_id = ? AND runtime_session_id = ? AND status IN ('running','cancelling')",
+    )
+    .bind(tenant_id)
+    .bind(session_id)
+    .fetch_all(db)
+    .await?;
+    for row in rows {
+        if let Some(pgid) = row
+            .get::<Option<i64>, _>("process_group_id")
+            .or_else(|| row.get::<Option<i64>, _>("pid"))
+        {
+            signal_process_group_best_effort(pgid, "-KILL");
         }
     }
     Ok(())
 }
 
 #[cfg(unix)]
-fn kill_process_group_best_effort(pgid: i64) {
+fn signal_process_group_best_effort(pgid: i64, signal: &str) {
     let _ = std::process::Command::new("kill")
-        .arg("-TERM")
+        .arg(signal)
         .arg(format!("-{pgid}"))
         .status();
 }
 
 #[cfg(not(unix))]
-fn kill_process_group_best_effort(_pgid: i64) {}
+fn signal_process_group_best_effort(_pgid: i64, _signal: &str) {}
 
 fn kill_docker_container_best_effort(container_name: &str) {
     let _ = std::process::Command::new("docker")
@@ -1621,5 +1686,67 @@ mod tests {
     #[test]
     fn safe_path_segment_removes_path_separators() {
         assert_eq!(safe_path_segment("../tenant/user"), "tenant_user");
+    }
+
+    #[test]
+    fn local_runtime_uses_the_probed_sandbox_or_fails_closed() {
+        let workspace = std::env::temp_dir().join(format!(
+            "aos-agent-runtime-sandbox-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cwd = workspace.join("subdir");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let session = AgentRuntimeSessionInfo {
+            id: "session".into(),
+            tenant_id: "tenant".into(),
+            user_id: "user".into(),
+            agent_task_id: None,
+            capability_key: "rd_agent".into(),
+            workspace_root: workspace.to_string_lossy().into_owned(),
+            status: "running".into(),
+            isolation_mode: RUNTIME_ISOLATION_LOCAL_PROCESS.into(),
+            pid: None,
+            process_group_id: None,
+            cancel_requested: false,
+            heartbeat_at: None,
+            started_at: None,
+            completed_at: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let plan = runtime_launch_plan(&session, &cwd, "pwd", "process", 30);
+        if runtime::sandbox_backend_capability() == runtime::sandbox::EnforcementCapability::Full {
+            let plan = plan.expect("probed backend must build a launch plan");
+            assert_eq!(plan.program, "prlimit");
+            assert!(plan.args.iter().any(|arg| arg == "bwrap"));
+            assert!(plan.args.iter().any(|arg| arg == "--unshare-all"));
+            assert!(plan.args.iter().any(|arg| arg == "/workspace/subdir"));
+        } else {
+            assert!(matches!(plan, Err(AppError::Unimplemented(_))));
+        }
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_child_validation_rejects_symlink_escape_for_host_artifacts() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "aos-agent-runtime-path-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "aos-agent-runtime-outside-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+        let error = ensure_workspace_child_safe(&root, &root.join("escape/artifact.txt"))
+            .expect_err("nearest existing symlink ancestor must be canonicalized");
+        assert!(error.to_string().contains("symbolic link"));
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
     }
 }

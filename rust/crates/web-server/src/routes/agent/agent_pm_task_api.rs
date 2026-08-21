@@ -1445,6 +1445,13 @@ pub(crate) async fn build_pm_task_image_summary(
                     continue;
                 }
             };
+            let provider = crate::governed_provider::GovernedProviderClient::new(
+                provider,
+                state.db.clone(),
+                tenant_id,
+                user_id,
+                "pm:image-summary",
+            );
 
             let api_req = api::MessageRequest {
                 model: candidate_model.clone(),
@@ -1563,6 +1570,13 @@ pub(crate) async fn build_pm_task_image_summary(
     {
         let provider = api::ProviderClient::from_model(requested_model)
             .map_err(|error| format!("image summary env fallback init failed: {error}"))?;
+        let provider = crate::governed_provider::GovernedProviderClient::new(
+            provider,
+            state.db.clone(),
+            tenant_id,
+            user_id,
+            "pm:image-summary-env-fallback",
+        );
         let api_req = api::MessageRequest {
             model: requested_model.to_string(),
             max_tokens: pm_task_image_summary_max_tokens(),

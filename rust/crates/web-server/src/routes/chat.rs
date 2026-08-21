@@ -19,7 +19,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 
 use crate::auth::Claims;
 use crate::error::AppError;
@@ -238,6 +238,7 @@ pub struct SessionInfo {
     pub last_updated: u64,
 }
 
+#[expect(dead_code, reason = "kept only for compatibility-export diagnostics")]
 fn list_user_sessions(
     data_dir: &std::path::Path,
     tenant_id: &str,
@@ -296,6 +297,10 @@ fn delete_session_file(
 #[serde(rename_all = "camelCase")]
 pub struct SendMessageRequest {
     pub session_id: Option<String>,
+    /// Stable client request id. Reusing it with different content is rejected
+    /// by the canonical ledger; omitting it preserves backward compatibility
+    /// but cannot deduplicate a retry made as a new HTTP request.
+    pub request_id: Option<String>,
     pub model: Option<String>,
     #[serde(default)]
     pub messages: Vec<ChatMessage>,
@@ -471,6 +476,92 @@ fn to_api_messages(chat_messages: &[ChatMessage]) -> Vec<api::InputMessage> {
         .collect()
 }
 
+fn chat_message_from_api(message: api::InputMessage) -> ChatMessage {
+    let content = if let [api::InputContentBlock::Text { text }] = message.content.as_slice() {
+        serde_json::Value::String(text.clone())
+    } else {
+        serde_json::to_value(&message.content).unwrap_or(serde_json::Value::Array(Vec::new()))
+    };
+    ChatMessage {
+        role: message.role,
+        content,
+    }
+}
+
+async fn list_canonical_sessions(
+    db: &SqlitePool,
+    tenant_id: &str,
+    user_id: &str,
+) -> Result<Vec<SessionInfo>, AppError> {
+    let rows = sqlx::query(
+        "SELECT t.id,
+                SUM(CASE WHEN e.event_type IN ('runtime.chat_input', 'runtime.assistant_message')
+                         THEN 1 ELSE 0 END) AS message_count,
+                COALESCE(MAX(e.occurred_at), t.updated_at) AS last_updated
+         FROM agent_threads t
+         LEFT JOIN agent_event_ledger e
+           ON e.tenant_id = t.tenant_id AND e.thread_id = t.id
+         WHERE t.tenant_id = ? AND t.owner_user_id = ? AND t.status <> 'deleted'
+           AND EXISTS (
+               SELECT 1 FROM agent_event_ledger marker
+               WHERE marker.tenant_id = t.tenant_id AND marker.thread_id = t.id
+                 AND marker.event_type = 'runtime.chat_input'
+           )
+         GROUP BY t.id, t.updated_at
+         ORDER BY last_updated DESC",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .fetch_all(db)
+    .await
+    .map_err(|error| AppError::Internal(error.to_string()))?;
+    rows.into_iter()
+        .map(|row| {
+            let last_updated = row
+                .try_get::<String, _>("last_updated")
+                .ok()
+                .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
+                .and_then(|value| u64::try_from(value.timestamp_millis()).ok())
+                .unwrap_or_default();
+            Ok(SessionInfo {
+                session_id: row
+                    .try_get("id")
+                    .map_err(|error| AppError::Internal(error.to_string()))?,
+                message_count: usize::try_from(
+                    row.try_get::<i64, _>("message_count").unwrap_or_default(),
+                )
+                .unwrap_or_default(),
+                last_updated,
+            })
+        })
+        .collect()
+}
+
+async fn import_legacy_chat_if_needed(
+    kernel: &crate::semantic_kernel_store::RuntimeExecutionKernel,
+    data_dir: &std::path::Path,
+    tenant_id: &str,
+    user_id: &str,
+    session_id: &str,
+) -> Result<(), AppError> {
+    if !kernel
+        .load_chat_messages()
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .is_empty()
+    {
+        return Ok(());
+    }
+    let legacy = load_session_messages(data_dir, tenant_id, user_id, session_id)?;
+    if legacy.is_empty() {
+        return Ok(());
+    }
+    kernel
+        .import_legacy_chat_messages(&to_api_messages(&legacy))
+        .await
+        .map_err(|error| AppError::Internal(format!("legacy chat import failed: {error}")))
+}
+
 #[allow(clippy::cast_possible_truncation)]
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -630,19 +721,32 @@ async fn send_message(
     let last_msg_role = last_msg.role.clone();
     let last_msg_content = last_msg.content.clone();
     let session_id = req.session_id.unwrap_or_else(new_session_id);
-
-    let history = match load_session_messages(&state.data_dir, &tenant_id, user_id, &session_id) {
-        Ok(h) => h,
-        Err(e) => return e.into_response(),
-    };
-
-    let mut all_messages = history;
-    let new_messages = req.messages;
-    all_messages.extend(new_messages);
-
+    let request_id = req
+        .request_id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let model = req.model.unwrap_or_else(|| state.default_model.clone());
-
-    let api_messages = to_api_messages(&all_messages);
+    let incoming_messages = to_api_messages(&req.messages);
+    let kernel = crate::semantic_kernel_store::RuntimeExecutionKernel::new(
+        state.db.clone(),
+        tenant_id.clone(),
+        user_id.clone(),
+        session_id.clone(),
+    );
+    if let Err(error) =
+        import_legacy_chat_if_needed(&kernel, &state.data_dir, &tenant_id, user_id, &session_id)
+            .await
+    {
+        return error.into_response();
+    }
+    let api_messages = match kernel
+        .prepare_chat_request(&request_id, &incoming_messages, &model)
+        .await
+    {
+        Ok(messages) => messages,
+        Err(error) => {
+            return AppError::from(error).into_response();
+        }
+    };
 
     let (provider, api_key_id, provider_name) = match resolve_api_client_with_failover(
         &tenant_id,
@@ -654,7 +758,18 @@ async fn send_message(
     .await
     {
         Ok(v) => v,
-        Err(e) => return e.into_response(),
+        Err(e) => {
+            if let Err(checkpoint_error) = kernel
+                .record_chat_failure(&request_id, &format!("provider resolution failed: {e}"))
+                .await
+            {
+                return AppError::Internal(format!(
+                    "{e}; failed to persist terminal chat failure: {checkpoint_error}"
+                ))
+                .into_response();
+            }
+            return e.into_response();
+        }
     };
 
     let api_req = api::MessageRequest {
@@ -678,7 +793,16 @@ async fn send_message(
 
     let response = match provider.send_message(&api_req).await {
         Ok(r) => r,
-        Err(e) => return AppError::Internal(format!("LLM call failed: {e}")).into_response(),
+        Err(e) => {
+            let detail = format!("LLM call failed: {e}");
+            if let Err(checkpoint_error) = kernel.record_chat_failure(&request_id, &detail).await {
+                return AppError::Internal(format!(
+                    "{detail}; failed to persist terminal chat failure: {checkpoint_error}"
+                ))
+                .into_response();
+            }
+            return AppError::Internal(detail).into_response();
+        }
     };
 
     let assistant_text: String = response
@@ -696,6 +820,18 @@ async fn send_message(
 
     let ts = now_ms();
 
+    if let Err(error) = kernel
+        .record_chat_assistant(&request_id, &assistant_text)
+        .await
+    {
+        return AppError::Internal(format!(
+            "model response was not committed to the canonical ledger: {error}"
+        ))
+        .into_response();
+    }
+
+    // Compatibility JSONL is an export only. Durable success has already
+    // committed user, assistant and terminal events above.
     if let Err(e) = append_message(
         &state.data_dir,
         &tenant_id,
@@ -741,7 +877,7 @@ async fn send_message(
         tenant_id: tenant_id.clone(),
         user_id: user_id.clone(),
         session_id: session_id.clone(),
-        request_id: None,
+        request_id: Some(request_id),
         model: model.clone(),
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
@@ -798,19 +934,33 @@ async fn stream_message(
     let last_msg_content = last_msg.content.clone();
     let has_session_id = req_session_id.is_some();
     let session_id = req_session_id.unwrap_or_else(new_session_id);
+    let request_id = req
+        .request_id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     tracing::debug!(has_session_id, session_id = %session_id, "stream_message using session");
-
-    let history = match load_session_messages(&state.data_dir, &tenant_id, &user_id, &session_id) {
-        Ok(h) => h,
-        Err(e) => return e.into_response(),
-    };
-
-    let mut all_messages = history;
-    all_messages.extend(req.messages);
-
     let model = req.model.unwrap_or_else(|| state.default_model.clone());
-
-    let api_messages = to_api_messages(&all_messages);
+    let incoming_messages = to_api_messages(&req.messages);
+    let kernel = crate::semantic_kernel_store::RuntimeExecutionKernel::new(
+        state.db.clone(),
+        tenant_id.clone(),
+        user_id.clone(),
+        session_id.clone(),
+    );
+    if let Err(error) =
+        import_legacy_chat_if_needed(&kernel, &state.data_dir, &tenant_id, &user_id, &session_id)
+            .await
+    {
+        return error.into_response();
+    }
+    let api_messages = match kernel
+        .prepare_chat_request(&request_id, &incoming_messages, &model)
+        .await
+    {
+        Ok(messages) => messages,
+        Err(error) => {
+            return AppError::from(error).into_response();
+        }
+    };
 
     let (provider, api_key_id, provider_name) = match resolve_api_client_with_failover(
         &tenant_id,
@@ -822,7 +972,18 @@ async fn stream_message(
     .await
     {
         Ok(v) => v,
-        Err(e) => return e.into_response(),
+        Err(e) => {
+            if let Err(checkpoint_error) = kernel
+                .record_chat_failure(&request_id, &format!("provider resolution failed: {e}"))
+                .await
+            {
+                return AppError::Internal(format!(
+                    "{e}; failed to persist terminal chat failure: {checkpoint_error}"
+                ))
+                .into_response();
+            }
+            return e.into_response();
+        }
     };
 
     let api_req = api::MessageRequest {
@@ -870,10 +1031,24 @@ async fn stream_message(
     let data_dir_clone = state.data_dir.clone();
     let provider_name_clone = provider_name.clone();
     let api_key_id_clone = api_key_id.clone();
+    let request_id_clone = request_id.clone();
+    let kernel_for_stream = kernel.clone();
 
     let sse_stream = async_stream::try_stream! {
-        let mut stream = provider.stream_message(&api_req).await
-            .map_err(std::io::Error::other)?;
+        let mut stream = match provider.stream_message(&api_req).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                let detail = format!("LLM stream start failed: {error}");
+                kernel_for_stream
+                    .record_chat_failure(&request_id_clone, &detail)
+                    .await
+                    .map_err(|checkpoint_error| std::io::Error::other(format!(
+                        "{detail}; failed to persist terminal chat failure: {checkpoint_error}"
+                    )))?;
+                Err(std::io::Error::other(detail))?;
+                unreachable!();
+            }
+        };
 
         let mut full_text = String::new();
         let mut acc = StreamAcc::default();
@@ -944,68 +1119,65 @@ async fn stream_message(
                     }
                 }
                 Ok(None) => {
-                    // Save assistant response and usage to background task
-                    let data_dir_for_bg = data_dir_clone.clone();
-                    let user_id_for_bg = user_id_clone.clone();
-                    let session_id_for_bg = session_id_clone2.clone();
-                    let model_for_bg = model_clone.clone();
-                    let tenant_id_for_bg = tenant_id_clone.clone();
-                    let provider_name_clone = provider_name_clone;
-                    let api_key_id_clone = api_key_id_clone.clone();
-                    let ts_for_bg = ts;
-                    let full_text_for_bg = full_text.clone();
-                    let acc_for_bg = acc;
-                    let usage_writer_for_bg = usage_writer.clone();
-                    tokio::spawn(async move {
-                        // Save assistant message
-                        if let Err(e) = append_message(
-                            &data_dir_for_bg,
-                            &tenant_id_for_bg,
-                            &user_id_for_bg,
-                            &session_id_for_bg,
-                            &SessionMessageRecord::from_message("assistant", &serde_json::json!(full_text_for_bg), ts_for_bg + 1),
-                        ) {
-                            tracing::error!(
-                                error = %e,
-                                session_id = %session_id_for_bg,
-                                "failed to persist assistant message to session file"
-                            );
-                        }
-
-                        // Write usage record
-                        let total_tokens = acc_for_bg.input.saturating_add(acc_for_bg.output);
-                        let cost = estimate_cost(
-                            acc_for_bg.input,
-                            acc_for_bg.output,
-                            acc_for_bg.cache_creation,
-                            acc_for_bg.cache_read,
-                            &model_for_bg,
+                    if let Err(error) = kernel_for_stream
+                        .record_chat_assistant(&request_id_clone, &full_text)
+                        .await
+                    {
+                        yield axum::response::sse::Event::default()
+                            .event("error")
+                            .data(serde_json::json!({
+                                "error": format!("model response was not committed to the canonical ledger: {error}")
+                            }).to_string());
+                        break;
+                    }
+                    if let Err(error) = append_message(
+                        &data_dir_clone,
+                        &tenant_id_clone,
+                        &user_id_clone,
+                        &session_id_clone2,
+                        &SessionMessageRecord::from_message(
+                            "assistant",
+                            &serde_json::json!(full_text),
+                            ts + 1,
+                        ),
+                    ) {
+                        tracing::error!(
+                            error = %error,
+                            session_id = %session_id_clone2,
+                            "failed to export assistant message to compatibility JSONL"
                         );
-                        let record = TokenUsageRecord {
-                            tenant_id: tenant_id_for_bg,
-                            user_id: user_id_for_bg,
-                            session_id: session_id_for_bg,
-                            request_id: None,
-                            model: model_for_bg,
-                            input_tokens: acc_for_bg.input,
-                            output_tokens: acc_for_bg.output,
-                            cache_creation_tokens: acc_for_bg.cache_creation,
-                            cache_read_tokens: acc_for_bg.cache_read,
-                            total_tokens,
-                            estimated_cost_usd: cost,
-                            api_key_id: api_key_id_clone,
-                            provider: provider_name_clone,
-                            created_at: Utc::now(),
-                        };
-
-                        if let Some(usage_writer) = usage_writer_for_bg {
-                            if let Err(e) = usage_writer.write(&record).await {
-                                tracing::error!(error = %e, "failed to write token usage for stream");
-                            }
-                        } else {
-                            tracing::warn!("token usage writer is not configured; streaming chat usage was not persisted");
+                    }
+                    let total_tokens = acc.input.saturating_add(acc.output);
+                    let cost = estimate_cost(
+                        acc.input,
+                        acc.output,
+                        acc.cache_creation,
+                        acc.cache_read,
+                        &model_clone,
+                    );
+                    let record = TokenUsageRecord {
+                        tenant_id: tenant_id_clone.clone(),
+                        user_id: user_id_clone.clone(),
+                        session_id: session_id_clone2.clone(),
+                        request_id: Some(request_id_clone.clone()),
+                        model: model_clone.clone(),
+                        input_tokens: acc.input,
+                        output_tokens: acc.output,
+                        cache_creation_tokens: acc.cache_creation,
+                        cache_read_tokens: acc.cache_read,
+                        total_tokens,
+                        estimated_cost_usd: cost,
+                        api_key_id: api_key_id_clone.clone(),
+                        provider: provider_name_clone.clone(),
+                        created_at: Utc::now(),
+                    };
+                    if let Some(writer) = usage_writer.as_ref() {
+                        if let Err(error) = writer.write(&record).await {
+                            tracing::error!(error = %error, "failed to write token usage for stream");
                         }
-                    });
+                    } else {
+                        tracing::warn!("token usage writer is not configured; streaming chat usage was not persisted");
+                    }
 
                     yield axum::response::sse::Event::default()
                         .event("stream_end")
@@ -1013,9 +1185,21 @@ async fn stream_message(
                     break;
                 }
                 Err(e) => {
+                    let detail = format!("LLM stream failed: {e}");
+                    if let Err(checkpoint_error) = kernel_for_stream
+                        .record_chat_failure(&request_id_clone, &detail)
+                        .await
+                    {
+                        yield axum::response::sse::Event::default()
+                            .event("error")
+                            .data(serde_json::json!({
+                                "error": format!("{detail}; failed to persist terminal chat failure: {checkpoint_error}")
+                            }).to_string());
+                        break;
+                    }
                     yield axum::response::sse::Event::default()
                         .event("error")
-                        .data(serde_json::json!({ "error": format!("{e}") }).to_string());
+                        .data(serde_json::json!({ "error": detail }).to_string());
                     break;
                 }
             }
@@ -1034,22 +1218,12 @@ async fn list_sessions(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
 ) -> impl IntoResponse {
-    // Wrap blocking file I/O in spawn_blocking to avoid blocking the async runtime.
-    let data_dir = state.data_dir.clone();
-    let tenant_id = claims.tenant_id.clone();
-    let user_id = claims.sub.clone();
-    match tokio::task::spawn_blocking(move || list_user_sessions(&data_dir, &tenant_id, &user_id))
-        .await
-    {
-        Ok(Ok(sessions)) => {
+    match list_canonical_sessions(&state.db, &claims.tenant_id, &claims.sub).await {
+        Ok(sessions) => {
             let total = sessions.len();
             Json(serde_json::json!({ "sessions": sessions, "total": total })).into_response()
         }
-        Ok(Err(e)) => e.into_response(),
-        Err(e) => {
-            tracing::error!("spawn_blocking for list_sessions failed: {e}");
-            AppError::Internal("failed to list sessions".to_string()).into_response()
-        }
+        Err(error) => error.into_response(),
     }
 }
 
@@ -1059,14 +1233,32 @@ async fn get_session(
     Extension(claims): Extension<Claims>,
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
-    match load_session_messages(&state.data_dir, &claims.tenant_id, &claims.sub, &session_id) {
+    let kernel = crate::semantic_kernel_store::RuntimeExecutionKernel::new(
+        state.db.clone(),
+        claims.tenant_id.clone(),
+        claims.sub.clone(),
+        session_id.clone(),
+    );
+    if let Err(error) = import_legacy_chat_if_needed(
+        &kernel,
+        &state.data_dir,
+        &claims.tenant_id,
+        &claims.sub,
+        &session_id,
+    )
+    .await
+    {
+        return error.into_response();
+    }
+    match kernel.load_chat_messages().await {
         Ok(messages) => Json(serde_json::json!({
             "sessionId": session_id,
             "userId": claims.sub,
-            "messages": messages,
+            "messages": messages.into_iter().map(chat_message_from_api).collect::<Vec<_>>(),
         }))
         .into_response(),
-        Err(e) => e.into_response(),
+        Err(error) => AppError::Internal(format!("failed to load canonical chat session: {error}"))
+            .into_response(),
     }
 }
 
@@ -1076,31 +1268,44 @@ async fn delete_session(
     Extension(claims): Extension<Claims>,
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
-    match delete_session_file(&state.data_dir, &claims.tenant_id, &claims.sub, &session_id) {
-        Ok(()) => {
-            if let Err(error) = crate::semantic_kernel_store::delete_session_artifacts(
-                &state.db,
-                &claims.tenant_id,
-                &session_id,
-            )
-            .await
-            {
-                tracing::error!(
-                    tenant_id = %claims.tenant_id,
-                    session_id = %session_id,
-                    error = %error,
-                    "chat session deleted but artifact tombstone cleanup failed"
-                );
-                return AppError::Internal(
-                    "session deleted; artifact cleanup will be retried by retention recovery"
-                        .to_string(),
-                )
-                .into_response();
-            }
-            Json(serde_json::json!({ "deleted": true })).into_response()
-        }
-        Err(e) => e.into_response(),
+    let kernel = crate::semantic_kernel_store::RuntimeExecutionKernel::new(
+        state.db.clone(),
+        claims.tenant_id.clone(),
+        claims.sub.clone(),
+        session_id.clone(),
+    );
+    if let Err(error) = kernel.delete_chat_session().await {
+        return AppError::Internal(format!("failed to revoke canonical chat session: {error}"))
+            .into_response();
     }
+    if let Err(error) = crate::semantic_kernel_store::delete_session_artifacts(
+        &state.db,
+        &claims.tenant_id,
+        &session_id,
+    )
+    .await
+    {
+        tracing::error!(
+            tenant_id = %claims.tenant_id,
+            session_id = %session_id,
+            error = %error,
+            "canonical chat session revoked but artifact tombstone cleanup failed"
+        );
+        return AppError::Internal(
+            "session revoked; artifact cleanup will be retried by retention recovery".to_string(),
+        )
+        .into_response();
+    }
+    if let Err(error) =
+        delete_session_file(&state.data_dir, &claims.tenant_id, &claims.sub, &session_id)
+    {
+        tracing::warn!(
+            error = %error,
+            session_id = %session_id,
+            "canonical session was revoked but compatibility JSONL removal failed"
+        );
+    }
+    Json(serde_json::json!({ "deleted": true })).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1121,7 +1326,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
 }
 
 // ---------------------------------------------------------------------------
-// Stream accumulator (background task)
+// Stream accumulator
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]

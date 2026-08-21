@@ -42,6 +42,12 @@ pub struct RuntimeContract {
     pub supports_process_group_cancel: bool,
     pub supports_artifacts: bool,
     pub default_enabled: bool,
+    pub configured: bool,
+    pub supported: bool,
+    pub active: bool,
+    pub enforcement: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
     pub description: &'static str,
 }
 
@@ -216,8 +222,13 @@ impl RuntimeRegistry {
             supports_process_group_cancel: true,
             supports_artifacts: true,
             default_enabled: true,
+            configured: true,
+            supported: false,
+            active: false,
+            enforcement: "unavailable",
+            unavailable_reason: Some("sandbox capability has not been probed".to_string()),
             description:
-                "默认本机 workspace 隔离运行时，支持进程组取消、stdout/stderr 预览和 artifacts。",
+                "本机 Agent Runtime 仅在 bwrap+prlimit 完整探针通过后启用；不允许回退到 host shell。",
         });
         registry.register_static(RuntimeContract {
             key: "docker_sandbox",
@@ -226,6 +237,13 @@ impl RuntimeRegistry {
             supports_process_group_cancel: true,
             supports_artifacts: true,
             default_enabled: false,
+            configured: false,
+            supported: false,
+            active: false,
+            enforcement: "request_time_verification",
+            unavailable_reason: Some(
+                "Docker runtime has not been configured or verified".to_string(),
+            ),
             description:
                 "可选容器沙箱运行时，通过 Docker 挂载任务 workspace 并在容器内执行命令；默认关闭。",
         });

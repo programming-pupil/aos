@@ -770,27 +770,16 @@ pub async fn resolve_routing_llm(
     tenant_id: &str,
     user_id: &str,
     default_model: &str,
-) -> anyhow::Result<(api::ProviderClient, String, RoutingLlmMeta)> {
+) -> anyhow::Result<(
+    crate::governed_provider::GovernedProviderClient,
+    String,
+    RoutingLlmMeta,
+)> {
     let registry = match config_registry.as_ref() {
         Some(r) => r.as_ref(),
-        None => {
-            if !runtime::explicit_env_opt_in_enabled("AOS_ALLOW_TENANT_MODEL_ENV_FALLBACK") {
-                anyhow::bail!(
-                    "no tenant config registry available and model environment fallback is disabled"
-                );
-            }
-            return api::ProviderClient::from_model(default_model)
-                .map(|client| {
-                    let meta = RoutingLlmMeta {
-                        provider: "env-fallback".to_string(),
-                        key_id: None,
-                        masked_api_key: None,
-                        base_url: client.base_url().to_string(),
-                    };
-                    (client, default_model.to_string(), meta)
-                })
-                .map_err(|e| anyhow::anyhow!("routing LLM env fallback failed: {}", e));
-        }
+        None => anyhow::bail!(
+            "no tenant config registry is available for durable routing-model dispatch"
+        ),
     };
     let runtime_config = registry
         .load_user_config(tenant_id, user_id, None)
@@ -820,7 +809,17 @@ pub async fn resolve_routing_llm(
                         masked_api_key: Some(mask_api_key(&entry.key)),
                         base_url: client.base_url().to_string(),
                     };
-                    return Ok((client, effective_model.clone(), meta));
+                    return Ok((
+                        crate::governed_provider::GovernedProviderClient::new(
+                            client,
+                            registry.database(),
+                            tenant_id,
+                            user_id,
+                            "nl2sql:routing",
+                        ),
+                        effective_model.clone(),
+                        meta,
+                    ));
                 }
                 Err(e) => {
                     tracing::warn!(tenant_id = %tenant_id, key_id = %entry.id, error = %e, "routing LLM key failed, trying next");
@@ -841,7 +840,17 @@ pub async fn resolve_routing_llm(
                 masked_api_key: None,
                 base_url: client.base_url().to_string(),
             };
-            (client, default_model.to_string(), meta)
+            (
+                crate::governed_provider::GovernedProviderClient::new(
+                    client,
+                    registry.database(),
+                    tenant_id,
+                    user_id,
+                    "nl2sql:routing",
+                ),
+                default_model.to_string(),
+                meta,
+            )
         })
         .map_err(|e| anyhow::anyhow!("routing LLM env fallback failed: {}", e))
 }
@@ -859,7 +868,7 @@ pub async fn route_hybrid(
     question: &str,
     candidates: Vec<GlobalTableMatch>,
     available_sources: &[(String, String, String)],
-    llm_client: &api::ProviderClient,
+    llm_client: &crate::governed_provider::GovernedProviderClient,
     llm_model: &str,
     llm_meta: &RoutingLlmMeta,
     col_descriptions: Option<&std::collections::HashMap<(String, String), String>>,
@@ -1644,7 +1653,7 @@ pub async fn resolve_all_business_domains_for_tenant(
 pub async fn classify_question_to_domains(
     question: &str,
     domains: &[BusinessDomain],
-    llm_client: &api::ProviderClient,
+    llm_client: &crate::governed_provider::GovernedProviderClient,
     llm_model: &str,
     llm_meta: &RoutingLlmMeta,
 ) -> anyhow::Result<Vec<(String, f32)>> {
