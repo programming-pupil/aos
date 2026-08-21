@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sqlx::{Row, Sqlite, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use tokio::sync::Notify;
 
 use crate::semantic_kernel_store::{
@@ -43,6 +43,65 @@ fn sha256(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
 }
 
+async fn worker_lease_is_valid_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    tenant_id: &str,
+    thread_id: &str,
+    lease: &WorkerLease,
+) -> Result<bool, SemanticStoreError> {
+    Ok(sqlx::query_scalar::<Sqlite, i64>(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM agent_team_members m
+             JOIN agent_concurrency_permits p
+               ON p.tenant_id = m.tenant_id
+              AND p.scope = 'agent_team:' || m.team_id
+              AND p.holder_thread_id = m.thread_id
+              AND p.lease_fencing = m.lease_fencing
+             WHERE m.tenant_id = ? AND m.thread_id = ? AND m.team_id = ?
+               AND m.status = 'running' AND m.lease_owner = ?
+               AND m.lease_fencing = ?
+               AND m.lease_expires_at IS NOT NULL
+               AND m.lease_expires_at > CURRENT_TIMESTAMP
+               AND p.expires_at > CURRENT_TIMESTAMP
+         )",
+    )
+    .bind(tenant_id)
+    .bind(thread_id)
+    .bind(&lease.team_id)
+    .bind(&lease.owner)
+    .bind(lease.fencing)
+    .fetch_one(&mut **tx)
+    .await?
+        != 0)
+}
+
+async fn team_caller_is_authorized_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    tenant_id: &str,
+    thread_id: &str,
+    lease: Option<&WorkerLease>,
+    allow_unregistered_root: bool,
+) -> Result<bool, SemanticStoreError> {
+    if let Some(lease) = lease {
+        return worker_lease_is_valid_in_transaction(tx, tenant_id, thread_id, lease).await;
+    }
+    let memberships = sqlx::query_as::<Sqlite, (String, Option<String>, String)>(
+        "SELECT team_id, parent_thread_id, role
+         FROM agent_team_members
+         WHERE tenant_id = ? AND thread_id = ?",
+    )
+    .bind(tenant_id)
+    .bind(thread_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if memberships.is_empty() {
+        return Ok(allow_unregistered_root);
+    }
+    Ok(matches!(memberships.as_slice(), [(team_id, None, role)]
+        if team_id == thread_id && role == "coordinator"))
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AgentTeamMember {
@@ -64,6 +123,28 @@ pub(crate) struct SpawnRegistration {
     pub team_id: String,
     pub child_thread_id: String,
     pub existing: bool,
+}
+
+/// A worker lease is the capability required to mutate a running team member.
+/// The monotonically increasing fencing value makes an old process harmless
+/// after its lease is reclaimed by a replacement worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkerLease {
+    pub owner: String,
+    pub fencing: i64,
+    pub team_id: String,
+}
+
+pub(crate) async fn worker_lease_is_valid(
+    db: &SqlitePool,
+    tenant_id: &str,
+    thread_id: &str,
+    lease: &WorkerLease,
+) -> Result<bool, SemanticStoreError> {
+    let mut tx = db.begin().await?;
+    let valid = worker_lease_is_valid_in_transaction(&mut tx, tenant_id, thread_id, lease).await?;
+    tx.commit().await?;
+    Ok(valid)
 }
 
 #[derive(Debug, Clone)]
@@ -123,23 +204,6 @@ pub(crate) async fn ensure_root_member(
     Ok(())
 }
 
-pub(crate) async fn find_spawn_by_key(
-    db: &SqlitePool,
-    tenant_id: &str,
-    parent_thread_id: &str,
-    idempotency_key: &str,
-) -> Result<Option<String>, SemanticStoreError> {
-    Ok(sqlx::query_scalar::<Sqlite, String>(
-        "SELECT thread_id FROM agent_team_members
-         WHERE tenant_id = ? AND parent_thread_id = ? AND spawn_idempotency_key = ?",
-    )
-    .bind(tenant_id)
-    .bind(parent_thread_id)
-    .bind(idempotency_key)
-    .fetch_optional(db)
-    .await?)
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn register_spawn(
     db: &SqlitePool,
@@ -152,6 +216,7 @@ pub(crate) async fn register_spawn(
     context_mode: &str,
     model: Option<&str>,
     idempotency_key: &str,
+    caller_lease: Option<&WorkerLease>,
 ) -> Result<SpawnRegistration, SemanticStoreError> {
     let name = name.trim();
     let task = task.trim();
@@ -167,23 +232,6 @@ pub(crate) async fn register_spawn(
     }
     let mut tx = db.begin().await?;
     acquire_sqlite_write_lock(&mut tx).await?;
-    if let Some((existing_team, existing_thread)) = sqlx::query_as::<Sqlite, (String, String)>(
-        "SELECT team_id, thread_id FROM agent_team_members
-         WHERE tenant_id = ? AND parent_thread_id = ? AND spawn_idempotency_key = ?",
-    )
-    .bind(tenant_id)
-    .bind(parent_thread_id)
-    .bind(idempotency_key)
-    .fetch_optional(&mut *tx)
-    .await?
-    {
-        tx.commit().await?;
-        return Ok(SpawnRegistration {
-            team_id: existing_team,
-            child_thread_id: existing_thread,
-            existing: true,
-        });
-    }
     let parent = sqlx::query_as::<Sqlite, (String, String)>(
         "SELECT tenant_id, owner_user_id FROM agent_threads WHERE id = ?",
     )
@@ -195,6 +243,58 @@ pub(crate) async fn register_spawn(
         return Err(SemanticStoreError::InvalidEvent(
             "agent team spawn crossed tenant or owner scope".into(),
         ));
+    }
+    if !team_caller_is_authorized_in_transaction(
+        &mut tx,
+        tenant_id,
+        parent_thread_id,
+        caller_lease,
+        true,
+    )
+    .await?
+    {
+        return Err(SemanticStoreError::InvalidEvent(
+            "agent team caller is neither the root coordinator nor a valid worker lease".into(),
+        ));
+    }
+    let requested_task_hash = sha256(task);
+    if let Some((existing_team, existing_thread, existing_name, existing_context, existing_model)) =
+        sqlx::query_as::<Sqlite, (String, String, String, String, Option<String>)>(
+            "SELECT team_id, thread_id, name, context_mode, model FROM agent_team_members
+         WHERE tenant_id = ? AND parent_thread_id = ? AND spawn_idempotency_key = ?",
+        )
+        .bind(tenant_id)
+        .bind(parent_thread_id)
+        .bind(idempotency_key)
+        .fetch_optional(&mut *tx)
+        .await?
+    {
+        let stored_task_hash = sqlx::query_scalar::<Sqlite, String>(
+            "SELECT content_hash FROM agent_mailbox_items
+             WHERE tenant_id = ? AND target_thread_id = ?
+               AND idempotency_key = ?
+             LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(&existing_thread)
+        .bind(format!("spawn:{idempotency_key}"))
+        .fetch_optional(&mut *tx)
+        .await?;
+        if existing_name != name
+            || existing_context != context_mode
+            || existing_model.as_deref() != model
+            || stored_task_hash.as_deref() != Some(requested_task_hash.as_str())
+        {
+            return Err(SemanticStoreError::InvalidEvent(
+                "agent spawn idempotency key was reused with different payload".into(),
+            ));
+        }
+        tx.commit().await?;
+        return Ok(SpawnRegistration {
+            team_id: existing_team,
+            child_thread_id: existing_thread,
+            existing: true,
+        });
     }
     let parent_member = sqlx::query_as::<Sqlite, (String, i64)>(
         "SELECT team_id, depth FROM agent_team_members
@@ -409,6 +509,57 @@ pub(crate) async fn deliver_message(
     wake: bool,
     idempotency_key: &str,
 ) -> Result<serde_json::Value, SemanticStoreError> {
+    deliver_message_inner(
+        db,
+        tenant_id,
+        owner_user_id,
+        sender_thread_id,
+        target,
+        content,
+        wake,
+        idempotency_key,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn deliver_message_fenced(
+    db: &SqlitePool,
+    tenant_id: &str,
+    owner_user_id: &str,
+    sender_thread_id: &str,
+    target: &str,
+    content: &str,
+    wake: bool,
+    idempotency_key: &str,
+    lease: &WorkerLease,
+) -> Result<serde_json::Value, SemanticStoreError> {
+    deliver_message_inner(
+        db,
+        tenant_id,
+        owner_user_id,
+        sender_thread_id,
+        target,
+        content,
+        wake,
+        idempotency_key,
+        Some(lease),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn deliver_message_inner(
+    db: &SqlitePool,
+    tenant_id: &str,
+    owner_user_id: &str,
+    sender_thread_id: &str,
+    target: &str,
+    content: &str,
+    wake: bool,
+    idempotency_key: &str,
+    lease: Option<&WorkerLease>,
+) -> Result<serde_json::Value, SemanticStoreError> {
     let content = content.trim();
     if content.is_empty() || content.chars().count() > 16_000 {
         return Err(SemanticStoreError::InvalidEvent(
@@ -429,6 +580,13 @@ pub(crate) async fn deliver_message(
     .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
     let mut tx = db.begin().await?;
     acquire_sqlite_write_lock(&mut tx).await?;
+    if !team_caller_is_authorized_in_transaction(&mut tx, tenant_id, sender_thread_id, lease, false)
+        .await?
+    {
+        return Err(SemanticStoreError::InvalidEvent(
+            "agent team sender is neither the root coordinator nor a valid worker lease".into(),
+        ));
+    }
     let inserted = sqlx::query::<Sqlite>(
         "INSERT INTO agent_mailbox_items
             (id, tenant_id, team_id, sender_thread_id, target_thread_id, delivery,
@@ -577,8 +735,18 @@ pub(crate) async fn acknowledge_pending_mailbox(
     tenant_id: &str,
     thread_id: &str,
     turn_id: &str,
+    caller_lease: Option<&WorkerLease>,
 ) -> Result<u64, SemanticStoreError> {
-    Ok(sqlx::query::<Sqlite>(
+    let mut tx = db.begin().await?;
+    acquire_sqlite_write_lock(&mut tx).await?;
+    if !team_caller_is_authorized_in_transaction(&mut tx, tenant_id, thread_id, caller_lease, false)
+        .await?
+    {
+        return Err(SemanticStoreError::InvalidEvent(
+            "agent team caller is neither the root coordinator nor a valid worker lease".into(),
+        ));
+    }
+    let changed = sqlx::query::<Sqlite>(
         "UPDATE agent_mailbox_items
          SET consumed_turn_id = COALESCE(consumed_turn_id, observed_turn_id, ?),
              consumed_at = CURRENT_TIMESTAMP
@@ -588,9 +756,11 @@ pub(crate) async fn acknowledge_pending_mailbox(
     .bind(turn_id)
     .bind(tenant_id)
     .bind(thread_id)
-    .execute(db)
+    .execute(&mut *tx)
     .await?
-    .rows_affected())
+    .rows_affected();
+    tx.commit().await?;
+    Ok(changed)
 }
 
 pub(crate) async fn claim_pending_mailbox_items(
@@ -599,10 +769,18 @@ pub(crate) async fn claim_pending_mailbox_items(
     thread_id: &str,
     delivery_id: &str,
     item_ids: &[String],
+    caller_lease: Option<&WorkerLease>,
 ) -> Result<u64, SemanticStoreError> {
     let mut claimed = 0_u64;
     let mut tx = db.begin().await?;
     acquire_sqlite_write_lock(&mut tx).await?;
+    if !team_caller_is_authorized_in_transaction(&mut tx, tenant_id, thread_id, caller_lease, false)
+        .await?
+    {
+        return Err(SemanticStoreError::InvalidEvent(
+            "agent team caller is neither the root coordinator nor a valid worker lease".into(),
+        ));
+    }
     for item_id in item_ids {
         claimed = claimed.saturating_add(
             sqlx::query::<Sqlite>(
@@ -648,9 +826,15 @@ pub(crate) async fn consume_mailbox(
     db: &SqlitePool,
     tenant_id: &str,
     thread_id: &str,
+    lease: &WorkerLease,
 ) -> Result<MailboxDelivery, SemanticStoreError> {
     let mut tx = db.begin().await?;
     acquire_sqlite_write_lock(&mut tx).await?;
+    if !worker_lease_is_valid_in_transaction(&mut tx, tenant_id, thread_id, lease).await? {
+        return Err(SemanticStoreError::InvalidEvent(
+            "agent team worker lease is no longer valid".into(),
+        ));
+    }
     let existing_delivery = sqlx::query_scalar::<Sqlite, String>(
         "SELECT consumed_turn_id FROM agent_mailbox_items
          WHERE tenant_id = ? AND target_thread_id = ? AND consumed_at IS NULL
@@ -714,15 +898,24 @@ pub(crate) async fn consume_mailbox(
             messages.push(plaintext);
         }
     }
-    sqlx::query::<Sqlite>(
+    let member = sqlx::query::<Sqlite>(
         "UPDATE agent_team_members SET wake_requested = 0, status = 'running',
                  updated_at = CURRENT_TIMESTAMP
-         WHERE tenant_id = ? AND thread_id = ?",
+         WHERE tenant_id = ? AND thread_id = ? AND team_id = ?
+           AND status = 'running' AND lease_owner = ? AND lease_fencing = ?",
     )
     .bind(tenant_id)
     .bind(thread_id)
+    .bind(&lease.team_id)
+    .bind(&lease.owner)
+    .bind(lease.fencing)
     .execute(&mut *tx)
     .await?;
+    if member.rows_affected() != 1 {
+        return Err(SemanticStoreError::InvalidEvent(
+            "agent team worker lease changed during mailbox delivery".into(),
+        ));
+    }
     tx.commit().await?;
     Ok(MailboxDelivery {
         delivery_id,
@@ -730,6 +923,7 @@ pub(crate) async fn consume_mailbox(
     })
 }
 
+#[cfg(test)]
 pub(crate) async fn acknowledge_mailbox_turn(
     db: &SqlitePool,
     tenant_id: &str,
@@ -749,6 +943,37 @@ pub(crate) async fn acknowledge_mailbox_turn(
     .rows_affected())
 }
 
+pub(crate) async fn acknowledge_mailbox_turn_fenced(
+    db: &SqlitePool,
+    tenant_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    lease: &WorkerLease,
+) -> Result<u64, SemanticStoreError> {
+    let mut tx = db.begin().await?;
+    acquire_sqlite_write_lock(&mut tx).await?;
+    let valid = worker_lease_is_valid_in_transaction(&mut tx, tenant_id, thread_id, lease).await?;
+    if !valid {
+        return Err(SemanticStoreError::InvalidEvent(
+            "agent team worker lease is no longer valid".into(),
+        ));
+    }
+    let changed = sqlx::query::<Sqlite>(
+        "UPDATE agent_mailbox_items SET consumed_at = CURRENT_TIMESTAMP
+         WHERE tenant_id = ? AND target_thread_id = ? AND consumed_turn_id = ?
+           AND consumed_at IS NULL",
+    )
+    .bind(tenant_id)
+    .bind(thread_id)
+    .bind(turn_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(changed)
+}
+
+#[cfg(test)]
 pub(crate) async fn requeue_unacknowledged_mailbox(
     db: &SqlitePool,
     tenant_id: &str,
@@ -778,12 +1003,70 @@ pub(crate) async fn requeue_unacknowledged_mailbox(
     Ok(retryable)
 }
 
+pub(crate) async fn requeue_unacknowledged_mailbox_fenced(
+    db: &SqlitePool,
+    tenant_id: &str,
+    thread_id: &str,
+    lease: &WorkerLease,
+) -> Result<bool, SemanticStoreError> {
+    let mut tx = db.begin().await?;
+    acquire_sqlite_write_lock(&mut tx).await?;
+    let retryable = sqlx::query_scalar::<Sqlite, i64>(
+        "SELECT EXISTS(
+             SELECT 1 FROM agent_mailbox_items
+             WHERE tenant_id = ? AND target_thread_id = ? AND consumed_at IS NULL
+               AND delivery_attempts < 3
+         )",
+    )
+    .bind(tenant_id)
+    .bind(thread_id)
+    .fetch_one(&mut *tx)
+    .await?
+        != 0;
+    if !retryable {
+        tx.commit().await?;
+        return Ok(false);
+    }
+    let changed = sqlx::query::<Sqlite>(
+        "UPDATE agent_team_members
+         SET status = 'queued', wake_requested = 1, lease_owner = NULL,
+             lease_expires_at = NULL, updated_at = CURRENT_TIMESTAMP
+         WHERE tenant_id = ? AND thread_id = ? AND team_id = ?
+           AND status = 'running' AND lease_owner = ? AND lease_fencing = ?",
+    )
+    .bind(tenant_id)
+    .bind(thread_id)
+    .bind(&lease.team_id)
+    .bind(&lease.owner)
+    .bind(lease.fencing)
+    .execute(&mut *tx)
+    .await?;
+    if changed.rows_affected() == 1 {
+        sqlx::query::<Sqlite>(
+            "DELETE FROM agent_concurrency_permits
+             WHERE tenant_id = ? AND holder_thread_id = ? AND lease_fencing = ?",
+        )
+        .bind(tenant_id)
+        .bind(thread_id)
+        .bind(lease.fencing)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    if changed.rows_affected() == 1 {
+        notify_team(tenant_id, &lease.team_id);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 pub(crate) async fn claim_worker(
     db: &SqlitePool,
     tenant_id: &str,
     thread_id: &str,
     lease_owner: &str,
-) -> Result<bool, SemanticStoreError> {
+) -> Result<Option<WorkerLease>, SemanticStoreError> {
     let mut tx = db.begin().await?;
     acquire_sqlite_write_lock(&mut tx).await?;
     let member = sqlx::query_as::<Sqlite, (String, String)>(
@@ -797,7 +1080,7 @@ pub(crate) async fn claim_worker(
     .ok_or_else(|| SemanticStoreError::InvalidEvent("agent team member is missing".into()))?;
     if member.1 != "queued" {
         tx.commit().await?;
-        return Ok(false);
+        return Ok(None);
     }
     let scope = format!("agent_team:{}", member.0);
     sqlx::query::<Sqlite>(
@@ -834,29 +1117,8 @@ pub(crate) async fn claim_worker(
             )
         {
             tx.commit().await?;
-            return Ok(false);
+            return Ok(None);
         }
-        sqlx::query::<Sqlite>(
-            "INSERT INTO agent_concurrency_permits
-                (tenant_id, scope, holder_thread_id, lease_fencing, expires_at)
-             VALUES (?, ?, ?, 1, datetime('now', '+10 minutes'))",
-        )
-        .bind(tenant_id)
-        .bind(&scope)
-        .bind(thread_id)
-        .execute(&mut *tx)
-        .await?;
-    } else {
-        sqlx::query::<Sqlite>(
-            "UPDATE agent_concurrency_permits
-             SET expires_at = datetime('now', '+10 minutes'), updated_at = CURRENT_TIMESTAMP
-             WHERE tenant_id = ? AND scope = ? AND holder_thread_id = ?",
-        )
-        .bind(tenant_id)
-        .bind(&scope)
-        .bind(thread_id)
-        .execute(&mut *tx)
-        .await?;
     }
     let changed = sqlx::query::<Sqlite>(
         "UPDATE agent_team_members
@@ -871,8 +1133,46 @@ pub(crate) async fn claim_worker(
     .bind(thread_id)
     .execute(&mut *tx)
     .await?;
+    if changed.rows_affected() != 1 {
+        tx.commit().await?;
+        return Ok(None);
+    }
+    let fencing = sqlx::query_scalar::<Sqlite, i64>(
+        "SELECT lease_fencing FROM agent_team_members
+         WHERE tenant_id = ? AND thread_id = ? AND lease_owner = ?
+           AND status = 'running'",
+    )
+    .bind(tenant_id)
+    .bind(thread_id)
+    .bind(lease_owner)
+    .fetch_one(&mut *tx)
+    .await?;
+    let permit = sqlx::query::<Sqlite>(
+        "INSERT INTO agent_concurrency_permits
+            (tenant_id, scope, holder_thread_id, lease_fencing, expires_at)
+         VALUES (?, ?, ?, ?, datetime('now', '+10 minutes'))
+         ON CONFLICT(tenant_id, scope, holder_thread_id) DO UPDATE SET
+             lease_fencing = excluded.lease_fencing,
+             expires_at = excluded.expires_at,
+             updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(tenant_id)
+    .bind(&scope)
+    .bind(thread_id)
+    .bind(fencing)
+    .execute(&mut *tx)
+    .await?;
+    if permit.rows_affected() != 1 {
+        return Err(SemanticStoreError::InvalidEvent(
+            "agent team worker permit could not be fenced".into(),
+        ));
+    }
     tx.commit().await?;
-    Ok(changed.rows_affected() == 1)
+    Ok(Some(WorkerLease {
+        owner: lease_owner.to_string(),
+        fencing,
+        team_id: member.0,
+    }))
 }
 
 pub(crate) async fn renew_worker_lease(
@@ -880,16 +1180,19 @@ pub(crate) async fn renew_worker_lease(
     tenant_id: &str,
     thread_id: &str,
     lease_owner: &str,
+    lease_fencing: i64,
 ) -> Result<bool, SemanticStoreError> {
     let mut tx = db.begin().await?;
     acquire_sqlite_write_lock(&mut tx).await?;
     let team_id = sqlx::query_scalar::<Sqlite, String>(
         "SELECT team_id FROM agent_team_members
-         WHERE tenant_id = ? AND thread_id = ? AND status = 'running' AND lease_owner = ?",
+         WHERE tenant_id = ? AND thread_id = ? AND status = 'running' AND lease_owner = ?
+           AND lease_fencing = ? AND lease_expires_at > CURRENT_TIMESTAMP",
     )
     .bind(tenant_id)
     .bind(thread_id)
     .bind(lease_owner)
+    .bind(lease_fencing)
     .fetch_optional(&mut *tx)
     .await?;
     let Some(team_id) = team_id else {
@@ -899,27 +1202,36 @@ pub(crate) async fn renew_worker_lease(
     let member = sqlx::query::<Sqlite>(
         "UPDATE agent_team_members
          SET lease_expires_at = datetime('now', '+10 minutes'), updated_at = CURRENT_TIMESTAMP
-         WHERE tenant_id = ? AND thread_id = ? AND status = 'running' AND lease_owner = ?",
+         WHERE tenant_id = ? AND thread_id = ? AND status = 'running' AND lease_owner = ?
+           AND lease_fencing = ? AND lease_expires_at > CURRENT_TIMESTAMP",
     )
     .bind(tenant_id)
     .bind(thread_id)
     .bind(lease_owner)
+    .bind(lease_fencing)
     .execute(&mut *tx)
     .await?;
     if member.rows_affected() != 1 {
         tx.commit().await?;
         return Ok(false);
     }
-    sqlx::query::<Sqlite>(
+    let permit = sqlx::query::<Sqlite>(
         "UPDATE agent_concurrency_permits
          SET expires_at = datetime('now', '+10 minutes'), updated_at = CURRENT_TIMESTAMP
-         WHERE tenant_id = ? AND scope = ? AND holder_thread_id = ?",
+         WHERE tenant_id = ? AND scope = ? AND holder_thread_id = ?
+           AND lease_fencing = ? AND expires_at > CURRENT_TIMESTAMP",
     )
     .bind(tenant_id)
     .bind(format!("agent_team:{team_id}"))
     .bind(thread_id)
+    .bind(lease_fencing)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if permit != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
     tx.commit().await?;
     Ok(true)
 }
@@ -1009,10 +1321,14 @@ pub(crate) async fn request_descendant_cancellation(
              JOIN descendants parent ON child.parent_thread_id = parent.thread_id
               WHERE child.tenant_id = ? AND child.detached = 0
          )
-         SELECT thread_id FROM descendants",
+         SELECT d.thread_id FROM descendants d
+         JOIN agent_team_members m
+           ON m.tenant_id = ? AND m.thread_id = d.thread_id
+         WHERE m.status IN ('queued','running','interrupt_requested')",
     )
     .bind(tenant_id)
     .bind(root_thread_id)
+    .bind(tenant_id)
     .bind(tenant_id)
     .fetch_all(&mut *tx)
     .await?;
@@ -1020,9 +1336,10 @@ pub(crate) async fn request_descendant_cancellation(
         sqlx::query::<Sqlite>(
             "UPDATE agent_team_members
              SET status = 'interrupt_requested', wake_requested = 0,
+                 lease_owner = NULL, lease_expires_at = NULL,
                  updated_at = CURRENT_TIMESTAMP
              WHERE tenant_id = ? AND thread_id = ?
-               AND status IN ('queued','running','idle','completed','failed')",
+               AND status IN ('queued','running')",
         )
         .bind(tenant_id)
         .bind(thread_id)
@@ -1132,11 +1449,16 @@ pub(crate) async fn wait_for_change(
     tokio::pin!(notified);
     notified.as_mut().enable();
     let armed = list_members(db, tenant_id, caller_thread_id, None).await?;
-    if armed != before {
+    // Re-read both authorities after arming Notify. `notify_waiters` does not
+    // retain a permit, so a quiet mailbox write in this window must be caught
+    // by the post-arm read rather than sleeping until the timeout.
+    let armed_mailbox = pending_mailbox(db, tenant_id, caller_thread_id).await?;
+    if armed != before || !armed_mailbox.is_empty() {
         return Ok(serde_json::json!({
             "changed": true,
-            "reason": "team_event",
+            "reason": if !armed_mailbox.is_empty() { "mailbox" } else { "team_event" },
             "agents": armed,
+            "mailbox": armed_mailbox,
         }));
     }
     let notified = tokio::time::timeout(
@@ -1156,6 +1478,7 @@ pub(crate) async fn wait_for_change(
     }))
 }
 
+#[cfg(test)]
 pub(crate) async fn mark_member_status(
     db: &SqlitePool,
     tenant_id: &str,
@@ -1171,18 +1494,20 @@ pub(crate) async fn mark_member_status(
             "invalid agent team member status".into(),
         ));
     }
+    let mut tx = db.begin().await?;
+    acquire_sqlite_write_lock(&mut tx).await?;
     let team_id = sqlx::query_scalar::<Sqlite, String>(
         "SELECT team_id FROM agent_team_members WHERE tenant_id = ? AND thread_id = ?",
     )
     .bind(tenant_id)
     .bind(thread_id)
-    .fetch_optional(db)
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| SemanticStoreError::InvalidEvent("agent team member is missing".into()))?;
     let protected_error = error.map(|value| {
         runtime::protect_sensitive_text(value, runtime::configured_data_protection_mode()).value
     });
-    sqlx::query::<Sqlite>(
+    let changed = sqlx::query::<Sqlite>(
         "UPDATE agent_team_members SET status = ?, last_error = ?,
                 lease_owner = NULL, lease_expires_at = NULL,
                 updated_at = CURRENT_TIMESTAMP
@@ -1192,8 +1517,13 @@ pub(crate) async fn mark_member_status(
     .bind(protected_error)
     .bind(tenant_id)
     .bind(thread_id)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
+    if changed.rows_affected() != 1 {
+        return Err(SemanticStoreError::InvalidEvent(
+            "agent team member disappeared during status transition".into(),
+        ));
+    }
     if matches!(status, "completed" | "failed" | "idle") {
         sqlx::query::<Sqlite>(
             "DELETE FROM agent_concurrency_permits
@@ -1201,7 +1531,7 @@ pub(crate) async fn mark_member_status(
         )
         .bind(tenant_id)
         .bind(thread_id)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
         if matches!(status, "completed" | "failed") {
             sqlx::query::<Sqlite>(
@@ -1212,12 +1542,197 @@ pub(crate) async fn mark_member_status(
             .bind(status)
             .bind(tenant_id)
             .bind(thread_id)
-            .execute(db)
+            .execute(&mut *tx)
             .await?;
         }
     }
+    tx.commit().await?;
     notify_team(tenant_id, &team_id);
     Ok(())
+}
+
+pub(crate) async fn mark_member_status_fenced(
+    db: &SqlitePool,
+    tenant_id: &str,
+    thread_id: &str,
+    lease: &WorkerLease,
+    status: &str,
+    error: Option<&str>,
+) -> Result<bool, SemanticStoreError> {
+    if !matches!(status, "idle" | "completed" | "failed") {
+        return Err(SemanticStoreError::InvalidEvent(
+            "invalid fenced agent team member status".into(),
+        ));
+    }
+    let protected_error = error.map(|value| {
+        runtime::protect_sensitive_text(value, runtime::configured_data_protection_mode()).value
+    });
+    let mut tx = db.begin().await?;
+    acquire_sqlite_write_lock(&mut tx).await?;
+    if !worker_lease_is_valid_in_transaction(&mut tx, tenant_id, thread_id, lease).await? {
+        tx.commit().await?;
+        return Ok(false);
+    }
+    let changed = sqlx::query::<Sqlite>(
+        "UPDATE agent_team_members SET status = ?, last_error = ?,
+                lease_owner = NULL, lease_expires_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+         WHERE tenant_id = ? AND thread_id = ? AND team_id = ?
+           AND status = 'running' AND lease_owner = ? AND lease_fencing = ?
+           AND lease_expires_at IS NOT NULL AND lease_expires_at > CURRENT_TIMESTAMP",
+    )
+    .bind(status)
+    .bind(protected_error)
+    .bind(tenant_id)
+    .bind(thread_id)
+    .bind(&lease.team_id)
+    .bind(&lease.owner)
+    .bind(lease.fencing)
+    .execute(&mut *tx)
+    .await?;
+    if changed.rows_affected() != 1 {
+        tx.commit().await?;
+        return Ok(false);
+    }
+    if matches!(status, "completed" | "failed" | "idle") {
+        sqlx::query::<Sqlite>(
+            "DELETE FROM agent_concurrency_permits
+             WHERE tenant_id = ? AND holder_thread_id = ? AND lease_fencing = ?",
+        )
+        .bind(tenant_id)
+        .bind(thread_id)
+        .bind(lease.fencing)
+        .execute(&mut *tx)
+        .await?;
+        if matches!(status, "completed" | "failed") {
+            sqlx::query::<Sqlite>(
+                "UPDATE agent_team_tasks SET status = ?, revision = revision + 1,
+                         updated_at = CURRENT_TIMESTAMP
+                 WHERE tenant_id = ? AND owner_thread_id = ? AND status = 'assigned'",
+            )
+            .bind(status)
+            .bind(tenant_id)
+            .bind(thread_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    tx.commit().await?;
+    notify_team(tenant_id, &lease.team_id);
+    Ok(true)
+}
+
+pub(crate) async fn mark_lost_worker_failed(
+    db: &SqlitePool,
+    tenant_id: &str,
+    thread_id: &str,
+    lease: &WorkerLease,
+    error: &str,
+) -> Result<bool, SemanticStoreError> {
+    let protected_error =
+        runtime::protect_sensitive_text(error, runtime::configured_data_protection_mode()).value;
+    let mut tx = db.begin().await?;
+    acquire_sqlite_write_lock(&mut tx).await?;
+    let changed = sqlx::query::<Sqlite>(
+        "UPDATE agent_team_members
+         SET status = 'failed', last_error = ?, lease_owner = NULL,
+             lease_expires_at = NULL, updated_at = CURRENT_TIMESTAMP
+         WHERE tenant_id = ? AND thread_id = ? AND team_id = ?
+           AND status = 'running' AND lease_owner = ? AND lease_fencing = ?
+           AND (
+               lease_expires_at IS NULL OR lease_expires_at <= CURRENT_TIMESTAMP
+               OR NOT EXISTS (
+                   SELECT 1 FROM agent_concurrency_permits p
+                   WHERE p.tenant_id = agent_team_members.tenant_id
+                     AND p.scope = 'agent_team:' || agent_team_members.team_id
+                     AND p.holder_thread_id = agent_team_members.thread_id
+                     AND p.lease_fencing = agent_team_members.lease_fencing
+                     AND p.expires_at > CURRENT_TIMESTAMP
+               )
+           )",
+    )
+    .bind(protected_error)
+    .bind(tenant_id)
+    .bind(thread_id)
+    .bind(&lease.team_id)
+    .bind(&lease.owner)
+    .bind(lease.fencing)
+    .execute(&mut *tx)
+    .await?;
+    if changed.rows_affected() == 1 {
+        sqlx::query::<Sqlite>(
+            "DELETE FROM agent_concurrency_permits
+             WHERE tenant_id = ? AND holder_thread_id = ? AND lease_fencing = ?",
+        )
+        .bind(tenant_id)
+        .bind(thread_id)
+        .bind(lease.fencing)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query::<Sqlite>(
+            "UPDATE agent_team_tasks SET status = 'failed', revision = revision + 1,
+                     updated_at = CURRENT_TIMESTAMP
+             WHERE tenant_id = ? AND owner_thread_id = ? AND status = 'assigned'",
+        )
+        .bind(tenant_id)
+        .bind(thread_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    if changed.rows_affected() == 1 {
+        notify_team(tenant_id, &lease.team_id);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Complete an interrupt requested by the control plane. This transition is
+/// deliberately separate from worker-owned terminal commits and only succeeds
+/// while the member is still in the management-owned interrupt state.
+pub(crate) async fn settle_interrupted_member(
+    db: &SqlitePool,
+    tenant_id: &str,
+    thread_id: &str,
+) -> Result<bool, SemanticStoreError> {
+    let mut tx = db.begin().await?;
+    acquire_sqlite_write_lock(&mut tx).await?;
+    let team_id = sqlx::query_scalar::<Sqlite, String>(
+        "SELECT team_id FROM agent_team_members WHERE tenant_id = ? AND thread_id = ?",
+    )
+    .bind(tenant_id)
+    .bind(thread_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| SemanticStoreError::InvalidEvent("agent team member is missing".into()))?;
+    let changed = sqlx::query::<Sqlite>(
+        "UPDATE agent_team_members
+         SET status = 'idle', wake_requested = 0, lease_owner = NULL,
+             lease_expires_at = NULL, updated_at = CURRENT_TIMESTAMP
+         WHERE tenant_id = ? AND thread_id = ? AND status = 'interrupt_requested'",
+    )
+    .bind(tenant_id)
+    .bind(thread_id)
+    .execute(&mut *tx)
+    .await?;
+    if changed.rows_affected() == 1 {
+        sqlx::query::<Sqlite>(
+            "DELETE FROM agent_concurrency_permits
+             WHERE tenant_id = ? AND holder_thread_id = ?",
+        )
+        .bind(tenant_id)
+        .bind(thread_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    if changed.rows_affected() == 1 {
+        notify_team(tenant_id, &team_id);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 pub(crate) async fn interrupt_member(
@@ -1225,6 +1740,7 @@ pub(crate) async fn interrupt_member(
     tenant_id: &str,
     caller_thread_id: &str,
     target: &str,
+    caller_lease: Option<&WorkerLease>,
 ) -> Result<String, SemanticStoreError> {
     let (team_id, target_thread_id) =
         resolve_target(db, tenant_id, caller_thread_id, target).await?;
@@ -1235,8 +1751,41 @@ pub(crate) async fn interrupt_member(
     }
     let mut tx = db.begin().await?;
     acquire_sqlite_write_lock(&mut tx).await?;
+    if !team_caller_is_authorized_in_transaction(
+        &mut tx,
+        tenant_id,
+        caller_thread_id,
+        caller_lease,
+        false,
+    )
+    .await?
+    {
+        return Err(SemanticStoreError::InvalidEvent(
+            "agent team caller is neither the root coordinator nor a valid worker lease".into(),
+        ));
+    }
+    let target_is_root = sqlx::query_scalar::<Sqlite, i64>(
+        "SELECT EXISTS(
+             SELECT 1 FROM agent_team_members
+             WHERE tenant_id = ? AND team_id = ? AND thread_id = ?
+               AND parent_thread_id IS NULL
+         )",
+    )
+    .bind(tenant_id)
+    .bind(&team_id)
+    .bind(&target_thread_id)
+    .fetch_one(&mut *tx)
+    .await?
+        != 0;
+    if target_is_root {
+        return Err(SemanticStoreError::InvalidEvent(
+            "the root agent team coordinator cannot be interrupted".into(),
+        ));
+    }
     sqlx::query::<Sqlite>(
-        "UPDATE agent_team_members SET status = 'interrupt_requested', updated_at = CURRENT_TIMESTAMP
+        "UPDATE agent_team_members SET status = 'interrupt_requested',
+                 lease_owner = NULL, lease_expires_at = NULL,
+                 updated_at = CURRENT_TIMESTAMP
          WHERE tenant_id = ? AND team_id = ? AND thread_id = ?
            AND status IN ('queued','running')",
     )
@@ -1283,6 +1832,17 @@ mod tests {
         name: &str,
         key: &str,
     ) -> Result<SpawnRegistration, SemanticStoreError> {
+        spawn_with_lease(db, parent, child, name, key, None).await
+    }
+
+    async fn spawn_with_lease(
+        db: &SqlitePool,
+        parent: &str,
+        child: &str,
+        name: &str,
+        key: &str,
+        lease: Option<&WorkerLease>,
+    ) -> Result<SpawnRegistration, SemanticStoreError> {
         register_spawn(
             db,
             "tenant",
@@ -1294,6 +1854,7 @@ mod tests {
             "fresh",
             Some("test-model"),
             key,
+            lease,
         )
         .await
     }
@@ -1309,7 +1870,7 @@ mod tests {
         let first = spawn(&db, "root", "child-a", "worker-a", "spawn-a")
             .await
             .unwrap();
-        let duplicate = spawn(&db, "root", "ignored-child", "ignored-name", "spawn-a")
+        let duplicate = spawn(&db, "root", "ignored-child", "worker-a", "spawn-a")
             .await
             .unwrap();
         assert!(!first.existing);
@@ -1324,6 +1885,30 @@ mod tests {
             .await
             .unwrap(),
             0
+        );
+        assert!(
+            spawn(&db, "root", "child-conflict", "worker-b", "spawn-a")
+                .await
+                .is_err(),
+            "same idempotency key with a different payload must fail closed"
+        );
+        assert!(
+            register_spawn(
+                &db,
+                "tenant",
+                "other-owner",
+                "root",
+                "owner-conflict",
+                "worker-a",
+                "task for worker-a",
+                "fresh",
+                Some("test-model"),
+                "spawn-a",
+                None,
+            )
+            .await
+            .is_err(),
+            "idempotent replay must still validate the parent owner"
         );
 
         let conflict = spawn(&db, "root", "child-bad", "worker-a", "spawn-bad").await;
@@ -1391,7 +1976,13 @@ mod tests {
             Some("queued".into())
         );
 
-        let first_delivery = consume_mailbox(&db, "tenant", "child-a").await.unwrap();
+        let first_delivery_lease = claim_worker(&db, "tenant", "child-a", "delivery-lease-1")
+            .await
+            .unwrap()
+            .expect("queued mailbox worker should acquire a lease");
+        let first_delivery = consume_mailbox(&db, "tenant", "child-a", &first_delivery_lease)
+            .await
+            .unwrap();
         assert_eq!(first_delivery.messages.len(), 3);
         for expected in ["task for worker-a", "quiet update", "follow-up"] {
             assert!(first_delivery
@@ -1402,7 +1993,13 @@ mod tests {
         assert!(requeue_unacknowledged_mailbox(&db, "tenant", "child-a")
             .await
             .unwrap());
-        let retry = consume_mailbox(&db, "tenant", "child-a").await.unwrap();
+        let retry_lease = claim_worker(&db, "tenant", "child-a", "delivery-lease-2")
+            .await
+            .unwrap()
+            .expect("requeued mailbox worker should acquire a replacement lease");
+        let retry = consume_mailbox(&db, "tenant", "child-a", &retry_lease)
+            .await
+            .unwrap();
         assert_eq!(retry.delivery_id, first_delivery.delivery_id);
         assert_eq!(retry.messages, first_delivery.messages);
         assert_eq!(
@@ -1411,7 +2008,7 @@ mod tests {
                 .unwrap(),
             3
         );
-        assert!(consume_mailbox(&db, "tenant", "child-a")
+        assert!(consume_mailbox(&db, "tenant", "child-a", &retry_lease)
             .await
             .unwrap()
             .messages
@@ -1427,7 +2024,7 @@ mod tests {
             &db,
             "tenant",
             "owner",
-            "child-a",
+            "root",
             "root",
             "child result",
             false,
@@ -1444,13 +2041,13 @@ mod tests {
             .map(|item| item["id"].as_str().unwrap().to_string())
             .collect::<Vec<_>>();
         assert_eq!(
-            claim_pending_mailbox_items(&db, "tenant", "root", "wait-tool", &item_ids)
+            claim_pending_mailbox_items(&db, "tenant", "root", "wait-tool", &item_ids, None)
                 .await
                 .unwrap(),
             1
         );
         assert_eq!(
-            acknowledge_pending_mailbox(&db, "tenant", "root", "parent-turn")
+            acknowledge_pending_mailbox(&db, "tenant", "root", "parent-turn", None)
                 .await
                 .unwrap(),
             1
@@ -1472,7 +2069,7 @@ mod tests {
         )
         .await
         .unwrap();
-        interrupt_member(&db, "tenant", "root", "child-a")
+        interrupt_member(&db, "tenant", "root", "child-a", None)
             .await
             .unwrap();
         assert_eq!(
@@ -1534,14 +2131,179 @@ mod tests {
             .await
             .is_err());
 
-        assert!(claim_worker(&db, "tenant", "child-1", "lease-1")
+        let lease = claim_worker(&db, "tenant", "child-1", "lease-1")
             .await
-            .unwrap());
+            .unwrap()
+            .expect("queued worker should acquire its permit");
         let recovered = reclaim_startup_workers(&db).await.unwrap();
         assert!(recovered.iter().any(|member| member.thread_id == "child-1"));
         assert_eq!(
             member_status(&db, "tenant", "child-1").await.unwrap(),
             Some("queued".into())
+        );
+        assert!(
+            !mark_member_status_fenced(&db, "tenant", "child-1", &lease, "completed", None,)
+                .await
+                .unwrap(),
+            "the old lease cannot complete after startup fencing"
+        );
+
+        let replacement_lease = claim_worker(&db, "tenant", "child-1", "lease-2")
+            .await
+            .unwrap()
+            .expect("recovered worker should acquire a replacement lease");
+        sqlx::query::<Sqlite>(
+            "UPDATE agent_concurrency_permits
+             SET expires_at = datetime('now', '-1 second')
+             WHERE tenant_id = 'tenant' AND holder_thread_id = 'child-1'",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        assert!(!renew_worker_lease(
+            &db,
+            "tenant",
+            "child-1",
+            &replacement_lease.owner,
+            replacement_lease.fencing,
+        )
+        .await
+        .unwrap());
+        assert!(
+            !mark_member_status_fenced(
+                &db,
+                "tenant",
+                "child-1",
+                &replacement_lease,
+                "completed",
+                None,
+            )
+            .await
+            .unwrap(),
+            "an expired permit must fence terminal worker output"
+        );
+        assert!(
+            requeue_unacknowledged_mailbox_fenced(&db, "tenant", "child-1", &replacement_lease,)
+                .await
+                .unwrap(),
+            "the same fencing generation may safely requeue its unacknowledged work"
+        );
+        let current_lease = claim_worker(&db, "tenant", "child-1", "lease-3")
+            .await
+            .unwrap()
+            .expect("requeued worker should be reclaimable");
+        assert!(current_lease.fencing > replacement_lease.fencing);
+        assert!(
+            interrupt_member(&db, "tenant", "child-1", "root", Some(&current_lease))
+                .await
+                .is_err(),
+            "a child worker cannot interrupt the root coordinator"
+        );
+        assert_eq!(
+            member_status(&db, "tenant", "root").await.unwrap(),
+            Some("running".into())
+        );
+        assert!(
+            spawn(
+                &db,
+                "child-1",
+                "unfenced-grandchild",
+                "unfenced-grandchild",
+                "unfenced-spawn",
+            )
+            .await
+            .is_err(),
+            "a child cannot downgrade spawn to the root-only lease path"
+        );
+        assert!(
+            deliver_message(
+                &db,
+                "tenant",
+                "owner",
+                "child-1",
+                "root",
+                "unfenced message",
+                false,
+                "unfenced-message",
+            )
+            .await
+            .is_err(),
+            "a child cannot downgrade message delivery to the root-only lease path"
+        );
+        assert!(
+            consume_mailbox(&db, "tenant", "child-1", &replacement_lease)
+                .await
+                .is_err(),
+            "a replaced worker generation cannot consume mailbox work"
+        );
+        assert!(
+            !mark_member_status_fenced(
+                &db,
+                "tenant",
+                "child-1",
+                &replacement_lease,
+                "completed",
+                None,
+            )
+            .await
+            .unwrap(),
+            "a replaced worker generation cannot overwrite the current worker"
+        );
+
+        deliver_message(
+            &db,
+            "tenant",
+            "owner",
+            "root",
+            "child-1",
+            "fenced acknowledgement",
+            false,
+            "fenced-ack",
+        )
+        .await
+        .unwrap();
+        let ack_item = pending_mailbox(&db, "tenant", "child-1")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.message == "fenced acknowledgement")
+            .expect("test mailbox item should exist");
+        assert_eq!(
+            claim_pending_mailbox_items(
+                &db,
+                "tenant",
+                "child-1",
+                "fenced-ack-turn",
+                &[ack_item.id],
+                Some(&current_lease),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert!(
+            acknowledge_pending_mailbox(
+                &db,
+                "tenant",
+                "child-1",
+                "stale-turn",
+                Some(&replacement_lease),
+            )
+            .await
+            .is_err(),
+            "a replaced worker generation cannot acknowledge observed mailbox work"
+        );
+        assert_eq!(
+            acknowledge_pending_mailbox(
+                &db,
+                "tenant",
+                "child-1",
+                "current-turn",
+                Some(&current_lease),
+            )
+            .await
+            .unwrap(),
+            1
         );
 
         for index in 2..=4 {
@@ -1549,19 +2311,80 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let nested = spawn(&db, "child-1", "grandchild", "grandchild", "nested-1")
+        spawn(&db, "root", "lost-child", "lost-worker", "lost-spawn")
             .await
             .unwrap();
-        assert_eq!(nested.team_id, "root");
-        let deep = spawn(&db, "grandchild", "great-grandchild", "great", "nested-2")
+        let lost_lease = claim_worker(&db, "tenant", "lost-child", "lost-lease")
             .await
-            .unwrap();
-        assert_eq!(deep.team_id, "root");
+            .unwrap()
+            .expect("lost-worker should acquire a lease");
+        sqlx::query::<Sqlite>(
+            "UPDATE agent_mailbox_items SET delivery_attempts = 3
+             WHERE tenant_id = 'tenant' AND target_thread_id = 'lost-child'",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query::<Sqlite>(
+            "UPDATE agent_concurrency_permits
+             SET expires_at = datetime('now', '-1 second')
+             WHERE tenant_id = 'tenant' AND holder_thread_id = 'lost-child'",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
         assert!(
-            spawn(&db, "great-grandchild", "too-deep", "too-deep", "nested-3")
+            !requeue_unacknowledged_mailbox_fenced(&db, "tenant", "lost-child", &lost_lease)
                 .await
-                .is_err()
+                .unwrap()
         );
+        assert!(
+            mark_lost_worker_failed(&db, "tenant", "lost-child", &lost_lease, "lease lost",)
+                .await
+                .unwrap(),
+            "a lost worker with exhausted delivery attempts must reach a durable terminal state"
+        );
+        let nested = spawn_with_lease(
+            &db,
+            "child-1",
+            "grandchild",
+            "grandchild",
+            "nested-1",
+            Some(&current_lease),
+        )
+        .await
+        .unwrap();
+        assert_eq!(nested.team_id, "root");
+        let grandchild_lease = claim_worker(&db, "tenant", "grandchild", "grandchild-lease")
+            .await
+            .unwrap()
+            .expect("nested worker should acquire its fenced lease");
+        let deep = spawn_with_lease(
+            &db,
+            "grandchild",
+            "great-grandchild",
+            "great",
+            "nested-2",
+            Some(&grandchild_lease),
+        )
+        .await
+        .unwrap();
+        assert_eq!(deep.team_id, "root");
+        let great_grandchild_lease =
+            claim_worker(&db, "tenant", "great-grandchild", "great-grandchild-lease")
+                .await
+                .unwrap()
+                .expect("deep worker should acquire its fenced lease");
+        assert!(spawn_with_lease(
+            &db,
+            "great-grandchild",
+            "too-deep",
+            "too-deep",
+            "nested-3",
+            Some(&great_grandchild_lease),
+        )
+        .await
+        .is_err());
 
         let cancelled = request_descendant_cancellation(&db, "tenant", "root")
             .await

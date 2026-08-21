@@ -131,6 +131,15 @@ struct ProviderCompactionCapability {
     unavailable_reason: Option<String>,
 }
 
+fn compaction_attempt_is_active(
+    configured: bool,
+    supported: bool,
+    status: &str,
+    output_applied: bool,
+) -> bool {
+    configured && supported && status == "completed" && output_applied
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatCapabilityQuery {
@@ -285,6 +294,37 @@ async fn configured_model_capabilities_json(
     })
 }
 
+async fn configured_provider_supports_responses_compact_v1(
+    state: &AppState,
+    tenant_id: &str,
+    model: &str,
+) -> bool {
+    let row = sqlx::query(
+        r#"
+        SELECT provider, base_url
+        FROM api_keys
+        WHERE tenant_id = ?
+          AND enabled = 1
+          AND model_type = 'chat'
+          AND model = ?
+        ORDER BY priority ASC, created_at ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(model)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+    row.is_some_and(|row| {
+        let provider = sqlx::Row::get::<String, _>(&row, "provider");
+        let base_url = sqlx::Row::get::<Option<String>, _>(&row, "base_url");
+        provider.trim().to_ascii_lowercase() != "anthropic"
+            || base_url.is_some_and(|value| !value.trim().is_empty())
+    })
+}
+
 fn configured_compaction_protocol(value: Option<&Value>) -> Option<String> {
     let value = value?;
     let capability = [
@@ -297,25 +337,38 @@ fn configured_compaction_protocol(value: Option<&Value>) -> Option<String> {
     ]
     .iter()
     .find_map(|key| value.get(*key))?;
+    fn canonical_protocol(protocol: &str) -> Option<String> {
+        match protocol.trim().to_ascii_lowercase().as_str() {
+            "model_summary" | "summary" | "chat_summary" => Some("model_summary".to_string()),
+            "responses_compact_v1" | "responses_v1" | "v1" => {
+                Some("responses_compact_v1".to_string())
+            }
+            "responses_compact_v2" | "responses_v2" | "v2" => {
+                Some("responses_compact_v2".to_string())
+            }
+            _ => None,
+        }
+    }
     match capability {
         Value::Bool(true) => Some("model_summary".to_string()),
-        Value::String(protocol) => Some(protocol.trim().to_ascii_lowercase()),
+        Value::String(protocol) => canonical_protocol(protocol),
         Value::Object(object) => {
             let enabled = object
                 .get("enabled")
                 .or_else(|| object.get("enable"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            enabled.then(|| {
+            if !enabled {
+                return None;
+            }
+            canonical_protocol(
                 object
                     .get("protocol")
                     .or_else(|| object.get("mode"))
                     .or_else(|| object.get("strategy"))
                     .and_then(Value::as_str)
-                    .unwrap_or("model_summary")
-                    .trim()
-                    .to_ascii_lowercase()
-            })
+                    .unwrap_or("model_summary"),
+            )
         }
         _ => None,
     }
@@ -329,7 +382,10 @@ async fn provider_compaction_capability(
     let capabilities = configured_model_capabilities_json(state, tenant_id, model).await;
     let protocol = configured_compaction_protocol(capabilities.as_ref());
     let configured = protocol.is_some();
-    let supported = protocol.as_deref() == Some("responses_compact_v1");
+    let protocol_supported = protocol.as_deref() == Some("responses_compact_v1");
+    let provider_supported =
+        configured_provider_supports_responses_compact_v1(state, tenant_id, model).await;
+    let supported = protocol_supported && provider_supported;
     let provider_model = model
         .split_once('/')
         .map_or(model, |(_, provider_model)| provider_model);
@@ -347,23 +403,32 @@ async fn provider_compaction_capability(
     .ok()
     .flatten();
     let endpoint_called = latest.is_some();
-    let active = latest
-        .as_ref()
-        .is_some_and(|row| sqlx::Row::get::<String, _>(row, "status") == "completed");
     let output_applied = latest
         .as_ref()
         .is_some_and(|row| sqlx::Row::get::<i64, _>(row, "output_applied") != 0);
+    let active = latest.as_ref().is_some_and(|row| {
+        compaction_attempt_is_active(
+            configured,
+            supported,
+            &sqlx::Row::get::<String, _>(row, "status"),
+            output_applied,
+        )
+    });
     let fallback_reason = latest
         .as_ref()
         .and_then(|row| sqlx::Row::get::<Option<String>, _>(row, "fallback_reason"));
     let unavailable_reason = if !configured {
         Some("model capability does not declare provider compaction".to_string())
-    } else if !supported {
+    } else if !protocol_supported {
         Some("only responses_compact_v1 has a verified AOS adapter".to_string())
+    } else if !provider_supported {
+        Some("the configured provider does not expose a responses compact v1 adapter".to_string())
     } else if !active {
         Some(
-            "the configured /responses/compact endpoint has not completed a verified attempt"
-                .to_string(),
+            fallback_reason.clone().unwrap_or_else(|| {
+                "the configured /responses/compact endpoint has not completed a verified, applied attempt"
+                    .to_string()
+            }),
         )
     } else {
         None
@@ -572,7 +637,11 @@ pub fn routes(state: AppState) -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
-    use super::{current_search_provider, model_supports_reasoning_effort, SearchProviderStatus};
+    use super::{
+        compaction_attempt_is_active, configured_compaction_protocol, current_search_provider,
+        model_supports_reasoning_effort, SearchProviderStatus,
+    };
+    use serde_json::json;
 
     #[test]
     fn reasoning_effort_capability_is_model_specific() {
@@ -639,5 +708,41 @@ mod tests {
             current_search_provider(&providers).as_deref(),
             Some("mcp_search")
         );
+    }
+
+    #[test]
+    fn provider_compaction_aliases_are_canonicalized_and_only_applied_output_is_active() {
+        assert_eq!(
+            configured_compaction_protocol(Some(&json!({
+                "providerNativeCompaction": {"enabled": true, "protocol": "responses_v1"}
+            }))),
+            Some("responses_compact_v1".to_string())
+        );
+        assert_eq!(
+            configured_compaction_protocol(Some(&json!({
+                "providerNativeCompaction": {"enabled": true, "protocol": "unknown_v9"}
+            }))),
+            None
+        );
+        assert!(!compaction_attempt_is_active(
+            true,
+            true,
+            "completed",
+            false
+        ));
+        assert!(compaction_attempt_is_active(true, true, "completed", true));
+        assert!(!compaction_attempt_is_active(true, true, "failed", true));
+        assert!(!compaction_attempt_is_active(
+            false,
+            true,
+            "completed",
+            true
+        ));
+        assert!(!compaction_attempt_is_active(
+            true,
+            false,
+            "completed",
+            true
+        ));
     }
 }

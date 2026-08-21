@@ -866,12 +866,10 @@ pub(crate) async fn cancel_parent_turn(
                     .cancel_running_turn(&child_thread_id)
                     .await
                     .unwrap_or(false);
-                crate::agent_team::mark_member_status(
+                crate::agent_team::settle_interrupted_member(
                     &state.db,
                     &claims.tenant_id,
                     &child_thread_id,
-                    "idle",
-                    None,
                 )
                 .await?;
                 let result = json!({"status":"cancelled","liveSignal":live_signal});
@@ -3740,7 +3738,47 @@ fn agent_team_blocked_deferred_tools() -> Vec<String> {
 
 fn launch_agent_team_worker(state: AppState, claims: Claims, child_thread_id: String) {
     tokio::spawn(async move {
-        let result = run_agent_team_worker(&state, &claims, &child_thread_id).await;
+        let lease_owner = format!("agent-team-worker-{}", uuid::Uuid::new_v4());
+        let lease = match crate::agent_team::claim_worker(
+            &state.db,
+            &claims.tenant_id,
+            &child_thread_id,
+            &lease_owner,
+        )
+        .await
+        {
+            Ok(Some(lease)) => lease,
+            Ok(None) => {
+                if crate::agent_team::member_status(&state.db, &claims.tenant_id, &child_thread_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some("queued")
+                {
+                    let _ = crate::agent_team::wait_for_change(
+                        &state.db,
+                        &claims.tenant_id,
+                        &child_thread_id,
+                        10_000,
+                    )
+                    .await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    launch_agent_team_worker(state, claims, child_thread_id);
+                }
+                return;
+            }
+            Err(error) => {
+                tracing::error!(
+                    tenant_id = %claims.tenant_id,
+                    child_thread_id,
+                    error = %error,
+                    "durable agent team worker could not claim lease"
+                );
+                return;
+            }
+        };
+        let result = run_agent_team_worker(&state, &claims, &child_thread_id, &lease).await;
         if let Err(error) = result {
             tracing::error!(
                 tenant_id = %claims.tenant_id,
@@ -3756,52 +3794,44 @@ fn launch_agent_team_worker(state: AppState, claims: Claims, child_thread_id: St
                     .as_deref()
                     == Some("interrupt_requested");
             if interrupted {
-                let _ = crate::agent_team::mark_member_status(
+                let _ = crate::agent_team::settle_interrupted_member(
                     &state.db,
                     &claims.tenant_id,
                     &child_thread_id,
-                    "idle",
-                    None,
                 )
                 .await;
-            } else if crate::agent_team::requeue_unacknowledged_mailbox(
+            } else if crate::agent_team::requeue_unacknowledged_mailbox_fenced(
                 &state.db,
                 &claims.tenant_id,
                 &child_thread_id,
+                &lease,
             )
             .await
             .unwrap_or(false)
             {
                 launch_agent_team_worker(state.clone(), claims.clone(), child_thread_id.clone());
             } else {
-                let _ = crate::agent_team::mark_member_status(
+                let marked = crate::agent_team::mark_member_status_fenced(
                     &state.db,
                     &claims.tenant_id,
                     &child_thread_id,
+                    &lease,
                     "failed",
                     Some(&error.to_string()),
                 )
-                .await;
+                .await
+                .unwrap_or(false);
+                if !marked {
+                    let _ = crate::agent_team::mark_lost_worker_failed(
+                        &state.db,
+                        &claims.tenant_id,
+                        &child_thread_id,
+                        &lease,
+                        &error.to_string(),
+                    )
+                    .await;
+                }
             }
-        } else if crate::agent_team::member_status(&state.db, &claims.tenant_id, &child_thread_id)
-            .await
-            .ok()
-            .flatten()
-            .as_deref()
-            == Some("queued")
-        {
-            // The durable global permit may be temporarily full. Keep one
-            // replaceable waiter for this queued member and retry after a team
-            // lifecycle notification or a bounded lease-expiry interval.
-            let _ = crate::agent_team::wait_for_change(
-                &state.db,
-                &claims.tenant_id,
-                &child_thread_id,
-                10_000,
-            )
-            .await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            launch_agent_team_worker(state, claims, child_thread_id);
         }
     });
 }
@@ -3857,17 +3887,15 @@ async fn run_agent_team_worker(
     state: &AppState,
     claims: &Claims,
     child_thread_id: &str,
+    lease: &crate::agent_team::WorkerLease,
 ) -> Result<()> {
-    let lease_owner = format!("agent-team-worker-{}", uuid::Uuid::new_v4());
-    if !crate::agent_team::claim_worker(&state.db, &claims.tenant_id, child_thread_id, &lease_owner)
-        .await?
-    {
-        return Ok(());
-    }
     let heartbeat_db = state.db.clone();
     let heartbeat_tenant = claims.tenant_id.clone();
     let heartbeat_thread = child_thread_id.to_string();
-    let heartbeat_owner = lease_owner.clone();
+    let heartbeat_owner = lease.owner.clone();
+    let heartbeat_fencing = lease.fencing;
+    let heartbeat_manager = state.agent_manager().clone();
+    let (lease_lost_sender, mut lease_lost_receiver) = watch::channel(false);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(30));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3879,11 +3907,18 @@ async fn run_agent_team_worker(
                 &heartbeat_tenant,
                 &heartbeat_thread,
                 &heartbeat_owner,
+                heartbeat_fencing,
             )
             .await
             {
                 Ok(true) => {}
-                Ok(false) => break,
+                Ok(false) => {
+                    let _ = lease_lost_sender.send(true);
+                    let _ = heartbeat_manager
+                        .cancel_running_turn(&heartbeat_thread)
+                        .await;
+                    break;
+                }
                 Err(error) => {
                     tracing::warn!(
                         tenant_id = %heartbeat_tenant,
@@ -3891,12 +3926,18 @@ async fn run_agent_team_worker(
                         error = %error,
                         "agent team worker lease heartbeat failed"
                     );
+                    let _ = lease_lost_sender.send(true);
+                    let _ = heartbeat_manager
+                        .cancel_running_turn(&heartbeat_thread)
+                        .await;
+                    break;
                 }
             }
         }
     });
     let delivery =
-        crate::agent_team::consume_mailbox(&state.db, &claims.tenant_id, child_thread_id).await?;
+        crate::agent_team::consume_mailbox(&state.db, &claims.tenant_id, child_thread_id, lease)
+            .await?;
     let mailbox_turn_id = delivery.delivery_id;
     let messages = delivery.messages;
     if crate::agent_team::mailbox_result_was_delivered(
@@ -3907,11 +3948,12 @@ async fn run_agent_team_worker(
     )
     .await?
     {
-        crate::agent_team::acknowledge_mailbox_turn(
+        crate::agent_team::acknowledge_mailbox_turn_fenced(
             &state.db,
             &claims.tenant_id,
             child_thread_id,
             &mailbox_turn_id,
+            lease,
         )
         .await?;
         crate::agent_team::acknowledge_pending_mailbox(
@@ -3919,27 +3961,40 @@ async fn run_agent_team_worker(
             &claims.tenant_id,
             child_thread_id,
             &mailbox_turn_id,
+            Some(lease),
         )
         .await?;
-        crate::agent_team::mark_member_status(
+        if !crate::agent_team::mark_member_status_fenced(
             &state.db,
             &claims.tenant_id,
             child_thread_id,
+            lease,
             "completed",
             None,
         )
-        .await?;
+        .await?
+        {
+            return Err(AppError::Conflict(
+                "agent team worker lease was fenced before completion".to_string(),
+            ));
+        }
         return Ok(());
     }
     if messages.is_empty() {
-        crate::agent_team::mark_member_status(
+        if !crate::agent_team::mark_member_status_fenced(
             &state.db,
             &claims.tenant_id,
             child_thread_id,
+            lease,
             "idle",
             None,
         )
-        .await?;
+        .await?
+        {
+            return Err(AppError::Conflict(
+                "agent team worker lease was fenced before becoming idle".to_string(),
+            ));
+        }
         return Ok(());
     }
     let user_input = messages
@@ -4000,18 +4055,29 @@ async fn run_agent_team_worker(
             let mut results = Vec::with_capacity(suspended.deferred_tools.len());
             for tool in &suspended.deferred_tools {
                 results.push(
-                    resolve_agent_team_control_tool(state, claims, child_thread_id, tool).await,
+                    resolve_agent_team_control_tool(
+                        state,
+                        claims,
+                        child_thread_id,
+                        tool,
+                        Some(lease),
+                    )
+                    .await,
                 );
             }
-            manager
-                .resume_turn_streaming_with_options(
+            tokio::select! {
+                result = manager.resume_turn_streaming_with_options(
                     child_thread_id,
                     results,
                     sender.clone(),
                     options.clone(),
-                )
-                .await
-                .map_err(super_assistant_gateway_error)?
+                ) => result.map_err(super_assistant_gateway_error)?,
+                _ = lease_lost_receiver.wait_for(|lost| *lost) => {
+                    return Err(AppError::Conflict(
+                        "agent team worker lost its fenced lease during turn resume".to_string(),
+                    ));
+                }
+            }
         } else {
             if let Some(turn_id) = interrupted_turn_id.as_deref() {
                 manager
@@ -4019,15 +4085,19 @@ async fn run_agent_team_worker(
                     .await
                     .map_err(super_assistant_gateway_error)?;
             }
-            manager
-                .run_turn_streaming_with_options(
+            tokio::select! {
+                result = manager.run_turn_streaming_with_options(
                     child_thread_id,
                     user_input,
                     sender.clone(),
                     options.clone(),
-                )
-                .await
-                .map_err(super_assistant_gateway_error)?
+                ) => result.map_err(super_assistant_gateway_error)?,
+                _ = lease_lost_receiver.wait_for(|lost| *lost) => {
+                    return Err(AppError::Conflict(
+                        "agent team worker lost its fenced lease during turn execution".to_string(),
+                    ));
+                }
+            }
         };
         const MAX_AGENT_TEAM_CONTROL_ROUNDS: usize = 32;
         let mut control_rounds = usize::from(suspended_delivery);
@@ -4045,19 +4115,30 @@ async fn run_agent_team_worker(
                     let mut results = Vec::with_capacity(suspended.deferred_tools.len());
                     for tool in &suspended.deferred_tools {
                         results.push(
-                            resolve_agent_team_control_tool(state, claims, child_thread_id, tool)
-                                .await,
+                            resolve_agent_team_control_tool(
+                                state,
+                                claims,
+                                child_thread_id,
+                                tool,
+                                Some(lease),
+                            )
+                            .await,
                         );
                     }
-                    outcome = manager
-                        .resume_turn_streaming_with_options(
+                    outcome = tokio::select! {
+                        result = manager.resume_turn_streaming_with_options(
                             child_thread_id,
                             results,
                             sender.clone(),
                             options.clone(),
-                        )
-                        .await
-                        .map_err(super_assistant_gateway_error)?;
+                        ) => result.map_err(super_assistant_gateway_error)?,
+                        _ = lease_lost_receiver.wait_for(|lost| *lost) => {
+                            return Err(AppError::Conflict(
+                                "agent team worker lost its fenced lease during control resume"
+                                    .to_string(),
+                            ));
+                        }
+                    };
                 }
             }
         };
@@ -4073,7 +4154,7 @@ async fn run_agent_team_worker(
         .find(|member| member.thread_id == child_thread_id)
         .and_then(|member| member.parent_thread_id.clone());
     if let Some(parent_thread_id) = parent_thread_id {
-        crate::agent_team::deliver_message(
+        crate::agent_team::deliver_message_fenced(
             &state.db,
             &claims.tenant_id,
             &claims.sub,
@@ -4082,14 +4163,16 @@ async fn run_agent_team_worker(
             &result_text,
             false,
             &format!("agent-result:{mailbox_turn_id}"),
+            lease,
         )
         .await?;
     }
-    let acknowledged = crate::agent_team::acknowledge_mailbox_turn(
+    let acknowledged = crate::agent_team::acknowledge_mailbox_turn_fenced(
         &state.db,
         &claims.tenant_id,
         child_thread_id,
         &mailbox_turn_id,
+        lease,
     )
     .await?;
     if acknowledged == 0 {
@@ -4102,16 +4185,23 @@ async fn run_agent_team_worker(
         &claims.tenant_id,
         child_thread_id,
         &mailbox_turn_id,
+        Some(lease),
     )
     .await?;
-    crate::agent_team::mark_member_status(
+    if !crate::agent_team::mark_member_status_fenced(
         &state.db,
         &claims.tenant_id,
         child_thread_id,
+        lease,
         "completed",
         None,
     )
-    .await?;
+    .await?
+    {
+        return Err(AppError::Conflict(
+            "agent team worker lease was fenced before completion".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -4121,21 +4211,11 @@ async fn spawn_agent_control(
     caller_thread_id: &str,
     raw_input: &str,
     idempotency_key: &str,
+    caller_lease: Option<&crate::agent_team::WorkerLease>,
 ) -> Result<Value> {
     let request: SpawnAgentInput = serde_json::from_str(raw_input).map_err(|error| {
         AppError::ValidationError(format!("invalid spawn_agent input: {error}"))
     })?;
-    if let Some(existing) = crate::agent_team::find_spawn_by_key(
-        &state.db,
-        &claims.tenant_id,
-        caller_thread_id,
-        idempotency_key,
-    )
-    .await?
-    {
-        launch_agent_team_worker(state.clone(), claims.clone(), existing.clone());
-        return Ok(json!({"threadId": existing, "deduplicated": true}));
-    }
     let parent = state
         .agent_manager()
         .get_owned_session(caller_thread_id, &claims.tenant_id, &claims.sub)
@@ -4200,6 +4280,7 @@ async fn spawn_agent_control(
         context_mode,
         Some(selected_model),
         idempotency_key,
+        caller_lease,
     )
     .await;
     let registration = match registration {
@@ -4239,8 +4320,23 @@ async fn resolve_agent_team_control_tool(
     claims: &Claims,
     caller_thread_id: &str,
     tool: &DeferredToolUse,
+    caller_lease: Option<&crate::agent_team::WorkerLease>,
 ) -> DeferredToolResult {
     let result: Result<Value> = async {
+        if let Some(lease) = caller_lease {
+            if !crate::agent_team::worker_lease_is_valid(
+                &state.db,
+                &claims.tenant_id,
+                caller_thread_id,
+                lease,
+            )
+            .await?
+            {
+                return Err(AppError::Conflict(
+                    "agent team caller lost its fenced lease".to_string(),
+                ));
+            }
+        }
         match tool.tool_name.as_str() {
             "spawn_agent" => {
                 spawn_agent_control(
@@ -4249,6 +4345,7 @@ async fn resolve_agent_team_control_tool(
                     caller_thread_id,
                     &tool.input,
                     &tool.tool_use_id,
+                    caller_lease,
                 )
                 .await
             }
@@ -4261,17 +4358,32 @@ async fn resolve_agent_team_control_tool(
                         ))
                     })?;
                 let wake = tool.tool_name == "followup_task";
-                let output = crate::agent_team::deliver_message(
-                    &state.db,
-                    &claims.tenant_id,
-                    &claims.sub,
-                    caller_thread_id,
-                    &request.target,
-                    &request.message,
-                    wake,
-                    &tool.tool_use_id,
-                )
-                .await?;
+                let output = if let Some(lease) = caller_lease {
+                    crate::agent_team::deliver_message_fenced(
+                        &state.db,
+                        &claims.tenant_id,
+                        &claims.sub,
+                        caller_thread_id,
+                        &request.target,
+                        &request.message,
+                        wake,
+                        &tool.tool_use_id,
+                        lease,
+                    )
+                    .await?
+                } else {
+                    crate::agent_team::deliver_message(
+                        &state.db,
+                        &claims.tenant_id,
+                        &claims.sub,
+                        caller_thread_id,
+                        &request.target,
+                        &request.message,
+                        wake,
+                        &tool.tool_use_id,
+                    )
+                    .await?
+                };
                 if wake {
                     if let Some(target) = output.get("target").and_then(Value::as_str) {
                         launch_agent_team_worker(state.clone(), claims.clone(), target.to_string());
@@ -4335,6 +4447,7 @@ async fn resolve_agent_team_control_tool(
                         caller_thread_id,
                         &tool.tool_use_id,
                         &mailbox_ids,
+                        caller_lease,
                     )
                     .await?;
                 }
@@ -4350,6 +4463,7 @@ async fn resolve_agent_team_control_tool(
                     &claims.tenant_id,
                     caller_thread_id,
                     &request.target,
+                    caller_lease,
                 )
                 .await?;
                 let control_id = crate::semantic_kernel_store::record_child_control(
@@ -4366,12 +4480,10 @@ async fn resolve_agent_team_control_tool(
                     .await
                     .map_err(super_assistant_gateway_error)?;
                 if !interrupted {
-                    crate::agent_team::mark_member_status(
+                    crate::agent_team::settle_interrupted_member(
                         &state.db,
                         &claims.tenant_id,
                         &target,
-                        "idle",
-                        None,
                     )
                     .await?;
                 }
@@ -4423,7 +4535,7 @@ async fn resolve_parent_tool(
         "spawn_agent" | "send_message" | "followup_task" | "list_agents" | "wait_agent"
         | "interrupt_agent" => {
             let result =
-                resolve_agent_team_control_tool(state, claims, &input.session_id, tool).await;
+                resolve_agent_team_control_tool(state, claims, &input.session_id, tool, None).await;
             if result.is_error {
                 Err(AppError::ValidationError(result.output))
             } else {
@@ -8814,6 +8926,7 @@ async fn persist_parent_final(
         &claims.tenant_id,
         &input.session_id,
         &input.turn_id,
+        None,
     )
     .await?;
     let newly_committed = !committed_events.is_empty();

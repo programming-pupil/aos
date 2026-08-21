@@ -1,24 +1,24 @@
 # AOS 对齐 Codex 与 DeepSeek Harness 最终架构审计
 
-> 审计日期：2026-08-20
-> AOS 本轮修复基线：`870bf8d6b6ffa1ca015801abf45ec8f124ca5e5a`
-> OpenAI Codex 对比版本：`bc3545b805de6e91a11b88114fe1673b678633ca`
+> 审计日期：2026-08-21
+> AOS 本轮复审起点：`747a08f84284065b5b7b2e8aeb53bf27088ac5f5`；修复基线为本报告所在提交
+> OpenAI Codex 对比版本：`bd19459358f534ed1cae464ec13d56600aeb45f2`
 > DeepSeek Harness（下称 DSH）对比版本：`141eb6fef83422698aef7a981029e843e8161534`
 > 审计范围：harness、上下文真实性、压缩、恢复、多 Agent、沙箱、Provider 边界、Memory 与能力声明
 
 ## 1. 最终结论
 
-本轮审计发现的三个 P0 架构缺口和三个 P1 治理缺口已经完成代码修复，不再需要另行输出“待研发实现”的规格文档。
+本次复审不是复述上一版文档，而是重新阅读三方当前核心源码并验证生产调用链。复审新发现的 Agent Team lease fencing 失效、quiet mailbox missed wakeup、spawn 幂等碰撞、provider compaction `active` 误报、surface 输入校验不足和状态更新非事务问题均已完成代码修复，不再需要另行输出“待研发实现”的规格文档。
 
 AOS 当前可以准确表述为：
 
 - 核心 harness 架构不变量已经与 Codex、DSH 对齐；
 - 普通 Chat、Super Assistant 与 Agent Runtime 的模型可见会话都以 durable append-only Ledger 的 canonical surface 为权威；
 - 不产生长期会话的 PM、RD、NL2SQL、搜索、附件摘要、安全扫描和对抗模型调用，使用独立的 durable one-shot dispatch authority，在 Provider I/O 前提交完整 typed request；
-- 通用 Agent Team 已具备模型可调用的 `spawn / send / followup / list / wait / interrupt`、独立子会话、持久 mailbox、全局 permit、lease、递归取消和冷恢复；
+- 通用 Agent Team 已具备模型可调用的 `spawn / send / followup / list / wait / interrupt`、独立子会话、持久 mailbox、全局 permit、owner+generation fencing lease、失租取消、递归取消和冷恢复；
 - shell 已收敛到统一 `SandboxBackend`：Linux 在 `bwrap + prlimit` 探针通过时提供 full enforcement；不支持的平台或探针失败时 fail-closed，不再回退 host shell；
 - `/responses/compact` v1 已使用专用 endpoint、请求/响应类型和持久 attempt lineage；opaque provider item 不会被伪装成文本摘要；
-- capability API 区分 `configured / supported / active`，不再把配置存在误报为实际生效。
+- capability API 区分 `configured / supported / active`；`/responses/compact` endpoint 完成但 opaque output 未应用时，必须报告 `active=false` 并公开 durable fallback reason。
 
 这不等于可以宣称“效果全面超过 Codex 和 DSH”。源码对齐证明架构基础与故障语义，不证明回答质量、任务完成率或成本领先。领先结论仍需同模型、同工具、同权限和同预算的去品牌盲测。
 
@@ -33,14 +33,14 @@ AOS 当前可以准确表述为：
 | 压缩、大输出与长期连续性 | 12% | 9.1 | 9.5 | 9.2 | exact archive、replacement provenance、native compact v1 与安全回退 |
 | Session durability、replay、crash recovery | 12% | 9.2 | 9.0 | 9.7 | durable Ledger、writer fencing、checkpoint、legacy import/export |
 | 长期 Memory | 10% | 9.4 | 8.5 | 6.5 | typed fact、证据、敏感度、projection/outbox、冲突与污染治理 |
-| 通用模型驱动多 Agent | 14% | 8.8 | 9.5 | 9.0 | durable roster/mailbox/task/permit/lease、六个统一控制工具 |
+| 通用模型驱动多 Agent | 14% | 9.3 | 9.5 | 9.0 | durable roster/mailbox/task、六个控制工具、generation fencing 与失租取消 |
 | 权限、审批与执行沙箱 | 12% | 8.3 | 9.5 | 9.2 | Linux full enforcement；其他平台 unavailable + fail-closed |
-| Provider 抽象与请求 lineage | 7% | 9.3 | 9.0 | 8.5 | 会话 surface 与 one-shot dispatch 分治，完整 request hashes/AAD ciphertext |
+| Provider 抽象与请求 lineage | 7% | 9.2 | 9.0 | 8.5 | 会话 surface 与 one-shot dispatch 分治，完整 request hashes/AAD ciphertext，能力真值 |
 | MCP、Skills 与扩展性 | 5% | 8.8 | 9.0 | 9.5 | 工具注册、deferred controls、tenant-scoped MCP/Skill |
 | 可观测、评测与故障证据 | 6% | 9.0 | 9.0 | 9.0 | capability truth、迁移升级测试、语义行为门禁与故障测试 |
-| **加权总分** | **100%** | **9.0** | **9.2** | **9.0** | **核心架构已对齐；领先仍需实证** |
+| **加权总分** | **100%** | **9.1** | **9.2** | **9.0** | **核心架构已对齐；效果领先仍需实证** |
 
-AOS 相比审计前的 7.6 分，主要提升来自 canonical surface、Durable Agent Team 和统一沙箱三个 P0 的关闭。没有给到 10 分的原因是跨平台 full sandbox 尚未提供，以及 opaque `/responses/compact` continuation 仍选择安全回退而非直接应用。
+AOS 相比首次审计前的 7.6 分，主要提升来自 canonical surface、Durable Agent Team 和统一沙箱三个 P0 的关闭。本次把多 Agent 从 8.8 调整为 9.3，是因为 lease generation 已真正贯穿 claim、renew、result delivery、mailbox ack、terminal commit 和失租取消，而不是只在表中递增。没有给到 10 分的原因是跨平台 full sandbox 尚未提供，以及 opaque `/responses/compact` continuation 仍选择安全回退而非直接应用。
 
 ## 3. 三方源码基准
 
@@ -52,9 +52,10 @@ AOS 相比审计前的 7.6 分，主要提升来自 canonical surface、Durable 
 - `codex-rs/core/src/compact.rs`、`compact_remote.rs`、`compact_remote_v2.rs`：本地及 remote compaction；
 - `codex-rs/memories/write/`：Memory 抽取、整合、lease、heartbeat 和污染控制；
 - `codex-rs/core/src/tools/handlers/multi_agents_v2/`、`core/src/session/multi_agents.rs`：通用 Agent 控制面；
+- `codex-rs/core/src/agents_md.rs`、`agents_md_manager.rs`、`session/mod.rs`：active project trust 进入项目指令加载和 cache key；
 - `codex-rs/linux-sandbox/`、`windows-sandbox-rs/`：真实 OS enforcement。
 
-固定版本：<https://github.com/openai/codex/tree/bc3545b805de6e91a11b88114fe1673b678633ca>。
+固定版本：<https://github.com/openai/codex/tree/bd19459358f534ed1cae464ec13d56600aeb45f2>。
 
 ### 3.2 DSH
 
@@ -78,6 +79,7 @@ AOS 相比审计前的 7.6 分，主要提升来自 canonical surface、Durable 
 - `SurfaceMessage` 保留 role、text、thinking、image/document、tool call/result；
 - `SurfaceOperation::Append/Replace` 绑定事件序列和来源；
 - fold 校验 Ledger 序列连续、message id 唯一、replacement 当前且连续；
+- event-local 校验 role/block 合法性、tool invocation/name 非空、image/document source 仅允许 `url/base64`；
 - Provider dispatch 前校验 tool call/result 严格配对、surface hash 与 request messages hash 相同；
 - crash repair 通过显式 error tool result 收敛未完成调用，不能静默删掉半边历史。
 
@@ -113,10 +115,17 @@ AOS 相比审计前的 7.6 分，主要提升来自 canonical surface、Durable 
 控制平面的关键不变量：
 
 - spawn、child edge、mailbox、task、permit 和 Ledger control event 在一个事务内提交，事务完成后才启动 worker；
+- 所有 optional lease 写入口均 fail-closed：`Some` 必须通过 member+permit fencing，`None` 只允许 root coordinator；child 不能通过内部 API 降级为无租约调用；
 - `(tenant, team, name)` 与 mailbox idempotency key 唯一；同 key 不得改变内容或 quiet/followup 语义；
+- spawn 幂等重试在返回既有 child 前重新验证 parent owner、name、task hash、context mode 与 model；同 key 不同 payload fail-closed；
 - 全树共享 team permit，深度和并发有硬上限，queued worker 不会绕过全局配额；
+- root coordinator 不是合法的 interrupt target，child 无法通过控制面取消主协调器；
 - mailbox at-least-once delivery，delivery ID 固定，result delivery 和 consume acknowledgement 幂等；
-- lease heartbeat、进程重启 reclaim、未 ack requeue、递归取消和 tenant/owner 隔离均已实现；
+- quiet mailbox 在 `Notify` arm 后会同时复读 roster 和 mailbox，关闭 `notify_waiters` 不保留 permit 导致的 missed wakeup；
+- `WorkerLease(owner, fencing, team)` 同时绑定 member 与 global permit；mailbox consume、renew、result delivery、ack 和 terminal 都在写事务内校验 generation 与未过期 permit；
+- 旧 generation 无法提交完成/失败、投递结果或消费 mailbox；heartbeat 失租/续租异常会立即取消当前模型 turn；
+- member、permit 和 task terminal 更新在同一 SQLite write transaction 内提交；expired permit 不会被旧 worker 覆盖；
+- lease heartbeat、进程重启 reclaim、未 ack fenced requeue、递归取消和 tenant/owner 隔离均已实现；
 - child 使用独立 canonical Session、预算和工具生命周期；父子权限不通过控制消息升级。
 
 ### 4.3 P0：统一真实 SandboxBackend
@@ -141,7 +150,8 @@ Linux full enforcement 包含：
 
 当前语义：
 
-- 只有显式 `responses_compact_v1` 且 Provider adapter 支持时才标记 active；
+- `responses_v1/v1` 等配置别名与 runtime parser 使用同一 canonical protocol；
+- 只有当前仍显式配置 `responses_compact_v1`、所选 Provider adapter 支持、attempt completed 且 `output_applied=true` 时才标记 active；历史成功 attempt 不会污染已关闭或已切换协议的当前能力状态；
 - `model_summary` 继续如实标记为 fallback，不冒充 native compact；
 - v2 目前仅能被识别为 configured，不能标记 supported/active；
 - normalized output、retained items、hash、AAD ciphertext、parent attempt、timeout/failure 和 `output_applied` 均可审计；
@@ -160,6 +170,8 @@ Linux full enforcement 包含：
 
 PM、RD、NL2SQL、搜索、Skill 安全扫描、图片摘要和对抗流程使用 governed provider wrapper；会话型 runtime 继续使用 canonical Ledger + request lineage。两类 authority 按是否存在可延续 session 分治，避免为“一致”而制造第二套 shadow history。
 
+Codex 最新版本新增了 active-project trust gate。AOS 的应用边界不同：生产 session workspace 只能来自 tenant/user 专属 workspace、用户显式绑定并由 `GitLabManager` 同步的 owned repository，或由这些 workspace 派生的 hidden internal worktree；RD instruction loader 在 `repository_root` 处再次校验 tenant/user ownership。AOS 不接受客户端传入任意 host cwd 后自动把其中 `AGENTS.md/CLAUDE.md` 提升为指令，因此不需要复制 Codex 的本地 CLI trust UI；若未来开放任意本地 cwd，必须先增加等价 trust gate。
+
 ## 5. 关键负向与恢复场景
 
 本轮新增或加强的测试覆盖：
@@ -170,7 +182,7 @@ PM、RD、NL2SQL、搜索、Skill 安全扫描、图片摘要和对抗流程使�
 - compaction prepare/commit 的 archive hash、stream revision、turn revision、baseline、token proof；
 - compaction commit 任一后段写失败时 Memory、cursor、checkpoint、Ledger 全事务回滚；
 - Agent Team 同名冲突、幂等 spawn、quiet/followup 差异、missed wakeup、tenant isolation；
-- mailbox lost-ack retry、permit 饥饿、lease recovery、递归取消和 interrupt 后消息保留；
+- mailbox lost-ack retry、stale generation consume/ack/terminal rejection、child 无租约降级拒绝、expired permit fencing/requeue、lease recovery、递归取消和 interrupt 后消息保留；
 - unsupported sandbox 不执行、launcher path/cwd 不越界、model bash 不接受危险控制字段；
 - one-shot dispatch request 加密、attempt 递增、terminal 与 restart recovery；
 - N-1/N-2 SQLite snapshot 可升级且 semantic data 不丢失。
@@ -182,7 +194,7 @@ PM、RD、NL2SQL、搜索、Skill 安全扫描、图片摘要和对抗流程使�
 1. **当前开发机为 macOS。** 本机 sandbox 状态必须是 `unavailable` 且 fail-closed。只有在安装 `bwrap + prlimit` 并通过真实 probe 的 Linux runner 上，才能对外声明 `full`。不得把 macOS 单元测试当成 Linux escape-test 证据。
 2. **macOS/Windows 未提供 full runner。** AOS 在这些平台的安全承诺是“不执行受保护命令”，不是“已经有原生隔离”。
 3. **opaque compact continuation 不直接应用。** AOS 保存并审计 opaque items，但在拥有经过验证的 continuation contract 前回退到 deterministic/model summary。这比伪装成文本摘要更安全，但功能上不等同于 Codex 的全部 remote-v2 continuation。
-4. **9.0 是架构评分，不是效果评分。** 对外如需使用“领先/赶超”，必须公开盲测原始 cases、失败样本、任务完成率、恢复成功率、越权率、p50/p95、token/cost 和置信区间。
+4. **9.1 是架构评分，不是效果评分。** 对外如需使用“领先/赶超”，必须公开盲测原始 cases、失败样本、任务完成率、恢复成功率、越权率、p50/p95、token/cost 和置信区间。
 
 ## 7. 最终门禁
 
@@ -192,7 +204,9 @@ PM、RD、NL2SQL、搜索、Skill 安全扫描、图片摘要和对抗流程使�
 | --- | --- |
 | `cargo fmt --all -- --check` | 通过 |
 | `cargo check --workspace --all-features` | 通过 |
-| `cargo test --workspace --all-features` | 通过（exit 0；web-server 1178 passed、0 failed、1 ignored；进程故障集成测试 2 passed） |
+| semantic-kernel strict clippy（all features/targets，deny warnings） | 通过 |
+| `cargo clippy --workspace --all-features` | 通过（correctness/suspicious deny） |
+| `cargo test --workspace --all-features` | 通过（exit 0；web-server 1179 passed、0 failed、1 ignored；进程故障集成测试 2 passed） |
 | `scripts/check-semantic-kernel-behavior.sh` | 通过（40 cases，均产生 production trace） |
 | `git diff --check` | 通过 |
 
@@ -204,7 +218,7 @@ PM、RD、NL2SQL、搜索、Skill 安全扫描、图片摘要和对抗流程使�
 
 - AOS 已具备 durable canonical session surface、proof-carrying compaction、typed evidence-backed Memory、Durable Agent Team、统一 fail-closed sandbox backend 和持久 provider request lineage；
 - AOS 在多租户 Memory 治理、业务语义内核和审计证据上形成了区别于本地 coding agent 的研究价值；
-- AOS 的核心 harness 架构不变量已对齐 Codex 与 DSH，当前源码架构评分约 9.0/10。
+- AOS 的核心 harness 架构不变量已对齐 Codex 与 DSH，当前源码架构评分约 9.1/10。
 
 不可以声明：
 

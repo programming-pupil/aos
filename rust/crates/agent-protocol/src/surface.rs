@@ -132,6 +132,20 @@ pub enum SurfaceError {
     EmptyMessageId,
     #[error("surface message {0} has no content blocks")]
     EmptyMessage(String),
+    #[error("surface block is not valid for message role {role}: {block}")]
+    InvalidBlockRole { role: String, block: String },
+    #[error("tool call invocation id is empty")]
+    EmptyToolInvocationId,
+    #[error("tool call name is empty")]
+    EmptyToolName,
+    #[error("tool result invocation id is empty")]
+    EmptyToolResultInvocationId,
+    #[error("image/document source type is invalid: {0}")]
+    InvalidMediaSourceType(String),
+    #[error("image/document media type is empty")]
+    EmptyMediaType,
+    #[error("image/document data is empty")]
+    EmptyMediaData,
     #[error("surface message id is already active: {0}")]
     DuplicateMessageId(String),
     #[error("surface replacement source is empty")]
@@ -169,6 +183,76 @@ fn validate_message(message: &SurfaceMessage) -> Result<(), SurfaceError> {
     if message.blocks.is_empty() {
         return Err(SurfaceError::EmptyMessage(message.message_id.clone()));
     }
+    for block in &message.blocks {
+        match block {
+            SurfaceBlock::ToolCall {
+                invocation_id,
+                tool_name,
+                ..
+            } => {
+                if message.role != SurfaceRole::Assistant {
+                    return Err(SurfaceError::InvalidBlockRole {
+                        role: format!("{:?}", message.role),
+                        block: "tool_call".into(),
+                    });
+                }
+                if invocation_id.trim().is_empty() {
+                    return Err(SurfaceError::EmptyToolInvocationId);
+                }
+                if tool_name.trim().is_empty() {
+                    return Err(SurfaceError::EmptyToolName);
+                }
+            }
+            SurfaceBlock::ToolResult {
+                invocation_id,
+                tool_name,
+                ..
+            } => {
+                if !matches!(message.role, SurfaceRole::Tool | SurfaceRole::User) {
+                    return Err(SurfaceError::InvalidBlockRole {
+                        role: format!("{:?}", message.role),
+                        block: "tool_result".into(),
+                    });
+                }
+                if invocation_id.trim().is_empty() {
+                    return Err(SurfaceError::EmptyToolResultInvocationId);
+                }
+                // API tool results do not always carry a tool name. When a
+                // name is present it is validated against the invocation in
+                // `validate_model_messages`.
+                let _ = tool_name;
+            }
+            SurfaceBlock::Thinking { .. } if message.role != SurfaceRole::Assistant => {
+                return Err(SurfaceError::InvalidBlockRole {
+                    role: format!("{:?}", message.role),
+                    block: "thinking".into(),
+                });
+            }
+            SurfaceBlock::Thinking { .. } => {}
+            SurfaceBlock::Image {
+                media_type,
+                source_type,
+                data,
+            }
+            | SurfaceBlock::Document {
+                media_type,
+                source_type,
+                data,
+                ..
+            } => {
+                if media_type.trim().is_empty() {
+                    return Err(SurfaceError::EmptyMediaType);
+                }
+                if !matches!(source_type.trim(), "url" | "base64") {
+                    return Err(SurfaceError::InvalidMediaSourceType(source_type.clone()));
+                }
+                if data.trim().is_empty() {
+                    return Err(SurfaceError::EmptyMediaData);
+                }
+            }
+            SurfaceBlock::Text { .. } => {}
+        }
+    }
     Ok(())
 }
 
@@ -192,6 +276,15 @@ pub fn validate_model_messages(messages: &[ModelSurfaceMessage]) -> Result<(), S
     let mut calls = BTreeMap::<String, String>::new();
     let mut results = BTreeSet::<String>::new();
     for message in messages {
+        if message.blocks.is_empty() {
+            return Err(SurfaceError::EmptyReplacementOutput);
+        }
+        let synthetic = SurfaceMessage {
+            message_id: "model-message".into(),
+            role: message.role,
+            blocks: message.blocks.clone(),
+        };
+        validate_message(&synthetic)?;
         for block in &message.blocks {
             match block {
                 SurfaceBlock::ToolCall {
@@ -538,5 +631,46 @@ mod tests {
             validate_model_messages(&[call, mismatched]),
             Err(SurfaceError::ToolNameMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn surface_rejects_invalid_roles_and_media_sources_before_fold() {
+        let invalid_call = event(
+            1,
+            SurfaceOperation::Append {
+                message: SurfaceMessage {
+                    message_id: "bad-call".into(),
+                    role: SurfaceRole::User,
+                    blocks: vec![SurfaceBlock::ToolCall {
+                        invocation_id: "call".into(),
+                        tool_name: "read_file".into(),
+                        input: "{}".into(),
+                    }],
+                },
+            },
+        );
+        assert!(matches!(
+            fold_surface(&[invalid_call]),
+            Err(SurfaceError::InvalidBlockRole { .. })
+        ));
+
+        let invalid_media = event(
+            1,
+            SurfaceOperation::Append {
+                message: SurfaceMessage {
+                    message_id: "bad-media".into(),
+                    role: SurfaceRole::User,
+                    blocks: vec![SurfaceBlock::Image {
+                        media_type: "image/png".into(),
+                        source_type: "file_path".into(),
+                        data: "/tmp/image.png".into(),
+                    }],
+                },
+            },
+        );
+        assert_eq!(
+            fold_surface(&[invalid_media]).unwrap_err(),
+            SurfaceError::InvalidMediaSourceType("file_path".into())
+        );
     }
 }
