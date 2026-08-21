@@ -74,6 +74,9 @@ pub enum GatewayError {
     #[error("turn cancelled")]
     TurnCancelled,
 
+    #[error("agent runtime is shutting down and no longer accepts new turns")]
+    ShuttingDown,
+
     #[error("invalid token")]
     InvalidToken,
 
@@ -98,6 +101,7 @@ impl GatewayError {
             | Self::SessionAlreadyExists(_)
             | Self::SessionBusy
             | Self::TurnCancelled => StatusCode::CONFLICT,
+            Self::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
             Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             Self::GitError(_)
             | Self::RuntimeBuild(_)

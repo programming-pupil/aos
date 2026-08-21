@@ -9,13 +9,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::Row;
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify, RwLock};
 use tokio::time::{sleep, Duration, Instant};
 
 use crate::config_registry::{
@@ -41,6 +42,68 @@ use sha2::Digest;
 const DEFAULT_MAX_CONCURRENT: usize = 3;
 const INTERNAL_TRANSIENT_SESSION_SWEEP_AFTER_SECS: i64 = 30 * 60;
 const CONTEXT_ARCHIVE_MAX_CHARS: usize = 2_000_000;
+
+struct TurnAdmission {
+    accepting: AtomicBool,
+    active: AtomicUsize,
+    idle: Notify,
+}
+
+impl TurnAdmission {
+    fn new() -> Self {
+        Self {
+            accepting: AtomicBool::new(true),
+            active: AtomicUsize::new(0),
+            idle: Notify::new(),
+        }
+    }
+
+    fn admit(self: &Arc<Self>) -> Result<ActiveTurnGuard> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(GatewayError::ShuttingDown);
+        }
+        self.active.fetch_add(1, Ordering::AcqRel);
+        if !self.accepting.load(Ordering::Acquire) {
+            if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+                self.idle.notify_waiters();
+            }
+            return Err(GatewayError::ShuttingDown);
+        }
+        Ok(ActiveTurnGuard {
+            admission: Arc::clone(self),
+        })
+    }
+
+    async fn wait_until_idle(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.active.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.active.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.active.load(Ordering::Acquire) == 0;
+            }
+        }
+    }
+}
+
+struct ActiveTurnGuard {
+    admission: Arc<TurnAdmission>,
+}
+
+impl Drop for ActiveTurnGuard {
+    fn drop(&mut self) {
+        if self.admission.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.admission.idle.notify_waiters();
+        }
+    }
+}
 
 /// Rebuild the user-visible runtime session from the durable execution ledger.
 /// JSONL is intentionally not consulted here: it is an export/compatibility
@@ -745,6 +808,10 @@ pub struct AgentSessionManager {
     /// actions such as "Stop" can signal the in-flight async turn to drop its
     /// provider request, restore runtime state, and return control to the user.
     running_turn_cancels: Arc<RwLock<HashMap<String, oneshot::Sender<()>>>>,
+    /// Process-lifecycle gate. Shutdown closes admission before observing the
+    /// active count, then waits for every admitted turn to reach a durable
+    /// terminal state (or cooperatively cancels it after the grace period).
+    turn_admission: Arc<TurnAdmission>,
     /// Optional factory that builds a per-session "extract → persist → compact"
     /// hook (e.g. the web-server Super_Assistant `RuntimeCompactionHook`) applied
     /// to every runtime this manager builds. Set once at startup; `None` keeps
@@ -826,6 +893,7 @@ impl AgentSessionManager {
             // Config version starts at 0; incremented on each hot-reload.
             mcp_config_version: Arc::new(RwLock::new(HashMap::new())),
             running_turn_cancels: Arc::new(RwLock::new(HashMap::new())),
+            turn_admission: Arc::new(TurnAdmission::new()),
             compaction_hook_factory: None,
         }
     }
@@ -1303,6 +1371,7 @@ impl AgentSessionManager {
         user_input: String,
         options: AgentTurnOptions,
     ) -> Result<TurnResult> {
+        let _active_turn = self.turn_admission.admit()?;
         tracing::debug!(
             "session_manager::run_turn: starting for session {}",
             session_id
@@ -2053,6 +2122,7 @@ impl AgentSessionManager {
         deferred_results: Option<Vec<runtime::DeferredToolResult>>,
         approval_decisions: Option<Vec<runtime::DeferredApprovalDecision>>,
     ) -> Result<AgentTurnRunOutcome> {
+        let _active_turn = self.turn_admission.admit()?;
         // Acquire the per-session lock — non-blocking. If the session already has
         // a turn in-flight, try_lock returns None and we return 409 CONFLICT.
         let lock = {
@@ -3255,6 +3325,56 @@ impl AgentSessionManager {
         } else {
             Ok(false)
         }
+    }
+
+    /// Close turn admission and wait for in-flight work to converge. Once the
+    /// graceful budget expires, every registered cooperative cancel handle is
+    /// fired and the manager waits once more for the cancellation checkpoints.
+    /// A `false` result means the caller must preserve its unclean-shutdown marker.
+    pub async fn shutdown_gracefully(
+        &self,
+        graceful_timeout: Duration,
+        cancellation_timeout: Duration,
+    ) -> bool {
+        self.turn_admission
+            .accepting
+            .store(false, Ordering::Release);
+        if self.turn_admission.wait_until_idle(graceful_timeout).await {
+            return true;
+        }
+
+        let cancels = {
+            let mut running = self.running_turn_cancels.write().await;
+            running
+                .drain()
+                .map(|(_, cancel)| cancel)
+                .collect::<Vec<_>>()
+        };
+        let cancelled_count = cancels.len();
+        for cancel in cancels {
+            let _ = cancel.send(());
+        }
+        tracing::warn!(
+            active_turns = self.turn_admission.active.load(Ordering::Acquire),
+            cancelled_count,
+            "agent turn shutdown grace expired; requested cooperative cancellation"
+        );
+        self.turn_admission
+            .wait_until_idle(cancellation_timeout)
+            .await
+    }
+
+    /// Stop accepting new model turns immediately. This is split from the wait
+    /// method so the HTTP acceptor and the agent admission gate close together.
+    pub fn begin_shutdown(&self) {
+        self.turn_admission
+            .accepting
+            .store(false, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn active_turn_count(&self) -> usize {
+        self.turn_admission.active.load(Ordering::Acquire)
     }
 
     /// Return token-aware context status for a session without mutating it.
@@ -4677,6 +4797,19 @@ mod tests {
     use super::*;
     use crate::config_registry::{ApiKeyEntry, UserRuntimeConfig};
     use proptest::prelude::*;
+
+    #[tokio::test]
+    async fn turn_admission_rejects_shutdown_races_and_notifies_when_idle() {
+        let admission = Arc::new(TurnAdmission::new());
+        let active_turn = admission.admit().expect("first turn should be admitted");
+        admission.accepting.store(false, Ordering::Release);
+
+        assert!(matches!(admission.admit(), Err(GatewayError::ShuttingDown)));
+        assert!(!admission.wait_until_idle(Duration::from_millis(1)).await);
+
+        drop(active_turn);
+        assert!(admission.wait_until_idle(Duration::from_millis(100)).await);
+    }
 
     fn runtime_ledger_envelope(
         thread_id: &str,

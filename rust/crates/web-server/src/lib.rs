@@ -21,7 +21,7 @@ use crate::semantic_kernel_store::process_fault_point;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
@@ -2052,6 +2052,26 @@ async fn web_server_shutdown_signal() {
     }
 }
 
+fn agent_turn_shutdown_grace() -> Duration {
+    Duration::from_secs(
+        std::env::var("AOS_AGENT_TURN_SHUTDOWN_GRACE_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(30)
+            .clamp(1, 300),
+    )
+}
+
+fn agent_turn_cancellation_grace() -> Duration {
+    Duration::from_secs(
+        std::env::var("AOS_AGENT_TURN_CANCELLATION_GRACE_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(10)
+            .clamp(1, 60),
+    )
+}
+
 /// Start the HTTP server.
 pub async fn serve(addr: SocketAddr, data_dir: PathBuf) {
     serve_with_options(addr, data_dir, None, None, None).await;
@@ -2335,6 +2355,8 @@ pub async fn serve_with_options(
     };
 
     let shutdown_state = state.clone();
+    let shutdown_agent_manager = shutdown_state.agent_manager.clone();
+    let signal_agent_manager = shutdown_agent_manager.clone();
     let phase_started = Instant::now();
     let api_router = build_router(state);
     let router = if let Some(web_dir) = web_dir {
@@ -2364,6 +2386,9 @@ pub async fn serve_with_options(
     let mut server_shutdown = shutdown_tx.subscribe();
     tokio::spawn(async move {
         web_server_shutdown_signal().await;
+        if let Some(manager) = signal_agent_manager.as_ref() {
+            manager.begin_shutdown();
+        }
         tracing::info!("shutdown signal received, stopping server");
         let _ = shutdown_tx.send(true);
     });
@@ -2392,6 +2417,24 @@ pub async fn serve_with_options(
     if let Err(e) = server_result {
         tracing::error!("server error: {e}");
     }
+
+    let agent_turns_converged = match shutdown_agent_manager.as_ref() {
+        Some(manager) => {
+            let converged = manager
+                .shutdown_gracefully(agent_turn_shutdown_grace(), agent_turn_cancellation_grace())
+                .await;
+            if converged {
+                tracing::info!("all admitted agent turns reached a terminal shutdown checkpoint");
+            } else {
+                tracing::error!(
+                    active_turns = manager.active_turn_count(),
+                    "agent turns did not converge before shutdown deadline"
+                );
+            }
+            converged
+        }
+        None => true,
+    };
 
     // Tell the scheduler to stop and wait for its current cycle.
     #[cfg(feature = "nl2sql")]
@@ -2434,8 +2477,14 @@ pub async fn serve_with_options(
             }
         }
     }
-    if let Err(error) = shutdown_state.mark_clean_shutdown().await {
-        tracing::warn!(%error, "failed to checkpoint SQLite or clear the unclean marker");
+    if agent_turns_converged {
+        if let Err(error) = shutdown_state.mark_clean_shutdown().await {
+            tracing::warn!(%error, "failed to checkpoint SQLite or clear the unclean marker");
+        }
+    } else {
+        tracing::error!(
+            "preserving the unclean-shutdown marker because active agent turns did not converge"
+        );
     }
 }
 

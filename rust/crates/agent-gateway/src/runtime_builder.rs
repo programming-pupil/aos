@@ -796,6 +796,47 @@ struct ProviderRequestLineageRecorder {
 }
 
 impl ProviderRequestLineageRecorder {
+    fn assert_context_request_matches_manifest(
+        raw_manifest: &Value,
+        request: &MessageRequest,
+    ) -> std::result::Result<(), RuntimeError> {
+        let system_sections = raw_manifest
+            .get("systemSections")
+            .and_then(Value::as_array)
+            .ok_or_else(|| RuntimeError::new("context manifest is missing systemSections"))?
+            .iter()
+            .map(|section| {
+                section.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                    RuntimeError::new("context manifest contains a non-string system section")
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let expected_system = (!system_sections.is_empty()).then(|| system_sections.join("\n\n"));
+        let runtime_messages = raw_manifest
+            .get("messages")
+            .and_then(Value::as_array)
+            .ok_or_else(|| RuntimeError::new("context manifest is missing messages"))?
+            .iter()
+            .map(|entry| {
+                let message = entry.get("message").ok_or_else(|| {
+                    RuntimeError::new("context manifest message is missing its exact payload")
+                })?;
+                serde_json::from_value::<ConversationMessage>(message.clone()).map_err(|error| {
+                    RuntimeError::new(format!(
+                        "context manifest contains an invalid runtime message: {error}"
+                    ))
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let expected_messages = convert_messages(&runtime_messages);
+        if request.system != expected_system || request.messages != expected_messages {
+            return Err(RuntimeError::new(
+                "provider request system/messages diverged from the immutable context manifest",
+            ));
+        }
+        Ok(())
+    }
+
     async fn begin_compaction_attempt(
         &self,
         trigger: &str,
@@ -1078,8 +1119,11 @@ impl ProviderRequestLineageRecorder {
             .map_err(|error| RuntimeError::new(error.to_string()))?;
             id
         };
-        let context = sqlx::query_as::<sqlx::Sqlite, (Option<String>, Option<String>)>(
-            "SELECT turn_id, raw_manifest_hash FROM context_packet_manifests
+        let context = sqlx::query_as::<
+            sqlx::Sqlite,
+            (Option<String>, Option<String>, Option<String>),
+        >(
+            "SELECT turn_id, raw_manifest_hash, raw_manifest_ciphertext FROM context_packet_manifests
              WHERE id = ? AND tenant_id = ? AND thread_id = ?",
         )
         .bind(&context_manifest_id)
@@ -1098,6 +1142,34 @@ impl ProviderRequestLineageRecorder {
             return Err(RuntimeError::new(
                 "provider context manifest scope or hash does not match the request trace",
             ));
+        }
+        if trace.turn_id.is_some() {
+            let ciphertext = context.2.as_deref().ok_or_else(|| {
+                RuntimeError::new("provider context manifest has no exact encrypted request")
+            })?;
+            let raw_manifest = crate::crypto::decrypt_scoped(
+                ciphertext,
+                &crate::crypto::scoped_aad(
+                    "context_manifest.raw",
+                    &self.tenant_id,
+                    &context_manifest_id,
+                ),
+            )
+            .map_err(|error| {
+                RuntimeError::new(format!("cannot decrypt provider context manifest: {error}"))
+            })?;
+            let raw_hash = hex::encode(sha2::Sha256::digest(raw_manifest.as_bytes()));
+            if context.1.as_deref() != Some(raw_hash.as_str()) {
+                return Err(RuntimeError::new(
+                    "provider context manifest ciphertext failed hash verification",
+                ));
+            }
+            let raw_manifest = serde_json::from_str::<Value>(&raw_manifest).map_err(|error| {
+                RuntimeError::new(format!(
+                    "provider context manifest is invalid JSON: {error}"
+                ))
+            })?;
+            Self::assert_context_request_matches_manifest(&raw_manifest, request)?;
         }
         let prompt_manifest_id = if let Some(id) = trace.prompt_manifest_id.as_ref() {
             id.clone()
@@ -6922,6 +6994,83 @@ fn gateway_tool_supports_parallel(tool_name: &str) -> bool {
     false
 }
 
+fn gateway_max_parallel_tool_calls() -> usize {
+    std::env::var("AOS_MAX_PARALLEL_TOOL_CALLS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(8)
+        .clamp(1, 32)
+}
+
+fn bounded_parallel_map<T, R, F>(
+    items: Vec<T>,
+    max_parallel: usize,
+    execute: F,
+) -> Vec<std::thread::Result<R>>
+where
+    T: Send,
+    R: Send,
+    F: Fn(T) -> R + Sync,
+{
+    use std::collections::VecDeque;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    let item_count = items.len();
+    if item_count == 0 {
+        return Vec::new();
+    }
+    let worker_count = max_parallel.max(1).min(item_count);
+    let pending = Arc::new(Mutex::new(
+        items.into_iter().enumerate().collect::<VecDeque<_>>(),
+    ));
+    let mut ordered = (0..item_count).map(|_| None).collect::<Vec<_>>();
+
+    std::thread::scope(|scope| {
+        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(worker_count);
+        let workers = (0..worker_count)
+            .map(|_| {
+                let pending = Arc::clone(&pending);
+                let result_sender = result_sender.clone();
+                let execute = &execute;
+                scope.spawn(move || loop {
+                    let next = pending
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .pop_front();
+                    let Some((index, item)) = next else {
+                        break;
+                    };
+                    let result = catch_unwind(AssertUnwindSafe(|| execute(item)));
+                    if result_sender.send((index, result)).is_err() {
+                        break;
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(result_sender);
+
+        for _ in 0..item_count {
+            let Ok((index, result)) = result_receiver.recv() else {
+                break;
+            };
+            ordered[index] = Some(result);
+        }
+        for worker in workers {
+            let _ = worker.join();
+        }
+    });
+
+    ordered
+        .into_iter()
+        .map(|result| {
+            result.unwrap_or_else(|| {
+                Err(Box::new("parallel tool worker exited without a result")
+                    as Box<dyn std::any::Any + Send>)
+            })
+        })
+        .collect()
+}
+
 fn gateway_value_string_array(value: Option<&Value>) -> Vec<String> {
     value
         .and_then(Value::as_array)
@@ -9450,24 +9599,15 @@ impl ToolExecutor for GatewayToolExecutor {
                 .collect();
         }
 
-        std::thread::scope(|scope| {
-            let handles = requests
-                .into_iter()
-                .map(|request| {
-                    let mut executor = self.clone();
-                    scope.spawn(move || executor.execute(&request.tool_name, &request.input))
-                })
-                .collect::<Vec<_>>();
-
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .unwrap_or_else(|_| Err(ToolError::new("parallel tool thread panicked")))
-                })
-                .collect()
+        bounded_parallel_map(requests, gateway_max_parallel_tool_calls(), |request| {
+            let mut executor = self.clone();
+            executor.execute(&request.tool_name, &request.input)
         })
+        .into_iter()
+        .map(|result| {
+            result.unwrap_or_else(|_| Err(ToolError::new("parallel tool thread panicked")))
+        })
+        .collect()
     }
 }
 
@@ -10609,7 +10749,15 @@ pub(crate) struct StreamingReporter {
     /// Tool name captured at `on_tool_use_start`, used when `on_tool_result` fires.
     /// Cleared after `on_tool_result` sends the event.
     pending_tool_name: String,
+    /// Live SSE projection is deliberately lossy under backpressure. The
+    /// canonical turn and final response are persisted elsewhere; spawning one
+    /// waiter per full-channel event would make this bounded channel unbounded
+    /// in practice and could reorder structural events.
+    dropped_events: usize,
+    overflow_reported: bool,
 }
+
+const STREAMING_CONTROL_EVENT_RESERVE: usize = 32;
 
 fn runtime_status_events_to_tool_records(
     events: &Arc<Mutex<Vec<(String, String, std::time::Instant)>>>,
@@ -10883,12 +11031,36 @@ impl StreamingReporter {
             tool_index: 0,
             pending_tool_index: None,
             pending_tool_name: String::new(),
+            dropped_events: 0,
+            overflow_reported: false,
         }
     }
 
-    /// Try to send an event. Returns `Ok(())` if sent, `Err(())` if the
-    /// receiver was dropped (SSE client disconnected).
-    fn send(&self, event: crate::events::AgentEvent) {
+    fn is_best_effort_event(event: &crate::events::AgentEvent) -> bool {
+        matches!(
+            event,
+            crate::events::AgentEvent::ThinkingDelta { .. }
+                | crate::events::AgentEvent::TextDelta { .. }
+                | crate::events::AgentEvent::ToolUseInput { .. }
+                | crate::events::AgentEvent::HookProgress { .. }
+        )
+    }
+
+    fn record_dropped_event(&mut self, event_type_name: &'static str) {
+        self.dropped_events = self.dropped_events.saturating_add(1);
+        if !self.overflow_reported {
+            self.overflow_reported = true;
+            tracing::warn!(
+                event_type = event_type_name,
+                "SSE channel under backpressure; dropping best-effort live projection events"
+            );
+        }
+    }
+
+    /// Preserve a small part of the bounded channel for structural events. High
+    /// volume deltas are a recoverable live projection; turn state and the final
+    /// response are delivered through the canonical ledger/result path.
+    fn send(&mut self, event: crate::events::AgentEvent) {
         // Determine event type name before sending (avoids borrow after move).
         let event_type_name: &'static str = match &event {
             crate::events::AgentEvent::TurnStarted { .. } => "turn_started",
@@ -10914,17 +11086,19 @@ impl StreamingReporter {
             crate::events::AgentEvent::Usage { .. } => "usage",
             crate::events::AgentEvent::Error { .. } => "error",
         };
+        let control_reserve = STREAMING_CONTROL_EVENT_RESERVE.min(self.sender.max_capacity());
+        if Self::is_best_effort_event(&event) && self.sender.capacity() <= control_reserve {
+            self.record_dropped_event(event_type_name);
+            return;
+        }
         match self.sender.try_send(event) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(event)) => {
-                tracing::warn!(
-                    event_type = event_type_name,
-                    "SSE channel full — buffering event for async flush"
-                );
-                let sender = self.sender.clone();
-                tokio::spawn(async move {
-                    let _ = sender.send(event).await;
-                });
+            Ok(()) => {
+                if self.sender.capacity() > control_reserve {
+                    self.overflow_reported = false;
+                }
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.record_dropped_event(event_type_name);
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 tracing::debug!("SSE channel closed — receiver dropped");
@@ -11665,6 +11839,20 @@ pub(crate) async fn run_streaming_turn_with_options(
             .map_err(GatewayError::Runtime)
     };
     if let Err(error) = result.as_ref() {
+        if matches!(error, GatewayError::TurnCancelled) {
+            if let Err(terminal_error) = runtime
+                .finish_latest_kernel_turn(
+                    runtime::RuntimeTurnTerminalStatus::Cancelled,
+                    Some("outer coordinator interrupted the batched runtime turn"),
+                )
+                .await
+            {
+                tracing::warn!(
+                    error = %terminal_error,
+                    "run_streaming_turn: failed to commit cancelled turn checkpoint"
+                );
+            }
+        }
         if error.is_context_window_exceeded() {
             if let Err(rollback_error) =
                 rollback_current_runtime_turn(runtime, rollback_message_len)
@@ -11996,6 +12184,105 @@ mod tests {
     }
 
     #[test]
+    fn bounded_parallel_map_limits_peak_concurrency_and_preserves_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let results = bounded_parallel_map((0..12).collect(), 3, |item| {
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(current, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            active.fetch_sub(1, Ordering::SeqCst);
+            item * 2
+        });
+
+        assert_eq!(peak.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            results
+                .into_iter()
+                .map(|result| result.expect("worker should complete"))
+                .collect::<Vec<_>>(),
+            (0..12).map(|item| item * 2).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn bounded_parallel_map_contains_worker_panics_without_reordering() {
+        let results = bounded_parallel_map(vec![0, 1, 2], 2, |item| {
+            assert_ne!(item, 1, "simulated tool panic");
+            item
+        });
+
+        assert_eq!(results[0].as_ref().ok(), Some(&0));
+        assert!(results[1].is_err());
+        assert_eq!(results[2].as_ref().ok(), Some(&2));
+    }
+
+    #[test]
+    fn exact_context_manifest_rejects_system_or_message_drift() {
+        let messages = vec![ConversationMessage::user_text("original user request")];
+        let manifest = json!({
+            "systemSections": ["stable policy", "turn policy"],
+            "messages": messages
+                .iter()
+                .map(|message| json!({"message": message}))
+                .collect::<Vec<_>>(),
+        });
+        let request = MessageRequest {
+            system: Some("stable policy\n\nturn policy".to_string()),
+            messages: convert_messages(&messages),
+            ..Default::default()
+        };
+
+        ProviderRequestLineageRecorder::assert_context_request_matches_manifest(
+            &manifest, &request,
+        )
+        .expect("exact request should match its manifest");
+
+        let mut system_drift = request.clone();
+        system_drift.system = Some("changed policy".to_string());
+        assert!(
+            ProviderRequestLineageRecorder::assert_context_request_matches_manifest(
+                &manifest,
+                &system_drift,
+            )
+            .is_err()
+        );
+
+        let mut message_drift = request;
+        message_drift.messages = vec![InputMessage::user_text("different request")];
+        assert!(
+            ProviderRequestLineageRecorder::assert_context_request_matches_manifest(
+                &manifest,
+                &message_drift,
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_reporter_reserves_capacity_for_structural_events() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let mut reporter = StreamingReporter::new(sender, Arc::new(Mutex::new(Vec::new())));
+
+        reporter.on_text_delta("best-effort text");
+        reporter.on_thinking_start();
+        reporter.on_thinking_delta("best-effort thought");
+
+        assert_eq!(reporter.dropped_events, 2);
+        assert!(matches!(
+            receiver.recv().await,
+            Some(crate::events::AgentEvent::TextBlockStart { index: 0 })
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(crate::events::AgentEvent::ThinkingStart { index: 0 })
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
     fn task_state_change_tools_require_an_observed_state_version() {
         let definitions = parent_task_tool_definitions(runtime::PermissionMode::WorkspaceWrite);
         for tool_name in [
@@ -12243,7 +12530,21 @@ mod tests {
         ] {
             sqlx::query(statement).execute(&db).await.unwrap();
         }
-        sqlx::query("INSERT INTO context_packet_manifests (id, tenant_id, thread_id, turn_id, snapshot_version, manifest_hash, manifest_json, raw_manifest_hash) VALUES ('context-lineage', 'tenant-lineage', 'session-lineage', 'turn-lineage', 1, 'redacted-hash', '{}', 'context-hash')")
+        let exact_context = json!({
+            "schemaVersion": "context-manifest-v2",
+            "systemSections": [],
+            "messages": [],
+        })
+        .to_string();
+        let exact_context_hash = hex::encode(sha2::Sha256::digest(exact_context.as_bytes()));
+        let exact_context_ciphertext = crate::crypto::encrypt_scoped(
+            &exact_context,
+            &crate::crypto::scoped_aad("context_manifest.raw", "tenant-lineage", "context-lineage"),
+        )
+        .expect("encrypt exact provider context fixture");
+        sqlx::query("INSERT INTO context_packet_manifests (id, tenant_id, thread_id, turn_id, snapshot_version, manifest_hash, manifest_json, raw_manifest_hash, raw_manifest_ciphertext) VALUES ('context-lineage', 'tenant-lineage', 'session-lineage', 'turn-lineage', 1, 'redacted-hash', '{}', ?, ?)")
+            .bind(&exact_context_hash)
+            .bind(exact_context_ciphertext)
             .execute(&db)
             .await
             .unwrap();
@@ -12294,7 +12595,7 @@ mod tests {
             .expect("provider lineage recorder");
         let mut trace = runtime::ProviderRequestTrace::turn("turn-lineage", 7);
         trace.context_manifest_id = Some("context-lineage".into());
-        trace.context_manifest_hash = Some("context-hash".into());
+        trace.context_manifest_hash = Some(exact_context_hash);
         trace.prompt_manifest_id = Some("prompt-lineage".into());
         let request = MessageRequest {
             model: "gpt-lineage".to_string(),
