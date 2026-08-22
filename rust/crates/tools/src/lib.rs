@@ -2,6 +2,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use api::{
@@ -12,8 +14,8 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash, glob_search,
-    grep_search, load_system_prompt,
+    check_freshness, dedupe_superseded_commit_events, edit_file, edit_file_with_cancellation,
+    execute_bash, execute_bash_with_cancellation, glob_search, grep_search, load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
@@ -22,12 +24,12 @@ use runtime::{
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
-    write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
-    BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
-    GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
-    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError,
-    RuntimeToolCancellationContract, RuntimeToolContract, RuntimeToolRetryPolicy,
+    write_file, write_file_with_cancellation, ApiClient, ApiRequest, AssistantEvent,
+    BashCommandInput, BashCommandOutput, BranchFreshness, ConfigLoader, ContentBlock,
+    ConversationMessage, ConversationRuntime, GrepSearchInput, LaneCommitProvenance, LaneEvent,
+    LaneEventBlocker, LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport,
+    MessageRole, PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig,
+    RuntimeError, RuntimeToolCancellationContract, RuntimeToolContract, RuntimeToolRetryPolicy,
     RuntimeToolRiskLevel, RuntimeToolSideEffectClass, Session, TaskPacket, ToolError, ToolExecutor,
 };
 use scraper::{Html, Selector};
@@ -454,7 +456,7 @@ impl GlobalToolRegistry {
 
     pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
         if mvp_tool_specs().iter().any(|spec| spec.name == name) {
-            return execute_tool_with_enforcer(self.enforcer.as_ref(), name, input);
+            return execute_tool_with_enforcer(self.enforcer.as_ref(), name, input, None);
         }
         if let Some(plugin) = self
             .plugin_tools
@@ -464,7 +466,7 @@ impl GlobalToolRegistry {
             return plugin.execute(input).map_err(|error| error.to_string());
         }
         if let Some(canonical) = canonical_builtin_execution_name(name) {
-            return execute_tool_with_enforcer(self.enforcer.as_ref(), canonical, input);
+            return execute_tool_with_enforcer(self.enforcer.as_ref(), canonical, input, None);
         }
         Err(format!("unsupported tool: {name}"))
     }
@@ -1538,7 +1540,15 @@ pub fn enforce_permission_check(
 }
 
 pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
-    execute_tool_with_enforcer(None, name, input)
+    execute_tool_with_enforcer(None, name, input, None)
+}
+
+pub fn execute_tool_with_cancellation(
+    name: &str,
+    input: &Value,
+    cancellation: &Arc<AtomicBool>,
+) -> Result<String, String> {
+    execute_tool_with_enforcer(None, name, input, Some(cancellation))
 }
 
 #[derive(Debug, Clone)]
@@ -1658,7 +1668,11 @@ fn execute_tool_with_enforcer(
     enforcer: Option<&PermissionEnforcer>,
     name: &str,
     input: &Value,
+    cancellation: Option<&Arc<AtomicBool>>,
 ) -> Result<String, String> {
+    if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err("tool execution cancelled before dispatch".to_string());
+    }
     let name = canonical_builtin_execution_name(name).unwrap_or(name);
     match name {
         "bash" => {
@@ -1678,7 +1692,7 @@ fn execute_tool_with_enforcer(
             }
             let classified_mode = classify_bash_permission(&bash_input.command);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
-            run_bash(bash_input)
+            run_bash(bash_input, cancellation.cloned())
         }
         "read_file" => {
             let file_input: ReadFileInput = from_value(input)?;
@@ -1690,13 +1704,13 @@ fn execute_tool_with_enforcer(
             let file_input: WriteFileInput = from_value(input)?;
             let required_mode = classify_file_path_permission(&file_input.path, true);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_write_file(file_input)
+            run_write_file(file_input, cancellation.map(Arc::as_ref))
         }
         "edit_file" => {
             let file_input: EditFileInput = from_value(input)?;
             let required_mode = classify_file_path_permission(&file_input.path, false);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_edit_file(file_input)
+            run_edit_file(file_input, cancellation.map(Arc::as_ref))
         }
         "glob_search" => {
             let glob_input: GlobSearchInputValue = from_value(input)?;
@@ -2567,12 +2581,19 @@ fn has_dangerous_paths(command: &str) -> bool {
     false
 }
 
-fn run_bash(input: BashCommandInput) -> Result<String, String> {
+fn run_bash(
+    input: BashCommandInput,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> Result<String, String> {
     if let Some(output) = workspace_test_branch_preflight(&input.command) {
         return serde_json::to_string_pretty(&output).map_err(|error| error.to_string());
     }
-    serde_json::to_string_pretty(&execute_bash(input).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())
+    let output = match cancellation {
+        Some(cancellation) => execute_bash_with_cancellation(input, cancellation),
+        None => execute_bash(input),
+    }
+    .map_err(|error| error.to_string())?;
+    serde_json::to_string_pretty(&output).map_err(|error| error.to_string())
 }
 
 fn workspace_test_branch_preflight(command: &str) -> Option<BashCommandOutput> {
@@ -2727,21 +2748,42 @@ fn run_read_file(input: ReadFileInput) -> Result<String, String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_write_file(input: WriteFileInput) -> Result<String, String> {
-    to_pretty_json(write_file(&input.path, &input.content).map_err(io_to_string)?)
+fn run_write_file(
+    input: WriteFileInput,
+    cancellation: Option<&AtomicBool>,
+) -> Result<String, String> {
+    let output = match cancellation {
+        Some(cancellation) => {
+            write_file_with_cancellation(&input.path, &input.content, cancellation)
+        }
+        None => write_file(&input.path, &input.content),
+    }
+    .map_err(io_to_string)?;
+    to_pretty_json(output)
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_edit_file(input: EditFileInput) -> Result<String, String> {
-    to_pretty_json(
-        edit_file(
+fn run_edit_file(
+    input: EditFileInput,
+    cancellation: Option<&AtomicBool>,
+) -> Result<String, String> {
+    let output = match cancellation {
+        Some(cancellation) => edit_file_with_cancellation(
             &input.path,
             &input.old_string,
             &input.new_string,
             input.replace_all.unwrap_or(false),
-        )
-        .map_err(io_to_string)?,
-    )
+            cancellation,
+        ),
+        None => edit_file(
+            &input.path,
+            &input.old_string,
+            &input.new_string,
+            input.replace_all.unwrap_or(false),
+        ),
+    }
+    .map_err(io_to_string)?;
+    to_pretty_json(output)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -9158,6 +9200,7 @@ async fn stream_with_provider(
     Ok(events)
 }
 
+#[derive(Clone)]
 struct SubagentToolExecutor {
     allowed_tools: BTreeSet<String>,
     enforcer: Option<PermissionEnforcer>,
@@ -9204,7 +9247,7 @@ impl ToolExecutor for SubagentToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        execute_tool_with_enforcer(self.enforcer.as_ref(), tool_name, &value)
+        execute_tool_with_enforcer(self.enforcer.as_ref(), tool_name, &value, None)
             .map_err(ToolError::new)
     }
 }
@@ -11444,7 +11487,7 @@ mod tests {
             json!({"command":"printf safe", "filesystemMode":"off"}),
             json!({"command":"printf safe", "run_in_background":true}),
         ] {
-            let error = super::execute_tool_with_enforcer(None, "bash", &malicious)
+            let error = super::execute_tool_with_enforcer(None, "bash", &malicious, None)
                 .expect_err("model-controlled execution policy must fail closed");
             assert!(error.contains("operator-controlled"));
         }

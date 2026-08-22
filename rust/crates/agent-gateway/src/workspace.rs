@@ -56,10 +56,9 @@ struct WorkspaceExecutionRegistration {
 }
 
 impl WorkspaceExecutionRegistration {
-    fn register(context: &WorkspaceAccessContext) -> Self {
+    fn register(context: &WorkspaceAccessContext, cancellation: Arc<AtomicBool>) -> Self {
         let key =
             workspace_execution_key(&context.tenant_id, &context.user_id, &context.session_id);
-        let cancellation = Arc::new(AtomicBool::new(false));
         let mut registry = workspace_execution_registry()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -324,11 +323,30 @@ impl BoundedHitWindow {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn execute_workspace_operation(
     context: &WorkspaceAccessContext,
     operation: &str,
     input: &Value,
 ) -> Result<String, String> {
+    execute_workspace_operation_with_cancellation(
+        context,
+        operation,
+        input,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+}
+
+pub(crate) async fn execute_workspace_operation_with_cancellation(
+    context: &WorkspaceAccessContext,
+    operation: &str,
+    input: &Value,
+    cancellation: Arc<AtomicBool>,
+) -> Result<String, String> {
+    if cancellation.load(std::sync::atomic::Ordering::Acquire) {
+        return Err("workspace operation cancelled before dispatch".to_string());
+    }
     let started = Instant::now();
     let workspace = ensure_workspace(context).await?;
     let path = input.get("path").and_then(Value::as_str).unwrap_or("/");
@@ -339,7 +357,9 @@ pub(crate) async fn execute_workspace_operation(
         "workspace_read" => workspace_read(context, &workspace.id, input, false).await,
         "workspace_open" => workspace_read(context, &workspace.id, input, true).await,
         "workspace_stat" => workspace_stat(context, &workspace.id, input).await,
-        "workspace_execute" => workspace_execute(context, &workspace, input).await,
+        "workspace_execute" => {
+            workspace_execute(context, &workspace, input, Arc::clone(&cancellation)).await
+        }
         _ => Err(format!("unsupported workspace operation: {operation}")),
     };
     let (outcome, denial_code) = match &result {
@@ -377,6 +397,7 @@ async fn workspace_execute(
     context: &WorkspaceAccessContext,
     workspace: &WorkspaceHandle,
     input: &Value,
+    cancellation: Arc<AtomicBool>,
 ) -> Result<String, String> {
     if !crate::workspace_sandbox::isolation_available() {
         return Err("workspace execution isolation is unavailable".to_string());
@@ -390,7 +411,7 @@ async fn workspace_execute(
     if command.chars().count() > 32_000 {
         return Err("workspace_execute command exceeds 32000 characters".to_string());
     }
-    let execution = WorkspaceExecutionRegistration::register(context);
+    let execution = WorkspaceExecutionRegistration::register(context, cancellation);
     let cwd = VirtualPath::parse(
         input
             .get("cwd")

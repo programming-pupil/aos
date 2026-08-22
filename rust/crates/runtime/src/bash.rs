@@ -1,12 +1,15 @@
 use std::env;
 use std::io;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
+use tokio::process::Child;
 use tokio::process::Command as TokioCommand;
 use tokio::runtime::Builder;
-use tokio::time::timeout;
 
 use crate::sandbox::{
     build_linux_sandbox_command, resolve_sandbox_status_for_request, FilesystemIsolationMode,
@@ -68,6 +71,23 @@ pub struct BashCommandOutput {
 
 /// Executes a shell command with the requested sandbox settings.
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
+    execute_bash_with_cancellation(input, Arc::new(AtomicBool::new(false)))
+}
+
+/// Executes a shell command while observing the owning tool invocation's
+/// cancellation authority. Foreground children are assigned an independent
+/// process group and explicitly terminated and reaped before this call returns
+/// to the runtime's settle barrier.
+pub fn execute_bash_with_cancellation(
+    input: BashCommandInput,
+    cancellation: Arc<AtomicBool>,
+) -> io::Result<BashCommandOutput> {
+    if cancellation.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "bash execution cancelled before dispatch",
+        ));
+    }
     let cwd = env::current_dir()?;
     let sandbox_status = sandbox_status_for_input(&input, &cwd);
     if sandbox_status.enabled && !sandbox_status.active {
@@ -111,60 +131,82 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     }
 
     let runtime = Builder::new_current_thread().enable_all().build()?;
-    runtime.block_on(execute_bash_async(input, sandbox_status, cwd))
+    runtime.block_on(execute_bash_async(input, sandbox_status, cwd, cancellation))
 }
 
 async fn execute_bash_async(
     input: BashCommandInput,
     sandbox_status: SandboxStatus,
     cwd: std::path::PathBuf,
+    cancellation: Arc<AtomicBool>,
 ) -> io::Result<BashCommandOutput> {
     let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let process_group_id = child.id();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("bash child stdout pipe missing"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("bash child stderr pipe missing"))?;
+    let stdout_reader = tokio::spawn(read_child_pipe(stdout));
+    let stderr_reader = tokio::spawn(read_child_pipe(stderr));
 
-    let output_result = if let Some(timeout_ms) = input.timeout {
-        match timeout(Duration::from_millis(timeout_ms), command.output()).await {
-            Ok(result) => (result?, false),
-            Err(_) => {
-                return Ok(BashCommandOutput {
-                    stdout: String::new(),
-                    stderr: format!("Command exceeded timeout of {timeout_ms} ms"),
-                    raw_output_path: None,
-                    interrupted: true,
-                    is_image: None,
-                    background_task_id: None,
-                    backgrounded_by_user: None,
-                    assistant_auto_backgrounded: None,
-                    dangerously_disable_sandbox: input.dangerously_disable_sandbox,
-                    return_code_interpretation: Some(String::from("timeout")),
-                    no_output_expected: Some(true),
-                    structured_content: None,
-                    persisted_output_path: None,
-                    persisted_output_size: None,
-                    sandbox_status: Some(sandbox_status),
-                });
+    let (status, interruption) = if let Some(timeout_ms) = input.timeout {
+        tokio::select! {
+            result = child.wait() => (result?, None),
+            () = wait_for_cancellation(Arc::clone(&cancellation)) => {
+                let status = terminate_process_tree(&mut child, process_group_id).await?;
+                (status, Some(("cancelled", "Command cancelled by the owning turn".to_string())))
+            }
+            () = tokio::time::sleep(Duration::from_millis(timeout_ms)) => {
+                let status = terminate_process_tree(&mut child, process_group_id).await?;
+                (status, Some(("timeout", format!("Command exceeded timeout of {timeout_ms} ms"))))
             }
         }
     } else {
-        (command.output().await?, false)
-    };
-
-    let (output, interrupted) = output_result;
-    let stdout = truncate_output(&String::from_utf8_lossy(&output.stdout));
-    let stderr = truncate_output(&String::from_utf8_lossy(&output.stderr));
-    let no_output_expected = Some(stdout.trim().is_empty() && stderr.trim().is_empty());
-    let return_code_interpretation = output.status.code().and_then(|code| {
-        if code == 0 {
-            None
-        } else {
-            Some(format!("exit_code:{code}"))
+        tokio::select! {
+            result = child.wait() => (result?, None),
+            () = wait_for_cancellation(cancellation) => {
+                let status = terminate_process_tree(&mut child, process_group_id).await?;
+                (status, Some(("cancelled", "Command cancelled by the owning turn".to_string())))
+            }
         }
-    });
+    };
+    let stdout = join_child_pipe(stdout_reader).await?;
+    let stderr = join_child_pipe(stderr_reader).await?;
+    let stdout = truncate_output(&String::from_utf8_lossy(&stdout));
+    let mut stderr = truncate_output(&String::from_utf8_lossy(&stderr));
+    if let Some((_, message)) = interruption.as_ref() {
+        if !stderr.trim().is_empty() {
+            stderr.push('\n');
+        }
+        stderr.push_str(message);
+    }
+    let no_output_expected = Some(stdout.trim().is_empty() && stderr.trim().is_empty());
+    let return_code_interpretation = interruption.map_or_else(
+        || {
+            status.code().and_then(|code| {
+                if code == 0 {
+                    None
+                } else {
+                    Some(format!("exit_code:{code}"))
+                }
+            })
+        },
+        |(interpretation, _)| Some(interpretation.to_string()),
+    );
 
     Ok(BashCommandOutput {
         stdout,
         stderr,
         raw_output_path: None,
-        interrupted,
+        interrupted: return_code_interpretation
+            .as_deref()
+            .is_some_and(|value| matches!(value, "cancelled" | "timeout")),
         is_image: None,
         background_task_id: None,
         backgrounded_by_user: None,
@@ -177,6 +219,70 @@ async fn execute_bash_async(
         persisted_output_size: None,
         sandbox_status: Some(sandbox_status),
     })
+}
+
+async fn read_child_pipe<R: tokio::io::AsyncRead + Unpin>(mut pipe: R) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    pipe.read_to_end(&mut output).await?;
+    Ok(output)
+}
+
+async fn join_child_pipe(
+    reader: tokio::task::JoinHandle<io::Result<Vec<u8>>>,
+) -> io::Result<Vec<u8>> {
+    reader
+        .await
+        .map_err(|error| io::Error::other(format!("bash output reader failed: {error}")))?
+}
+
+async fn terminate_process_tree(
+    child: &mut Child,
+    process_group_id: Option<u32>,
+) -> io::Result<std::process::ExitStatus> {
+    #[cfg(unix)]
+    if let Some(process_group_id) = process_group_id {
+        if !signal_process_group(process_group_id, "-TERM").await {
+            child.start_kill()?;
+        }
+        let graceful = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
+        let killed_group = signal_process_group(process_group_id, "-KILL").await;
+        if graceful.is_err() && !killed_group {
+            child.start_kill()?;
+        }
+        return match graceful {
+            Ok(status) => status,
+            Err(_) => child.wait().await,
+        };
+    }
+
+    child.kill().await?;
+    child.wait().await
+}
+
+#[cfg(unix)]
+async fn signal_process_group(process_group_id: u32, signal: &str) -> bool {
+    let status = TokioCommand::new("kill")
+        .arg(signal)
+        .arg(format!("-{process_group_id}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    let signalled = status.is_ok_and(|status| status.success());
+    if !signalled {
+        tracing::warn!(
+            process_group_id,
+            signal,
+            "failed to signal bash process group"
+        );
+    }
+    signalled
+}
+
+async fn wait_for_cancellation(cancellation: Arc<AtomicBool>) {
+    while !cancellation.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> SandboxStatus {
@@ -237,12 +343,16 @@ fn prepare_tokio_command(
         prepared.current_dir(cwd);
         prepared.envs(launcher.env);
         prepared.kill_on_drop(true);
+        #[cfg(unix)]
+        prepared.process_group(0);
         return prepared;
     }
 
     let mut prepared = TokioCommand::new("sh");
     prepared.arg("-lc").arg(command).current_dir(cwd);
     prepared.kill_on_drop(true);
+    #[cfg(unix)]
+    prepared.process_group(0);
     if sandbox_status.filesystem_active {
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
@@ -257,8 +367,12 @@ fn prepare_sandbox_dirs(cwd: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_bash, BashCommandInput};
+    use super::{execute_bash, execute_bash_with_cancellation, BashCommandInput};
     use crate::sandbox::FilesystemIsolationMode;
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn executes_simple_command() {
@@ -285,6 +399,81 @@ mod tests {
             assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
             assert!(error.to_string().contains("command was not executed"));
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cancellation_terminates_a_foreground_child_before_returning() {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation);
+        let child_pid_path = std::env::temp_dir().join(format!(
+            "aos-bash-child-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let command = format!(
+            "sleep 30 & child=$!; printf '%s' \"$child\" > '{}'; wait \"$child\"",
+            child_pid_path.display()
+        );
+        let worker = std::thread::spawn(move || {
+            execute_bash_with_cancellation(
+                BashCommandInput {
+                    command,
+                    timeout: Some(60_000),
+                    description: None,
+                    run_in_background: Some(false),
+                    dangerously_disable_sandbox: Some(true),
+                    namespace_restrictions: Some(false),
+                    isolate_network: Some(false),
+                    filesystem_mode: None,
+                    allowed_mounts: None,
+                },
+                worker_cancellation,
+            )
+        });
+        let child_pid_deadline = Instant::now() + Duration::from_secs(5);
+        let child_pid = loop {
+            match std::fs::read_to_string(&child_pid_path) {
+                Ok(child_pid) if child_pid.trim().parse::<u32>().is_ok() => break child_pid,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    cancellation.store(true, Ordering::Release);
+                    let _ = worker.join();
+                    panic!("failed to read shell child pid: {error}");
+                }
+            }
+            if Instant::now() >= child_pid_deadline {
+                cancellation.store(true, Ordering::Release);
+                let worker_result = worker.join();
+                panic!(
+                    "shell did not publish its child pid before the deadline; worker={worker_result:?}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let cancellation_started = Instant::now();
+        cancellation.store(true, Ordering::Release);
+        let output = worker
+            .join()
+            .expect("bash worker should join")
+            .expect("cancelled bash should return an interrupted output");
+        assert!(output.interrupted);
+        assert_eq!(
+            output.return_code_interpretation.as_deref(),
+            Some("cancelled")
+        );
+        assert!(cancellation_started.elapsed() < Duration::from_secs(2));
+        let still_running = std::process::Command::new("kill")
+            .args(["-0", child_pid.trim()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(!still_running, "cancelled shell child must be reaped");
+        let _ = std::fs::remove_file(child_pid_path);
     }
 
     #[test]

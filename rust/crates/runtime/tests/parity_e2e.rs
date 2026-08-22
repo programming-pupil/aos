@@ -81,6 +81,7 @@ impl ApiClient for ScriptedProvider {
 
 /// Tool executor that performs real file operations inside a workspace root —
 /// the same `*_in_workspace` helpers the production tool layer uses.
+#[derive(Clone)]
 struct WorkspaceToolExecutor {
     root: PathBuf,
 }

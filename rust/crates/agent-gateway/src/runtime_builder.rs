@@ -33,8 +33,8 @@ use runtime::mcp::write_audit_log;
 use runtime::{
     ApiClient, ApiRequest, AssistantEvent, ContentBlock as RuntimeContentBlock,
     ConversationMessage, ConversationRuntime, McpServerSessionManager, PermissionPolicy,
-    PermissionPrompter, RuntimeError, RuntimeEventReporter, Session, SessionTracer, TokenUsage,
-    ToolError, ToolExecutionOutcome, ToolExecutionRequest, ToolExecutor,
+    PermissionPrompter, RuntimeCancellationToken, RuntimeError, RuntimeEventReporter, Session,
+    SessionTracer, TokenUsage, ToolError, ToolExecutionOutcome, ToolExecutionRequest, ToolExecutor,
 };
 use serde_json::json;
 use serde_json::Value;
@@ -49,7 +49,7 @@ use crate::error::{GatewayError, Result};
 use crate::path_safety::PathValidator;
 use crate::session_manager::InternalReasoningBudget;
 use crate::skill_tools;
-use crate::workspace::{execute_workspace_operation, WorkspaceAccessContext};
+use crate::workspace::{execute_workspace_operation_with_cancellation, WorkspaceAccessContext};
 
 /// Timeout for a single API key's stream request (including all retries).
 const STREAM_TIMEOUT_SECS: u64 = 120;
@@ -5451,8 +5451,9 @@ pub struct GatewayToolExecutor {
     file_context: Option<GatewayFileContext>,
     workspace_context: Option<WorkspaceAccessContext>,
     pm_search_providers: Vec<tools::WebSearchProviderConfig>,
-    rd_read_cache: BTreeMap<String, RdReadCacheEntry>,
+    rd_read_cache: Arc<Mutex<BTreeMap<String, RdReadCacheEntry>>>,
     pm_web_fetch_guard: Arc<Mutex<PmWebFetchGuardState>>,
+    invocation_cancellation: Option<RuntimeCancellationToken>,
     /// Skill paths keyed by sanitized skill name.
     /// Lazily populated by `discover_skill_tools`.
     skill_tools: std::collections::HashMap<String, std::path::PathBuf>,
@@ -6513,8 +6514,9 @@ impl GatewayToolExecutor {
             file_context,
             workspace_context,
             pm_search_providers,
-            rd_read_cache: BTreeMap::new(),
+            rd_read_cache: Arc::new(Mutex::new(BTreeMap::new())),
             pm_web_fetch_guard: Arc::new(Mutex::new(PmWebFetchGuardState::default())),
+            invocation_cancellation: None,
             tool_registry,
         }
     }
@@ -6638,6 +6640,10 @@ impl GatewayToolExecutor {
                         &workspace,
                         self.scenario.as_deref(),
                         &self.pm_search_providers,
+                        self.invocation_cancellation.as_ref().map_or_else(
+                            || Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                            RuntimeCancellationToken::atomic_flag,
+                        ),
                     )
                         .map_err(|e| ToolError::new(format!("tool '{tool_name}' failed: {e}")))
                 }));
@@ -6705,7 +6711,11 @@ impl GatewayToolExecutor {
         })?;
         let cache_key = format!("{}:{offset}:{limit}", absolute_path.display());
         if !force {
-            if let Some(entry) = self.rd_read_cache.get(&cache_key) {
+            let cache = self
+                .rd_read_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(entry) = cache.get(&cache_key) {
                 if entry.fingerprint == fingerprint {
                     return serde_json::to_string_pretty(&serde_json::json!({
                         "type": "read_file_cached",
@@ -6729,14 +6739,17 @@ impl GatewayToolExecutor {
             }
         }
         let output = self.execute_builtin_tool_in_workspace_uncached("read_file", input)?;
-        self.rd_read_cache.insert(
-            cache_key,
-            RdReadCacheEntry {
-                fingerprint,
-                output_hash: stable_gateway_hash(&output),
-                output_chars: output.len(),
-            },
-        );
+        self.rd_read_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                cache_key,
+                RdReadCacheEntry {
+                    fingerprint,
+                    output_hash: stable_gateway_hash(&output),
+                    output_chars: output.len(),
+                },
+            );
         Ok(output)
     }
 
@@ -6768,6 +6781,10 @@ impl GatewayToolExecutor {
                         &workspace,
                         self.scenario.as_deref(),
                         &self.pm_search_providers,
+                        self.invocation_cancellation.as_ref().map_or_else(
+                            || Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                            RuntimeCancellationToken::atomic_flag,
+                        ),
                     )
                         .map_err(|e| ToolError::new(format!("tool '{tool_name}' failed: {e}")))
                 }));
@@ -6805,6 +6822,7 @@ impl GatewayToolExecutor {
         workspace: &Path,
         _scenario: Option<&str>,
         pm_search_providers: &[tools::WebSearchProviderConfig],
+        cancellation: Arc<std::sync::atomic::AtomicBool>,
     ) -> std::result::Result<String, String> {
         match tool_name {
             "glob_search" => {
@@ -6829,10 +6847,10 @@ impl GatewayToolExecutor {
             }
             "WebSearch" if !pm_search_providers.is_empty() => {
                 tools::with_web_search_provider_override(pm_search_providers.to_vec(), || {
-                    tools::execute_tool(tool_name, input)
+                    tools::execute_tool_with_cancellation(tool_name, input, &cancellation)
                 })
             }
-            _ => tools::execute_tool(tool_name, input),
+            _ => tools::execute_tool_with_cancellation(tool_name, input, &cancellation),
         }
     }
 
@@ -9430,6 +9448,7 @@ impl ToolExecutor for GatewayToolExecutor {
 
         let result = if tool_name.starts_with("mcp__") {
             let mcp_manager = Arc::clone(&self.mcp_manager);
+            let cancellation = self.invocation_cancellation.clone();
             let qualified_name = tool_name.to_string();
             let args: Value = if input.is_empty() || input == "{}" {
                 serde_json::json!({})
@@ -9456,17 +9475,28 @@ impl ToolExecutor for GatewayToolExecutor {
                         // server between the check and the call_tool. Instead, we let call_tool
                         // return a structured UnknownServer error which is converted to a friendly
                         // ToolError below — identical in meaning but without the race window.
-                        guard
-                            .call_tool(&qualified_name, Some(args))
-                            .await
-                            .map_err(|e| {
-                                ToolError::new(format!("MCP tool '{qualified_name}' failed: {e}",))
-                            })
-                            .and_then(|call_result| {
-                                serde_json::to_string_pretty(&call_result).map_err(|e| {
-                                    ToolError::new(format!("failed to serialize MCP result: {e}"))
+                        let call = async {
+                            guard
+                                .call_tool(&qualified_name, Some(args))
+                                .await
+                                .map_err(|e| {
+                                    ToolError::new(format!(
+                                        "MCP tool '{qualified_name}' failed: {e}"
+                                    ))
                                 })
-                            })
+                        };
+                        let call_result = match cancellation {
+                            Some(cancellation) => tokio::select! {
+                                result = call => result,
+                                () = cancellation.cancelled() => {
+                                    Err(ToolError::new("MCP tool call cancelled by the owning turn"))
+                                }
+                            },
+                            None => call.await,
+                        }?;
+                        serde_json::to_string_pretty(&call_result).map_err(|e| {
+                            ToolError::new(format!("failed to serialize MCP result: {e}"))
+                        })
                     })
                 })
                 .join()
@@ -9580,8 +9610,30 @@ impl ToolExecutor for GatewayToolExecutor {
         ToolExecutionOutcome::Completed(self.execute(tool_name, input))
     }
 
+    fn execute_outcome_with_context(
+        &mut self,
+        request: &ToolExecutionRequest,
+    ) -> ToolExecutionOutcome {
+        if request.context.is_cancelled() {
+            return ToolExecutionOutcome::Cancelled {
+                reason: "tool call aborted before dispatch".to_string(),
+            };
+        }
+        self.invocation_cancellation = Some(request.context.cancellation.clone());
+        let outcome = self.execute_outcome(&request.tool_name, &request.input);
+        self.invocation_cancellation = None;
+        if !request.context.is_cancelled() {
+            return outcome;
+        }
+        reconcile_tool_outcome_after_cancellation(&request.tool_name, outcome)
+    }
+
     fn supports_parallel_tool_calls(&self, tool_name: &str) -> bool {
         gateway_tool_supports_parallel(tool_name)
+    }
+
+    fn max_parallel_tool_calls(&self) -> usize {
+        gateway_max_parallel_tool_calls()
     }
 
     fn execute_batch(
@@ -9611,6 +9663,48 @@ impl ToolExecutor for GatewayToolExecutor {
     }
 }
 
+fn reconcile_tool_outcome_after_cancellation(
+    tool_name: &str,
+    outcome: ToolExecutionOutcome,
+) -> ToolExecutionOutcome {
+    match outcome {
+        ToolExecutionOutcome::Completed(Err(error)) if tool_crosses_external_boundary(tool_name) => {
+            ToolExecutionOutcome::OutcomeUnknown {
+                reason: format!(
+                    "external tool transport stopped after cancellation, but remote side effects cannot be proven absent: {error}"
+                ),
+            }
+        }
+        ToolExecutionOutcome::Completed(Err(error))
+            if tool_error_confirms_local_cancellation(&error) =>
+        {
+            ToolExecutionOutcome::Cancelled {
+                reason: "tool execution was cancelled before its local commit boundary"
+                    .to_string(),
+            }
+        }
+        ToolExecutionOutcome::Completed(Ok(output)) if tool_output_confirms_cancellation(&output) => {
+            ToolExecutionOutcome::Cancelled {
+                reason: "tool execution cancelled and locally settled".to_string(),
+            }
+        }
+        other => other,
+    }
+}
+
+fn tool_error_confirms_local_cancellation(error: &ToolError) -> bool {
+    let message = error.to_string();
+    [
+        "tool execution cancelled before dispatch",
+        "file operation cancelled before commit",
+        "workspace operation cancelled before dispatch",
+        "bash execution cancelled before dispatch",
+        "sandbox execution cancelled before start",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
 fn tool_crosses_external_boundary(tool_name: &str) -> bool {
     let normalized = tool_name.trim().to_ascii_lowercase();
     normalized.starts_with("mcp__")
@@ -9629,6 +9723,19 @@ fn tool_crosses_external_boundary(tool_name: &str) -> bool {
                 | "nl2sql_analyze"
                 | "data_attribution_start"
         )
+}
+
+fn tool_output_confirms_cancellation(output: &str) -> bool {
+    serde_json::from_str::<Value>(output).is_ok_and(|value| {
+        value
+            .get("cancelled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || value
+                .get("returnCodeInterpretation")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case("cancelled"))
+    })
 }
 
 fn flatten_workspace_thread_result<T>(
@@ -9664,7 +9771,15 @@ impl GatewayToolExecutor {
                             .map_err(|error| {
                                 format!("failed to build workspace tool runtime: {error}")
                             })?;
-                        runtime.block_on(execute_workspace_operation(&context, &operation, &parsed))
+                        runtime.block_on(execute_workspace_operation_with_cancellation(
+                            &context,
+                            &operation,
+                            &parsed,
+                            self.invocation_cancellation.as_ref().map_or_else(
+                                || Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                                RuntimeCancellationToken::atomic_flag,
+                            ),
+                        ))
                     })
                     .join(),
             )
@@ -9777,6 +9892,7 @@ impl GatewayToolExecutor {
         };
 
         let mcp_manager = Arc::clone(&self.mcp_manager);
+        let cancellation = self.invocation_cancellation.clone();
 
         let joined = std::thread::scope(|s| {
             s.spawn(|| {
@@ -9806,14 +9922,23 @@ impl GatewayToolExecutor {
                                 return Err(format!("server '{server}' not found"));
                             }
 
-                            guard
-                                .call_tool(&qualified_name, args.cloned())
-                                .await
-                                .map_err(|e| format!("MCP tool '{qualified_name}' failed: {e}"))
-                                .and_then(|call_result| {
-                                    serde_json::to_string_pretty(&call_result)
-                                        .map_err(|e| format!("failed to serialize MCP result: {e}"))
-                                })
+                            let call = async {
+                                guard
+                                    .call_tool(&qualified_name, args.cloned())
+                                    .await
+                                    .map_err(|e| format!("MCP tool '{qualified_name}' failed: {e}"))
+                            };
+                            let call_result = match cancellation {
+                                Some(cancellation) => tokio::select! {
+                                    result = call => result,
+                                    () = cancellation.cancelled() => {
+                                        Err("MCP tool call cancelled by the owning turn".to_string())
+                                    }
+                                },
+                                None => call.await,
+                            }?;
+                            serde_json::to_string_pretty(&call_result)
+                                .map_err(|e| format!("failed to serialize MCP result: {e}"))
                         }
                         "ListMcpResources" => {
                             let server = parsed
@@ -9825,7 +9950,17 @@ impl GatewayToolExecutor {
                                 return Err(format!("server '{server}' not found"));
                             }
 
-                            match guard.list_resources(server).await {
+                            let list = async { guard.list_resources(server).await };
+                            let resources = match cancellation {
+                                Some(cancellation) => tokio::select! {
+                                    result = list => result.map(|resources| resources.to_vec()),
+                                    () = cancellation.cancelled() => {
+                                        return Err("MCP resource listing cancelled by the owning turn".to_string());
+                                    }
+                                },
+                                None => list.await.map(|resources| resources.to_vec()),
+                            };
+                            match resources {
                                 Ok(resources) => {
                                     let items: Vec<_> = resources
                                         .iter()
@@ -11417,18 +11552,43 @@ pub(crate) async fn run_streaming_turn_streaming(
     let reporter = StreamingReporter::new(sender.clone(), runtime_status_events.clone());
     let mut prompter = DurableDeferPrompter;
     let rollback_message_len = runtime.message_count();
-    let result = if let Some(cancel_rx) = cancel_rx {
-        tokio::select! {
-            result = async {
-                match (deferred_results, approval_decisions) {
-                    (Some(results), None) => runtime.resume_turn_with_tool_results(results, Some(&mut prompter), reporter).await,
-                    (None, Some(decisions)) => runtime.resume_turn_with_approval_decisions(decisions, Some(&mut prompter), reporter).await,
-                    (None, None) => runtime.run_turn_resumable(user_input, Some(&mut prompter), reporter).await,
-                    (Some(_), Some(_)) => unreachable!("validated above"),
+    let cancellation = runtime.begin_cancellable_turn();
+    let mut result = if let Some(cancel_rx) = cancel_rx {
+        let turn = async {
+            match (deferred_results, approval_decisions) {
+                (Some(results), None) => {
+                    runtime
+                        .resume_turn_with_tool_results(results, Some(&mut prompter), reporter)
+                        .await
                 }
-            } => result.map_err(GatewayError::Runtime),
+                (None, Some(decisions)) => {
+                    runtime
+                        .resume_turn_with_approval_decisions(
+                            decisions,
+                            Some(&mut prompter),
+                            reporter,
+                        )
+                        .await
+                }
+                (None, None) => {
+                    runtime
+                        .run_turn_resumable(user_input, Some(&mut prompter), reporter)
+                        .await
+                }
+                (Some(_), Some(_)) => unreachable!("validated above"),
+            }
+        };
+        tokio::pin!(turn);
+        tokio::select! {
+            biased;
+            result = &mut turn => result.map_err(GatewayError::Runtime),
             _ = cancel_rx => {
-                Err(GatewayError::TurnCancelled)
+                cancellation.cancel();
+                match turn.await {
+                    Ok(outcome) => Ok(outcome),
+                    Err(error) if error.is_cancelled() => Err(GatewayError::TurnCancelled),
+                    Err(error) => Err(GatewayError::Runtime(error)),
+                }
             },
         }
     } else {
@@ -11452,18 +11612,29 @@ pub(crate) async fn run_streaming_turn_streaming(
         }
         .map_err(GatewayError::Runtime)
     };
-    if let Err(error) = result.as_ref() {
-        let _ = runtime
-            .finish_latest_kernel_turn(
-                if matches!(error, GatewayError::TurnCancelled) {
+    if result.is_err() {
+        let (terminal_status, terminal_detail, context_window_exceeded) = {
+            let error = result.as_ref().expect_err("result checked as error");
+            let cancelled = matches!(error, GatewayError::TurnCancelled);
+            (
+                if cancelled {
                     runtime::RuntimeTurnTerminalStatus::Cancelled
                 } else {
                     runtime::RuntimeTurnTerminalStatus::Failed
                 },
-                Some("outer coordinator interrupted the runtime turn"),
+                if cancelled {
+                    "outer coordinator interrupted the runtime turn"
+                } else {
+                    "runtime turn failed before outer settlement"
+                },
+                error.is_context_window_exceeded(),
             )
-            .await;
-        if error.is_context_window_exceeded() {
+        };
+        let terminal_error = runtime
+            .finish_latest_kernel_turn(terminal_status, Some(terminal_detail))
+            .await
+            .err();
+        if context_window_exceeded {
             if let Err(rollback_error) =
                 rollback_current_runtime_turn(runtime, rollback_message_len)
             {
@@ -11472,6 +11643,13 @@ pub(crate) async fn run_streaming_turn_streaming(
                     "run_streaming_turn_streaming: failed to rollback context-window-exceeded turn messages"
                 );
             }
+        }
+        if let Some(terminal_error) = terminal_error {
+            tracing::error!(
+                error = %terminal_error,
+                "run_streaming_turn_streaming: failed to commit terminal turn checkpoint"
+            );
+            result = Err(GatewayError::Runtime(terminal_error));
         }
     }
     runtime.set_hook_progress_reporter(None);
@@ -11819,17 +11997,20 @@ pub(crate) async fn run_streaming_turn_with_options(
     let collector = SseEventCollector::new(runtime_status_events.clone());
     let mut prompter = DurableDeferPrompter;
     let rollback_message_len = runtime.message_count();
-    let result = if let Some(cancel_rx) = cancel_rx {
+    let cancellation = runtime.begin_cancellable_turn();
+    let mut result = if let Some(cancel_rx) = cancel_rx {
+        let turn = runtime.run_turn(user_input, Some(&mut prompter), collector);
+        tokio::pin!(turn);
         tokio::select! {
-            result = runtime.run_turn(user_input, Some(&mut prompter), collector) => result.map_err(GatewayError::Runtime),
+            biased;
+            result = &mut turn => result.map_err(GatewayError::Runtime),
             _ = cancel_rx => {
-                if let Err(error) = rollback_current_runtime_turn(runtime, rollback_message_len) {
-                    tracing::warn!(
-                        error = %error,
-                        "run_streaming_turn: failed to rollback cancelled turn messages"
-                    );
+                cancellation.cancel();
+                match turn.await {
+                    Ok(summary) => Ok(summary),
+                    Err(error) if error.is_cancelled() => Err(GatewayError::TurnCancelled),
+                    Err(error) => Err(GatewayError::Runtime(error)),
                 }
-                Err(GatewayError::TurnCancelled)
             },
         }
     } else {
@@ -11838,22 +12019,26 @@ pub(crate) async fn run_streaming_turn_with_options(
             .await
             .map_err(GatewayError::Runtime)
     };
-    if let Err(error) = result.as_ref() {
-        if matches!(error, GatewayError::TurnCancelled) {
-            if let Err(terminal_error) = runtime
+    if result.is_err() {
+        let (cancelled, context_window_exceeded) = {
+            let error = result.as_ref().expect_err("result checked as error");
+            (
+                matches!(error, GatewayError::TurnCancelled),
+                error.is_context_window_exceeded(),
+            )
+        };
+        let terminal_error = if cancelled {
+            runtime
                 .finish_latest_kernel_turn(
                     runtime::RuntimeTurnTerminalStatus::Cancelled,
                     Some("outer coordinator interrupted the batched runtime turn"),
                 )
                 .await
-            {
-                tracing::warn!(
-                    error = %terminal_error,
-                    "run_streaming_turn: failed to commit cancelled turn checkpoint"
-                );
-            }
-        }
-        if error.is_context_window_exceeded() {
+                .err()
+        } else {
+            None
+        };
+        if context_window_exceeded {
             if let Err(rollback_error) =
                 rollback_current_runtime_turn(runtime, rollback_message_len)
             {
@@ -11862,6 +12047,13 @@ pub(crate) async fn run_streaming_turn_with_options(
                     "run_streaming_turn: failed to rollback context-window-exceeded turn messages"
                 );
             }
+        }
+        if let Some(terminal_error) = terminal_error {
+            tracing::error!(
+                error = %terminal_error,
+                "run_streaming_turn: failed to commit cancelled turn checkpoint"
+            );
+            result = Err(GatewayError::Runtime(terminal_error));
         }
     }
     runtime.set_hook_progress_reporter(None);
@@ -14210,6 +14402,7 @@ mod tests {
             &workspace.path,
             Some("chat"),
             &[],
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .expect("workspace glob should succeed");
 
@@ -14245,6 +14438,7 @@ mod tests {
             &workspace.path,
             Some("chat"),
             &[],
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
 
         assert!(
@@ -14719,6 +14913,47 @@ mod tests {
         executor
             .validate_paths("bash", &input)
             .expect("non-rd scenarios should not use the rd-specific bash guard");
+    }
+
+    #[test]
+    fn cancelled_external_transport_records_unknown_unless_completion_is_known() {
+        let unknown = reconcile_tool_outcome_after_cancellation(
+            "mcp__payments__charge",
+            ToolExecutionOutcome::Completed(Err(ToolError::new("transport future dropped"))),
+        );
+        assert!(matches!(
+            unknown,
+            ToolExecutionOutcome::OutcomeUnknown { reason }
+                if reason.contains("remote side effects cannot be proven absent")
+        ));
+
+        let completed = reconcile_tool_outcome_after_cancellation(
+            "mcp__search__query",
+            ToolExecutionOutcome::Completed(Ok(r#"{"items":[1]}"#.to_string())),
+        );
+        assert!(matches!(
+            completed,
+            ToolExecutionOutcome::Completed(Ok(output)) if output.contains("items")
+        ));
+
+        let local = reconcile_tool_outcome_after_cancellation(
+            "bash",
+            ToolExecutionOutcome::Completed(Ok(
+                r#"{"returnCodeInterpretation":"cancelled","interrupted":true}"#.to_string(),
+            )),
+        );
+        assert!(matches!(local, ToolExecutionOutcome::Cancelled { .. }));
+
+        let local_precommit = reconcile_tool_outcome_after_cancellation(
+            "write_file",
+            ToolExecutionOutcome::Completed(Err(ToolError::new(
+                "file operation cancelled before commit",
+            ))),
+        );
+        assert!(matches!(
+            local_precommit,
+            ToolExecutionOutcome::Cancelled { .. }
+        ));
     }
 
     #[test]

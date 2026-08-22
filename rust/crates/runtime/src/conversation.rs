@@ -1,12 +1,15 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use telemetry::SessionTracer;
+use tokio::sync::Notify;
+use tokio::task::JoinSet;
 
 use crate::compact::{
     compact_session, compact_session_with_summary, CompactionConfig, CompactionResult,
@@ -513,8 +516,134 @@ fn latest_user_objective(messages: &[ConversationMessage]) -> String {
         .unwrap_or_else(|| "continue current turn".into())
 }
 
+/// Shared cancellation state for one runtime turn and every tool invocation it owns.
+///
+/// Cancellation is level-triggered: callers cannot miss a notification that raced
+/// with waiter registration. Executors may also use [`Self::atomic_flag`] from a
+/// blocking worker or process supervisor.
+#[derive(Debug, Clone)]
+pub struct RuntimeCancellationToken {
+    cancelled: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl Default for RuntimeCancellationToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RuntimeCancellationToken {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    pub fn cancel(&self) {
+        if !self.cancelled.swap(true, Ordering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn atomic_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
+    pub async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+/// Immutable authority passed to a single tool invocation.
+#[derive(Debug, Clone)]
+pub struct ToolInvocationContext {
+    pub turn_id: String,
+    pub invocation_id: String,
+    pub iteration: usize,
+    pub started_at: Instant,
+    pub timeout_at: Instant,
+    pub deadline: Instant,
+    /// Invocation-scoped cancellation, triggered by either the parent turn or
+    /// this invocation's timeout without cancelling sibling tools.
+    pub cancellation: RuntimeCancellationToken,
+    turn_cancellation: RuntimeCancellationToken,
+}
+
+enum InvocationStopReason {
+    TurnCancelled,
+    TimedOut,
+}
+
+impl ToolInvocationContext {
+    #[must_use]
+    fn new(
+        turn_id: &str,
+        invocation_id: &str,
+        iteration: usize,
+        timeout_ms: u64,
+        deadline_ms: u64,
+        turn_cancellation: RuntimeCancellationToken,
+    ) -> Self {
+        let started_at = Instant::now();
+        let timeout_at = started_at
+            .checked_add(Duration::from_millis(timeout_ms))
+            .unwrap_or_else(|| started_at + Duration::from_secs(24 * 60 * 60));
+        let deadline = started_at
+            .checked_add(Duration::from_millis(deadline_ms))
+            .unwrap_or_else(|| started_at + Duration::from_secs(24 * 60 * 60));
+        Self {
+            turn_id: turn_id.to_string(),
+            invocation_id: invocation_id.to_string(),
+            iteration,
+            started_at,
+            timeout_at,
+            deadline,
+            cancellation: RuntimeCancellationToken::new(),
+            turn_cancellation,
+        }
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled() || self.turn_cancellation.is_cancelled()
+    }
+
+    #[must_use]
+    pub fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    #[must_use]
+    pub fn timeout_remaining(&self) -> Duration {
+        self.timeout_at.saturating_duration_since(Instant::now())
+    }
+}
+
 /// Trait implemented by tool dispatchers that execute model-requested tools.
-pub trait ToolExecutor {
+///
+/// Each invocation runs on an owned executor clone. This keeps the async turn
+/// responsive while legacy blocking tools execute, and lets the runtime build a
+/// bounded rolling pool without sharing a mutable dispatcher across tasks.
+#[::async_trait::async_trait]
+pub trait ToolExecutor: Clone + Send + 'static {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError>;
 
     fn tool_contract(&self, _tool_name: &str) -> Option<RuntimeToolContract> {
@@ -537,8 +666,75 @@ pub trait ToolExecutor {
         ToolExecutionOutcome::Completed(self.execute(tool_name, input))
     }
 
+    fn execute_outcome_with_context(
+        &mut self,
+        request: &ToolExecutionRequest,
+    ) -> ToolExecutionOutcome {
+        if request.context.is_cancelled() {
+            return ToolExecutionOutcome::Cancelled {
+                reason: "tool call aborted before dispatch".to_string(),
+            };
+        }
+        self.execute_outcome(&request.tool_name, &request.input)
+    }
+
+    async fn execute_invocation(mut self, request: ToolExecutionRequest) -> ToolExecutionOutcome {
+        if request.context.is_cancelled() {
+            return ToolExecutionOutcome::Cancelled {
+                reason: "tool call aborted before dispatch".to_string(),
+            };
+        }
+        if request.context.timeout_remaining().is_zero() {
+            return ToolExecutionOutcome::Expired {
+                reason: "tool invocation timeout elapsed before dispatch".to_string(),
+            };
+        }
+        let invocation_cancellation = request.context.cancellation.clone();
+        let turn_cancellation = request.context.turn_cancellation.clone();
+        let timeout_at = request.context.timeout_at;
+        let mut worker =
+            tokio::task::spawn_blocking(move || self.execute_outcome_with_context(&request));
+        let stop_reason = tokio::select! {
+            biased;
+            result = &mut worker => {
+                return match result {
+                    Ok(outcome) => outcome,
+                    Err(error) => ToolExecutionOutcome::OutcomeUnknown {
+                        reason: format!(
+                            "tool invocation worker failed after durable dispatch; side-effect outcome is unknown: {error}"
+                        ),
+                    },
+                };
+            }
+            () = turn_cancellation.cancelled() => InvocationStopReason::TurnCancelled,
+            () = tokio::time::sleep_until(timeout_at.into()) => InvocationStopReason::TimedOut,
+        };
+        invocation_cancellation.cancel();
+        let outcome = match worker.await {
+            Ok(outcome) => outcome,
+            Err(error) => ToolExecutionOutcome::OutcomeUnknown {
+                reason: format!(
+                    "tool invocation worker failed after durable dispatch; side-effect outcome is unknown: {error}"
+                ),
+            },
+        };
+        match (stop_reason, outcome) {
+            (InvocationStopReason::TimedOut, ToolExecutionOutcome::Cancelled { .. }) => {
+                ToolExecutionOutcome::Expired {
+                    reason: "tool invocation exceeded its runtime timeout and settled locally"
+                        .to_string(),
+                }
+            }
+            (_, outcome) => outcome,
+        }
+    }
+
     fn supports_parallel_tool_calls(&self, _tool_name: &str) -> bool {
         false
+    }
+
+    fn max_parallel_tool_calls(&self) -> usize {
+        1
     }
 
     fn execute_batch(
@@ -572,8 +768,9 @@ fn resolve_executor_tool_contract<E: ToolExecutor>(
     Ok(contract)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ToolExecutionRequest {
+    pub context: ToolInvocationContext,
     pub tool_name: String,
     pub input: String,
 }
@@ -581,6 +778,9 @@ pub struct ToolExecutionRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolExecutionOutcome {
     Completed(Result<String, ToolError>),
+    Cancelled { reason: String },
+    Expired { reason: String },
+    OutcomeUnknown { reason: String },
     Deferred { metadata: String },
 }
 
@@ -589,6 +789,62 @@ impl ToolExecutionOutcome {
     pub fn deferred(metadata: impl Into<String>) -> Self {
         Self::Deferred {
             metadata: metadata.into(),
+        }
+    }
+}
+
+struct ParallelToolSchedulerState {
+    limit: usize,
+    tasks: JoinSet<(usize, ToolExecutionOutcome)>,
+    task_indices: HashMap<tokio::task::Id, usize>,
+    slots: Vec<Option<ToolExecutionOutcome>>,
+    results: Vec<ConversationMessage>,
+    next_to_start: usize,
+    next_to_commit: usize,
+}
+
+struct ParallelToolGroupOutcome {
+    consumed: usize,
+    results: Vec<ConversationMessage>,
+}
+
+impl ParallelToolSchedulerState {
+    fn new(tool_count: usize, limit: usize) -> Self {
+        Self {
+            limit,
+            tasks: JoinSet::new(),
+            task_indices: HashMap::new(),
+            slots: (0..tool_count).map(|_| None).collect(),
+            results: Vec::with_capacity(tool_count),
+            next_to_start: 0,
+            next_to_commit: 0,
+        }
+    }
+
+    fn store_task_result(
+        &mut self,
+        joined: Result<(tokio::task::Id, (usize, ToolExecutionOutcome)), tokio::task::JoinError>,
+    ) {
+        match joined {
+            Ok((task_id, (index, outcome))) => {
+                self.task_indices.remove(&task_id);
+                self.slots[index] = Some(outcome);
+            }
+            Err(error) => {
+                if let Some(index) = self.task_indices.remove(&error.id()) {
+                    self.slots[index] = Some(ToolExecutionOutcome::OutcomeUnknown {
+                        reason: format!(
+                            "tool scheduler task failed after durable dispatch; side-effect outcome is unknown: {error}"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    async fn drain(&mut self) {
+        while let Some(joined) = self.tasks.join_next_with_id().await {
+            self.store_task_result(joined);
         }
     }
 }
@@ -697,6 +953,11 @@ impl RuntimeError {
         Self {
             message: message.into(),
         }
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.message == "runtime turn cancelled"
     }
 }
 
@@ -876,6 +1137,7 @@ pub struct ConversationRuntime<C, T> {
     /// Authoritative durable execution boundary.  When configured, no tool is
     /// dispatched until its intent, capability and reservation are committed.
     execution_kernel: Option<Arc<dyn AgentExecutionKernel>>,
+    turn_cancellation: RuntimeCancellationToken,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -929,7 +1191,17 @@ where
             session_tracer: None,
             compaction_hook: None,
             execution_kernel: None,
+            turn_cancellation: RuntimeCancellationToken::new(),
         }
+    }
+
+    /// Install a fresh turn-level cancellation authority and return a clone to
+    /// the outer coordinator. The coordinator must cancel it and then await the
+    /// turn future before committing a terminal cancellation checkpoint.
+    pub fn begin_cancellable_turn(&mut self) -> RuntimeCancellationToken {
+        let cancellation = RuntimeCancellationToken::new();
+        self.turn_cancellation = cancellation.clone();
+        cancellation
     }
 
     #[must_use]
@@ -1650,6 +1922,7 @@ where
             .await
         {
             Ok(outcome) => Ok(outcome),
+            Err(error) if self.turn_cancellation.is_cancelled() => Err(error),
             Err(error) => {
                 self.record_turn_failed(0, &error);
                 self.complete_session_turn(turn_id, SessionTurnStatus::Failed);
@@ -1680,6 +1953,9 @@ where
         mut accumulator: TurnAccumulator,
     ) -> Result<ResumableTurnOutcome, RuntimeError> {
         loop {
+            if self.turn_cancellation.is_cancelled() {
+                return Err(RuntimeError::new("runtime turn cancelled"));
+            }
             accumulator.iterations += 1;
             if accumulator.iterations > self.max_iterations {
                 let error = RuntimeError::new(
@@ -1838,11 +2114,13 @@ where
                 request.trace.prompt_manifest_id = lineage.prompt_manifest_id;
                 request.trace.context_manifest_hash = Some(lineage.context_manifest_hash);
             }
-            let events = match self
-                .api_client
-                .stream_with_reporter(request, reporter)
-                .await
-            {
+            let cancellation = self.turn_cancellation.clone();
+            let events = match tokio::select! {
+                result = self.api_client.stream_with_reporter(request, reporter) => result,
+                () = cancellation.cancelled() => {
+                    return Err(RuntimeError::new("runtime turn cancelled"));
+                }
+            } {
                 Ok(events) => events,
                 Err(error) => {
                     self.record_turn_failed(accumulator.iterations, &error);
@@ -1998,6 +2276,24 @@ where
             let mut deferred_tools = Vec::new();
             let mut tool_index = 0;
             while tool_index < prepared_tool_uses.len() {
+                if self.turn_cancellation.is_cancelled() {
+                    for prepared in &prepared_tool_uses[tool_index..] {
+                        let result_message = self
+                            .finalize_cancelled_before_dispatch(
+                                turn_id,
+                                accumulator.iterations,
+                                prepared,
+                                reporter,
+                            )
+                            .await?;
+                        self.session
+                            .push_message(result_message.clone())
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        self.record_tool_finished(accumulator.iterations, &result_message);
+                        accumulator.tool_results.push(result_message);
+                    }
+                    return Err(RuntimeError::new("runtime turn cancelled"));
+                }
                 let prepared = &prepared_tool_uses[tool_index];
                 if !prepared.is_allowed_parallel(&self.tool_executor) {
                     match self
@@ -2042,40 +2338,13 @@ where
                     batch_end += 1;
                 }
 
-                for prepared in &prepared_tool_uses[batch_start..batch_end] {
-                    self.authorize_tool_in_kernel(turn_id, accumulator.iterations, prepared)
-                        .await?;
-                    self.start_tool_in_kernel(turn_id, accumulator.iterations, prepared)
-                        .await?;
-                    self.record_tool_started(accumulator.iterations, &prepared.tool_name);
-                    reporter.on_tool_use_start(&prepared.tool_name);
-                    reporter.on_tool_input_delta(&prepared.effective_input);
-                }
+                let group = &prepared_tool_uses[batch_start..batch_end];
+                let outcome = self
+                    .execute_parallel_tool_group(turn_id, accumulator.iterations, group, reporter)
+                    .await?;
+                let consumed = outcome.consumed;
 
-                let requests = prepared_tool_uses[batch_start..batch_end]
-                    .iter()
-                    .map(|prepared| ToolExecutionRequest {
-                        tool_name: prepared.tool_name.clone(),
-                        input: prepared.effective_input.clone(),
-                    })
-                    .collect::<Vec<_>>();
-                let mut batch_results = self.tool_executor.execute_batch(requests).into_iter();
-
-                for prepared in &prepared_tool_uses[batch_start..batch_end] {
-                    let execution = batch_results.next().unwrap_or_else(|| {
-                        Err(ToolError::new(
-                            "parallel tool executor returned fewer results than requested",
-                        ))
-                    });
-                    let result_message = self
-                        .finalize_allowed_tool_use(
-                            turn_id,
-                            accumulator.iterations,
-                            prepared,
-                            execution,
-                            reporter,
-                        )
-                        .await?;
+                for (prepared, result_message) in group.iter().take(consumed).zip(outcome.results) {
                     self.observe_repeated_tool_failure(&mut accumulator, prepared, &result_message);
                     self.session
                         .push_message(result_message.clone())
@@ -2088,13 +2357,7 @@ where
                     self.activate_tools_from_search_result(&result_message);
                     accumulator.tool_results.push(result_message);
                 }
-                if batch_results.next().is_some() {
-                    self.record_runtime_warning(
-                        "parallel_tool_executor_extra_result",
-                        "parallel tool executor returned more results than requested",
-                    );
-                }
-                tool_index = batch_end;
+                tool_index = batch_start + consumed;
             }
 
             if !deferred_tools.is_empty() {
@@ -2121,6 +2384,284 @@ where
             .await?;
 
         Ok(ResumableTurnOutcome::Completed(summary))
+    }
+
+    async fn execute_parallel_tool_group<R: RuntimeEventReporter>(
+        &mut self,
+        turn_id: &str,
+        iteration: usize,
+        prepared: &[PreparedToolUse],
+        reporter: &mut R,
+    ) -> Result<ParallelToolGroupOutcome, RuntimeError> {
+        let limit = self.parallel_tool_limit(prepared.len());
+        let mut scheduler = ParallelToolSchedulerState::new(prepared.len(), limit);
+
+        loop {
+            while !self.turn_cancellation.is_cancelled()
+                && scheduler.next_to_start < prepared.len()
+                && scheduler.tasks.len() < scheduler.limit
+            {
+                let index = scheduler.next_to_start;
+                let item = &prepared[index];
+                if index > 0 && !item.is_allowed_parallel(&self.tool_executor) {
+                    break;
+                }
+                if let Err(error) = self
+                    .authorize_tool_in_kernel(turn_id, iteration, item)
+                    .await
+                {
+                    return Err(self
+                        .settle_parallel_scheduler_after_error(
+                            turn_id,
+                            iteration,
+                            prepared,
+                            &mut scheduler,
+                            reporter,
+                            error,
+                        )
+                        .await);
+                }
+                if self.turn_cancellation.is_cancelled() {
+                    reporter.on_tool_use_start(&item.tool_name);
+                    reporter.on_tool_input_delta(&item.effective_input);
+                    scheduler.slots[index] = Some(ToolExecutionOutcome::Cancelled {
+                        reason: "tool call aborted before dispatch".to_string(),
+                    });
+                    scheduler.next_to_start += 1;
+                    break;
+                }
+                if let Err(error) = self.start_tool_in_kernel(turn_id, iteration, item).await {
+                    return Err(self
+                        .settle_parallel_scheduler_after_error(
+                            turn_id,
+                            iteration,
+                            prepared,
+                            &mut scheduler,
+                            reporter,
+                            error,
+                        )
+                        .await);
+                }
+                self.record_tool_started(iteration, &item.tool_name);
+                reporter.on_tool_use_start(&item.tool_name);
+                reporter.on_tool_input_delta(&item.effective_input);
+                let request = ToolExecutionRequest {
+                    context: ToolInvocationContext::new(
+                        turn_id,
+                        &item.tool_use_id,
+                        iteration,
+                        item.contract.timeout_ms,
+                        item.contract.deadline_ms,
+                        self.turn_cancellation.clone(),
+                    ),
+                    tool_name: item.tool_name.clone(),
+                    input: item.effective_input.clone(),
+                };
+                let executor = self.tool_executor.clone();
+                let task = scheduler
+                    .tasks
+                    .spawn(async move { (index, executor.execute_invocation(request).await) });
+                scheduler.task_indices.insert(task.id(), index);
+                scheduler.next_to_start += 1;
+            }
+
+            self.commit_parallel_slots_or_settle(
+                turn_id,
+                iteration,
+                prepared,
+                &mut scheduler,
+                reporter,
+            )
+            .await?;
+            if scheduler.tasks.is_empty() {
+                break;
+            }
+            if let Some(joined) = scheduler.tasks.join_next_with_id().await {
+                scheduler.store_task_result(joined);
+            }
+            self.commit_parallel_slots_or_settle(
+                turn_id,
+                iteration,
+                prepared,
+                &mut scheduler,
+                reporter,
+            )
+            .await?;
+        }
+
+        self.finalize_queued_parallel_tools(turn_id, iteration, prepared, scheduler, reporter)
+            .await
+    }
+
+    fn parallel_tool_limit(&self, tool_count: usize) -> usize {
+        self.tool_executor
+            .max_parallel_tool_calls()
+            .max(1)
+            .min(tool_count)
+    }
+
+    async fn finalize_queued_parallel_tools<R: RuntimeEventReporter>(
+        &mut self,
+        turn_id: &str,
+        iteration: usize,
+        prepared: &[PreparedToolUse],
+        mut scheduler: ParallelToolSchedulerState,
+        reporter: &mut R,
+    ) -> Result<ParallelToolGroupOutcome, RuntimeError> {
+        let consumed = if self.turn_cancellation.is_cancelled() {
+            for item in &prepared[scheduler.next_to_start..] {
+                scheduler.results.push(
+                    self.finalize_cancelled_before_dispatch(turn_id, iteration, item, reporter)
+                        .await?,
+                );
+            }
+            prepared.len()
+        } else {
+            scheduler.next_to_start
+        };
+        if scheduler.results.len() != consumed {
+            return Err(RuntimeError::new(
+                "parallel tool scheduler ended with uncommitted results",
+            ));
+        }
+        Ok(ParallelToolGroupOutcome {
+            consumed,
+            results: scheduler.results,
+        })
+    }
+
+    async fn commit_parallel_slots_or_settle<R: RuntimeEventReporter>(
+        &mut self,
+        turn_id: &str,
+        iteration: usize,
+        prepared: &[PreparedToolUse],
+        scheduler: &mut ParallelToolSchedulerState,
+        reporter: &mut R,
+    ) -> Result<(), RuntimeError> {
+        let end_exclusive = scheduler.next_to_start;
+        if let Err(error) = self
+            .finalize_ready_parallel_slots(
+                turn_id,
+                iteration,
+                prepared,
+                scheduler,
+                end_exclusive,
+                reporter,
+            )
+            .await
+        {
+            return Err(self
+                .settle_parallel_scheduler_after_error(
+                    turn_id, iteration, prepared, scheduler, reporter, error,
+                )
+                .await);
+        }
+        Ok(())
+    }
+
+    async fn settle_parallel_scheduler_after_error<R: RuntimeEventReporter>(
+        &mut self,
+        turn_id: &str,
+        iteration: usize,
+        prepared: &[PreparedToolUse],
+        scheduler: &mut ParallelToolSchedulerState,
+        reporter: &mut R,
+        error: RuntimeError,
+    ) -> RuntimeError {
+        scheduler.drain().await;
+        let end_exclusive = scheduler.next_to_start;
+        match self
+            .finalize_ready_parallel_slots(
+                turn_id,
+                iteration,
+                prepared,
+                scheduler,
+                end_exclusive,
+                reporter,
+            )
+            .await
+        {
+            Ok(()) => error,
+            Err(settle_error) => RuntimeError::new(format!(
+                "{error}; started parallel tools settled but outcome commit also failed: {settle_error}"
+            )),
+        }
+    }
+
+    async fn finalize_ready_parallel_slots<R: RuntimeEventReporter>(
+        &mut self,
+        turn_id: &str,
+        iteration: usize,
+        prepared: &[PreparedToolUse],
+        scheduler: &mut ParallelToolSchedulerState,
+        end_exclusive: usize,
+        reporter: &mut R,
+    ) -> Result<(), RuntimeError> {
+        while scheduler.next_to_commit < end_exclusive {
+            let Some(outcome) = scheduler.slots[scheduler.next_to_commit].take() else {
+                break;
+            };
+            let index = scheduler.next_to_commit;
+            let result = self
+                .finalize_parallel_tool_outcome(
+                    turn_id,
+                    iteration,
+                    &prepared[index],
+                    outcome,
+                    reporter,
+                )
+                .await?;
+            scheduler.next_to_commit += 1;
+            scheduler.results.push(result);
+        }
+        Ok(())
+    }
+
+    async fn finalize_parallel_tool_outcome<R: RuntimeEventReporter>(
+        &mut self,
+        turn_id: &str,
+        iteration: usize,
+        prepared: &PreparedToolUse,
+        outcome: ToolExecutionOutcome,
+        reporter: &mut R,
+    ) -> Result<ConversationMessage, RuntimeError> {
+        match outcome {
+            ToolExecutionOutcome::Completed(execution) => {
+                self.finalize_allowed_tool_use(
+                    turn_id, iteration, prepared, execution, reporter,
+                )
+                .await
+            }
+            ToolExecutionOutcome::Cancelled { reason } => {
+                self.finalize_cancelled_tool_use(
+                    turn_id, iteration, prepared, &reason, reporter,
+                )
+                .await
+            }
+            ToolExecutionOutcome::Expired { reason } => {
+                self.finalize_expired_tool_use(turn_id, iteration, prepared, &reason, reporter)
+                    .await
+            }
+            ToolExecutionOutcome::OutcomeUnknown { reason } => {
+                self.finalize_unknown_tool_use(
+                    turn_id, iteration, prepared, &reason, reporter,
+                )
+                .await
+            }
+            ToolExecutionOutcome::Deferred { .. } => {
+                self.finalize_allowed_tool_use(
+                    turn_id,
+                    iteration,
+                    prepared,
+                    Err(ToolError::new(format!(
+                        "parallel tool `{}` violated its lifecycle contract by returning deferred work",
+                        prepared.tool_name
+                    ))),
+                    reporter,
+                )
+                .await
+            }
+        }
     }
 
     #[must_use]
@@ -2647,15 +3188,38 @@ where
             .await?;
         match &prepared.permission_outcome {
             PermissionOutcome::Allow => {
+                if self.turn_cancellation.is_cancelled() {
+                    reporter.on_tool_use_start(&prepared.tool_name);
+                    reporter.on_tool_input_delta(&prepared.effective_input);
+                    return Ok(PreparedToolExecution::Completed(
+                        self.finalize_cancelled_tool_use(
+                            turn_id,
+                            iteration,
+                            prepared,
+                            "tool call aborted before dispatch",
+                            reporter,
+                        )
+                        .await?,
+                    ));
+                }
                 self.start_tool_in_kernel(turn_id, iteration, prepared)
                     .await?;
                 self.record_tool_started(iteration, &prepared.tool_name);
                 reporter.on_tool_use_start(&prepared.tool_name);
                 reporter.on_tool_input_delta(&prepared.effective_input);
-                match self
-                    .tool_executor
-                    .execute_outcome(&prepared.tool_name, &prepared.effective_input)
-                {
+                let request = ToolExecutionRequest {
+                    context: ToolInvocationContext::new(
+                        turn_id,
+                        &prepared.tool_use_id,
+                        iteration,
+                        prepared.contract.timeout_ms,
+                        prepared.contract.deadline_ms,
+                        self.turn_cancellation.clone(),
+                    ),
+                    tool_name: prepared.tool_name.clone(),
+                    input: prepared.effective_input.clone(),
+                };
+                match self.tool_executor.clone().execute_invocation(request).await {
                     ToolExecutionOutcome::Completed(execution) => {
                         Ok(PreparedToolExecution::Completed(
                             self.finalize_allowed_tool_use(
@@ -2714,6 +3278,30 @@ where
                             input: prepared.effective_input.clone(),
                             metadata,
                         }))
+                    }
+                    ToolExecutionOutcome::Cancelled { reason } => {
+                        Ok(PreparedToolExecution::Completed(
+                            self.finalize_cancelled_tool_use(
+                                turn_id, iteration, prepared, &reason, reporter,
+                            )
+                            .await?,
+                        ))
+                    }
+                    ToolExecutionOutcome::Expired { reason } => {
+                        Ok(PreparedToolExecution::Completed(
+                            self.finalize_expired_tool_use(
+                                turn_id, iteration, prepared, &reason, reporter,
+                            )
+                            .await?,
+                        ))
+                    }
+                    ToolExecutionOutcome::OutcomeUnknown { reason } => {
+                        Ok(PreparedToolExecution::Completed(
+                            self.finalize_unknown_tool_use(
+                                turn_id, iteration, prepared, &reason, reporter,
+                            )
+                            .await?,
+                        ))
                     }
                 }
             }
@@ -2828,6 +3416,139 @@ where
         ))
     }
 
+    async fn finalize_cancelled_tool_use<R: RuntimeEventReporter>(
+        &mut self,
+        turn_id: &str,
+        iteration: usize,
+        prepared: &PreparedToolUse,
+        reason: &str,
+        reporter: &mut R,
+    ) -> Result<ConversationMessage, RuntimeError> {
+        let output = merge_hook_feedback(
+            prepared.pre_hook_result.messages(),
+            reason.to_string(),
+            true,
+        );
+        let projected = self
+            .finish_tool_in_kernel(RuntimeToolOutcome {
+                turn_id: turn_id.to_string(),
+                invocation_id: prepared.tool_use_id.clone(),
+                tool_name: prepared.tool_name.clone(),
+                input: prepared.effective_input.clone(),
+                output,
+                iteration,
+                outcome: RuntimeToolOutcomeKind::Cancelled,
+            })
+            .await?;
+        reporter.on_tool_result(
+            &prepared.tool_name,
+            &prepared.effective_input,
+            &projected.model_output,
+            true,
+        );
+        reporter.on_tool_use_end();
+        Ok(ConversationMessage::tool_result(
+            prepared.tool_use_id.clone(),
+            prepared.tool_name.clone(),
+            projected.model_output,
+            true,
+        ))
+    }
+
+    async fn finalize_unknown_tool_use<R: RuntimeEventReporter>(
+        &mut self,
+        turn_id: &str,
+        iteration: usize,
+        prepared: &PreparedToolUse,
+        reason: &str,
+        reporter: &mut R,
+    ) -> Result<ConversationMessage, RuntimeError> {
+        let output = merge_hook_feedback(
+            prepared.pre_hook_result.messages(),
+            reason.to_string(),
+            true,
+        );
+        let projected = self
+            .finish_tool_in_kernel(RuntimeToolOutcome {
+                turn_id: turn_id.to_string(),
+                invocation_id: prepared.tool_use_id.clone(),
+                tool_name: prepared.tool_name.clone(),
+                input: prepared.effective_input.clone(),
+                output,
+                iteration,
+                outcome: RuntimeToolOutcomeKind::OutcomeUnknown,
+            })
+            .await?;
+        reporter.on_tool_result(
+            &prepared.tool_name,
+            &prepared.effective_input,
+            &projected.model_output,
+            true,
+        );
+        reporter.on_tool_use_end();
+        Ok(ConversationMessage::tool_result(
+            prepared.tool_use_id.clone(),
+            prepared.tool_name.clone(),
+            projected.model_output,
+            true,
+        ))
+    }
+
+    async fn finalize_expired_tool_use<R: RuntimeEventReporter>(
+        &mut self,
+        turn_id: &str,
+        iteration: usize,
+        prepared: &PreparedToolUse,
+        reason: &str,
+        reporter: &mut R,
+    ) -> Result<ConversationMessage, RuntimeError> {
+        let output = merge_hook_feedback(
+            prepared.pre_hook_result.messages(),
+            reason.to_string(),
+            true,
+        );
+        let projected = self
+            .finish_tool_in_kernel(RuntimeToolOutcome {
+                turn_id: turn_id.to_string(),
+                invocation_id: prepared.tool_use_id.clone(),
+                tool_name: prepared.tool_name.clone(),
+                input: prepared.effective_input.clone(),
+                output,
+                iteration,
+                outcome: RuntimeToolOutcomeKind::Expired,
+            })
+            .await?;
+        reporter.on_tool_result(
+            &prepared.tool_name,
+            &prepared.effective_input,
+            &projected.model_output,
+            true,
+        );
+        reporter.on_tool_use_end();
+        Ok(ConversationMessage::tool_result(
+            prepared.tool_use_id.clone(),
+            prepared.tool_name.clone(),
+            projected.model_output,
+            true,
+        ))
+    }
+
+    async fn finalize_cancelled_before_dispatch<R: RuntimeEventReporter>(
+        &mut self,
+        turn_id: &str,
+        iteration: usize,
+        prepared: &PreparedToolUse,
+        reporter: &mut R,
+    ) -> Result<ConversationMessage, RuntimeError> {
+        let reason = "tool call aborted before dispatch";
+        self.authorize_cancelled_tool_in_kernel(turn_id, iteration, prepared, reason)
+            .await?;
+        reporter.on_tool_use_start(&prepared.tool_name);
+        reporter.on_tool_input_delta(&prepared.effective_input);
+        self.finalize_cancelled_tool_use(turn_id, iteration, prepared, reason, reporter)
+            .await
+    }
+
     async fn authorize_tool_in_kernel(
         &self,
         turn_id: &str,
@@ -2861,6 +3582,36 @@ where
             .map_err(|error| {
                 RuntimeError::new(format!(
                     "tool `{}` was not executed because durable authorization failed: {error}",
+                    prepared.tool_name
+                ))
+            })
+    }
+
+    async fn authorize_cancelled_tool_in_kernel(
+        &self,
+        turn_id: &str,
+        iteration: usize,
+        prepared: &PreparedToolUse,
+        reason: &str,
+    ) -> Result<(), RuntimeError> {
+        let Some(kernel) = self.execution_kernel.clone() else {
+            return Ok(());
+        };
+        kernel
+            .authorize_tool(&RuntimeToolIntent::new_with_contract(
+                turn_id,
+                &prepared.tool_use_id,
+                &prepared.tool_name,
+                &prepared.effective_input,
+                iteration,
+                false,
+                Some(reason.to_string()),
+                prepared.contract.clone(),
+            ))
+            .await
+            .map_err(|error| {
+                RuntimeError::new(format!(
+                    "tool `{}` cancellation could not be recorded durably: {error}",
                     prepared.tool_name
                 ))
             })
@@ -3591,10 +4342,10 @@ fn merge_hook_feedback(messages: &[String], output: String, is_error: bool) -> S
     sections.join("\n\n")
 }
 
-type ToolHandler = Box<dyn FnMut(&str) -> Result<String, ToolError>>;
+type ToolHandler = Arc<Mutex<Box<dyn FnMut(&str) -> Result<String, ToolError> + Send>>>;
 
 /// Simple in-memory tool executor for tests and lightweight integrations.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct StaticToolExecutor {
     handlers: BTreeMap<String, ToolHandler>,
 }
@@ -3609,9 +4360,10 @@ impl StaticToolExecutor {
     pub fn register(
         mut self,
         tool_name: impl Into<String>,
-        handler: impl FnMut(&str) -> Result<String, ToolError> + 'static,
+        handler: impl FnMut(&str) -> Result<String, ToolError> + Send + 'static,
     ) -> Self {
-        self.handlers.insert(tool_name.into(), Box::new(handler));
+        self.handlers
+            .insert(tool_name.into(), Arc::new(Mutex::new(Box::new(handler))));
         self
     }
 }
@@ -3619,8 +4371,10 @@ impl StaticToolExecutor {
 impl ToolExecutor for StaticToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
         self.handlers
-            .get_mut(tool_name)
-            .ok_or_else(|| ToolError::new(format!("unknown tool: {tool_name}")))?(input)
+            .get(tool_name)
+            .ok_or_else(|| ToolError::new(format!("unknown tool: {tool_name}")))?
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)(input)
     }
 }
 
@@ -3631,7 +4385,8 @@ mod tests {
         parse_auto_compaction_threshold, should_auto_compact, stable_context_hash, ApiClient,
         ApiRequest, AssistantEvent, CompactionHook, ConversationRuntime, DeferredApprovalDecision,
         DeferredToolResult, PreparedCompaction, PromptCacheEvent, ResumableTurnOutcome,
-        RuntimeError, StaticToolExecutor, ToolExecutionOutcome, ToolExecutionRequest, ToolExecutor,
+        RuntimeCancellationToken, RuntimeError, StaticToolExecutor, ToolExecutionOutcome,
+        ToolExecutionRequest, ToolExecutor, ToolInvocationContext,
         DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::{CompactionConfig, CompactionResult};
@@ -3640,7 +4395,7 @@ mod tests {
         AgentExecutionKernel, RuntimeApprovalDecision, RuntimeApprovalRequest,
         RuntimeApprovalResolution, RuntimeContextManifestInput, RuntimeInteractionRequest,
         RuntimeManifestLineage, RuntimeToolContract, RuntimeToolIntent, RuntimeToolOutcome,
-        RuntimeToolProjection, RuntimeTurnStart, RuntimeTurnTerminalStatus,
+        RuntimeToolOutcomeKind, RuntimeToolProjection, RuntimeTurnStart, RuntimeTurnTerminalStatus,
     };
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
@@ -3656,9 +4411,9 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
 
     /// Keep compaction fixtures large enough that the framed continuation is
@@ -3887,6 +4642,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct CountingApprovalExecutor {
         executions: Arc<AtomicUsize>,
     }
@@ -3915,6 +4671,8 @@ mod tests {
     struct ApprovalTestKernel {
         state: Mutex<ApprovalKernelState>,
         session_dir_to_block_on_start: Option<PathBuf>,
+        authorization_failure_invocation: Option<String>,
+        finish_failure_invocation: Option<String>,
     }
 
     impl ApprovalTestKernel {
@@ -3922,6 +4680,8 @@ mod tests {
             Self {
                 state: Mutex::new(ApprovalKernelState::default()),
                 session_dir_to_block_on_start: None,
+                authorization_failure_invocation: None,
+                finish_failure_invocation: None,
             }
         }
 
@@ -3929,6 +4689,26 @@ mod tests {
             Self {
                 state: Mutex::new(ApprovalKernelState::default()),
                 session_dir_to_block_on_start: Some(path),
+                authorization_failure_invocation: None,
+                finish_failure_invocation: None,
+            }
+        }
+
+        fn failing_authorization_for(invocation_id: &str) -> Self {
+            Self {
+                state: Mutex::new(ApprovalKernelState::default()),
+                session_dir_to_block_on_start: None,
+                authorization_failure_invocation: Some(invocation_id.to_string()),
+                finish_failure_invocation: None,
+            }
+        }
+
+        fn failing_finish_for(invocation_id: &str) -> Self {
+            Self {
+                state: Mutex::new(ApprovalKernelState::default()),
+                session_dir_to_block_on_start: None,
+                authorization_failure_invocation: None,
+                finish_failure_invocation: Some(invocation_id.to_string()),
             }
         }
     }
@@ -4006,6 +4786,13 @@ mod tests {
         }
 
         async fn authorize_tool(&self, intent: &RuntimeToolIntent) -> Result<(), RuntimeError> {
+            if self
+                .authorization_failure_invocation
+                .as_deref()
+                .is_some_and(|invocation_id| invocation_id == intent.invocation_id)
+            {
+                return Err(RuntimeError::new("injected durable authorization failure"));
+            }
             self.state.lock().unwrap().authorized.push(intent.clone());
             Ok(())
         }
@@ -4101,6 +4888,13 @@ mod tests {
             &self,
             outcome: RuntimeToolOutcome,
         ) -> Result<RuntimeToolProjection, RuntimeError> {
+            if self
+                .finish_failure_invocation
+                .as_deref()
+                .is_some_and(|invocation_id| invocation_id == outcome.invocation_id)
+            {
+                return Err(RuntimeError::new("injected durable finish failure"));
+            }
             let projection = RuntimeToolProjection::inline(outcome.output.clone());
             self.state.lock().unwrap().finished.push(outcome);
             Ok(projection)
@@ -4509,6 +5303,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct DeferredExecutor;
 
     impl ToolExecutor for DeferredExecutor {
@@ -4723,6 +5518,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct MultiDeferredExecutor;
 
     impl ToolExecutor for MultiDeferredExecutor {
@@ -4852,12 +5648,24 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct BatchRecordingToolExecutor {
-        batches: Arc<Mutex<Vec<Vec<String>>>>,
+        barrier: Arc<std::sync::Barrier>,
+        completed: Arc<Mutex<Vec<String>>>,
     }
 
     impl ToolExecutor for BatchRecordingToolExecutor {
         fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+            self.barrier.wait();
+            std::thread::sleep(Duration::from_millis(match tool_name {
+                "safe_read" => 40,
+                "safe_search" => 20,
+                _ => 0,
+            }));
+            self.completed
+                .lock()
+                .expect("completion lock")
+                .push(tool_name.to_string());
             Ok(format!("{tool_name}:{input}"))
         }
 
@@ -4873,28 +5681,17 @@ mod tests {
             matches!(tool_name, "safe_read" | "safe_search" | "safe_memory")
         }
 
-        fn execute_batch(
-            &mut self,
-            requests: Vec<ToolExecutionRequest>,
-        ) -> Vec<Result<String, ToolError>> {
-            self.batches.lock().expect("batch lock").push(
-                requests
-                    .iter()
-                    .map(|request| request.tool_name.clone())
-                    .collect(),
-            );
-            requests
-                .into_iter()
-                .map(|request| Ok(format!("{}:{}", request.tool_name, request.input)))
-                .collect()
+        fn max_parallel_tool_calls(&self) -> usize {
+            3
         }
     }
 
     #[tokio::test]
-    async fn parallel_safe_tool_calls_are_batched_and_results_keep_model_order() {
-        let batches = Arc::new(Mutex::new(Vec::new()));
+    async fn parallel_safe_tool_calls_dispatch_concurrently_and_commit_in_model_order() {
+        let completed = Arc::new(Mutex::new(Vec::new()));
         let tool_executor = BatchRecordingToolExecutor {
-            batches: Arc::clone(&batches),
+            barrier: Arc::new(std::sync::Barrier::new(3)),
+            completed: Arc::clone(&completed),
         };
         let mut runtime = ConversationRuntime::new(
             Session::new(),
@@ -4910,12 +5707,8 @@ mod tests {
             .expect("parallel tool loop succeeds");
 
         assert_eq!(
-            batches.lock().expect("batch lock").as_slice(),
-            &[vec![
-                "safe_read".to_string(),
-                "safe_search".to_string(),
-                "safe_memory".to_string()
-            ]]
+            completed.lock().expect("completion lock").as_slice(),
+            &["safe_memory", "safe_search", "safe_read"]
         );
         let outputs = summary
             .tool_results
@@ -4935,6 +5728,414 @@ mod tests {
                 r#"safe_memory:{"query":"previous sql"}"#,
             ]
         );
+    }
+
+    struct DynamicExecutionModeApi {
+        calls: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl ApiClient for DynamicExecutionModeApi {
+        async fn stream(
+            &mut self,
+            request: ApiRequest,
+        ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.calls += 1;
+            match self.calls {
+                1 => {
+                    let mut events = (0..3)
+                        .map(|index| AssistantEvent::ToolUse {
+                            id: format!("dynamic-{index}"),
+                            name: "dynamic_read".to_string(),
+                            input: format!(r#"{{"index":{index}}}"#),
+                        })
+                        .collect::<Vec<_>>();
+                    events.push(AssistantEvent::MessageStop);
+                    Ok(events)
+                }
+                2 => {
+                    assert_eq!(
+                        request
+                            .messages
+                            .iter()
+                            .flat_map(|message| &message.blocks)
+                            .filter(|block| matches!(block, ContentBlock::ToolResult { .. }))
+                            .count(),
+                        3
+                    );
+                    Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+                _ => unreachable!("dynamic execution mode test made an extra model call"),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct DynamicExecutionModeExecutor {
+        parallel: Arc<AtomicBool>,
+        initial_barrier: Arc<std::sync::Barrier>,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+        third_overlapped: Arc<AtomicBool>,
+    }
+
+    impl ToolExecutor for DynamicExecutionModeExecutor {
+        fn execute(&mut self, _tool_name: &str, input: &str) -> Result<String, ToolError> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            if input.contains(r#""index":0"#) || input.contains(r#""index":1"#) {
+                self.initial_barrier.wait();
+            }
+            if input.contains(r#""index":0"#) {
+                std::thread::sleep(Duration::from_millis(10));
+                self.parallel.store(false, Ordering::SeqCst);
+            } else if input.contains(r#""index":1"#) {
+                std::thread::sleep(Duration::from_millis(80));
+            } else if active > 1 {
+                self.third_overlapped.store(true, Ordering::SeqCst);
+            }
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(input.to_string())
+        }
+
+        fn tool_contract(&self, tool_name: &str) -> Option<RuntimeToolContract> {
+            let mut contract = RuntimeToolContract::test_read_only(tool_name);
+            contract.can_parallel = true;
+            Some(contract)
+        }
+
+        fn supports_parallel_tool_calls(&self, _tool_name: &str) -> bool {
+            self.parallel.load(Ordering::SeqCst)
+        }
+
+        fn max_parallel_tool_calls(&self) -> usize {
+            2
+        }
+    }
+
+    #[tokio::test]
+    async fn rolling_pool_reclassifies_unstarted_calls_into_an_exclusive_barrier() {
+        let parallel = Arc::new(AtomicBool::new(true));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let third_overlapped = Arc::new(AtomicBool::new(false));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            DynamicExecutionModeApi { calls: 0 },
+            DynamicExecutionModeExecutor {
+                parallel: Arc::clone(&parallel),
+                initial_barrier: Arc::new(std::sync::Barrier::new(2)),
+                active: Arc::clone(&active),
+                max_active: Arc::clone(&max_active),
+                third_overlapped: Arc::clone(&third_overlapped),
+            },
+            PermissionPolicy::new(PermissionMode::Allow),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("reclassify the rolling pool", None, ())
+            .await
+            .expect("live execution mode reclassification should preserve the turn");
+
+        assert_eq!(summary.tool_results.len(), 3);
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+        assert!(!third_overlapped.load(Ordering::SeqCst));
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    struct AuthorizationFailureApi;
+
+    #[async_trait::async_trait]
+    impl ApiClient for AuthorizationFailureApi {
+        async fn stream(
+            &mut self,
+            _request: ApiRequest,
+        ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            let mut events = (0..4)
+                .map(|index| AssistantEvent::ToolUse {
+                    id: format!("auth-failure-{index}"),
+                    name: "parallel_read".to_string(),
+                    input: format!(r#"{{"index":{index}}}"#),
+                })
+                .collect::<Vec<_>>();
+            events.push(AssistantEvent::MessageStop);
+            Ok(events)
+        }
+    }
+
+    #[derive(Clone)]
+    struct AuthorizationFailureExecutor {
+        barrier: Arc<std::sync::Barrier>,
+        completed: Arc<AtomicUsize>,
+    }
+
+    impl ToolExecutor for AuthorizationFailureExecutor {
+        fn execute(&mut self, _tool_name: &str, input: &str) -> Result<String, ToolError> {
+            self.barrier.wait();
+            if input.contains(r#""index":1"#) {
+                std::thread::sleep(Duration::from_millis(100));
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            self.completed.fetch_add(1, Ordering::SeqCst);
+            Ok(input.to_string())
+        }
+
+        fn tool_contract(&self, tool_name: &str) -> Option<RuntimeToolContract> {
+            let mut contract = RuntimeToolContract::test_read_only(tool_name);
+            contract.can_parallel = true;
+            Some(contract)
+        }
+
+        fn supports_parallel_tool_calls(&self, _tool_name: &str) -> bool {
+            true
+        }
+
+        fn max_parallel_tool_calls(&self) -> usize {
+            2
+        }
+    }
+
+    #[tokio::test]
+    async fn authorization_failure_drains_and_commits_already_started_parallel_tools() {
+        let kernel = Arc::new(ApprovalTestKernel::failing_authorization_for(
+            "auth-failure-2",
+        ));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            AuthorizationFailureApi,
+            AuthorizationFailureExecutor {
+                barrier: Arc::new(std::sync::Barrier::new(2)),
+                completed: Arc::clone(&completed),
+            },
+            PermissionPolicy::new(PermissionMode::Allow),
+            vec!["system".to_string()],
+        )
+        .with_execution_kernel(kernel.clone());
+
+        let error = runtime
+            .run_turn("exercise scheduler cleanup", None, ())
+            .await
+            .expect_err("third durable authorization should fail");
+        assert!(error
+            .to_string()
+            .contains("injected durable authorization failure"));
+        assert_eq!(completed.load(Ordering::SeqCst), 2);
+        let state = kernel.state.lock().unwrap();
+        assert_eq!(state.started.len(), 2);
+        assert_eq!(state.finished.len(), 2);
+        assert!(state
+            .finished
+            .iter()
+            .all(|outcome| matches!(outcome.outcome, RuntimeToolOutcomeKind::Completed)));
+    }
+
+    #[tokio::test]
+    async fn ordered_commit_failure_drains_without_committing_past_the_failed_slot() {
+        let kernel = Arc::new(ApprovalTestKernel::failing_finish_for("auth-failure-0"));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            AuthorizationFailureApi,
+            AuthorizationFailureExecutor {
+                barrier: Arc::new(std::sync::Barrier::new(2)),
+                completed: Arc::clone(&completed),
+            },
+            PermissionPolicy::new(PermissionMode::Allow),
+            vec!["system".to_string()],
+        )
+        .with_execution_kernel(kernel.clone());
+
+        let error = runtime
+            .run_turn("exercise ordered commit failure", None, ())
+            .await
+            .expect_err("first durable outcome commit should fail");
+        assert!(error
+            .to_string()
+            .contains("injected durable finish failure"));
+        assert_eq!(completed.load(Ordering::SeqCst), 2);
+        let state = kernel.state.lock().unwrap();
+        assert_eq!(state.started.len(), 2);
+        assert!(
+            state.finished.is_empty(),
+            "a later result must not commit past the failed model-order slot"
+        );
+    }
+
+    struct CancellationToolApi {
+        calls: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl ApiClient for CancellationToolApi {
+        async fn stream(
+            &mut self,
+            _request: ApiRequest,
+        ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.calls += 1;
+            assert_eq!(
+                self.calls, 1,
+                "cancelled turn must not call the model again"
+            );
+            let mut events = (0..4)
+                .map(|index| AssistantEvent::ToolUse {
+                    id: format!("cancel-{index}"),
+                    name: "cancellable_read".to_string(),
+                    input: format!(r#"{{"index":{index}}}"#),
+                })
+                .collect::<Vec<_>>();
+            events.push(AssistantEvent::MessageStop);
+            Ok(events)
+        }
+    }
+
+    #[derive(Clone)]
+    struct CancellationToolExecutor {
+        started: Arc<AtomicUsize>,
+    }
+
+    impl ToolExecutor for CancellationToolExecutor {
+        fn execute(&mut self, _tool_name: &str, _input: &str) -> Result<String, ToolError> {
+            unreachable!("cancellation test uses the invocation context")
+        }
+
+        fn tool_contract(&self, tool_name: &str) -> Option<RuntimeToolContract> {
+            let mut contract = RuntimeToolContract::test_read_only(tool_name);
+            contract.can_parallel = true;
+            Some(contract)
+        }
+
+        fn supports_parallel_tool_calls(&self, _tool_name: &str) -> bool {
+            true
+        }
+
+        fn max_parallel_tool_calls(&self) -> usize {
+            2
+        }
+
+        fn execute_outcome_with_context(
+            &mut self,
+            request: &ToolExecutionRequest,
+        ) -> ToolExecutionOutcome {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            while !request.context.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            ToolExecutionOutcome::Cancelled {
+                reason: "cancelled by test coordinator".to_string(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_cancellation_is_level_triggered_for_all_waiters() {
+        let cancellation = RuntimeCancellationToken::new();
+        let waiters = (0..16)
+            .map(|_| {
+                let cancellation = cancellation.clone();
+                tokio::spawn(async move { cancellation.cancelled().await })
+            })
+            .collect::<Vec<_>>();
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+
+        for waiter in waiters {
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("every registered waiter must observe cancellation")
+                .expect("cancellation waiter should join");
+        }
+        tokio::time::timeout(Duration::from_millis(10), cancellation.cancelled())
+            .await
+            .expect("late waiters must observe the level-triggered state");
+    }
+
+    #[tokio::test]
+    async fn invocation_timeout_cancels_only_the_tool_and_records_expired() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let request = ToolExecutionRequest {
+            context: ToolInvocationContext::new(
+                "turn-timeout",
+                "invocation-timeout",
+                1,
+                20,
+                100,
+                RuntimeCancellationToken::new(),
+            ),
+            tool_name: "cancellable_read".to_string(),
+            input: "{}".to_string(),
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            CancellationToolExecutor {
+                started: Arc::clone(&started),
+            }
+            .execute_invocation(request),
+        )
+        .await
+        .expect("cooperative invocation should settle after timeout");
+
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        assert!(matches!(outcome, ToolExecutionOutcome::Expired { .. }));
+    }
+
+    #[tokio::test]
+    async fn cancellation_drains_started_tools_and_never_dispatches_queued_tools() {
+        let kernel = Arc::new(ApprovalTestKernel::new());
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            CancellationToolApi { calls: 0 },
+            CancellationToolExecutor {
+                started: Arc::clone(&started),
+            },
+            PermissionPolicy::new(PermissionMode::Allow),
+            vec!["system".to_string()],
+        )
+        .with_execution_kernel(kernel.clone());
+        let cancellation = runtime.begin_cancellable_turn();
+
+        let task = tokio::spawn(async move {
+            let result = runtime.run_turn("cancel the rolling pool", None, ()).await;
+            (runtime, result)
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while started.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the bounded pool should start two calls");
+        cancellation.cancel();
+
+        let (runtime, result) = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("cancelled tool calls should settle")
+            .expect("runtime task should join");
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert_eq!(started.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            runtime
+                .session()
+                .messages
+                .iter()
+                .flat_map(|message| &message.blocks)
+                .filter(|block| matches!(block, ContentBlock::ToolResult { .. }))
+                .count(),
+            4
+        );
+        let state = kernel.state.lock().unwrap();
+        assert_eq!(state.started.len(), 2);
+        assert_eq!(state.finished.len(), 4);
+        assert!(state
+            .finished
+            .iter()
+            .all(|outcome| matches!(outcome.outcome, RuntimeToolOutcomeKind::Cancelled)));
     }
 
     #[tokio::test]

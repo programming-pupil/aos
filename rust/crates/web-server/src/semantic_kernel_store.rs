@@ -12092,6 +12092,7 @@ mod tests {
             }
         }
 
+        #[derive(Clone)]
         struct StrictExecutor {
             contract: Option<runtime::RuntimeToolContract>,
             executions: Arc<AtomicUsize>,

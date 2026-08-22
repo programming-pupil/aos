@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use glob::Pattern;
@@ -254,6 +255,24 @@ pub fn read_file(
 
 /// Replaces a file's contents and returns patch metadata.
 pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
+    write_file_impl(path, content, None)
+}
+
+/// Replaces a file's contents unless cancellation wins before the first write.
+pub fn write_file_with_cancellation(
+    path: &str,
+    content: &str,
+    cancellation: &AtomicBool,
+) -> io::Result<WriteFileOutput> {
+    write_file_impl(path, content, Some(cancellation))
+}
+
+fn write_file_impl(
+    path: &str,
+    content: &str,
+    cancellation: Option<&AtomicBool>,
+) -> io::Result<WriteFileOutput> {
+    ensure_file_commit_allowed(cancellation)?;
     if content.len() > MAX_WRITE_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -267,6 +286,9 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
 
     let absolute_path = normalize_path_allow_missing(path)?;
     let original_file = fs::read_to_string(&absolute_path).ok();
+    // This is the operation's cancellation linearization point. Once the first
+    // filesystem mutation starts, the worker settles and reports its real result.
+    ensure_file_commit_allowed(cancellation)?;
     if let Some(parent) = absolute_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -293,6 +315,34 @@ pub fn edit_file(
     new_string: &str,
     replace_all: bool,
 ) -> io::Result<EditFileOutput> {
+    edit_file_impl(path, old_string, new_string, replace_all, None)
+}
+
+/// Performs an in-file replacement unless cancellation wins before commit.
+pub fn edit_file_with_cancellation(
+    path: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+    cancellation: &AtomicBool,
+) -> io::Result<EditFileOutput> {
+    edit_file_impl(
+        path,
+        old_string,
+        new_string,
+        replace_all,
+        Some(cancellation),
+    )
+}
+
+fn edit_file_impl(
+    path: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+    cancellation: Option<&AtomicBool>,
+) -> io::Result<EditFileOutput> {
+    ensure_file_commit_allowed(cancellation)?;
     let absolute_path = normalize_path(path)?;
     let original_file = fs::read_to_string(&absolute_path)?;
     if old_string == new_string {
@@ -313,6 +363,7 @@ pub fn edit_file(
     } else {
         original_file.replacen(old_string, new_string, 1)
     };
+    ensure_file_commit_allowed(cancellation)?;
     fs::write(&absolute_path, &updated)?;
 
     Ok(EditFileOutput {
@@ -325,6 +376,16 @@ pub fn edit_file(
         replace_all,
         git_diff: None,
     })
+}
+
+fn ensure_file_commit_allowed(cancellation: Option<&AtomicBool>) -> io::Result<()> {
+    if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "file operation cancelled before commit",
+        ));
+    }
+    Ok(())
 }
 
 /// Expands a glob pattern and returns matching filenames.
@@ -820,13 +881,14 @@ fn expand_braces(pattern: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        component_contains_glob, derive_glob_walk_root, edit_file, expand_braces, glob_search,
-        glob_search_in_workspace, grep_search, grep_search_in_workspace, is_symlink_escape,
-        read_file, read_file_in_workspace, write_file, write_file_in_workspace, GrepSearchInput,
-        MAX_WRITE_SIZE,
+        component_contains_glob, derive_glob_walk_root, edit_file, edit_file_with_cancellation,
+        expand_braces, glob_search, glob_search_in_workspace, grep_search,
+        grep_search_in_workspace, is_symlink_escape, read_file, read_file_in_workspace, write_file,
+        write_file_in_workspace, write_file_with_cancellation, GrepSearchInput, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -865,6 +927,40 @@ mod tests {
         let output = edit_file(path.to_string_lossy().as_ref(), "alpha", "omega", true)
             .expect("edit should succeed");
         assert!(output.replace_all);
+    }
+
+    #[test]
+    fn cancellation_before_file_commit_preserves_existing_content() {
+        let path = temp_path("cancelled-write.txt");
+        write_file(path.to_string_lossy().as_ref(), "original")
+            .expect("initial write should succeed");
+        let cancellation = AtomicBool::new(true);
+
+        let write_error = write_file_with_cancellation(
+            path.to_string_lossy().as_ref(),
+            "replacement",
+            &cancellation,
+        )
+        .expect_err("cancelled write must not commit");
+        assert_eq!(write_error.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("existing file should remain readable"),
+            "original"
+        );
+
+        let edit_error = edit_file_with_cancellation(
+            path.to_string_lossy().as_ref(),
+            "original",
+            "replacement",
+            false,
+            &cancellation,
+        )
+        .expect_err("cancelled edit must not commit");
+        assert_eq!(edit_error.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("existing file should remain readable"),
+            "original"
+        );
     }
 
     #[test]

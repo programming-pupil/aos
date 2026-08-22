@@ -69,7 +69,7 @@ pub use approval_tokens::{
     ApprovalDelegationHop, ApprovalScope, ApprovalTokenAudit, ApprovalTokenError,
     ApprovalTokenGrant, ApprovalTokenLedger, ApprovalTokenStatus,
 };
-pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
+pub use bash::{execute_bash, execute_bash_with_cancellation, BashCommandInput, BashCommandOutput};
 
 pub(crate) fn behavior_trace(case_id: &str) {
     if std::env::var("AOS_BEHAVIOR_TRACE_CASE").as_deref() == Ok(case_id) {
@@ -102,9 +102,10 @@ pub use conversation::{
     auto_compaction_threshold_from_env, trident_compaction_enabled_from_env, ApiClient, ApiRequest,
     AssistantEvent, AutoCompactionEvent, CompactionHook, ContextManagementReport,
     ConversationRuntime, DeferredApprovalDecision, DeferredToolResult, DeferredToolUse,
-    PreparedCompaction, PromptCacheEvent, ProviderRequestTrace, ResumableTurnOutcome, RuntimeError,
-    RuntimeEventReporter, StaticToolExecutor, SuspendedTurn, ToolError, ToolExecutionOutcome,
-    ToolExecutionRequest, ToolExecutor, TurnSummary,
+    PreparedCompaction, PromptCacheEvent, ProviderRequestTrace, ResumableTurnOutcome,
+    RuntimeCancellationToken, RuntimeError, RuntimeEventReporter, StaticToolExecutor,
+    SuspendedTurn, ToolError, ToolExecutionOutcome, ToolExecutionRequest, ToolExecutor,
+    ToolInvocationContext, TurnSummary,
 };
 pub use data_protection::{
     configured_data_protection_mode, explicit_env_opt_in_enabled, explicit_opt_in_value,
@@ -125,10 +126,11 @@ pub use execution_kernel::{
     RuntimeTurnTerminalStatus,
 };
 pub use file_ops::{
-    edit_file, edit_file_in_workspace, glob_search, glob_search_in_workspace, grep_search,
-    grep_search_in_workspace, read_file, read_file_in_workspace, write_file,
-    write_file_in_workspace, EditFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput,
-    ReadFileOutput, StructuredPatchHunk, TextFilePayload, WriteFileOutput,
+    edit_file, edit_file_in_workspace, edit_file_with_cancellation, glob_search,
+    glob_search_in_workspace, grep_search, grep_search_in_workspace, read_file,
+    read_file_in_workspace, write_file, write_file_in_workspace, write_file_with_cancellation,
+    EditFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput, ReadFileOutput,
+    StructuredPatchHunk, TextFilePayload, WriteFileOutput,
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use hooks::{
