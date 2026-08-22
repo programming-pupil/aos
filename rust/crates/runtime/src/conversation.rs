@@ -801,15 +801,27 @@ impl RuntimeStepToolSnapshot {
         authoritative: bool,
         executor: &E,
     ) -> Result<Self, RuntimeError> {
+        let active_tools = active_tools.iter().cloned().collect::<BTreeSet<_>>();
         let mut contracts = BTreeMap::new();
-        for tool_name in active_tools {
+        for tool_name in &active_tools {
             contracts.insert(
                 tool_name.clone(),
                 resolve_executor_tool_contract(executor, tool_name)?,
             );
         }
+        // This legacy model alias is executable whenever data attribution is
+        // active, so it belongs to the step authority even when not advertised.
+        if authoritative
+            && active_tools.contains("data_attribution_start")
+            && !contracts.contains_key("nl2sql_analyze")
+        {
+            contracts.insert(
+                "nl2sql_analyze".to_string(),
+                resolve_executor_tool_contract(executor, "nl2sql_analyze")?,
+            );
+        }
         Ok(Self {
-            active_tools: active_tools.iter().cloned().collect(),
+            active_tools,
             contracts,
             authoritative,
         })
@@ -829,10 +841,15 @@ impl RuntimeStepToolSnapshot {
         executor: &E,
         tool_name: &str,
     ) -> Result<RuntimeToolContract, RuntimeError> {
-        self.contracts
-            .get(tool_name)
-            .cloned()
-            .map_or_else(|| resolve_executor_tool_contract(executor, tool_name), Ok)
+        if let Some(contract) = self.contracts.get(tool_name) {
+            return Ok(contract.clone());
+        }
+        if self.authoritative {
+            return Err(RuntimeError::new(format!(
+                "tool `{tool_name}` is unavailable because its lifecycle contract was not present in the authoritative step snapshot"
+            )));
+        }
+        resolve_executor_tool_contract(executor, tool_name)
     }
 }
 
@@ -7800,6 +7817,113 @@ mod tests {
             .run_turn("use the contract snapshot tool", None, ())
             .await
             .expect("the step contract should remain frozen after provider dispatch");
+
+        assert_eq!(live_timeout_ms.load(Ordering::SeqCst), 10_000);
+        assert_eq!(observed_timeout_ms.load(Ordering::SeqCst), 1_000);
+        assert_eq!(summary.iterations, 2);
+    }
+
+    #[tokio::test]
+    async fn authoritative_step_snapshot_pins_legacy_alias_contract_through_execution() {
+        struct LegacyAliasApi {
+            calls: usize,
+            live_timeout_ms: Arc<AtomicUsize>,
+        }
+
+        #[::async_trait::async_trait]
+        impl ApiClient for LegacyAliasApi {
+            fn active_tool_names(&self) -> Vec<String> {
+                vec!["data_attribution_start".to_string()]
+            }
+
+            fn active_tool_snapshot_is_authoritative(&self) -> bool {
+                true
+            }
+
+            async fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    self.live_timeout_ms.store(10_000, Ordering::SeqCst);
+                    return Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "legacy-alias-call".to_string(),
+                            name: "nl2sql_analyze".to_string(),
+                            input: r#"{"question":"why did revenue change"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                Ok(vec![
+                    AssistantEvent::TextDelta("legacy alias complete".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        #[derive(Clone)]
+        struct LegacyAliasExecutor {
+            live_timeout_ms: Arc<AtomicUsize>,
+            observed_timeout_ms: Arc<AtomicUsize>,
+        }
+
+        impl ToolExecutor for LegacyAliasExecutor {
+            fn execute(&mut self, tool_name: &str, _input: &str) -> Result<String, ToolError> {
+                assert_eq!(tool_name, "nl2sql_analyze");
+                Ok("legacy alias result".to_string())
+            }
+
+            fn tool_contract(&self, tool_name: &str) -> Option<RuntimeToolContract> {
+                let timeout_ms = self.live_timeout_ms.load(Ordering::SeqCst) as u64;
+                let mut contract = RuntimeToolContract::test_read_only(tool_name);
+                contract.timeout_ms = timeout_ms;
+                contract.deadline_ms = timeout_ms.saturating_mul(2);
+                Some(contract)
+            }
+
+            fn requires_tool_contracts(&self) -> bool {
+                true
+            }
+
+            fn execute_outcome_with_context(
+                &mut self,
+                request: &ToolExecutionRequest,
+            ) -> ToolExecutionOutcome {
+                let timeout_ms = usize::try_from(
+                    request
+                        .context
+                        .timeout_at
+                        .duration_since(request.context.started_at)
+                        .as_millis(),
+                )
+                .expect("test timeout should fit in usize");
+                self.observed_timeout_ms.store(timeout_ms, Ordering::SeqCst);
+                ToolExecutionOutcome::Completed(self.execute(&request.tool_name, &request.input))
+            }
+        }
+
+        let live_timeout_ms = Arc::new(AtomicUsize::new(1_000));
+        let observed_timeout_ms = Arc::new(AtomicUsize::new(0));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            LegacyAliasApi {
+                calls: 0,
+                live_timeout_ms: Arc::clone(&live_timeout_ms),
+            },
+            LegacyAliasExecutor {
+                live_timeout_ms: Arc::clone(&live_timeout_ms),
+                observed_timeout_ms: Arc::clone(&observed_timeout_ms),
+            },
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("attribute the revenue change", None, ())
+            .await
+            .expect("the legacy alias must execute under its frozen step contract");
 
         assert_eq!(live_timeout_ms.load(Ordering::SeqCst), 10_000);
         assert_eq!(observed_timeout_ms.load(Ordering::SeqCst), 1_000);
