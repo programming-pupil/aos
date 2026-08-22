@@ -241,13 +241,20 @@ async fn terminate_process_tree(
 ) -> io::Result<std::process::ExitStatus> {
     #[cfg(unix)]
     if let Some(process_group_id) = process_group_id {
-        if !signal_process_group(process_group_id, "-TERM").await {
+        if let Err(error) =
+            signal_process_group(process_group_id, nix::sys::signal::Signal::SIGTERM)
+        {
+            tracing::warn!(process_group_id, %error, "failed to terminate bash process group");
             child.start_kill()?;
         }
         let graceful = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
-        let killed_group = signal_process_group(process_group_id, "-KILL").await;
-        if graceful.is_err() && !killed_group {
-            child.start_kill()?;
+        if let Err(error) =
+            signal_process_group(process_group_id, nix::sys::signal::Signal::SIGKILL)
+        {
+            tracing::warn!(process_group_id, %error, "failed to kill bash process group");
+            if graceful.is_err() {
+                child.start_kill()?;
+            }
         }
         return match graceful {
             Ok(status) => status,
@@ -260,23 +267,17 @@ async fn terminate_process_tree(
 }
 
 #[cfg(unix)]
-async fn signal_process_group(process_group_id: u32, signal: &str) -> bool {
-    let status = TokioCommand::new("kill")
-        .arg(signal)
-        .arg(format!("-{process_group_id}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-    let signalled = status.is_ok_and(|status| status.success());
-    if !signalled {
-        tracing::warn!(
-            process_group_id,
-            signal,
-            "failed to signal bash process group"
-        );
+fn signal_process_group(process_group_id: u32, signal: nix::sys::signal::Signal) -> io::Result<()> {
+    use nix::errno::Errno;
+    use nix::sys::signal::killpg;
+    use nix::unistd::Pid;
+
+    let process_group_id = i32::try_from(process_group_id)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "process group id overflow"))?;
+    match killpg(Pid::from_raw(process_group_id), signal) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
     }
-    signalled
 }
 
 async fn wait_for_cancellation(cancellation: Arc<AtomicBool>) {

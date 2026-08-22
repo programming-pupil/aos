@@ -325,6 +325,14 @@ fn stale_tool_alias_is_allowed(client: &impl ApiClient, tool_name: &str) -> bool
     canonical == "nl2sql_analyze" && client.is_tool_call_allowed("data_attribution_start")
 }
 
+fn stale_tool_alias_is_allowed_in_snapshot(
+    active_tools: &BTreeSet<String>,
+    tool_name: &str,
+) -> bool {
+    let canonical = tool_name.rsplit("__").next().unwrap_or(tool_name);
+    canonical == "nl2sql_analyze" && active_tools.contains("data_attribution_start")
+}
+
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
@@ -429,6 +437,14 @@ pub trait ApiClient: Send + Sync {
 
     fn active_tool_names(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Whether [`Self::active_tool_names`] is the complete tool surface shown
+    /// to the model for this sampling step. Production clients should opt in so
+    /// tool availability can be frozen before provider dispatch; compatibility
+    /// clients retain their historical live check.
+    fn active_tool_snapshot_is_authoritative(&self) -> bool {
+        false
     }
 
     /// Effective provider context window. The compiler reserves headroom for
@@ -766,6 +782,58 @@ fn resolve_executor_tool_contract<E: ToolExecutor>(
     };
     contract.validate(tool_name)?;
     Ok(contract)
+}
+
+/// Immutable tool authority for one model sampling step. Contracts are frozen
+/// before provider I/O so a registry reload cannot make the model observe one
+/// lifecycle contract and execute under another. Execution mode remains live
+/// because it is a dispatch-time safety classification.
+#[derive(Debug, Clone)]
+struct RuntimeStepToolSnapshot {
+    active_tools: BTreeSet<String>,
+    contracts: BTreeMap<String, RuntimeToolContract>,
+    authoritative: bool,
+}
+
+impl RuntimeStepToolSnapshot {
+    fn capture<E: ToolExecutor>(
+        active_tools: &[String],
+        authoritative: bool,
+        executor: &E,
+    ) -> Result<Self, RuntimeError> {
+        let mut contracts = BTreeMap::new();
+        for tool_name in active_tools {
+            contracts.insert(
+                tool_name.clone(),
+                resolve_executor_tool_contract(executor, tool_name)?,
+            );
+        }
+        Ok(Self {
+            active_tools: active_tools.iter().cloned().collect(),
+            contracts,
+            authoritative,
+        })
+    }
+
+    fn allows<C: ApiClient>(&self, client: &C, tool_name: &str) -> bool {
+        if !self.authoritative {
+            return client.is_tool_call_allowed(tool_name)
+                || stale_tool_alias_is_allowed(client, tool_name);
+        }
+        self.active_tools.contains(tool_name)
+            || stale_tool_alias_is_allowed_in_snapshot(&self.active_tools, tool_name)
+    }
+
+    fn contract<E: ToolExecutor>(
+        &self,
+        executor: &E,
+        tool_name: &str,
+    ) -> Result<RuntimeToolContract, RuntimeError> {
+        self.contracts
+            .get(tool_name)
+            .cloned()
+            .map_or_else(|| resolve_executor_tool_contract(executor, tool_name), Ok)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2030,6 +2098,11 @@ where
                 .min(context_compiler_max_tokens())
                 .max(1);
             let active_tools = self.api_client.active_tool_names();
+            let step_tools = RuntimeStepToolSnapshot::capture(
+                &active_tools,
+                self.api_client.active_tool_snapshot_is_authoritative(),
+                &self.tool_executor,
+            )?;
             let model_version = self.api_client.model_version();
             let objective = latest_user_objective(&request_messages);
             let domain = self.api_client.context_domain();
@@ -2206,8 +2279,7 @@ where
 
             let mut prepared_tool_uses = Vec::with_capacity(pending_tool_uses.len());
             for (tool_use_id, tool_name, input) in pending_tool_uses {
-                let tool_call_allowed = self.api_client.is_tool_call_allowed(&tool_name)
-                    || stale_tool_alias_is_allowed(&self.api_client, &tool_name);
+                let tool_call_allowed = step_tools.allows(&self.api_client, &tool_name);
                 let tool_call_allowed =
                     tool_call_allowed && !accumulator.failure_blocked_tools.contains(&tool_name);
                 let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
@@ -2262,7 +2334,7 @@ where
                     )
                 };
 
-                let contract = resolve_executor_tool_contract(&self.tool_executor, &tool_name)?;
+                let contract = step_tools.contract(&self.tool_executor, &tool_name)?;
                 prepared_tool_uses.push(PreparedToolUse {
                     tool_use_id,
                     tool_name,
@@ -7561,6 +7633,177 @@ mod tests {
             .iter()
             .flat_map(|message| message.blocks.iter())
             .any(|block| matches!(block, ContentBlock::Text { text } if text == "best available answer")));
+    }
+
+    #[tokio::test]
+    async fn authoritative_step_snapshot_pins_tool_availability_through_execution() {
+        struct SnapshotApi {
+            calls: usize,
+        }
+
+        #[::async_trait::async_trait]
+        impl ApiClient for SnapshotApi {
+            fn active_tool_names(&self) -> Vec<String> {
+                vec!["snapshot_tool".to_string()]
+            }
+
+            fn active_tool_snapshot_is_authoritative(&self) -> bool {
+                true
+            }
+
+            fn is_tool_call_allowed(&self, _tool_name: &str) -> bool {
+                false
+            }
+
+            async fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    return Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "snapshot-call".to_string(),
+                            name: "snapshot_tool".to_string(),
+                            input: "{}".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                Ok(vec![
+                    AssistantEvent::TextDelta("snapshot complete".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let executions = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&executions);
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            SnapshotApi { calls: 0 },
+            StaticToolExecutor::new().register("snapshot_tool", move |_input| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok("snapshot result".to_string())
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("use the snapshot tool", None, ())
+            .await
+            .expect("the step snapshot should remain authoritative after provider dispatch");
+
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert_eq!(summary.iterations, 2);
+        assert!(summary.tool_results.iter().any(|message| {
+            message.blocks.iter().any(
+                |block| matches!(block, ContentBlock::ToolResult { output, .. } if output == "snapshot result"),
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn authoritative_step_snapshot_pins_tool_contract_through_execution() {
+        struct ContractSnapshotApi {
+            calls: usize,
+            live_timeout_ms: Arc<AtomicUsize>,
+        }
+
+        #[::async_trait::async_trait]
+        impl ApiClient for ContractSnapshotApi {
+            fn active_tool_names(&self) -> Vec<String> {
+                vec!["snapshot_tool".to_string()]
+            }
+
+            fn active_tool_snapshot_is_authoritative(&self) -> bool {
+                true
+            }
+
+            async fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    self.live_timeout_ms.store(10_000, Ordering::SeqCst);
+                    return Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "contract-snapshot-call".to_string(),
+                            name: "snapshot_tool".to_string(),
+                            input: "{}".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                Ok(vec![
+                    AssistantEvent::TextDelta("contract snapshot complete".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        #[derive(Clone)]
+        struct ContractSnapshotExecutor {
+            live_timeout_ms: Arc<AtomicUsize>,
+            observed_timeout_ms: Arc<AtomicUsize>,
+        }
+
+        impl ToolExecutor for ContractSnapshotExecutor {
+            fn execute(&mut self, _tool_name: &str, _input: &str) -> Result<String, ToolError> {
+                Ok("contract snapshot result".to_string())
+            }
+
+            fn tool_contract(&self, tool_name: &str) -> Option<RuntimeToolContract> {
+                let timeout_ms = self.live_timeout_ms.load(Ordering::SeqCst) as u64;
+                let mut contract = RuntimeToolContract::test_read_only(tool_name);
+                contract.timeout_ms = timeout_ms;
+                contract.deadline_ms = timeout_ms.saturating_mul(2);
+                Some(contract)
+            }
+
+            fn execute_outcome_with_context(
+                &mut self,
+                request: &ToolExecutionRequest,
+            ) -> ToolExecutionOutcome {
+                let timeout_ms = usize::try_from(
+                    request
+                        .context
+                        .timeout_at
+                        .duration_since(request.context.started_at)
+                        .as_millis(),
+                )
+                .expect("test timeout should fit in usize");
+                self.observed_timeout_ms.store(timeout_ms, Ordering::SeqCst);
+                ToolExecutionOutcome::Completed(self.execute(&request.tool_name, &request.input))
+            }
+        }
+
+        let live_timeout_ms = Arc::new(AtomicUsize::new(1_000));
+        let observed_timeout_ms = Arc::new(AtomicUsize::new(0));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ContractSnapshotApi {
+                calls: 0,
+                live_timeout_ms: Arc::clone(&live_timeout_ms),
+            },
+            ContractSnapshotExecutor {
+                live_timeout_ms: Arc::clone(&live_timeout_ms),
+                observed_timeout_ms: Arc::clone(&observed_timeout_ms),
+            },
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("use the contract snapshot tool", None, ())
+            .await
+            .expect("the step contract should remain frozen after provider dispatch");
+
+        assert_eq!(live_timeout_ms.load(Ordering::SeqCst), 10_000);
+        assert_eq!(observed_timeout_ms.load(Ordering::SeqCst), 1_000);
+        assert_eq!(summary.iterations, 2);
     }
 
     #[tokio::test]

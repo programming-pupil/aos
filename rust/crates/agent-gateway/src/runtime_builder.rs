@@ -4033,6 +4033,10 @@ impl ApiClient for GatewayApiClient {
             .collect()
     }
 
+    fn active_tool_snapshot_is_authoritative(&self) -> bool {
+        true
+    }
+
     fn context_window_tokens(&self) -> Option<u64> {
         authoritative_token_limits(&self.model, &self.capabilities)
             .0

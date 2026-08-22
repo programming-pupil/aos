@@ -68,7 +68,7 @@ DSH 最强的是“可执行不变量”：
 
 AOS 采用“typed runtime + SQLite canonical ledger + semantic execution kernel + durable product control plane”。核心路径为：
 
-- `runtime::ConversationRuntime` 负责 turn/step、permission、tool lifecycle 和 in-turn compaction；
+- `runtime::ConversationRuntime` 负责 turn/step、permission、tool lifecycle 和 in-turn compaction；每个 sampling step 在 Provider I/O 前冻结权威工具集合与 lifecycle contract，模型返回后的授权和 durable intent 复用同一快照；
 - `RuntimeCancellationToken + ToolInvocationContext` 把 turn、invocation ID、monotonic timeout/deadline 和父子 cooperative cancellation 传到每个工具；
 - parallel tool 使用有界 rolling pool：durable start 后才 dispatch，补池前重读 live execution mode，完成可乱序，result/post-hook/session commit 严格按模型顺序；
 - `AgentSessionManager` 负责 session ownership、hot reload、per-session exclusion、stream/resume/cancel；
@@ -87,14 +87,14 @@ AOS 的差异化优势不是复制 coding agent，而是把多租户 Memory、�
 | 核心方向 | 权重 | AOS | Codex | DSH | 判断 |
 | --- | ---: | ---: | ---: | ---: | --- |
 | 控制面与进程生命周期 | 12% | 8.9 | 9.8 | 8.5 | Codex app-server 最成熟；AOS 已补齐 turn/tool settle barrier；DSH 偏组合式 SDK |
-| Agent loop 与 step 一致性 | 15% | 9.2 | 9.7 | 9.7 | Codex `StepContext` 最完整；DSH phase/invariant 极强 |
+| Agent loop 与 step 一致性 | 15% | 9.5 | 9.7 | 9.7 | AOS 已冻结 step 工具集合/contract；Codex `StepContext` 覆盖环境与 router 更完整，DSH phase/invariant 极强 |
 | Context authority 与请求真实性 | 15% | 9.4 | 9.5 | 9.9 | DSH dispatch-time reconstruction 最严格；AOS lineage/proof 更丰富 |
 | 压缩与长期连续性 | 13% | 9.4 | 9.7 | 9.2 | AOS exact archive/provenance 强；Codex remote continuation 更成熟 |
-| 工具调度、顺序与取消 | 14% | 9.5 | 9.8 | 9.7 | AOS 已实现 async invocation、live reclassification、ordered commit、timeout/cancel drain 与 synthetic result |
+| 工具调度、顺序与取消 | 14% | 9.6 | 9.8 | 9.7 | AOS 已实现 async invocation、live reclassification、ordered commit、timeout/cancel drain、synthetic result 与内核级进程组终止 |
 | Durability 与 crash recovery | 13% | 9.6 | 9.3 | 9.9 | DSH persistence contract 最纯；AOS SQLite ledger/事务闭环很强 |
 | 多 Agent 编排 | 10% | 9.3 | 9.6 | 8.8 | AOS durable team 有独特价值；Codex tool/runtime 结合更紧 |
-| 沙箱、扩展与可观测 | 8% | 8.7 | 9.7 | 9.1 | AOS shell/workspace cancellation 已贯通；非 Linux full sandbox 仍 unavailable |
-| **加权总分** | **100%** | **9.3** | **9.6** | **9.4** | **AOS 核心能力已对齐，差异主要转为跨平台成熟度和生产验证规模** |
+| 沙箱、扩展与可观测 | 8% | 8.8 | 9.7 | 9.1 | AOS shell/workspace cancellation 已贯通且不再依赖外部 `kill`；非 Linux full sandbox 仍 unavailable |
+| **加权总分** | **100%** | **9.4** | **9.6** | **9.4** | **AOS 核心能力已对齐；并列分数不代表相同优势，差异主要是跨平台成熟度、step 覆盖面和生产验证规模** |
 
 排名不是所有方向都按总分排序：
 
@@ -180,14 +180,25 @@ AOS 的差异化优势不是复制 coding agent，而是把多租户 Memory、�
 
 旧 Gateway 外层 settle 会忽略或只记录 `finish_latest_kernel_turn` 错误，可能在 cancelled/failed terminal 尚未持久化时仍向调用方宣布取消完成。现在流式和批量路径都会把 terminal checkpoint 失败提升为 `GatewayError::Runtime`；context-window rollback 仍执行，但持久化失败不能伪装成成功的所有权收敛。
 
+### 4.12 Shell 进程组终止改为内核级信号
+
+旧 foreground shell cancellation 通过再启动 PATH 中的外部 `kill` 命令向负 PGID 发信号。不同 Unix runner 的参数解析或启动失败会退化成只杀 shell；后台后代继续持有 stdout/stderr 管道，调用会等待到 `sleep 30` 自然结束。现在 Unix 路径直接调用安全封装的 `killpg(SIGTERM/SIGKILL)`，`ESRCH` 仅表示进程组已经收敛，其他失败显式降级并记录。取消仍先给 250ms graceful window，再强制终止、回收根进程，最后才读取完整管道和返回 settle barrier。
+
+### 4.13 Sampling step 冻结工具 authority
+
+旧 runtime 在 Provider 返回后重新读取 live `is_tool_call_allowed` 和 `tool_contract`。若 registry 在 Provider I/O 期间变化，可能出现模型看见工具 A、执行时却按 B 的 contract 授权。现在 production `ApiClient` 明确声明工具列表是本 step 的完整 authority；runtime 在网络调用前冻结工具集合与每个 lifecycle contract，模型返回后的 availability、permission、durable intent 和 outcome 使用该快照。执行模式仍在每个调用真正 dispatch 前实时读取，因为独占/并行降级属于安全 barrier，不应被旧快照覆盖。
+
+这使 AOS 达到 request/tool-contract 级 step 一致性，但还不能等同于 Codex 完整 `StepContext`：AOS 的 environment snapshot、MCP session binding、approval policy 和 executor router 尚未统一装入一个单独的不可变对象，因此本报告把该项提高到 9.5，而不是营销性地写成 9.7 或 9.8。
+
 ## 5. 仍存在的主要差距
 
 本轮没有再发现未实现的同等级 harness 核心模块；但以下成熟度差距必须保留，不能包装成“全面第一”：
 
 1. **Codex 控制面和跨平台 sandbox 更成熟。** AOS 非 Linux 环境仍 fail closed 为 isolation unavailable；Codex 的 app-server 协议兼容、客户端生态和进程执行覆盖更广。
-2. **DSH session/persistence 不变量更纯。** DSH 的 deep-freeze append、surface fold 和 folded request-header dispatch invariant 是更小、更容易独立验证的 contract；AOS 提供等价目标和更丰富 lineage，但实现面更大。
-3. **远端副作用无法被本地 harness 绝对撤销。** AOS 现在如实记录 `OutcomeUnknown`。要进一步改善，需要 MCP server/业务 API 自身支持 cancellation/idempotency/compensation，而不是在 harness 里虚构保证。
-4. **生产验证规模仍需时间积累。** Codex 的真实用户量、平台覆盖和长期故障样本明显更多。架构对齐不等于已获得同等运行历史。
+2. **完整 step snapshot 仍以 Codex 为标杆。** AOS 已冻结模型可见工具集合和 contract，也已固定 exact context/prompt lineage；但 environment、MCP binding、approval policy 与 executor router 还没有收束成单一 `StepContext`。继续改造需要跨 runtime/gateway/MCP 的版本化 contract，不能只增加一个同名结构体。
+3. **DSH session/persistence 不变量更纯。** DSH 的 deep-freeze append、surface fold 和 folded request-header dispatch invariant 是更小、更容易独立验证的 contract；AOS 提供等价目标和更丰富 lineage，但实现面更大。
+4. **远端副作用无法被本地 harness 绝对撤销。** AOS 现在如实记录 `OutcomeUnknown`。要进一步改善，需要 MCP server/业务 API 自身支持 cancellation/idempotency/compensation，而不是在 harness 里虚构保证。
+5. **生产验证规模仍需时间积累。** Codex 的真实用户量、平台覆盖和长期故障样本明显更多。架构对齐不等于已获得同等运行历史。
 
 因此本报告可以声明“AOS 的核心 harness 架构已经对齐，并在 durable semantic governance、Memory、proof-carrying compaction 和 Agent Team 上形成超集”，但不能声明“AOS 在所有工程成熟度上全面超过 Codex”。
 
@@ -209,7 +220,8 @@ AOS 的差异化优势不是复制 coding agent，而是把多租户 Memory、�
 - invocation timeout 只取消该工具并持久化 `Expired`；
 - cancelled external transport 在无法排除远端副作用时持久化 `OutcomeUnknown`；
 - cancelled `write_file/edit_file` 在提交边界前保持原文件不变，并映射为本地 `Cancelled`；
-- foreground shell cancellation 在限定时间内终止并回收进程组。
+- foreground shell cancellation 通过内核级 PGID 信号在限定时间内终止并回收进程组；
+- Provider 返回后 live client 即使发生变化，本 step 仍只能使用 Provider 前冻结的权威工具集合和 lifecycle contract。
 
 最终门禁以本报告所在提交的 CI/本地执行结果为准：
 
@@ -226,4 +238,13 @@ AOS 的差异化优势不是复制 coding agent，而是把多租户 Memory、�
 
 AOS 的 context、compaction、durability、Memory 和 Agent Team 已经具备开源研究价值，不是只有宏观框架。它在 semantic durability 方向有 Codex/DSH 没有的独特设计；本轮又补齐了此前唯一明确的核心短板：统一 async/cancellable tool invocation、live-reclassified durable rolling scheduler、ordered commit 和 settle-before-terminal。
 
-诚实结论是：当前综合 harness 评分约 **AOS 9.3、Codex 9.6、DSH 9.4**。AOS 的核心架构已经对齐，且在 durable semantic ledger、长期 Memory、compaction proof 和多 Agent 治理上超过两者的公开实现；Codex 仍以控制面、跨平台执行和生产成熟度领先，DSH 仍以 session/persistence contract 的纯度领先。回答效果是否领先仍必须用同模型、同权限、同工具和同预算盲测证明。
+诚实结论是：当前综合 harness 评分约 **AOS 9.4、Codex 9.6、DSH 9.4**。AOS 的核心架构已经对齐，且在 durable semantic ledger、长期 Memory、compaction proof 和多 Agent 治理上超过两者的公开实现；Codex 仍以完整 `StepContext`、控制面、跨平台执行和生产成熟度领先，DSH 仍以 session/persistence contract 的纯度领先。同为 9.4 不表示 AOS 与 DSH 的长短板相同；回答效果是否领先仍必须用同模型、同权限、同工具和同预算盲测证明。
+
+## 8. 达到 9.7+ 的真实验收线
+
+以下是仍值得继续的工程，不计入当前分数，也不应仅通过增加同名类型宣称完成：
+
+1. **Agent loop / StepContext**：把 model capability、reasoning、environment/world state、approval policy、MCP binding generation、tool router 与 instruction lineage 收束成版本化不可变 step authority；Provider wire 与 tool dispatch 都必须反向校验该 authority。把当前隐式 loop 分支改为可测试的 `preparing -> sampling -> committing -> executing -> compacting/suspended/completed` transition matrix，并覆盖每个阶段 crash/cancel/retry。
+2. **上下文压缩与 Session 连续性**：保留 AOS exact archive/proof/Memory 主路径；为支持的 Provider 增加可验证 remote continuation adapter，但 fallback 必须仍能从 canonical archive 本地重建。进一步把模型可见历史抽成更小的 append/replace surface fold contract，并增加 torn-tail、重复 compaction、remote/local 切换的差分测试。
+3. **多 Agent 编排**：让 `agent_team_tasks.blocked_by_json` 从存储字段升级为有环检测、dependency completion、失败传播和原子 ready transition 的真实 DAG；对 `write_scopes_json` 增加冲突 lease；为 parent fan-in 增加有预算的 artifact merge、部分成功和 deadlock detection。只有生产 worker claim/renew/recovery 全部消费这些约束，才能计入评分。
+4. **成熟度证据**：增加 Linux/macOS/Windows 分层故障矩阵、MCP server restart/upgrade、Provider fallback、SQLite torn-write/ENOSPC、长会话多次压缩和百任务 Agent Team soak；没有这些持续证据，架构设计分可以接近 9.7，生产成熟度仍不能与 Codex 等同。

@@ -4326,6 +4326,7 @@ dependencies = [
  "hex",
  "http",
  "memory-engine",
+ "nix",
  "notify",
  "parking_lot",
  "plugins",
