@@ -82,7 +82,7 @@ export function QuickOpenPalette({
       styles={{
         body: { background: '#020617', paddingTop: 8 },
         header: { background: '#07111f', borderBottomColor: 'rgba(148, 163, 184, 0.18)' },
-        content: { background: '#07111f' },
+        container: { background: '#07111f' },
       }}
     >
       <Input

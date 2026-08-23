@@ -1692,7 +1692,7 @@ export default function ApiKeys() {
                   />
                 </Form.Item>
               )}
-              <Divider orientation="left" plain>
+              <Divider titlePlacement="start" plain>
                 {t('apikeys.manualOverrides')}
               </Divider>
               <Form.Item name="supports_reasoning_effort" valuePropName="checked" style={{ marginBottom: 8 }}>
@@ -2139,7 +2139,7 @@ export default function ApiKeys() {
                   />
                 </Form.Item>
               )}
-              <Divider orientation="left" plain>
+              <Divider titlePlacement="start" plain>
                 {t('apikeys.manualOverrides')}
               </Divider>
               <Form.Item name="supports_reasoning_effort" valuePropName="checked" style={{ marginBottom: 8 }}>

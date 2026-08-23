@@ -192,7 +192,7 @@ function ChangeDetailDrawer({
         </Descriptions.Item>
       </Descriptions>
 
-      <Divider orientation="left">{t('schemaChanges.changeDetails')}</Divider>
+      <Divider titlePlacement="start">{t('schemaChanges.changeDetails')}</Divider>
 
       <div style={{ marginBottom: 16 }}>
         {notification.details.length === 0 && (
@@ -222,7 +222,7 @@ function ChangeDetailDrawer({
 
       {notification.affectedQueriesCount > 0 && (
         <>
-          <Divider orientation="left">
+          <Divider titlePlacement="start">
             <Space>
               <WarningOutlined />
               <span>{t('schemaChanges.affectedHistoryQueries', { count: notification.affectedQueriesCount })}</span>

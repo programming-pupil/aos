@@ -11,7 +11,7 @@
 //  6. Saved views: query results can be saved as named views for reuse.
 
 import { lazy, Suspense, useState, useRef, useCallback, useMemo, useEffect } from 'react';
-import type { ComponentType } from 'react';
+import type { ComponentType, ElementRef } from 'react';
 import type { MouseEvent as ReactMouseEvent } from 'react';
 import {
   Layout,
@@ -2008,7 +2008,7 @@ export default function Nl2sql() {
     },
   ]), [t]);
 
-  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const inputRef = useRef<ElementRef<typeof TextArea>>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const queryTaskUnsubMapRef = useRef<Record<string, () => void>>({});
