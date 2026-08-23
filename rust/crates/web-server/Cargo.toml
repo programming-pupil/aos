@@ -68,7 +68,7 @@ tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"], 
 feishu-sdk = { version = "0.1.2", features = ["websocket"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
 async-trait = "0.1"
-sqlparser = { version = "0.52", features = ["visitor"] }
+sqlparser = { version = "0.62", features = ["visitor"] }
 regex = { workspace = true }
 hex = "0.4"
 urlencoding = "2"
