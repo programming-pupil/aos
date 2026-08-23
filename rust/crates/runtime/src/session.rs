@@ -350,6 +350,7 @@ impl PartialEq for Session {
             && self.runtime_context == other.runtime_context
             && self.context_baseline == other.context_baseline
             && self.last_health_check_ms == other.last_health_check_ms
+            && self.model == other.model
             && self.user_id == other.user_id
             && self.tenant_id == other.tenant_id
     }
@@ -992,6 +993,15 @@ impl Session {
         if let Some(context_baseline) = &self.context_baseline {
             object.insert("context_baseline".to_string(), context_baseline.to_json()?);
         }
+        if let Some(last_health_check_ms) = self.last_health_check_ms {
+            object.insert(
+                "last_health_check_ms".to_string(),
+                JsonValue::Number(i64_from_u64(last_health_check_ms, "last_health_check_ms")?),
+            );
+        }
+        if let Some(model) = &self.model {
+            object.insert("model".to_string(), JsonValue::String(model.clone()));
+        }
         if let Some(user_id) = &self.user_id {
             object.insert("user_id".to_string(), JsonValue::String(user_id.clone()));
         }
@@ -1110,6 +1120,10 @@ impl Session {
             .get("model")
             .and_then(JsonValue::as_str)
             .map(String::from);
+        let last_health_check_ms = object
+            .get("last_health_check_ms")
+            .map(|value| required_u64_from_value(value, "last_health_check_ms"))
+            .transpose()?;
         let user_id = object
             .get("user_id")
             .and_then(JsonValue::as_str)
@@ -1131,7 +1145,7 @@ impl Session {
             turns,
             runtime_context,
             context_baseline,
-            last_health_check_ms: None,
+            last_health_check_ms,
             model,
             user_id,
             tenant_id,
@@ -1149,6 +1163,7 @@ impl Session {
         let mut fork = None;
         let mut workspace_root = None;
         let mut model = None;
+        let mut last_health_check_ms = None;
         let mut user_id = None;
         let mut tenant_id = None;
         let mut prompt_history = Vec::new();
@@ -1181,6 +1196,7 @@ impl Session {
                 &mut fork,
                 &mut workspace_root,
                 &mut model,
+                &mut last_health_check_ms,
                 &mut user_id,
                 &mut tenant_id,
                 &mut prompt_history,
@@ -1218,7 +1234,7 @@ impl Session {
             turns: replayed_turns,
             runtime_context: replayed_runtime_context,
             context_baseline: replayed_context_baseline,
-            last_health_check_ms: None,
+            last_health_check_ms,
             model,
             user_id,
             tenant_id,
@@ -1239,6 +1255,7 @@ impl Session {
         fork: &mut Option<SessionFork>,
         workspace_root: &mut Option<PathBuf>,
         model: &mut Option<String>,
+        last_health_check_ms: &mut Option<u64>,
         user_id: &mut Option<String>,
         tenant_id: &mut Option<String>,
         prompt_history: &mut Vec<SessionPromptEntry>,
@@ -1267,6 +1284,10 @@ impl Session {
                     .get("model")
                     .and_then(JsonValue::as_str)
                     .map(String::from);
+                *last_health_check_ms = object
+                    .get("last_health_check_ms")
+                    .map(|value| required_u64_from_value(value, "last_health_check_ms"))
+                    .transpose()?;
                 *user_id = object
                     .get("user_id")
                     .and_then(JsonValue::as_str)
@@ -1640,6 +1661,12 @@ impl Session {
         }
         if let Some(model) = &self.model {
             object.insert("model".to_string(), JsonValue::String(model.clone()));
+        }
+        if let Some(last_health_check_ms) = self.last_health_check_ms {
+            object.insert(
+                "last_health_check_ms".to_string(),
+                JsonValue::Number(i64_from_u64(last_health_check_ms, "last_health_check_ms")?),
+            );
         }
         if let Some(user_id) = &self.user_id {
             object.insert("user_id".to_string(), JsonValue::String(user_id.clone()));
@@ -3468,6 +3495,24 @@ mod tests {
 
         assert!(first < second);
         assert!(second < third);
+    }
+
+    #[test]
+    fn recovery_and_jsonl_round_trips_preserve_model_and_health_state() {
+        let mut session = Session::new();
+        session.model = Some("gpt-harness-test".to_string());
+        session.record_health_check(42_424);
+        session.push_user_text("hello").expect("message append");
+
+        let checkpoint = session.to_recovery_json().expect("recovery checkpoint");
+        let recovered = Session::from_recovery_json(&checkpoint).expect("recovery decode");
+        assert_eq!(recovered, session);
+
+        let path = temp_session_path("model-health-round-trip");
+        session.save_to_path(&path).expect("session save");
+        let restored = Session::load_from_path(&path).expect("session load");
+        fs::remove_file(path).expect("temp session cleanup");
+        assert_eq!(restored, session);
     }
 
     #[test]

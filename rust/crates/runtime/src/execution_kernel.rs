@@ -208,6 +208,37 @@ impl RuntimeToolContract {
         }
     }
 
+    /// Contract used only to account for a model-emitted call which was not in
+    /// the authoritative step surface. The corresponding intent must be denied.
+    #[must_use]
+    pub fn deny_only(tool_name: impl Into<String>) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+            contract_version: "deny-only-v1".into(),
+            input_schema_version: "unavailable".into(),
+            output_schema_version: "tool-error-v1".into(),
+            side_effect_class: RuntimeToolSideEffectClass::None,
+            risk_level: RuntimeToolRiskLevel::Low,
+            required_capability: "none".into(),
+            tenant_policy: "deny".into(),
+            secret_scope: "none".into(),
+            idempotency_strategy: "deny_only".into(),
+            retry_policy: RuntimeToolRetryPolicy::Never,
+            timeout_ms: 1,
+            deadline_ms: 1,
+            cancellation: RuntimeToolCancellationContract::Immediate,
+            network_policy: "deny".into(),
+            filesystem_policy: "deny".into(),
+            datasource_policy: "deny".into(),
+            artifact_policy: "none".into(),
+            evidence_policy: "ineligible".into(),
+            compensation: "none_required".into(),
+            can_parallel: false,
+            supports_deferred: false,
+            continue_after_parent_cancel: false,
+        }
+    }
+
     pub fn validate(&self, tool_name: &str) -> Result<(), RuntimeError> {
         if self.tool_name != tool_name
             || self.contract_version.trim().is_empty()
@@ -283,6 +314,9 @@ pub struct RuntimeInteractionRequest {
     pub idempotency_key: String,
     pub expected_turn_revision: u64,
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Present only when creating the interaction is itself the durable
+    /// suspension boundary for a started tool invocation.
+    pub deferred_tool_output: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -633,6 +667,18 @@ pub trait AgentExecutionKernel: Send + Sync {
     /// Commit durable intent, capability consumption and budget reservation
     /// before a tool executor is allowed to observe the request.
     async fn authorize_tool(&self, intent: &RuntimeToolIntent) -> Result<(), RuntimeError>;
+
+    /// Load the immutable executable contract captured for one invocation.
+    /// Approval resume must prefer this value over a live registry which may
+    /// have changed while the turn was suspended.
+    async fn load_tool_contract(
+        &self,
+        _turn_id: &str,
+        _invocation_id: &str,
+        _tool_name: &str,
+    ) -> Result<Option<RuntimeToolContract>, RuntimeError> {
+        Ok(None)
+    }
 
     /// Atomically transition an authorized intent to started immediately
     /// before dispatch. A second transition must fail, preventing duplicate

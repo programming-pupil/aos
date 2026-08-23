@@ -368,6 +368,7 @@ pub async fn run_semantic_kernel_process_tck(
                             idempotency_key: format!("request-{interaction_id}"),
                             expected_turn_revision: 0,
                             expires_at: Some(Utc::now() + ChronoDuration::minutes(5)),
+                            deferred_tool_output: None,
                         })
                         .await?;
                 }

@@ -1,5 +1,5 @@
 use crate::compact::{
-    collect_compaction_archive_messages, compact_session, CompactionConfig, CompactionResult,
+    compact_session, replace_compaction_summary, CompactionConfig, CompactionResult,
 };
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 use crate::token_estimator::estimate_message_tokens;
@@ -102,8 +102,11 @@ pub fn trident_compact_session(
     compaction_config: CompactionConfig,
     trident_config: &TridentConfig,
 ) -> CompactionResult {
+    let baseline = compact_session(session, compaction_config);
+    if baseline.removed_message_count == 0 {
+        return baseline;
+    }
     let (sanitized_input, pre_sanitized_count) = sanitize_tool_pairing_session(session);
-    let archive_messages = collect_compaction_archive_messages(&sanitized_input, compaction_config);
     let original_count = sanitized_input.messages.len();
     let original_tokens: usize = sanitized_input
         .messages
@@ -171,19 +174,22 @@ pub fn trident_compact_session(
     let (trident_session, post_stage_sanitized_count) =
         sanitize_tool_pairing_session(&trident_session);
 
-    let mut result = compact_session(&trident_session, compaction_config);
-    result.archived_messages = archive_messages;
-    let (final_session, post_compact_sanitized_count) =
-        sanitize_tool_pairing_session(&result.compacted_session);
-    if post_compact_sanitized_count > 0 {
-        result.compacted_session = final_session;
-        result.removed_message_count += post_compact_sanitized_count;
-        if let Some(compaction) = result.compacted_session.compaction.as_mut() {
-            compaction
-                .replacement_messages
-                .clone_from(&result.compacted_session.messages);
-        }
-    }
+    // The reducer may shrink the prefix below the original trigger threshold.
+    // Force a candidate summary when possible, then install it on the original
+    // baseline so archives and removal counts describe exact source messages.
+    let reduced_candidate = compact_session(
+        &trident_session,
+        CompactionConfig {
+            max_estimated_tokens: 0,
+            ..compaction_config
+        },
+    );
+    let reduced_summary = if reduced_candidate.summary.trim().is_empty() {
+        baseline.summary.clone()
+    } else {
+        reduced_candidate.summary
+    };
+    let result = replace_compaction_summary(baseline, reduced_summary);
 
     if stats.superseded_count > 0 || stats.collapsed_chains > 0 || stats.clusters_found > 0 {
         tracing::debug!(
@@ -191,7 +197,6 @@ pub fn trident_compact_session(
             report = %stats.format_report(),
             pre_sanitized_count,
             post_stage_sanitized_count,
-            post_compact_sanitized_count,
             "trident compaction complete"
         );
     }
@@ -993,7 +998,7 @@ mod tests {
         let result = trident_compact_session(
             &session,
             CompactionConfig {
-                preserve_recent_messages: 5,
+                preserve_recent_messages: 2,
                 max_estimated_tokens: 1,
             },
             &TridentConfig::default(),
@@ -1051,6 +1056,112 @@ mod tests {
             result.removed_message_count > 0
                 || result.compacted_session.messages.len() < session.messages.len()
         );
+    }
+
+    #[test]
+    fn trident_archive_metadata_matches_the_exact_source_window() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("inspect src/main.rs"),
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "read-1".to_string(),
+                name: "read_file".to_string(),
+                input: r#"{"path":"src/main.rs"}"#.to_string(),
+            }]),
+            ConversationMessage::tool_result(
+                "read-1",
+                "read_file",
+                r#"{"path":"src/main.rs","content":"old"}"#,
+                false,
+            ),
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "write-1".to_string(),
+                name: "write_file".to_string(),
+                input: r#"{"path":"src/main.rs","content":"new"}"#.to_string(),
+            }]),
+            ConversationMessage::tool_result(
+                "write-1",
+                "write_file",
+                r#"{"path":"src/main.rs","ok":true}"#,
+                false,
+            ),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "updated".to_string(),
+            }]),
+            ConversationMessage::user_text("verify it"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "verified".to_string(),
+            }]),
+        ];
+
+        let result = trident_compact_session(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 2,
+                max_estimated_tokens: 1,
+            },
+            &TridentConfig::default(),
+        );
+        let compaction = result
+            .compacted_session
+            .compaction
+            .as_ref()
+            .expect("compaction metadata");
+        assert_eq!(result.removed_message_count, result.archived_messages.len());
+        assert_eq!(
+            compaction.removed_message_count,
+            result.removed_message_count
+        );
+        assert_eq!(compaction.archived_messages, result.archived_messages);
+        assert_eq!(
+            compaction
+                .archive_windows
+                .last()
+                .expect("archive window")
+                .archived_messages,
+            result.archived_messages
+        );
+    }
+
+    #[test]
+    fn trident_archives_unsanitized_source_messages_without_hidden_loss() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("inspect the workspace"),
+            ConversationMessage::tool_result(
+                "orphan-result",
+                "read_file",
+                "orphaned but recoverable",
+                true,
+            ),
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "dangling-use".to_string(),
+                name: "read_file".to_string(),
+                input: r#"{"path":"README.md"}"#.to_string(),
+            }]),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "continue safely".to_string(),
+            }]),
+            ConversationMessage::user_text("final objective"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "final answer".to_string(),
+            }]),
+        ];
+        let config = CompactionConfig {
+            preserve_recent_messages: 2,
+            max_estimated_tokens: 1,
+        };
+        let baseline = compact_session(&session, config);
+        let result = trident_compact_session(&session, config, &TridentConfig::default());
+
+        assert_eq!(result.archived_messages, baseline.archived_messages);
+        assert_eq!(result.removed_message_count, baseline.removed_message_count);
+        assert!(result.archived_messages.iter().any(has_tool_result));
+        assert!(result.archived_messages.iter().any(|message| {
+            message.blocks.iter().any(
+                |block| matches!(block, ContentBlock::ToolUse { id, .. } if id == "dangling-use"),
+            )
+        }));
     }
 
     #[test]

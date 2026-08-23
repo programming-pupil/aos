@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
-use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -12,7 +11,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
 use crate::compact::{
-    compact_session, compact_session_with_summary, CompactionConfig, CompactionResult,
+    compact_session, replace_compaction_summary, CompactionConfig, CompactionResult,
 };
 use crate::config::RuntimeFeatureConfig;
 use crate::execution_kernel::{
@@ -784,6 +783,11 @@ fn resolve_executor_tool_contract<E: ToolExecutor>(
     Ok(contract)
 }
 
+fn is_user_question_tool(tool_name: &str) -> bool {
+    tool_name.eq_ignore_ascii_case("AskUserQuestion")
+        || tool_name.eq_ignore_ascii_case("ask_user_question")
+}
+
 /// Immutable tool authority for one model sampling step. Contracts are frozen
 /// before provider I/O so a registry reload cannot make the model observe one
 /// lifecycle contract and execute under another. Execution mode remains live
@@ -850,6 +854,24 @@ impl RuntimeStepToolSnapshot {
             )));
         }
         resolve_executor_tool_contract(executor, tool_name)
+    }
+
+    fn denied_contract<E: ToolExecutor>(
+        &self,
+        executor: &E,
+        tool_name: &str,
+    ) -> Result<RuntimeToolContract, RuntimeError> {
+        self.contracts.get(tool_name).cloned().map_or_else(
+            || {
+                if self.authoritative {
+                    Ok(RuntimeToolContract::deny_only(tool_name))
+                } else {
+                    resolve_executor_tool_contract(executor, tool_name)
+                        .or_else(|_| Ok(RuntimeToolContract::deny_only(tool_name)))
+                }
+            },
+            Ok,
+        )
     }
 }
 
@@ -1402,7 +1424,12 @@ where
     }
 
     fn run_pre_tool_use_hook(&mut self, tool_name: &str, input: &str) -> HookRunResult {
-        if let Some(reporter) = self.hook_progress_reporter.lock().unwrap().as_mut() {
+        if let Some(reporter) = self
+            .hook_progress_reporter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
             self.hook_runner.run_pre_tool_use_with_context(
                 tool_name,
                 input,
@@ -1426,7 +1453,12 @@ where
         output: &str,
         is_error: bool,
     ) -> HookRunResult {
-        if let Some(reporter) = self.hook_progress_reporter.lock().unwrap().as_mut() {
+        if let Some(reporter) = self
+            .hook_progress_reporter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
             self.hook_runner.run_post_tool_use_with_context(
                 tool_name,
                 input,
@@ -1453,7 +1485,12 @@ where
         input: &str,
         output: &str,
     ) -> HookRunResult {
-        if let Some(reporter) = self.hook_progress_reporter.lock().unwrap().as_mut() {
+        if let Some(reporter) = self
+            .hook_progress_reporter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
             self.hook_runner.run_post_tool_use_failure_with_context(
                 tool_name,
                 input,
@@ -1474,20 +1511,20 @@ where
 
     /// Run a session health probe to verify the runtime is functional after compaction.
     /// Returns Ok(()) if healthy, Err if the session appears broken.
-    fn run_session_health_probe(&mut self) -> Result<(), String> {
-        // Check if we have basic session integrity
-        if self.session.messages.is_empty() && self.session.compaction.is_some() {
-            // Freshly compacted with no messages - this is normal
-            return Ok(());
+    fn run_session_health_probe(&self) -> Result<(), String> {
+        let checkpoint = self
+            .session
+            .to_recovery_json()
+            .map_err(|error| format!("cannot encode recovery checkpoint: {error}"))?;
+        let restored = Session::from_recovery_json(&checkpoint)
+            .map_err(|error| format!("cannot decode recovery checkpoint: {error}"))?;
+        let canonical = restored
+            .to_recovery_json()
+            .map_err(|error| format!("cannot re-encode recovery checkpoint: {error}"))?;
+        if canonical != checkpoint {
+            return Err("recovery checkpoint is not canonically stable".to_string());
         }
-
-        // Verify tool executor is responsive with a non-destructive probe
-        // Using glob_search with a pattern that won't match anything
-        let probe_input = r#"{"pattern": "*.health-check-probe-"}"#;
-        match self.tool_executor.execute("glob_search", probe_input) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(format!("Tool executor probe failed: {e}")),
-        }
+        Ok(())
     }
 
     pub async fn run_turn<R: RuntimeEventReporter>(
@@ -1750,7 +1787,17 @@ where
                     self.permission_policy
                         .authorize_approved(&tool_name, &effective_input)
                 };
-            let contract = resolve_executor_tool_contract(&self.tool_executor, &tool_name)?;
+            let frozen_contract = if let Some(kernel) = self.execution_kernel.clone() {
+                kernel
+                    .load_tool_contract(&turn.turn_id, &tool_use_id, &tool_name)
+                    .await?
+            } else {
+                None
+            };
+            let contract = frozen_contract.map_or_else(
+                || resolve_executor_tool_contract(&self.tool_executor, &tool_name),
+                Ok,
+            )?;
             let prepared = PreparedToolUse {
                 tool_use_id,
                 tool_name,
@@ -1836,7 +1883,7 @@ where
         }
 
         let mut tool_results = Vec::with_capacity(pending.len());
-        for (tool_use_id, tool_name, _) in pending {
+        for (tool_use_id, tool_name, input) in pending {
             let result = by_id
                 .remove(&tool_use_id)
                 .expect("terminal deferred result was validated above");
@@ -1845,7 +1892,7 @@ where
                     turn_id: turn.turn_id.clone(),
                     invocation_id: tool_use_id.clone(),
                     tool_name: tool_name.clone(),
-                    input: String::new(),
+                    input,
                     output: result.output,
                     iteration: 0,
                     outcome: if result.is_error {
@@ -2351,7 +2398,11 @@ where
                     )
                 };
 
-                let contract = step_tools.contract(&self.tool_executor, &tool_name)?;
+                let contract = if tool_call_allowed {
+                    step_tools.contract(&self.tool_executor, &tool_name)?
+                } else {
+                    step_tools.denied_contract(&self.tool_executor, &tool_name)?
+                };
                 prepared_tool_uses.push(PreparedToolUse {
                     tool_use_id,
                     tool_name,
@@ -2769,15 +2820,17 @@ where
         summary_override: Option<String>,
     ) -> Result<Option<CompactionResult>, RuntimeError> {
         crate::behavior_trace("CMP-001");
-        let baseline = compact_session(&self.session, config);
+        let baseline = compact_runtime_session(&self.session, config);
         if baseline.removed_message_count == 0 {
             return Ok(None);
         }
+        let expected_archived_messages = baseline.archived_messages.clone();
+        let expected_removed_message_count = baseline.removed_message_count;
         let requested_summary = summary_override.unwrap_or_else(|| baseline.summary.clone());
         let hook = self.compaction_hook.clone();
         let prepared = match hook.as_ref() {
             Some(hook) => Some(
-                hook.prepare_compaction(&baseline.archived_messages, &requested_summary, trigger)
+                hook.prepare_compaction(&expected_archived_messages, &requested_summary, trigger)
                     .await?,
             ),
             None => None,
@@ -2786,7 +2839,7 @@ where
             .as_ref()
             .and_then(|item| item.replacement_summary.clone())
             .unwrap_or(requested_summary);
-        let result = compact_session_with_summary(&self.session, config, replacement_summary);
+        let result = replace_compaction_summary(baseline, replacement_summary);
 
         let abort = |reason: String| async {
             if let (Some(hook), Some(prepared)) = (hook.as_ref(), prepared.as_ref()) {
@@ -2794,8 +2847,8 @@ where
             }
             Err(RuntimeError::new(reason))
         };
-        if result.archived_messages != baseline.archived_messages
-            || result.removed_message_count != baseline.removed_message_count
+        if result.archived_messages != expected_archived_messages
+            || result.removed_message_count != expected_removed_message_count
         {
             return abort("compaction source window changed after preparation".to_string()).await;
         }
@@ -3167,78 +3220,6 @@ where
         prepared: &PreparedToolUse,
         reporter: &mut R,
     ) -> Result<PreparedToolExecution, RuntimeError> {
-        if prepared.tool_name.eq_ignore_ascii_case("AskUserQuestion")
-            || prepared.tool_name.eq_ignore_ascii_case("ask_user_question")
-        {
-            let Some(kernel) = self.execution_kernel.clone() else {
-                return Err(RuntimeError::new(
-                    "user questions require a durable execution kernel",
-                ));
-            };
-            let input = serde_json::from_str::<serde_json::Value>(&prepared.effective_input)
-                .map_err(|error| RuntimeError::new(format!("invalid user question: {error}")))?;
-            let question = input
-                .get("question")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| RuntimeError::new("user question is empty"))?;
-            let options = input
-                .get("options")
-                .and_then(serde_json::Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let request_schema_hash = stable_context_hash(&prepared.effective_input);
-            let choice_schema_hash = (!options.is_empty()).then(|| {
-                stable_context_hash(&serde_json::Value::Array(options.clone()).to_string())
-            });
-            let interaction_id = format!(
-                "interaction:{}",
-                stable_context_hash(&format!(
-                    "{}:{}",
-                    self.session.session_id, prepared.tool_use_id
-                ))
-            );
-            let owner_user_id = self
-                .session
-                .user_id
-                .clone()
-                .ok_or_else(|| RuntimeError::new("durable user question has no owner"))?;
-            let expires_at = chrono::Utc::now() + chrono::Duration::hours(24);
-            let expected_turn_revision = kernel.current_turn_revision(turn_id).await?;
-            kernel
-                .request_interaction(&RuntimeInteractionRequest {
-                    interaction_id: interaction_id.clone(),
-                    kind: agent_protocol::InteractionKind::UserQuestion,
-                    turn_id: turn_id.to_string(),
-                    invocation_id: prepared.tool_use_id.clone(),
-                    owner_user_id,
-                    allowed_responder_ids: Vec::new(),
-                    capability_requirement: None,
-                    request_schema_hash,
-                    choice_schema_hash,
-                    display_projection: serde_json::json!({
-                        "question":question,
-                        "options":options,
-                    }),
-                    idempotency_key: format!("user-question:{}", prepared.tool_use_id),
-                    expected_turn_revision,
-                    expires_at: Some(expires_at),
-                })
-                .await?;
-            reporter.on_runtime_status("waiting_user_question", "waiting for the user response");
-            return Ok(PreparedToolExecution::Deferred(DeferredToolUse {
-                tool_use_id: prepared.tool_use_id.clone(),
-                tool_name: prepared.tool_name.clone(),
-                input: prepared.effective_input.clone(),
-                metadata: serde_json::json!({
-                    "kind":"user_question",
-                    "interactionId":interaction_id,
-                    "expiresAt":expires_at,
-                })
-                .to_string(),
-            }));
-        }
         if let PermissionOutcome::AwaitingApproval { request } = &prepared.permission_outcome {
             let Some(kernel) = self.execution_kernel.clone() else {
                 return Err(RuntimeError::new(
@@ -3296,6 +3277,11 @@ where
                 self.record_tool_started(iteration, &prepared.tool_name);
                 reporter.on_tool_use_start(&prepared.tool_name);
                 reporter.on_tool_input_delta(&prepared.effective_input);
+                if is_user_question_tool(&prepared.tool_name) {
+                    return self
+                        .suspend_for_user_question(turn_id, iteration, prepared, reporter)
+                        .await;
+                }
                 let request = ToolExecutionRequest {
                     context: ToolInvocationContext::new(
                         turn_id,
@@ -3431,6 +3417,174 @@ where
                 unreachable!("approval requests return before authorized intent processing")
             }
         }
+    }
+
+    async fn suspend_for_user_question<R: RuntimeEventReporter>(
+        &mut self,
+        turn_id: &str,
+        iteration: usize,
+        prepared: &PreparedToolUse,
+        reporter: &mut R,
+    ) -> Result<PreparedToolExecution, RuntimeError> {
+        if !prepared.contract.supports_deferred {
+            return self
+                .fail_user_question(
+                    turn_id,
+                    iteration,
+                    prepared,
+                    reporter,
+                    "AskUserQuestion contract does not permit durable suspension",
+                )
+                .await;
+        }
+        let input = match serde_json::from_str::<serde_json::Value>(&prepared.effective_input) {
+            Ok(input) => input,
+            Err(error) => {
+                return self
+                    .fail_user_question(
+                        turn_id,
+                        iteration,
+                        prepared,
+                        reporter,
+                        format!("invalid user question: {error}"),
+                    )
+                    .await;
+            }
+        };
+        let Some(question) = input
+            .get("question")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return self
+                .fail_user_question(
+                    turn_id,
+                    iteration,
+                    prepared,
+                    reporter,
+                    "user question is empty",
+                )
+                .await;
+        };
+        let Some(kernel) = self.execution_kernel.clone() else {
+            return self
+                .fail_user_question(
+                    turn_id,
+                    iteration,
+                    prepared,
+                    reporter,
+                    "user questions require a durable execution kernel",
+                )
+                .await;
+        };
+        let Some(owner_user_id) = self.session.user_id.clone() else {
+            return self
+                .fail_user_question(
+                    turn_id,
+                    iteration,
+                    prepared,
+                    reporter,
+                    "durable user question has no owner",
+                )
+                .await;
+        };
+        let expected_turn_revision = kernel.current_turn_revision(turn_id).await?;
+        let (request, metadata) = self.build_user_question_interaction_request(
+            turn_id,
+            prepared,
+            &input,
+            question,
+            owner_user_id,
+            expected_turn_revision,
+        );
+        let interaction = kernel.request_interaction(&request).await?;
+        if interaction.state != agent_protocol::InteractionState::Pending {
+            return Err(RuntimeError::new(
+                "user-question interaction is already terminal; resume from its durable response",
+            ));
+        }
+        reporter.on_runtime_status("waiting_user_question", "waiting for the user response");
+        Ok(PreparedToolExecution::Deferred(DeferredToolUse {
+            tool_use_id: prepared.tool_use_id.clone(),
+            tool_name: prepared.tool_name.clone(),
+            input: prepared.effective_input.clone(),
+            metadata,
+        }))
+    }
+
+    fn build_user_question_interaction_request(
+        &self,
+        turn_id: &str,
+        prepared: &PreparedToolUse,
+        input: &serde_json::Value,
+        question: &str,
+        owner_user_id: String,
+        expected_turn_revision: u64,
+    ) -> (RuntimeInteractionRequest, String) {
+        let options = input
+            .get("options")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let choice_schema_hash = (!options.is_empty())
+            .then(|| stable_context_hash(&serde_json::Value::Array(options.clone()).to_string()));
+        let interaction_id = format!(
+            "interaction:{}",
+            stable_context_hash(&format!(
+                "{}:{}",
+                self.session.session_id, prepared.tool_use_id
+            ))
+        );
+        let expires_at = chrono::Utc::now() + chrono::Duration::hours(24);
+        let metadata = serde_json::json!({
+            "kind":"user_question",
+            "interactionId":interaction_id,
+            "expiresAt":expires_at,
+        })
+        .to_string();
+        (
+            RuntimeInteractionRequest {
+                interaction_id,
+                kind: agent_protocol::InteractionKind::UserQuestion,
+                turn_id: turn_id.to_string(),
+                invocation_id: prepared.tool_use_id.clone(),
+                owner_user_id,
+                allowed_responder_ids: Vec::new(),
+                capability_requirement: None,
+                request_schema_hash: stable_context_hash(&prepared.effective_input),
+                choice_schema_hash,
+                display_projection: serde_json::json!({
+                    "question":question,
+                    "options":options,
+                }),
+                idempotency_key: format!("user-question:{}", prepared.tool_use_id),
+                expected_turn_revision,
+                expires_at: Some(expires_at),
+                deferred_tool_output: Some(metadata.clone()),
+            },
+            metadata,
+        )
+    }
+
+    async fn fail_user_question<R: RuntimeEventReporter>(
+        &mut self,
+        turn_id: &str,
+        iteration: usize,
+        prepared: &PreparedToolUse,
+        reporter: &mut R,
+        reason: impl Into<String>,
+    ) -> Result<PreparedToolExecution, RuntimeError> {
+        let message = self
+            .finalize_allowed_tool_use(
+                turn_id,
+                iteration,
+                prepared,
+                Err(ToolError::new(reason)),
+                reporter,
+            )
+            .await?;
+        Ok(PreparedToolExecution::Completed(message))
     }
 
     async fn finalize_allowed_tool_use<R: RuntimeEventReporter>(
@@ -4228,9 +4382,7 @@ fn compact_text_preview(text: &str, max_chars: usize) -> String {
 }
 
 fn stable_context_hash(value: &str) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    value.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    hex::encode(Sha256::digest(value.as_bytes()))
 }
 
 /// Reads the automatic compaction threshold from the environment.
@@ -4747,6 +4899,7 @@ mod tests {
     #[derive(Default)]
     struct ApprovalKernelState {
         approval_requests: Vec<RuntimeApprovalRequest>,
+        interaction_requests: Vec<RuntimeInteractionRequest>,
         resolutions: Vec<RuntimeApprovalResolution>,
         authorized: Vec<RuntimeToolIntent>,
         started: BTreeSet<String>,
@@ -4894,6 +5047,24 @@ mod tests {
             Ok(())
         }
 
+        async fn load_tool_contract(
+            &self,
+            _turn_id: &str,
+            invocation_id: &str,
+            tool_name: &str,
+        ) -> Result<Option<RuntimeToolContract>, RuntimeError> {
+            Ok(self
+                .state
+                .lock()
+                .unwrap()
+                .approval_requests
+                .iter()
+                .find(|request| {
+                    request.invocation_id == invocation_id && request.tool_name == tool_name
+                })
+                .map(|request| request.contract.clone()))
+        }
+
         async fn request_approval(
             &self,
             request: &RuntimeApprovalRequest,
@@ -4929,6 +5100,11 @@ mod tests {
             &self,
             request: &RuntimeInteractionRequest,
         ) -> Result<agent_protocol::DurableInteraction, RuntimeError> {
+            self.state
+                .lock()
+                .unwrap()
+                .interaction_requests
+                .push(request.clone());
             Ok(agent_protocol::DurableInteraction {
                 interaction_id: request.interaction_id.clone(),
                 kind: request.kind,
@@ -5219,6 +5395,222 @@ mod tests {
             .await
             .is_err());
         assert_eq!(executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn approval_resume_uses_the_frozen_contract_after_registry_reload() {
+        #[derive(Clone)]
+        struct ReloadingExecutor {
+            contract: Arc<Mutex<RuntimeToolContract>>,
+            executions: Arc<AtomicUsize>,
+        }
+
+        impl ToolExecutor for ReloadingExecutor {
+            fn execute(&mut self, _tool_name: &str, _input: &str) -> Result<String, ToolError> {
+                self.executions.fetch_add(1, Ordering::SeqCst);
+                Ok("completed under frozen contract".into())
+            }
+
+            fn tool_contract(&self, _tool_name: &str) -> Option<RuntimeToolContract> {
+                Some(self.contract.lock().unwrap().clone())
+            }
+
+            fn requires_tool_contracts(&self) -> bool {
+                true
+            }
+        }
+
+        let frozen = RuntimeToolContract::test_read_only("write_external");
+        let live_contract = Arc::new(Mutex::new(frozen.clone()));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let kernel = Arc::new(ApprovalTestKernel::new());
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ApprovalApiClient { call_count: 0 },
+            ReloadingExecutor {
+                contract: live_contract.clone(),
+                executions: executions.clone(),
+            },
+            PermissionPolicy::new(PermissionMode::Prompt)
+                .with_tool_requirement("write_external", PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_execution_kernel(kernel.clone());
+        let mut prompter = PromptDefer;
+        assert!(matches!(
+            runtime
+                .run_turn_resumable("perform the external write", Some(&mut prompter), ())
+                .await
+                .unwrap(),
+            ResumableTurnOutcome::Suspended(_)
+        ));
+        live_contract.lock().unwrap().contract_version = "reloaded-v2".into();
+        let resumed = runtime
+            .resume_turn_with_approval_decisions(
+                vec![DeferredApprovalDecision {
+                    tool_use_id: "approval-tool-1".into(),
+                    decision: RuntimeApprovalDecision::Approved,
+                    reason: None,
+                }],
+                None,
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(resumed, ResumableTurnOutcome::Completed(_)));
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        let state = kernel.state.lock().unwrap();
+        assert_eq!(state.authorized.last().unwrap().contract, frozen);
+    }
+
+    #[tokio::test]
+    async fn user_question_is_authorized_and_started_before_durable_suspension() {
+        struct QuestionApi;
+        #[::async_trait::async_trait]
+        impl ApiClient for QuestionApi {
+            async fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "question-tool-1".into(),
+                        name: "AskUserQuestion".into(),
+                        input: r#"{"question":"Continue?","options":["yes","no"]}"#.into(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        #[derive(Clone)]
+        struct QuestionExecutor;
+        impl ToolExecutor for QuestionExecutor {
+            fn execute(&mut self, _tool_name: &str, _input: &str) -> Result<String, ToolError> {
+                panic!("durable user questions must not execute through the tool adapter")
+            }
+
+            fn tool_contract(&self, tool_name: &str) -> Option<RuntimeToolContract> {
+                let mut contract = RuntimeToolContract::test_read_only(tool_name);
+                contract.supports_deferred = true;
+                Some(contract)
+            }
+
+            fn requires_tool_contracts(&self) -> bool {
+                true
+            }
+        }
+
+        let kernel = Arc::new(ApprovalTestKernel::new());
+        let mut session = Session::new();
+        session.user_id = Some("owner".into());
+        session.tenant_id = Some("tenant".into());
+        let mut runtime = ConversationRuntime::new(
+            session,
+            QuestionApi,
+            QuestionExecutor,
+            PermissionPolicy::new(PermissionMode::Allow),
+            vec!["system".into()],
+        )
+        .with_execution_kernel(kernel.clone());
+        let outcome = runtime
+            .run_turn_resumable("ask me before continuing", None, ())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ResumableTurnOutcome::Suspended(_)));
+        let state = kernel.state.lock().unwrap();
+        assert_eq!(state.authorized.len(), 1);
+        assert!(state.authorized[0].authorized);
+        assert!(state.started.contains("question-tool-1"));
+        assert_eq!(state.interaction_requests.len(), 1);
+        assert!(state.interaction_requests[0].deferred_tool_output.is_some());
+        assert!(state.finished.is_empty());
+    }
+
+    #[tokio::test]
+    async fn denied_user_question_never_creates_an_interaction() {
+        struct DeniedQuestionApi {
+            calls: usize,
+        }
+        #[::async_trait::async_trait]
+        impl ApiClient for DeniedQuestionApi {
+            async fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    return Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "denied-question".into(),
+                            name: "AskUserQuestion".into(),
+                            input: r#"{"question":"Should not be shown"}"#.into(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                assert!(matches!(
+                    request
+                        .messages
+                        .last()
+                        .and_then(|message| message.blocks.first()),
+                    Some(ContentBlock::ToolResult { is_error: true, .. })
+                ));
+                Ok(vec![
+                    AssistantEvent::TextDelta("continued without interaction".into()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        #[derive(Clone)]
+        struct DeniedQuestionExecutor;
+        impl ToolExecutor for DeniedQuestionExecutor {
+            fn execute(&mut self, _tool_name: &str, _input: &str) -> Result<String, ToolError> {
+                panic!("denied user question must not execute")
+            }
+
+            fn tool_contract(&self, tool_name: &str) -> Option<RuntimeToolContract> {
+                let mut contract = RuntimeToolContract::test_read_only(tool_name);
+                contract.supports_deferred = true;
+                Some(contract)
+            }
+
+            fn requires_tool_contracts(&self) -> bool {
+                true
+            }
+        }
+
+        let kernel = Arc::new(ApprovalTestKernel::new());
+        let policy = PermissionPolicy::new(PermissionMode::Allow).with_permission_rules(
+            &crate::config::RuntimePermissionRuleConfig::new(
+                Vec::new(),
+                vec!["AskUserQuestion(*)".into()],
+                Vec::new(),
+            ),
+        );
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            DeniedQuestionApi { calls: 0 },
+            DeniedQuestionExecutor,
+            policy,
+            vec!["system".into()],
+        )
+        .with_execution_kernel(kernel.clone());
+        let outcome = runtime
+            .run_turn_resumable("continue", None, ())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ResumableTurnOutcome::Completed(_)));
+        let state = kernel.state.lock().unwrap();
+        assert_eq!(state.authorized.len(), 1);
+        assert!(!state.authorized[0].authorized);
+        assert!(state.started.is_empty());
+        assert!(state.interaction_requests.is_empty());
+        assert!(matches!(
+            state.finished[0].outcome,
+            RuntimeToolOutcomeKind::Denied
+        ));
     }
 
     #[tokio::test]
@@ -7408,7 +7800,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compaction_health_probe_blocks_turn_when_tool_executor_is_broken() {
+    async fn compaction_health_probe_never_dispatches_an_untracked_tool() {
         struct SimpleApi;
         #[::async_trait::async_trait]
         impl ApiClient for SimpleApi {
@@ -7416,7 +7808,10 @@ mod tests {
                 &mut self,
                 _request: ApiRequest,
             ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                panic!("API should not run when health probe fails");
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
             }
         }
 
@@ -7426,8 +7821,11 @@ mod tests {
             .push_user_text("previous message")
             .expect("message should append");
 
-        let tool_executor = StaticToolExecutor::new().register("glob_search", |_input| {
-            Err(ToolError::new("transport unavailable"))
+        let executions = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&executions);
+        let tool_executor = StaticToolExecutor::new().register("glob_search", move |_input| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Err(ToolError::new("health probes must not dispatch tools"))
         });
         let mut runtime = ConversationRuntime::new(
             session,
@@ -7437,20 +7835,12 @@ mod tests {
             vec!["system".to_string()],
         );
 
-        let error = runtime
+        let summary = runtime
             .run_turn("trigger", None, ())
             .await
-            .expect_err("health probe failure should abort the turn");
-        assert!(
-            error
-                .to_string()
-                .contains("Session health probe failed after compaction"),
-            "unexpected error: {error}"
-        );
-        assert!(
-            error.to_string().contains("transport unavailable"),
-            "expected underlying probe error: {error}"
-        );
+            .expect("a recovery round-trip should validate the compacted session");
+        assert_eq!(summary.iterations, 1);
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -7491,6 +7881,37 @@ mod tests {
             .expect("empty compacted session should not fail health probe");
         assert_eq!(summary.auto_compaction, None);
         assert_eq!(runtime.session().messages.len(), 2);
+    }
+
+    #[test]
+    fn poisoned_hook_reporter_lock_does_not_break_later_tool_hooks() {
+        struct NoopApi;
+        #[::async_trait::async_trait]
+        impl ApiClient for NoopApi {
+            async fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                unreachable!("hook lock recovery does not call the provider")
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NoopApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::Allow),
+            Vec::new(),
+        );
+        let reporter = runtime.hook_progress_reporter.clone();
+        let poisoned = std::thread::spawn(move || {
+            let _guard = reporter.lock().unwrap();
+            panic!("poison the reporter lock");
+        });
+        assert!(poisoned.join().is_err());
+        let _ = runtime.run_pre_tool_use_hook("read_file", "{}");
+        let _ = runtime.run_post_tool_use_hook("read_file", "{}", "ok", false);
+        let _ = runtime.run_post_tool_use_failure_hook("read_file", "{}", "failed");
     }
 
     #[tokio::test]
@@ -7927,6 +8348,87 @@ mod tests {
 
         assert_eq!(live_timeout_ms.load(Ordering::SeqCst), 10_000);
         assert_eq!(observed_timeout_ms.load(Ordering::SeqCst), 1_000);
+        assert_eq!(summary.iterations, 2);
+    }
+
+    #[tokio::test]
+    async fn authoritative_snapshot_returns_unknown_tool_as_a_denied_result() {
+        struct UnknownToolApi {
+            calls: usize,
+        }
+
+        #[::async_trait::async_trait]
+        impl ApiClient for UnknownToolApi {
+            fn active_tool_names(&self) -> Vec<String> {
+                vec!["known_tool".to_string()]
+            }
+
+            fn active_tool_snapshot_is_authoritative(&self) -> bool {
+                true
+            }
+
+            async fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    return Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "unknown-call".to_string(),
+                            name: "hallucinated_tool".to_string(),
+                            input: "{}".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                assert!(request
+                    .messages
+                    .iter()
+                    .any(|message| message.blocks.iter().any(|block| matches!(
+                        block,
+                        ContentBlock::ToolResult {
+                            tool_name,
+                            output,
+                            is_error: true,
+                            ..
+                        } if tool_name == "hallucinated_tool" && output.contains("unavailable")
+                    ))));
+                Ok(vec![
+                    AssistantEvent::TextDelta("recovered answer".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        #[derive(Clone)]
+        struct ContractRequiredExecutor;
+
+        impl ToolExecutor for ContractRequiredExecutor {
+            fn execute(&mut self, _tool_name: &str, _input: &str) -> Result<String, ToolError> {
+                panic!("an unavailable tool must never reach the executor");
+            }
+
+            fn tool_contract(&self, tool_name: &str) -> Option<RuntimeToolContract> {
+                (tool_name == "known_tool").then(|| RuntimeToolContract::test_read_only(tool_name))
+            }
+
+            fn requires_tool_contracts(&self) -> bool {
+                true
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            UnknownToolApi { calls: 0 },
+            ContractRequiredExecutor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        let summary = runtime
+            .run_turn("use a tool", None, ())
+            .await
+            .expect("the model should receive a denied tool result and self-correct");
         assert_eq!(summary.iterations, 2);
     }
 

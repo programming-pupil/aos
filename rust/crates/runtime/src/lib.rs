@@ -83,7 +83,8 @@ pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
 pub use compact::{
     compact_session, compact_session_with_summary, format_compact_summary,
-    get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
+    get_compact_continuation_message, replace_compaction_summary, should_compact, CompactionConfig,
+    CompactionResult,
 };
 pub use config::{
     ConfigEntry, ConfigError, ConfigLoader, ConfigSource, McpConfigCollection,

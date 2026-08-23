@@ -263,6 +263,16 @@ pub fn compact_session_with_summary(
     summary: impl Into<String>,
 ) -> CompactionResult {
     let baseline = compact_session(session, config);
+    replace_compaction_summary(baseline, summary)
+}
+
+/// Replaces the summary on an already-discovered compaction candidate without
+/// recomputing its source window.
+#[must_use]
+pub fn replace_compaction_summary(
+    baseline: CompactionResult,
+    summary: impl Into<String>,
+) -> CompactionResult {
     if baseline.removed_message_count == 0 {
         return baseline;
     }
@@ -312,19 +322,6 @@ pub fn compact_session_with_summary(
         removed_message_count,
         archived_messages,
     }
-}
-
-/// Returns the raw messages that would be removed by standard compaction.
-/// Higher layers can persist selected entries as a recoverable history archive,
-/// while keeping the model-visible compacted session small.
-#[must_use]
-pub fn collect_compaction_archive_messages(
-    session: &Session,
-    config: CompactionConfig,
-) -> Vec<ConversationMessage> {
-    compaction_message_window(session, config)
-        .map(|(start, end)| session.messages[start..end].to_vec())
-        .unwrap_or_default()
 }
 
 fn compacted_summary_prefix_len(session: &Session) -> usize {

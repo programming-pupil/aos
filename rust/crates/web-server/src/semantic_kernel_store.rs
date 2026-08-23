@@ -3404,7 +3404,8 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         .await
         .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
         let open_tools = sqlx::query::<Sqlite>(
-            "SELECT id, turn_id, tool_name, idempotency_key FROM tool_invocations
+            "SELECT id, turn_id, tool_name, idempotency_key, lifecycle_state
+             FROM tool_invocations
              WHERE tenant_id = ? AND thread_id = ?
                AND lifecycle_state IN ('authorized','started','streaming')",
         )
@@ -3422,26 +3423,70 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             acquire_sqlite_write_lock(&mut tx)
                 .await
                 .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
-            sqlx::query::<Sqlite>(
-                "UPDATE agent_turns SET status = 'recovery_required'
+            let can_restore_suspension = sqlx::query_scalar::<Sqlite, i64>(
+                "SELECT EXISTS(
+                     SELECT 1 FROM tool_invocations
+                     WHERE tenant_id = ? AND thread_id = ? AND turn_id = ?
+                       AND lifecycle_state = 'suspended'
+                 ) AND NOT EXISTS(
+                     SELECT 1 FROM tool_invocations
+                     WHERE tenant_id = ? AND thread_id = ? AND turn_id = ?
+                       AND lifecycle_state IN ('authorized','started','streaming')
+                 )",
+            )
+            .bind(&self.tenant_id)
+            .bind(&self.session_id)
+            .bind(&turn_id)
+            .bind(&self.tenant_id)
+            .bind(&self.session_id)
+            .bind(&turn_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?
+                != 0;
+            let recovered_status = if can_restore_suspension {
+                "suspended"
+            } else {
+                "recovery_required"
+            };
+            let recovery_event = if can_restore_suspension {
+                "turn_suspension_recovered"
+            } else {
+                "turn_recovery_required"
+            };
+            let recovery_reason = if can_restore_suspension {
+                "durable_tool_suspension_without_turn_checkpoint"
+            } else {
+                "process_restart_without_atomic_terminal_checkpoint"
+            };
+            let changed = sqlx::query::<Sqlite>(
+                "UPDATE agent_turns SET status = ?
                  WHERE tenant_id = ? AND thread_id = ? AND id = ?
                    AND status = 'running' AND ended_at IS NULL",
             )
+            .bind(recovered_status)
             .bind(&self.tenant_id)
             .bind(&self.session_id)
             .bind(&turn_id)
             .execute(&mut *tx)
             .await
             .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            if changed.rows_affected() != 1 {
+                tx.rollback()
+                    .await
+                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+                continue;
+            }
             self.append_domain_event_in_transaction(
                 &mut tx,
                 Some(&turn_id),
-                &format!("turn-recovery-required:{turn_id}"),
-                "turn_recovery_required",
+                &format!("{recovery_event}:{turn_id}"),
+                recovery_event,
                 serde_json::json!({
-                    "reason":"process_restart_without_atomic_terminal_checkpoint"
+                    "reason":recovery_reason,
+                    "status":recovered_status,
                 }),
-                format!("turn-recovery-required:{turn_id}"),
+                format!("{recovery_event}:{turn_id}"),
             )
             .await
             .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
@@ -3463,6 +3508,26 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             let idempotency_key = row
                 .try_get::<String, _>(3)
                 .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+            let previous_state = row
+                .try_get::<String, _>(4)
+                .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+            let dispatched = previous_state != "authorized";
+            let (recovery_state, recovery_outcome, recovery_event, recovery_message) = if dispatched
+            {
+                (
+                    "outcome_unknown",
+                    "outcome_unknown",
+                    "tool_outcome_unknown",
+                    "Tool execution was interrupted by process restart; outcome is unknown.",
+                )
+            } else {
+                (
+                        "cancelled",
+                        "cancelled_before_dispatch",
+                        "tool_cancelled_before_dispatch",
+                        "Tool execution was cancelled during process restart before dispatch; no side effect started.",
+                    )
+            };
             let mut tx = self
                 .db
                 .begin()
@@ -3471,15 +3536,24 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             acquire_sqlite_write_lock(&mut tx)
                 .await
                 .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
-            sqlx::query::<Sqlite>(
-                "UPDATE tool_invocations SET lifecycle_state = 'outcome_unknown', outcome = 'outcome_unknown', updated_at = CURRENT_TIMESTAMP
-                 WHERE tenant_id = ? AND id = ? AND lifecycle_state IN ('authorized','started','streaming')",
+            let changed = sqlx::query::<Sqlite>(
+                "UPDATE tool_invocations SET lifecycle_state = ?, outcome = ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE tenant_id = ? AND id = ? AND lifecycle_state = ?",
             )
+            .bind(recovery_state)
+            .bind(recovery_outcome)
             .bind(&self.tenant_id)
             .bind(&invocation_id)
+            .bind(&previous_state)
             .execute(&mut *tx)
             .await
             .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+            if changed.rows_affected() != 1 {
+                tx.rollback()
+                    .await
+                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+                continue;
+            }
             let reserved_dimensions = sqlx::query_scalar::<Sqlite, String>(
                 "SELECT dimension FROM resource_budget_entries
                  WHERE tenant_id = ? AND owner_scope = ? AND reservation_id = ? AND state = 'reserved'",
@@ -3490,10 +3564,12 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             .fetch_all(&mut *tx)
             .await
             .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+            let budget_state = if dispatched { "committed" } else { "released" };
             let settled = sqlx::query::<Sqlite>(
-                "UPDATE resource_budget_entries SET state = 'committed'
+                "UPDATE resource_budget_entries SET state = ?
                  WHERE tenant_id = ? AND owner_scope = ? AND reservation_id = ? AND state = 'reserved'",
             )
+            .bind(budget_state)
             .bind(&self.tenant_id)
             .bind(&self.session_id)
             .bind(&idempotency_key)
@@ -3502,16 +3578,22 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
             if settled.rows_affected() > 0 {
                 for dimension in reserved_dimensions {
-                    sqlx::query::<Sqlite>(
-                        "UPDATE resource_budget_accounts SET reserved = MAX(reserved - 1, 0), committed = committed + 1
-                         WHERE tenant_id = ? AND owner_scope = ? AND dimension = ?",
-                    )
-                    .bind(&self.tenant_id)
-                    .bind(&self.session_id)
-                    .bind(dimension)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+                    let accounting = if dispatched {
+                        "UPDATE resource_budget_accounts
+                         SET reserved = MAX(reserved - 1, 0), committed = committed + 1
+                         WHERE tenant_id = ? AND owner_scope = ? AND dimension = ?"
+                    } else {
+                        "UPDATE resource_budget_accounts
+                         SET reserved = MAX(reserved - 1, 0), available = available + 1
+                         WHERE tenant_id = ? AND owner_scope = ? AND dimension = ?"
+                    };
+                    sqlx::query::<Sqlite>(accounting)
+                        .bind(&self.tenant_id)
+                        .bind(&self.session_id)
+                        .bind(dimension)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
                 }
             }
             let interrupted_surface = runtime_surface_message(
@@ -3521,9 +3603,7 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                     blocks: vec![runtime::ContentBlock::ToolResult {
                         tool_use_id: invocation_id.clone(),
                         tool_name: tool_name.clone(),
-                        output:
-                            "Tool execution was interrupted by process restart; outcome is unknown."
-                                .into(),
+                        output: recovery_message.into(),
                         is_error: true,
                     }],
                     thinking: None,
@@ -3536,12 +3616,14 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                 &mut tx,
                 Some(&turn_id),
                 &format!("tool-recovery:{invocation_id}"),
-                "tool_outcome_unknown",
+                recovery_event,
                 serde_json::json!({
                     "invocationRowId": invocation_id,
                     "toolName": tool_name,
                     "idempotencyKey": idempotency_key,
                     "reason": "process_restart",
+                    "previousState": previous_state,
+                    "outcome": recovery_outcome,
                 }),
                 format!("tool-recovery:{invocation_id}"),
                 Some(SurfaceOperation::Append {
@@ -4260,6 +4342,9 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         intent: &runtime::RuntimeToolIntent,
     ) -> Result<(), runtime::RuntimeError> {
         intent.contract.validate(&intent.tool_name)?;
+        let input_hash = sha256_bytes(intent.input.as_bytes());
+        let contract_json = serde_json::to_string(&intent.contract)
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
         let invocation_row_id = tenant_scoped_record_id(
             "tool-invocation",
             &self.tenant_id,
@@ -4284,7 +4369,9 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
         let mut transition_awaiting = false;
         if let Some(existing) = sqlx::query::<Sqlite>(
-            "SELECT idempotency_key, tool_name, lifecycle_state FROM tool_invocations WHERE id = ? AND tenant_id = ?",
+            "SELECT idempotency_key, tool_name, lifecycle_state, thread_id, turn_id,
+                    input_hash, contract_json
+             FROM tool_invocations WHERE id = ? AND tenant_id = ?",
         )
         .bind(&invocation_row_id)
         .bind(&self.tenant_id)
@@ -4301,9 +4388,31 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             let existing_state = existing
                 .try_get::<String, _>(2)
                 .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
-            if existing_key != intent.idempotency_key || existing_tool != intent.tool_name {
+            let existing_thread = existing
+                .try_get::<String, _>(3)
+                .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+            let existing_turn = existing
+                .try_get::<Option<String>, _>(4)
+                .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+            let existing_input_hash = existing
+                .try_get::<Option<String>, _>(5)
+                .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+            let existing_contract_json = existing
+                .try_get::<Option<String>, _>(6)
+                .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+            if existing_key != intent.idempotency_key
+                || existing_tool != intent.tool_name
+                || existing_thread != self.session_id
+                || existing_turn.as_deref() != Some(intent.turn_id.as_str())
+                || existing_input_hash
+                    .as_deref()
+                    .is_some_and(|existing| existing != input_hash)
+                || existing_contract_json
+                    .as_deref()
+                    .is_some_and(|existing| existing != contract_json)
+            {
                 return Err(runtime::RuntimeError::new(
-                    "tool invocation id was reused with a different idempotency key or tool",
+                    "tool invocation id was reused across scope, input, tool, or contract",
                 ));
             }
             if existing_state == "awaiting_authorization" {
@@ -4359,7 +4468,7 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                 .bind(&intent.turn_id)
                 .bind(&intent.invocation_id)
                 .bind(&intent.tool_name)
-                .bind(sha256_bytes(intent.input.as_bytes()))
+                .bind(&input_hash)
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
@@ -4405,16 +4514,16 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             }
         }
         if transition_awaiting {
-            let changed = sqlx::query::<Sqlite>("UPDATE tool_invocations SET lifecycle_state = 'authorized', capability_token_id = ?, outcome = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND tenant_id = ? AND lifecycle_state = 'awaiting_authorization'")
-                .bind(token_id).bind(&invocation_row_id).bind(&self.tenant_id).execute(&mut *tx).await.map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+            let changed = sqlx::query::<Sqlite>("UPDATE tool_invocations SET lifecycle_state = 'authorized', capability_token_id = ?, outcome = NULL, input_hash = ?, contract_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND tenant_id = ? AND thread_id = ? AND turn_id = ? AND tool_name = ? AND lifecycle_state = 'awaiting_authorization'")
+                .bind(token_id).bind(&input_hash).bind(&contract_json).bind(&invocation_row_id).bind(&self.tenant_id).bind(&self.session_id).bind(&intent.turn_id).bind(&intent.tool_name).execute(&mut *tx).await.map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
             if changed.rows_affected() != 1 {
                 return Err(runtime::RuntimeError::new(
                     "approval raced with another worker",
                 ));
             }
         } else {
-            sqlx::query::<Sqlite>("INSERT INTO tool_invocations (id, tenant_id, thread_id, turn_id, tool_name, lifecycle_state, idempotency_key, capability_token_id, outcome, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
-                .bind(&invocation_row_id).bind(&self.tenant_id).bind(&self.session_id).bind(&intent.turn_id).bind(&intent.tool_name).bind(if intent.authorized {"authorized"} else {"failed"}).bind(&intent.idempotency_key).bind(token_id).bind(if intent.authorized {Option::<String>::None} else {intent.denial_reason.clone()}).execute(&mut *tx).await.map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+            sqlx::query::<Sqlite>("INSERT INTO tool_invocations (id, tenant_id, thread_id, turn_id, tool_name, lifecycle_state, idempotency_key, capability_token_id, outcome, input_hash, contract_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
+                .bind(&invocation_row_id).bind(&self.tenant_id).bind(&self.session_id).bind(&intent.turn_id).bind(&intent.tool_name).bind(if intent.authorized {"authorized"} else {"failed"}).bind(&intent.idempotency_key).bind(token_id).bind(if intent.authorized {Option::<String>::None} else {intent.denial_reason.clone()}).bind(&input_hash).bind(&contract_json).execute(&mut *tx).await.map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
         }
         self.append_domain_event_in_transaction(
             &mut tx,
@@ -4444,10 +4553,50 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         Ok(())
     }
 
+    async fn load_tool_contract(
+        &self,
+        turn_id: &str,
+        invocation_id: &str,
+        tool_name: &str,
+    ) -> Result<Option<runtime::RuntimeToolContract>, runtime::RuntimeError> {
+        let invocation_row_id = tenant_scoped_record_id(
+            "tool-invocation",
+            &self.tenant_id,
+            &format!("{}:{invocation_id}", self.session_id),
+        );
+        let stored = sqlx::query_scalar::<Sqlite, Option<String>>(
+            "SELECT contract_json FROM tool_invocations
+             WHERE id = ? AND tenant_id = ? AND thread_id = ? AND turn_id = ?
+               AND tool_name = ?",
+        )
+        .bind(invocation_row_id)
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(turn_id)
+        .bind(tool_name)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?
+        .flatten();
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        let contract =
+            serde_json::from_str::<runtime::RuntimeToolContract>(&stored).map_err(|error| {
+                runtime::RuntimeError::new(format!("invalid frozen tool contract: {error}"))
+            })?;
+        contract.validate(tool_name)?;
+        Ok(Some(contract))
+    }
+
     async fn start_tool(
         &self,
         intent: &runtime::RuntimeToolIntent,
     ) -> Result<(), runtime::RuntimeError> {
+        intent.contract.validate(&intent.tool_name)?;
+        let input_hash = sha256_bytes(intent.input.as_bytes());
+        let contract_json = serde_json::to_string(&intent.contract)
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
         let invocation_row_id = tenant_scoped_record_id(
             "tool-invocation",
             &self.tenant_id,
@@ -4464,7 +4613,9 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         let changed = sqlx::query::<Sqlite>(
             "UPDATE tool_invocations SET lifecycle_state = 'started', updated_at = CURRENT_TIMESTAMP
              WHERE id = ? AND tenant_id = ? AND thread_id = ? AND turn_id = ?
-               AND tool_name = ? AND idempotency_key = ? AND lifecycle_state = 'authorized'",
+               AND tool_name = ? AND idempotency_key = ? AND lifecycle_state = 'authorized'
+               AND (input_hash = ? OR input_hash IS NULL)
+               AND (contract_json = ? OR contract_json IS NULL)",
         )
         .bind(&invocation_row_id)
         .bind(&self.tenant_id)
@@ -4472,6 +4623,8 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         .bind(&intent.turn_id)
         .bind(&intent.tool_name)
         .bind(&intent.idempotency_key)
+        .bind(&input_hash)
+        .bind(&contract_json)
         .execute(&mut *tx)
         .await
         .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
@@ -4598,6 +4751,9 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             &format!("{}:{}", self.session_id, request.invocation_id),
         );
         let input_hash = sha256_bytes(request.input.as_bytes());
+        request.contract.validate(&request.tool_name)?;
+        let contract_json = serde_json::to_string(&request.contract)
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
         let expires_at = Utc::now() + Duration::minutes(15);
         let interaction_idempotency_key = format!("approval:{}", request.invocation_id);
         let choice_schema_hash = sha256_json(&serde_json::json!({
@@ -4681,6 +4837,11 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
         if inserted.rows_affected() == 0 {
             let existing = load_durable_interaction(&mut tx, &self.tenant_id, &request_id).await?;
+            if existing.state != InteractionState::Pending {
+                return Err(runtime::RuntimeError::new(
+                    "approval request is already terminal; resume from its durable resolution",
+                ));
+            }
             if existing.kind != InteractionKind::Approval
                 || existing.scope.user_id != self.user_id
                 || existing.scope.session_id != self.session_id
@@ -4690,6 +4851,47 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             {
                 return Err(runtime::RuntimeError::new(
                     "approval idempotency key was reused across scopes",
+                ));
+            }
+            let invocation = sqlx::query_as::<
+                Sqlite,
+                (
+                    String,
+                    Option<String>,
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                ),
+            >(
+                "SELECT thread_id, turn_id, tool_name, idempotency_key, input_hash, contract_json
+                 FROM tool_invocations WHERE id = ? AND tenant_id = ?",
+            )
+            .bind(&invocation_row_id)
+            .bind(&self.tenant_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            let Some(invocation) = invocation else {
+                return Err(runtime::RuntimeError::new(
+                    "approval interaction exists without its tool invocation",
+                ));
+            };
+            if invocation.0 != self.session_id
+                || invocation.1.as_deref() != Some(request.turn_id.as_str())
+                || invocation.2 != request.tool_name
+                || invocation.3 != intent.idempotency_key
+                || invocation
+                    .4
+                    .as_deref()
+                    .is_some_and(|stored| stored != input_hash)
+                || invocation
+                    .5
+                    .as_deref()
+                    .is_some_and(|stored| stored != contract_json)
+            {
+                return Err(runtime::RuntimeError::new(
+                    "approval retry changed the frozen invocation scope, input, or contract",
                 ));
             }
             tx.commit()
@@ -4732,8 +4934,13 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                 "approval id was reused across scopes",
             ));
         }
-        sqlx::query::<Sqlite>("INSERT INTO tool_invocations (id, tenant_id, thread_id, turn_id, tool_name, lifecycle_state, idempotency_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'awaiting_authorization', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT(id) DO NOTHING")
-            .bind(&invocation_row_id).bind(&self.tenant_id).bind(&self.session_id).bind(&request.turn_id).bind(&request.tool_name).bind(&intent.idempotency_key).execute(&mut *tx).await.map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+        let invocation_inserted = sqlx::query::<Sqlite>("INSERT INTO tool_invocations (id, tenant_id, thread_id, turn_id, tool_name, lifecycle_state, idempotency_key, input_hash, contract_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'awaiting_authorization', ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT(id) DO NOTHING")
+            .bind(&invocation_row_id).bind(&self.tenant_id).bind(&self.session_id).bind(&request.turn_id).bind(&request.tool_name).bind(&intent.idempotency_key).bind(&input_hash).bind(&contract_json).execute(&mut *tx).await.map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+        if invocation_inserted.rows_affected() != 1 {
+            return Err(runtime::RuntimeError::new(
+                "approval invocation id already exists in this execution scope",
+            ));
+        }
         let event_key = format!("interaction-created:{request_id}");
         self.append_domain_event_in_transaction(
             &mut tx,
@@ -4871,6 +5078,29 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         .0;
         let allowed_responders = serde_json::to_string(&request.allowed_responder_ids)
             .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        let deferred_tool_outcome = if let Some(output) = &request.deferred_tool_output {
+            if request.kind != InteractionKind::UserQuestion {
+                return Err(runtime::RuntimeError::new(
+                    "only a user-question interaction may suspend a started tool invocation",
+                ));
+            }
+            let protected =
+                runtime::protect_sensitive_text(output, runtime::configured_data_protection_mode());
+            let preview =
+                runtime::reduce_runtime_artifact(&request.invocation_id, &protected.value, 16_000);
+            Some(
+                serde_json::json!({
+                    "kind":"deferred",
+                    "message":preview.text,
+                    "contentHash":sha256_bytes(output.as_bytes()),
+                    "artifactId":serde_json::Value::Null,
+                    "omittedBytes":preview.omitted_bytes,
+                })
+                .to_string(),
+            )
+        } else {
+            None
+        };
         let mut tx = self
             .db
             .begin()
@@ -4929,20 +5159,141 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             .await
             .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
             let existing = load_durable_interaction(&mut tx, &self.tenant_id, &existing_id).await?;
-            if existing.scope.session_id != self.session_id
+            if existing.kind != request.kind
+                || existing.scope.user_id != self.user_id
+                || existing.scope.session_id != self.session_id
                 || existing.scope.turn_id != request.turn_id
                 || existing.scope.invocation_id != request.invocation_id
-                || existing.request_schema_hash != request.request_schema_hash
-                || existing.interaction_id != request.interaction_id
+                || existing.owner_user_id != request.owner_user_id
+                || existing.allowed_responder_ids != request.allowed_responder_ids
+                || existing.capability_requirement != request.capability_requirement
+                || !durable_hash_matches(
+                    &existing.request_schema_hash,
+                    &request.request_schema_hash,
+                )
+                || !durable_optional_hash_matches(
+                    existing.choice_schema_hash.as_deref(),
+                    request.choice_schema_hash.as_deref(),
+                )
+                || existing.display_projection != display_projection
+                || existing.expected_turn_revision != request.expected_turn_revision
+                || !durable_interaction_id_matches(
+                    &existing.interaction_id,
+                    &request.interaction_id,
+                )
             {
                 return Err(runtime::RuntimeError::new(
                     "durable interaction idempotency key was reused for another request",
                 ));
             }
+            if let Some(expected_outcome) = deferred_tool_outcome.as_deref() {
+                let stored = sqlx::query_as::<Sqlite, (String, Option<String>)>(
+                    "SELECT lifecycle_state, outcome FROM tool_invocations
+                     WHERE tenant_id = ? AND thread_id = ? AND turn_id = ?
+                       AND id = ?",
+                )
+                .bind(&self.tenant_id)
+                .bind(&self.session_id)
+                .bind(&request.turn_id)
+                .bind(tenant_scoped_record_id(
+                    "tool-invocation",
+                    &self.tenant_id,
+                    &format!("{}:{}", self.session_id, request.invocation_id),
+                ))
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?
+                .ok_or_else(|| {
+                    runtime::RuntimeError::new(
+                        "durable interaction exists without its suspended tool invocation",
+                    )
+                })?;
+                let expected = serde_json::from_str::<serde_json::Value>(expected_outcome)
+                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+                let actual = stored
+                    .1
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok());
+                if stored.0 != "suspended" || actual.as_ref() != Some(&expected) {
+                    return Err(runtime::RuntimeError::new(
+                        "interaction retry does not match the suspended tool outcome",
+                    ));
+                }
+            }
             tx.commit()
                 .await
                 .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
             return Ok(existing);
+        }
+        if let Some(deferred_outcome) = deferred_tool_outcome.as_deref() {
+            let invocation_row_id = tenant_scoped_record_id(
+                "tool-invocation",
+                &self.tenant_id,
+                &format!("{}:{}", self.session_id, request.invocation_id),
+            );
+            let frozen_contract = sqlx::query_scalar::<Sqlite, Option<String>>(
+                "SELECT contract_json FROM tool_invocations
+                 WHERE id = ? AND tenant_id = ? AND thread_id = ? AND turn_id = ?
+                   AND lifecycle_state = 'started'",
+            )
+            .bind(&invocation_row_id)
+            .bind(&self.tenant_id)
+            .bind(&self.session_id)
+            .bind(&request.turn_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?
+            .flatten()
+            .ok_or_else(|| {
+                runtime::RuntimeError::new(
+                    "user-question interaction requires one started tool invocation",
+                )
+            })?;
+            let frozen_contract = serde_json::from_str::<runtime::RuntimeToolContract>(
+                &frozen_contract,
+            )
+            .map_err(|error| {
+                runtime::RuntimeError::new(format!(
+                    "invalid frozen user-question contract: {error}"
+                ))
+            })?;
+            frozen_contract.validate(&frozen_contract.tool_name)?;
+            if !frozen_contract
+                .tool_name
+                .eq_ignore_ascii_case("AskUserQuestion")
+                && !frozen_contract
+                    .tool_name
+                    .eq_ignore_ascii_case("ask_user_question")
+            {
+                return Err(runtime::RuntimeError::new(
+                    "user-question interaction cannot suspend another tool type",
+                ));
+            }
+            if !frozen_contract.supports_deferred {
+                return Err(runtime::RuntimeError::new(
+                    "frozen user-question contract does not permit suspension",
+                ));
+            }
+            let changed = sqlx::query::<Sqlite>(
+                "UPDATE tool_invocations
+                 SET lifecycle_state = 'suspended', outcome = ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ? AND tenant_id = ? AND thread_id = ? AND turn_id = ?
+                   AND tool_name = ? AND lifecycle_state = 'started'",
+            )
+            .bind(deferred_outcome)
+            .bind(&invocation_row_id)
+            .bind(&self.tenant_id)
+            .bind(&self.session_id)
+            .bind(&request.turn_id)
+            .bind(&frozen_contract.tool_name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            if changed.rows_affected() != 1 {
+                return Err(runtime::RuntimeError::new(
+                    "user-question tool suspension raced with another terminal transition",
+                ));
+            }
         }
         let suspended = sqlx::query::<Sqlite>(
             "UPDATE agent_turns SET status = 'suspended', revision = revision + 1
@@ -5073,6 +5424,33 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             .await
             .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
             if stored_hash.as_deref() == Some(response_hash.as_str()) {
+                let approval_was_granted = interaction.state == InteractionState::Granted
+                    || interaction
+                        .response_projection
+                        .as_ref()
+                        .and_then(|value| value.get("decision"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("granted");
+                if interaction.kind == InteractionKind::Approval && !approval_was_granted {
+                    sqlx::query::<Sqlite>(
+                        "UPDATE tool_invocations
+                         SET lifecycle_state = 'failed', outcome = ?, updated_at = CURRENT_TIMESTAMP
+                         WHERE tenant_id = ? AND thread_id = ? AND turn_id = ?
+                           AND id = ? AND lifecycle_state = 'awaiting_authorization'",
+                    )
+                    .bind(format!("approval_{}", interaction.state.as_str()))
+                    .bind(&self.tenant_id)
+                    .bind(&self.session_id)
+                    .bind(&resolution.turn_id)
+                    .bind(tenant_scoped_record_id(
+                        "tool-invocation",
+                        &self.tenant_id,
+                        &format!("{}:{}", self.session_id, interaction.scope.invocation_id),
+                    ))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+                }
                 tx.commit()
                     .await
                     .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
@@ -5194,6 +5572,31 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                 return Err(runtime::RuntimeError::new(
                     "approval compatibility projection is missing or stale",
                 ));
+            }
+            if interaction.state != InteractionState::Granted {
+                let closed = sqlx::query::<Sqlite>(
+                    "UPDATE tool_invocations
+                     SET lifecycle_state = 'failed', outcome = ?, updated_at = CURRENT_TIMESTAMP
+                     WHERE tenant_id = ? AND thread_id = ? AND turn_id = ?
+                       AND id = ? AND lifecycle_state = 'awaiting_authorization'",
+                )
+                .bind(format!("approval_{}", interaction.state.as_str()))
+                .bind(&self.tenant_id)
+                .bind(&self.session_id)
+                .bind(&resolution.turn_id)
+                .bind(tenant_scoped_record_id(
+                    "tool-invocation",
+                    &self.tenant_id,
+                    &format!("{}:{}", self.session_id, interaction.scope.invocation_id),
+                ))
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+                if closed.rows_affected() != 1 {
+                    return Err(runtime::RuntimeError::new(
+                        "terminal approval could not close its pending tool invocation",
+                    ));
+                }
             }
         }
         self.append_domain_event_in_transaction(
@@ -5410,6 +5813,18 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         let redaction_count = protected.report.finding_count;
         let mut model_output = model_preview.text.clone();
         let content_hash = sha256_bytes(outcome.output.as_bytes());
+        let input_hash = sha256_bytes(outcome.input.as_bytes());
+        let lifecycle_state = match outcome.outcome {
+            runtime::RuntimeToolOutcomeKind::Deferred => "suspended",
+            runtime::RuntimeToolOutcomeKind::Completed => "completed",
+            runtime::RuntimeToolOutcomeKind::Denied | runtime::RuntimeToolOutcomeKind::Failed => {
+                "failed"
+            }
+            runtime::RuntimeToolOutcomeKind::Cancelled => "cancelled",
+            runtime::RuntimeToolOutcomeKind::Expired => "expired",
+            runtime::RuntimeToolOutcomeKind::OutcomeUnknown => "outcome_unknown",
+        };
+        let outcome_state = format!("{:?}", outcome.outcome).to_ascii_lowercase();
         let mut artifact_id = None;
         let omitted_bytes = model_preview.omitted_bytes;
         let mut tx = self
@@ -5420,6 +5835,154 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         acquire_sqlite_write_lock(&mut tx)
             .await
             .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+        let invocation = sqlx::query_as::<
+            Sqlite,
+            (
+                String,
+                Option<String>,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                String,
+            ),
+        >(
+            "SELECT thread_id, turn_id, tool_name, lifecycle_state, outcome, artifact_id,
+                    input_hash, contract_json, idempotency_key
+             FROM tool_invocations WHERE id = ? AND tenant_id = ?",
+        )
+        .bind(&invocation_row_id)
+        .bind(&self.tenant_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?
+        .ok_or_else(|| {
+            runtime::RuntimeError::new(
+                "tool outcome has no matching authorized invocation in this tenant",
+            )
+        })?;
+        if invocation.0 != self.session_id
+            || invocation.1.as_deref() != Some(outcome.turn_id.as_str())
+            || invocation.2 != outcome.tool_name
+            || invocation
+                .6
+                .as_deref()
+                .is_some_and(|stored| stored != input_hash)
+        {
+            return Err(runtime::RuntimeError::new(
+                "tool outcome crossed its session, turn, tool, or input scope",
+            ));
+        }
+        if matches!(outcome.outcome, runtime::RuntimeToolOutcomeKind::Deferred) {
+            if let Some(contract_json) = invocation.7.as_deref() {
+                let contract = serde_json::from_str::<runtime::RuntimeToolContract>(contract_json)
+                    .map_err(|error| {
+                        runtime::RuntimeError::new(format!(
+                            "invalid frozen tool contract at suspension: {error}"
+                        ))
+                    })?;
+                contract.validate(&outcome.tool_name)?;
+                if !contract.supports_deferred {
+                    return Err(runtime::RuntimeError::new(
+                        "frozen tool contract does not permit suspension",
+                    ));
+                }
+            }
+        }
+        let stored_durable = invocation.4.as_deref().and_then(|stored| {
+            serde_json::from_str::<serde_json::Value>(stored)
+                .ok()
+                .filter(|value| {
+                    value
+                        .get("kind")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some()
+                        && value
+                            .get("contentHash")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some()
+                })
+        });
+        if let Some(stored) = stored_durable.as_ref() {
+            let stored_kind = stored
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let stored_hash = stored
+                .get("contentHash")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if invocation.3 == lifecycle_state
+                && stored_kind == outcome_state
+                && stored_hash == content_hash
+            {
+                let stored_artifact = stored
+                    .get("artifactId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned);
+                if stored_artifact != invocation.5 {
+                    return Err(runtime::RuntimeError::new(
+                        "stored tool outcome artifact projection is inconsistent",
+                    ));
+                }
+                let stored_output = stored
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        runtime::RuntimeError::new(
+                            "stored tool outcome is missing its model projection",
+                        )
+                    })?
+                    .to_string();
+                let stored_omitted_bytes = stored
+                    .get("omittedBytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(omitted_bytes);
+                tx.commit()
+                    .await
+                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+                return Ok(runtime::RuntimeToolProjection {
+                    model_output: stored_output,
+                    artifact_id: stored_artifact,
+                    content_hash,
+                    omitted_bytes: stored_omitted_bytes,
+                });
+            }
+        }
+        let legal_transition = match invocation.3.as_str() {
+            "started" => matches!(
+                outcome.outcome,
+                runtime::RuntimeToolOutcomeKind::Deferred
+                    | runtime::RuntimeToolOutcomeKind::Completed
+                    | runtime::RuntimeToolOutcomeKind::Failed
+                    | runtime::RuntimeToolOutcomeKind::Cancelled
+                    | runtime::RuntimeToolOutcomeKind::Expired
+                    | runtime::RuntimeToolOutcomeKind::OutcomeUnknown
+            ),
+            "suspended" => matches!(
+                outcome.outcome,
+                runtime::RuntimeToolOutcomeKind::Completed
+                    | runtime::RuntimeToolOutcomeKind::Failed
+                    | runtime::RuntimeToolOutcomeKind::Cancelled
+                    | runtime::RuntimeToolOutcomeKind::Expired
+                    | runtime::RuntimeToolOutcomeKind::OutcomeUnknown
+            ),
+            "authorized" => matches!(outcome.outcome, runtime::RuntimeToolOutcomeKind::Cancelled),
+            "failed" if stored_durable.is_none() => matches!(
+                outcome.outcome,
+                runtime::RuntimeToolOutcomeKind::Denied
+                    | runtime::RuntimeToolOutcomeKind::Cancelled
+            ),
+            _ => false,
+        };
+        if !legal_transition {
+            return Err(runtime::RuntimeError::new(format!(
+                "illegal tool lifecycle transition from {} to {lifecycle_state}",
+                invocation.3
+            )));
+        }
         if omitted_bytes > 0 {
             let id = tenant_scoped_record_id(
                 "artifact-tool",
@@ -5493,49 +6056,69 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                 ));
             }
         }
-        let lifecycle_state = match outcome.outcome {
-            runtime::RuntimeToolOutcomeKind::Deferred => "suspended",
-            runtime::RuntimeToolOutcomeKind::Completed => "completed",
-            runtime::RuntimeToolOutcomeKind::Denied | runtime::RuntimeToolOutcomeKind::Failed => {
-                "failed"
-            }
-            runtime::RuntimeToolOutcomeKind::Cancelled => "cancelled",
-            runtime::RuntimeToolOutcomeKind::Expired => "expired",
-            runtime::RuntimeToolOutcomeKind::OutcomeUnknown => "outcome_unknown",
-        };
         let durable_outcome = serde_json::json!({
-            "kind": format!("{:?}", outcome.outcome).to_ascii_lowercase(),
+            "kind": &outcome_state,
             "message": &model_output,
             "contentHash": &content_hash,
             "artifactId": artifact_id.as_deref(),
+            "omittedBytes": omitted_bytes,
         })
         .to_string();
-        sqlx::query::<Sqlite>("UPDATE tool_invocations SET lifecycle_state = ?, outcome = ?, artifact_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND tenant_id = ?")
+        let changed = sqlx::query::<Sqlite>("UPDATE tool_invocations SET lifecycle_state = ?, outcome = ?, artifact_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND tenant_id = ? AND thread_id = ? AND turn_id = ? AND tool_name = ? AND lifecycle_state = ?")
             .bind(lifecycle_state)
             .bind(durable_outcome)
             .bind(&artifact_id)
             .bind(&invocation_row_id)
             .bind(&self.tenant_id)
+            .bind(&self.session_id)
+            .bind(&outcome.turn_id)
+            .bind(&outcome.tool_name)
+            .bind(&invocation.3)
             .execute(&mut *tx)
             .await
             .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
-        let reservation_prefix = format!("tool:{}:{}:%", outcome.turn_id, outcome.invocation_id);
+        if changed.rows_affected() != 1 {
+            return Err(runtime::RuntimeError::new(
+                "tool lifecycle transition raced with another writer",
+            ));
+        }
+        let reservation_id = &invocation.8;
         let reserved_dimensions = sqlx::query_scalar::<Sqlite, String>(
             "SELECT dimension FROM resource_budget_entries
-             WHERE tenant_id = ? AND owner_scope = ? AND reservation_id LIKE ? AND state = 'reserved'",
+             WHERE tenant_id = ? AND owner_scope = ? AND reservation_id = ? AND state = 'reserved'",
         )
         .bind(&self.tenant_id)
         .bind(&self.session_id)
-        .bind(&reservation_prefix)
+        .bind(reservation_id)
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
-        let settled = sqlx::query::<Sqlite>("UPDATE resource_budget_entries SET state = 'committed' WHERE tenant_id = ? AND owner_scope = ? AND reservation_id LIKE ? AND state = 'reserved'")
-            .bind(&self.tenant_id).bind(&self.session_id).bind(reservation_prefix).execute(&mut *tx).await.map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+        let cancelled_before_dispatch = invocation.3 == "authorized";
+        let budget_state = if cancelled_before_dispatch {
+            "released"
+        } else {
+            "committed"
+        };
+        let settled = sqlx::query::<Sqlite>("UPDATE resource_budget_entries SET state = ? WHERE tenant_id = ? AND owner_scope = ? AND reservation_id = ? AND state = 'reserved'")
+            .bind(budget_state).bind(&self.tenant_id).bind(&self.session_id).bind(reservation_id).execute(&mut *tx).await.map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
         if settled.rows_affected() > 0 {
             for dimension in reserved_dimensions {
-                sqlx::query::<Sqlite>("UPDATE resource_budget_accounts SET reserved = MAX(reserved - 1, 0), committed = committed + 1 WHERE tenant_id = ? AND owner_scope = ? AND dimension = ?")
-                    .bind(&self.tenant_id).bind(&self.session_id).bind(dimension).execute(&mut *tx).await.map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+                let accounting = if cancelled_before_dispatch {
+                    "UPDATE resource_budget_accounts
+                     SET reserved = MAX(reserved - 1, 0), available = available + 1
+                     WHERE tenant_id = ? AND owner_scope = ? AND dimension = ?"
+                } else {
+                    "UPDATE resource_budget_accounts
+                     SET reserved = MAX(reserved - 1, 0), committed = committed + 1
+                     WHERE tenant_id = ? AND owner_scope = ? AND dimension = ?"
+                };
+                sqlx::query::<Sqlite>(accounting)
+                    .bind(&self.tenant_id)
+                    .bind(&self.session_id)
+                    .bind(dimension)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
             }
         }
         if let Some(artifact_id) = artifact_id.as_deref() {
@@ -5553,7 +6136,6 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                 tracing::warn!(tenant_id = %self.tenant_id, session_id = %self.session_id, artifact_id, artifact_bytes, "artifact spill exceeded the session accounting allowance; result retained and overage recorded");
             }
         }
-        let outcome_state = format!("{:?}", outcome.outcome).to_ascii_lowercase();
         let tool_surface_message = runtime_surface_message(
             format!("tool-outcome:{}:{outcome_state}", outcome.invocation_id),
             &runtime::ConversationMessage {
@@ -5664,25 +6246,29 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             )));
         }
         if !matches!(status, runtime::RuntimeTurnTerminalStatus::Suspended) {
-            let reservation_prefix = format!("model:{turn_id}:%");
+            let reservation_prefix = format!("model:{turn_id}:");
             let rows = sqlx::query::<Sqlite>(
                 "SELECT dimension, amount, parent_reservation_id
                  FROM resource_budget_entries
-                 WHERE tenant_id = ? AND owner_scope = ? AND reservation_id LIKE ?
+                 WHERE tenant_id = ? AND owner_scope = ?
+                   AND substr(reservation_id, 1, length(?)) = ?
                    AND state = 'reserved'",
             )
             .bind(&self.tenant_id)
             .bind(&self.session_id)
+            .bind(&reservation_prefix)
             .bind(&reservation_prefix)
             .fetch_all(&mut *tx)
             .await
             .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
             sqlx::query::<Sqlite>(
                 "UPDATE resource_budget_entries SET state = 'released'
-                 WHERE tenant_id = ? AND owner_scope = ? AND reservation_id LIKE ? AND state = 'reserved'",
+                 WHERE tenant_id = ? AND owner_scope = ?
+                   AND substr(reservation_id, 1, length(?)) = ? AND state = 'reserved'",
             )
             .bind(&self.tenant_id)
             .bind(&self.session_id)
+            .bind(&reservation_prefix)
             .bind(&reservation_prefix)
             .execute(&mut *tx)
             .await
@@ -5732,15 +6318,17 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                     .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
                 }
             }
-            let protected_prefix = format!("model-protected:{turn_id}:%");
+            let protected_prefix = format!("model-protected:{turn_id}:");
             let protected_rows = sqlx::query::<Sqlite>(
                 "SELECT dimension, amount, committed_amount
                  FROM resource_budget_entries
-                 WHERE tenant_id = ? AND owner_scope = ? AND reservation_id LIKE ?
+                 WHERE tenant_id = ? AND owner_scope = ?
+                   AND substr(reservation_id, 1, length(?)) = ?
                    AND state = 'protected'",
             )
             .bind(&self.tenant_id)
             .bind(&self.session_id)
+            .bind(&protected_prefix)
             .bind(&protected_prefix)
             .fetch_all(&mut *tx)
             .await
@@ -5775,11 +6363,13 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             sqlx::query::<Sqlite>(
                 "UPDATE resource_budget_entries
                  SET state = CASE WHEN committed_amount > 0 THEN 'committed' ELSE 'released' END
-                 WHERE tenant_id = ? AND owner_scope = ? AND reservation_id LIKE ?
+                 WHERE tenant_id = ? AND owner_scope = ?
+                   AND substr(reservation_id, 1, length(?)) = ?
                    AND state = 'protected'",
             )
             .bind(&self.tenant_id)
             .bind(&self.session_id)
+            .bind(&protected_prefix)
             .bind(&protected_prefix)
             .execute(&mut *tx)
             .await
@@ -6065,6 +6655,35 @@ pub(crate) async fn create_memory_conflict_question_in_transaction(
 
 fn sha256_bytes(value: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(value))
+}
+
+fn durable_hash_matches(stored: &str, requested: &str) -> bool {
+    stored == requested || (is_hex_hash(stored, 16) && is_hex_hash(requested, 64))
+}
+
+fn durable_optional_hash_matches(stored: Option<&str>, requested: Option<&str>) -> bool {
+    match (stored, requested) {
+        (None, None) => true,
+        (Some(stored), Some(requested)) => durable_hash_matches(stored, requested),
+        _ => false,
+    }
+}
+
+fn durable_interaction_id_matches(stored: &str, requested: &str) -> bool {
+    if stored == requested {
+        return true;
+    }
+    let Some(stored_hash) = stored.strip_prefix("interaction:") else {
+        return false;
+    };
+    let Some(requested_hash) = requested.strip_prefix("interaction:") else {
+        return false;
+    };
+    is_hex_hash(stored_hash, 16) && is_hex_hash(requested_hash, 64)
+}
+
+fn is_hex_hash(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn protected_model_reservation_id(
@@ -11254,6 +11873,22 @@ mod tests {
         crate::test_sqlite_pool().await
     }
 
+    #[test]
+    fn durable_interaction_hash_upgrade_accepts_only_the_legacy_to_sha256_shape() {
+        let legacy = "0123456789abcdef";
+        let sha256 = "a".repeat(64);
+        assert!(durable_hash_matches(legacy, &sha256));
+        assert!(durable_interaction_id_matches(
+            &format!("interaction:{legacy}"),
+            &format!("interaction:{sha256}")
+        ));
+        assert!(!durable_hash_matches(legacy, "changed-choice-schema"));
+        assert!(!durable_interaction_id_matches(
+            "interaction:0123456789abcdee",
+            "different:aabbccddeeff0011"
+        ));
+    }
+
     // Keep legacy fixture call sites compact while forcing every test through
     // the production atomic terminal/checkpoint command. There is no
     // production `finish_turn` compatibility method.
@@ -15177,6 +15812,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(state, "authorized");
+        kernel.start_tool(&intent).await.unwrap();
         let projection = kernel
             .finish_tool(runtime::RuntimeToolOutcome {
                 turn_id: "turn-1".into(),
@@ -15305,15 +15941,32 @@ mod tests {
         .fetch_one(&db)
         .await
         .unwrap();
-        assert_eq!(recovered, "outcome_unknown");
+        assert_eq!(recovered, "cancelled");
         let closer_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_event_ledger
-             WHERE thread_id = 'session' AND event_type = 'runtime.tool_outcome_unknown'",
+             WHERE thread_id = 'session'
+               AND event_type = 'runtime.tool_cancelled_before_dispatch'",
         )
         .fetch_one(&db)
         .await
         .unwrap();
         assert_eq!(closer_count, 1);
+        let (released_entries, web_budget): (i64, String) = sqlx::query_as(
+            "SELECT
+                (SELECT COUNT(*) FROM resource_budget_entries
+                 WHERE tenant_id = 'tenant' AND owner_scope = 'session'
+                   AND reservation_id = ? AND state = 'released'),
+                (SELECT printf('%d:%d:%d', available, reserved, committed)
+                 FROM resource_budget_accounts
+                 WHERE tenant_id = 'tenant' AND owner_scope = 'session'
+                   AND dimension = 'web_queries')",
+        )
+        .bind(&open.idempotency_key)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(released_entries, 2);
+        assert_eq!(web_budget, "64:0:0");
     }
 
     async fn fail_runtime_event(db: &SqlitePool, event_type: &str) {
@@ -15644,6 +16297,240 @@ mod tests {
         .unwrap();
         assert_eq!(recovery_state, ("started".into(), 0));
         allow_runtime_events(&db).await;
+    }
+
+    #[tokio::test]
+    async fn tool_terminal_transition_is_scoped_ordered_and_idempotent() {
+        let db = db().await;
+        let kernel = RuntimeExecutionKernel::new(db.clone(), "tenant", "user", "fenced-session");
+        kernel
+            .start_turn(runtime::RuntimeTurnStart {
+                turn_id: "fenced-turn".into(),
+                user_input: "run one fenced tool".into(),
+            })
+            .await
+            .unwrap();
+        let intent = runtime::RuntimeToolIntent::new(
+            "fenced-turn",
+            "fenced-tool",
+            "read_file",
+            r#"{"path":"README.md"}"#,
+            1,
+            true,
+            None,
+        );
+        kernel.authorize_tool(&intent).await.unwrap();
+        let completed = runtime::RuntimeToolOutcome {
+            turn_id: "fenced-turn".into(),
+            invocation_id: "fenced-tool".into(),
+            tool_name: "read_file".into(),
+            input: r#"{"path":"README.md"}"#.into(),
+            output: "fenced output".into(),
+            iteration: 1,
+            outcome: runtime::RuntimeToolOutcomeKind::Completed,
+        };
+        let ordering_error = kernel.finish_tool(completed.clone()).await.unwrap_err();
+        assert!(ordering_error
+            .to_string()
+            .contains("illegal tool lifecycle transition"));
+        let mut premature_unknown = completed.clone();
+        premature_unknown.outcome = runtime::RuntimeToolOutcomeKind::OutcomeUnknown;
+        assert!(kernel
+            .finish_tool(premature_unknown)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("illegal tool lifecycle transition"));
+        let mut changed_intent = intent.clone();
+        changed_intent.input = r#"{"path":"Cargo.toml"}"#.into();
+        assert!(kernel.start_tool(&changed_intent).await.is_err());
+        kernel.start_tool(&intent).await.unwrap();
+        let mut invalid_deferred = completed.clone();
+        invalid_deferred.output = r#"{"jobId":"unexpected"}"#.into();
+        invalid_deferred.outcome = runtime::RuntimeToolOutcomeKind::Deferred;
+        assert!(kernel
+            .finish_tool(invalid_deferred)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("does not permit suspension"));
+        let first = kernel.finish_tool(completed.clone()).await.unwrap();
+        let replay = kernel.finish_tool(completed.clone()).await.unwrap();
+        assert_eq!(first, replay);
+        let stored_outcome: String = sqlx::query_scalar(
+            "SELECT outcome FROM tool_invocations
+             WHERE tenant_id = 'tenant' AND thread_id = 'fenced-session'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let stored_outcome: serde_json::Value = serde_json::from_str(&stored_outcome).unwrap();
+        assert_eq!(stored_outcome["omittedBytes"], first.omitted_bytes);
+
+        let mut changed_payload = completed.clone();
+        changed_payload.output = "different output".into();
+        assert!(kernel.finish_tool(changed_payload).await.is_err());
+        let mut changed_terminal = completed.clone();
+        changed_terminal.outcome = runtime::RuntimeToolOutcomeKind::Failed;
+        assert!(kernel.finish_tool(changed_terminal).await.is_err());
+        let mut missing = completed;
+        missing.invocation_id = "missing-tool".into();
+        assert!(kernel.finish_tool(missing).await.is_err());
+
+        let (state, outcome_events, artifacts): (String, i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT lifecycle_state FROM tool_invocations
+                 WHERE tenant_id = 'tenant' AND thread_id = 'fenced-session'),
+                (SELECT COUNT(*) FROM agent_event_ledger
+                 WHERE tenant_id = 'tenant' AND thread_id = 'fenced-session'
+                   AND event_type = 'runtime.tool_outcome'),
+                (SELECT COUNT(*) FROM artifact_objects
+                 WHERE tenant_id = 'tenant' AND owner_scope = 'fenced-session')",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(state, "completed");
+        assert_eq!(outcome_events, 1);
+        assert_eq!(artifacts, 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_dispatch_releases_every_reserved_tool_budget() {
+        let db = db().await;
+        let kernel = RuntimeExecutionKernel::new(db.clone(), "tenant", "user", "cancel-session");
+        kernel
+            .start_turn(runtime::RuntimeTurnStart {
+                turn_id: "cancel-turn".into(),
+                user_input: "cancel before dispatch".into(),
+            })
+            .await
+            .unwrap();
+        let intent = runtime::RuntimeToolIntent::new(
+            "cancel-turn",
+            "cancel-%-tool",
+            "WebFetch",
+            r#"{"url":"https://example.test"}"#,
+            1,
+            true,
+            None,
+        );
+        kernel.authorize_tool(&intent).await.unwrap();
+        let other = runtime::RuntimeToolIntent::new(
+            "cancel-turn",
+            "cancel-other-tool",
+            "WebFetch",
+            r#"{"url":"https://other.example.test"}"#,
+            1,
+            true,
+            None,
+        );
+        kernel.authorize_tool(&other).await.unwrap();
+        kernel
+            .finish_tool(runtime::RuntimeToolOutcome {
+                turn_id: intent.turn_id.clone(),
+                invocation_id: intent.invocation_id.clone(),
+                tool_name: intent.tool_name.clone(),
+                input: intent.input.clone(),
+                output: "tool call aborted before dispatch".into(),
+                iteration: intent.iteration,
+                outcome: runtime::RuntimeToolOutcomeKind::Cancelled,
+            })
+            .await
+            .unwrap();
+
+        let (tool_state, released_entries, other_reserved_entries, account_state): (
+            String,
+            i64,
+            i64,
+            String,
+        ) =
+            sqlx::query_as(
+                "SELECT
+                    (SELECT lifecycle_state FROM tool_invocations
+                     WHERE tenant_id = 'tenant' AND thread_id = 'cancel-session'
+                       AND idempotency_key = ?),
+                    (SELECT COUNT(*) FROM resource_budget_entries
+                     WHERE tenant_id = 'tenant' AND owner_scope = 'cancel-session'
+                       AND reservation_id = ? AND state = 'released'),
+                    (SELECT COUNT(*) FROM resource_budget_entries
+                     WHERE tenant_id = 'tenant' AND owner_scope = 'cancel-session'
+                       AND reservation_id = ? AND state = 'reserved'),
+                    (SELECT group_concat(dimension || ':' || available || ':' || reserved || ':' || committed, ',')
+                     FROM (
+                         SELECT dimension, available, reserved, committed
+                         FROM resource_budget_accounts
+                         WHERE tenant_id = 'tenant' AND owner_scope = 'cancel-session'
+                         ORDER BY dimension
+                     ))",
+            )
+            .bind(&intent.idempotency_key)
+            .bind(&intent.idempotency_key)
+            .bind(&other.idempotency_key)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(tool_state, "cancelled");
+        assert_eq!(released_entries, 2);
+        assert_eq!(other_reserved_entries, 2);
+        assert_eq!(account_state, "tool_calls:255:1:0,web_queries:63:1:0");
+    }
+
+    #[tokio::test]
+    async fn recovery_restores_a_durable_tool_suspension_missing_its_turn_checkpoint() {
+        let db = db().await;
+        let kernel = RuntimeExecutionKernel::new(db.clone(), "tenant", "user", "deferred-recovery");
+        kernel
+            .start_turn(runtime::RuntimeTurnStart {
+                turn_id: "deferred-turn".into(),
+                user_input: "start deferred work".into(),
+            })
+            .await
+            .unwrap();
+        let mut contract = runtime::RuntimeToolContract::test_read_only("deferred_tool");
+        contract.supports_deferred = true;
+        let intent = runtime::RuntimeToolIntent::new_with_contract(
+            "deferred-turn",
+            "deferred-invocation",
+            "deferred_tool",
+            "{}",
+            1,
+            true,
+            None,
+            contract,
+        );
+        kernel.authorize_tool(&intent).await.unwrap();
+        kernel.start_tool(&intent).await.unwrap();
+        kernel
+            .finish_tool(runtime::RuntimeToolOutcome {
+                turn_id: "deferred-turn".into(),
+                invocation_id: "deferred-invocation".into(),
+                tool_name: "deferred_tool".into(),
+                input: "{}".into(),
+                output: r#"{"jobId":"job-1"}"#.into(),
+                iteration: 1,
+                outcome: runtime::RuntimeToolOutcomeKind::Deferred,
+            })
+            .await
+            .unwrap();
+
+        kernel.recover().await.unwrap();
+        let (turn_state, tool_state, recovery_events): (String, String, i64) = sqlx::query_as(
+            "SELECT
+                    (SELECT status FROM agent_turns
+                     WHERE tenant_id = 'tenant' AND thread_id = 'deferred-recovery'),
+                    (SELECT lifecycle_state FROM tool_invocations
+                     WHERE tenant_id = 'tenant' AND thread_id = 'deferred-recovery'),
+                    (SELECT COUNT(*) FROM agent_event_ledger
+                     WHERE tenant_id = 'tenant' AND thread_id = 'deferred-recovery'
+                       AND event_type = 'runtime.turn_suspension_recovered')",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(turn_state, "suspended");
+        assert_eq!(tool_state, "suspended");
+        assert_eq!(recovery_events, 1);
     }
 
     #[tokio::test]
@@ -16287,6 +17174,16 @@ mod tests {
             .unwrap();
         let request = approval_request("turn-approval", "tool-approval");
         kernel.request_approval(&request).await.unwrap();
+        assert_eq!(
+            kernel
+                .load_tool_contract("turn-approval", "tool-approval", "write_file")
+                .await
+                .unwrap(),
+            Some(request.contract.clone())
+        );
+        let mut changed_request = request.clone();
+        changed_request.contract.timeout_ms += 1;
+        assert!(kernel.request_approval(&changed_request).await.is_err());
         grant_approval_response_capability(&db, "session").await;
 
         let visible = list_runtime_approvals(&db, "tenant", "user", "session")
@@ -16345,6 +17242,7 @@ mod tests {
             ),
             ("consumed", "approved", "settled")
         );
+        assert!(kernel.request_approval(&request).await.is_err());
 
         let intent = runtime::RuntimeToolIntent::new(
             "turn-approval",
@@ -16434,7 +17332,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(approval_status, "expired");
-        assert_eq!(invocation_status, "awaiting_authorization");
+        assert_eq!(invocation_status, "failed");
     }
 
     fn durable_interaction_request(
@@ -16456,6 +17354,7 @@ mod tests {
             idempotency_key: format!("request-{interaction_id}"),
             expected_turn_revision: 0,
             expires_at: Some(Utc::now() + Duration::minutes(5)),
+            deferred_tool_output: None,
         }
     }
 
@@ -16542,6 +17441,78 @@ mod tests {
         assert_eq!(turn_status, "running");
         assert_eq!(resume_count, 1);
         assert_eq!(consumed_events, 1);
+    }
+
+    #[tokio::test]
+    async fn user_question_atomically_suspends_its_started_tool_and_turn() {
+        let db = db().await;
+        let kernel =
+            RuntimeExecutionKernel::new(db.clone(), "tenant", "owner", "tool-question-session");
+        kernel
+            .start_turn(runtime::RuntimeTurnStart {
+                turn_id: "tool-question-turn".into(),
+                user_input: "ask before continuing".into(),
+            })
+            .await
+            .unwrap();
+        let mut contract = runtime::RuntimeToolContract::test_read_only("AskUserQuestion");
+        contract.supports_deferred = true;
+        let intent = runtime::RuntimeToolIntent::new_with_contract(
+            "tool-question-turn",
+            "tool-question-invocation",
+            "AskUserQuestion",
+            r#"{"question":"Continue?"}"#,
+            1,
+            true,
+            None,
+            contract.clone(),
+        );
+        kernel.authorize_tool(&intent).await.unwrap();
+        kernel.start_tool(&intent).await.unwrap();
+        let mut request = durable_interaction_request(
+            InteractionKind::UserQuestion,
+            "tool-question-interaction",
+            "tool-question-turn",
+        );
+        request.invocation_id = "tool-question-invocation".into();
+        request.deferred_tool_output = Some(r#"{"kind":"user_question"}"#.into());
+        kernel.request_interaction(&request).await.unwrap();
+        kernel.request_interaction(&request).await.unwrap();
+        let mut changed_request = request.clone();
+        changed_request.choice_schema_hash = Some("changed-choice-schema".into());
+        assert!(kernel.request_interaction(&changed_request).await.is_err());
+        assert_eq!(
+            kernel
+                .load_tool_contract(
+                    "tool-question-turn",
+                    "tool-question-invocation",
+                    "AskUserQuestion",
+                )
+                .await
+                .unwrap(),
+            Some(contract)
+        );
+        let (tool_state, turn_state, interactions, displays): (String, String, i64, i64) =
+            sqlx::query_as(
+                "SELECT
+                    (SELECT lifecycle_state FROM tool_invocations
+                     WHERE tenant_id = 'tenant' AND thread_id = 'tool-question-session'),
+                    (SELECT status FROM agent_turns
+                     WHERE tenant_id = 'tenant' AND thread_id = 'tool-question-session'),
+                    (SELECT COUNT(*) FROM durable_interactions
+                     WHERE tenant_id = 'tenant' AND session_id = 'tool-question-session'),
+                    (SELECT COUNT(*) FROM durable_interaction_outbox
+                     WHERE tenant_id = 'tenant'
+                       AND interaction_id = 'tool-question-interaction'
+                       AND intent = 'display')",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(tool_state, "suspended");
+        assert_eq!(turn_state, "suspended");
+        assert_eq!(interactions, 1);
+        assert_eq!(displays, 1);
     }
 
     #[tokio::test]

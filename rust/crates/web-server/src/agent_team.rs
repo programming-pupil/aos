@@ -1782,7 +1782,7 @@ pub(crate) async fn interrupt_member(
             "the root agent team coordinator cannot be interrupted".into(),
         ));
     }
-    sqlx::query::<Sqlite>(
+    let changed = sqlx::query::<Sqlite>(
         "UPDATE agent_team_members SET status = 'interrupt_requested',
                  lease_owner = NULL, lease_expires_at = NULL,
                  updated_at = CURRENT_TIMESTAMP
@@ -1794,6 +1794,22 @@ pub(crate) async fn interrupt_member(
     .bind(&target_thread_id)
     .execute(&mut *tx)
     .await?;
+    if changed.rows_affected() == 0 {
+        let status = sqlx::query_scalar::<Sqlite, String>(
+            "SELECT status FROM agent_team_members
+             WHERE tenant_id = ? AND team_id = ? AND thread_id = ?",
+        )
+        .bind(tenant_id)
+        .bind(&team_id)
+        .bind(&target_thread_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if status != "interrupt_requested" {
+            return Err(SemanticStoreError::InvalidEvent(format!(
+                "agent team member has no active turn to interrupt (status={status})"
+            )));
+        }
+    }
     sqlx::query::<Sqlite>(
         "DELETE FROM agent_concurrency_permits
          WHERE tenant_id = ? AND holder_thread_id = ?",
@@ -2017,6 +2033,11 @@ mod tests {
         mark_member_status(&db, "tenant", "child-a", "completed", None)
             .await
             .unwrap();
+        assert!(interrupt_member(&db, "tenant", "root", "child-a", None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("no active turn"));
         let waited = wait_for_change(&db, "tenant", "root", 10).await.unwrap();
         assert_eq!(waited["reason"], "no_active_peer");
 
