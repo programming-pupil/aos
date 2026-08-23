@@ -62,7 +62,7 @@ clickhouse = { version = "0.15", features = ["native-tls"] }
 trino-rust-client = "0.12"
 clap = { version = "4", features = ["derive"] }
 async-stream = "0.3"
-zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"], optional = true }
 feishu-sdk = { version = "0.1.2", features = ["websocket"], optional = true }
