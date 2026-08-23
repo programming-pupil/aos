@@ -23,7 +23,7 @@ sqlparser = { version = "0.52", features = ["visitor"] }
 sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-trino-rust-client = "0.11"
+trino-rust-client = "0.12"
 urlencoding.workspace = true
 uuid.workspace = true
 mongodb.workspace = true
