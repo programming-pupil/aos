@@ -2519,6 +2519,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "is-docker"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "928bae27f42bc99b60d9ac7334e3a21d10ad8f1835a4e12ec3ec0464765ed1b3"
+dependencies = [
+ "once_cell",
+]
+
+[[package]]
+name = "is-wsl"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "173609498df190136aa7dea1a91db051746d339e18476eed5ca40521f02d7aa5"
+dependencies = [
+ "is-docker",
+ "once_cell",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3489,6 +3508,16 @@ name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
+
+[[package]]
+name = "open"
+version = "5.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9cfef937e9c486488c7e3d949ae31c0f1d06bdacd75b99c086cb35356e30408"
+dependencies = [
+ "is-wsl",
+ "libc",
+]
 
 [[package]]
 name = "openssl"
@@ -5811,13 +5840,13 @@ dependencies = [
 
 [[package]]
 name = "trino-rust-client"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bfe66faa4ffac64969c1cc2a20c26e2065785ae52392b73b4bad4a75e286b9a2"
+checksum = "0a21b8d85eefe93b66e612f0742183dfebb2092a261637993ccac403cb37e182"
 dependencies = [
  "async-stream",
  "backon",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bigdecimal",
  "chrono",
  "chrono-tz",
@@ -5826,6 +5855,7 @@ dependencies = [
  "http",
  "iterable",
  "lazy_static",
+ "open",
  "paste",
  "regex",
  "reqwest 0.13.4",
