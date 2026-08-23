@@ -58,7 +58,7 @@ rusqlite = { workspace = true }
 parking_lot.workspace = true
 fs2.workspace = true
 hnsw_rs = "0.3"
-clickhouse = { version = "0.14", features = ["native-tls"] }
+clickhouse = { version = "0.15", features = ["native-tls"] }
 trino-rust-client = "0.11"
 clap = { version = "4", features = ["derive"] }
 async-stream = "0.3"
