@@ -11,10 +11,10 @@ updates:
           - minor
           - patch
     ignore:
-      # fastembed 6 requires ONNX Runtime API 24, which has no macOS x86_64 binary.
+      # fastembed 5.14+ requires ONNX Runtime API 24, which has no macOS x86_64 binary.
       - dependency-name: fastembed
         versions:
-          - ">= 6.0.0, < 7.0.0"
+          - ">= 5.14.0, < 7.0.0"
 
   - package-ecosystem: npm
     directory: /webui
