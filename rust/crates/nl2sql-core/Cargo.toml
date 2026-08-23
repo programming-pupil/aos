@@ -9,7 +9,7 @@ publish.workspace = true
 semantic-core = { path = "../semantic-core" }
 anyhow.workspace = true
 chrono.workspace = true
-clickhouse = { version = "0.14", features = ["native-tls"] }
+clickhouse = { version = "0.15", features = ["native-tls"] }
 futures-util.workspace = true
 hex = "0.4"
 lazy_static = "1"
