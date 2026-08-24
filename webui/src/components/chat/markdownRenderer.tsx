@@ -12,7 +12,7 @@ import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import type { ComponentPropsWithoutRef } from 'react';
-import { useCallback, useState } from 'react';
+import { memo, useCallback, useState } from 'react';
 import { LazyCodeHighlighter } from '@/components/code/LazyCodeHighlighter';
 import { useAuthenticatedUploadUrl } from './AuthenticatedUploadImage';
 
@@ -803,7 +803,7 @@ export function normalizeMarkdownForRendering(source: string, relaxed = false): 
   );
 }
 
-export function Markdown({ children: source, inline, relaxed, suppressHr }: MarkdownProps) {
+function MarkdownImpl({ children: source, inline, relaxed, suppressHr }: MarkdownProps) {
   if (!source) return null;
   const renderedSource = normalizeMarkdownForRendering(source, relaxed);
 
@@ -926,3 +926,8 @@ export function Markdown({ children: source, inline, relaxed, suppressHr }: Mark
     </div>
   );
 }
+
+// Historical bubbles and side panels can re-render while a different message
+// streams. Keep the expensive markdown parse isolated when the source itself
+// did not change.
+export const Markdown = memo(MarkdownImpl);

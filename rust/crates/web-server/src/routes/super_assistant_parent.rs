@@ -1176,6 +1176,11 @@ fn parent_turn_options(input: &UnifiedParentTurnInput) -> AgentTurnOptions {
             "workspace_stat".to_string(),
             "workspace_execute".to_string(),
         ]);
+    } else {
+        options.system_instructions.push(
+            "Authenticated workspace protocol: this session has an isolated per-user workspace. When the user asks you to create, update, or repair a code/document file, use the authorized write_file or edit_file tool directly inside that workspace; do not claim that file-writing tools are unavailable. Keep every path relative to the workspace or otherwise prove it stays inside the workspace. Use read_file/grep_search first when existing content must be preserved, and report the exact files changed after the write. Do not write outside the authenticated workspace or use host paths."
+                .to_string(),
+        );
     }
     if !input.required_evidence.iter().any(|r| r == "deep_research") {
         options
@@ -10620,6 +10625,14 @@ mod tests {
         assert!(!ordinary_options.prefer_native_web_search);
         assert!(ordinary_options.suppress_native_web_search);
         assert_eq!(ordinary_options.web_tool_result_budget, None);
+        assert!(ordinary_options
+            .system_instructions
+            .iter()
+            .any(|instruction| {
+                instruction.contains("Authenticated workspace protocol")
+                    && instruction.contains("write_file")
+                    && instruction.contains("edit_file")
+            }));
         assert!(!ordinary_options
             .blocked_tools
             .iter()

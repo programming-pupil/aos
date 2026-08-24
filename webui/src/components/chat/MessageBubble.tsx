@@ -1498,8 +1498,10 @@ function MessageBubbleImpl({
   const displayContent = useMemo(() => {
     if (typeof message.content !== "string") return message.content;
     const stripped = stripEmptySourceTail(message.content);
-    return !isUser && variant === "pm" ? cleanupPmVisibleContent(stripped) : stripped;
-  }, [isUser, message.content, variant]);
+    return !isStreamingBubble && !isUser && variant === "pm"
+      ? cleanupPmVisibleContent(stripped)
+      : stripped;
+  }, [isStreamingBubble, isUser, message.content, variant]);
   const hasTextContent =
     !!displayContent &&
     (typeof displayContent === "string"
@@ -1574,25 +1576,32 @@ function MessageBubbleImpl({
     pmSearchUsage?: PmSearchUsageSummary;
     traceEvents?: Record<string, unknown>[];
   };
-  const evidenceSources = mergeEvidenceSources(
-    message.evidenceSources,
-    displayContent,
-    message.toolCalls,
+  const evidenceSources = useMemo(
+    () =>
+      isStreamingBubble
+        ? message.evidenceSources ?? []
+        : mergeEvidenceSources(
+            message.evidenceSources,
+            displayContent,
+            message.toolCalls,
+          ),
+    [displayContent, isStreamingBubble, message.evidenceSources, message.toolCalls],
   );
   const pmArticleHeadings = useMemo(
     () =>
-      !isUser && variant === "pm" && hasTextContent
+      !isStreamingBubble && !isUser && variant === "pm" && hasTextContent
         ? extractMarkdownHeadings(displayContent)
         : [],
-    [displayContent, hasTextContent, isUser, variant],
+    [displayContent, hasTextContent, isStreamingBubble, isUser, variant],
   );
   const shouldShowPmArticleToc = useMemo(
     () =>
+      !isStreamingBubble &&
       !isUser &&
       variant === "pm" &&
       pmArticleHeadings.length >= 3 &&
       !hasVisibleMarkdownToc(displayContent),
-    [displayContent, isUser, pmArticleHeadings.length, variant],
+    [displayContent, isStreamingBubble, isUser, pmArticleHeadings.length, variant],
   );
   const showStreamingPlaceholder =
     !!isStreamingBubble && !hasTextContent && !hasThinking && !hasToolCalls;
@@ -1774,7 +1783,7 @@ function MessageBubbleImpl({
               boxShadow: isUser ? undefined : "0 8px 24px rgba(15, 23, 42, 0.04)",
             }}
           >
-            {isUser
+            {isUser || isStreamingBubble
               ? renderPlainContent(displayContent)
               : (
                   <>

@@ -1921,6 +1921,8 @@ impl GatewayApiClient {
                 "ToolSearch",
                 "complete_turn",
                 "read_file",
+                "write_file",
+                "edit_file",
                 "glob_search",
                 "grep_search",
                 "WebSearch",
@@ -12680,6 +12682,13 @@ mod tests {
             .expect("runtime tool registry");
         let mut client = GatewayApiClient::new(&config, "session", None, registry).unwrap();
 
+        let default_chat_tools = client.filter_tool_specs();
+        assert!(default_chat_tools
+            .iter()
+            .any(|definition| definition.name == "write_file"));
+        assert!(default_chat_tools
+            .iter()
+            .any(|definition| definition.name == "edit_file"));
         assert!(!client
             .filter_tool_specs()
             .iter()
@@ -14793,6 +14802,24 @@ mod tests {
         assert!(
             output.contains("workspace-ok"),
             "read_file output should come from the session workspace: {output}"
+        );
+    }
+
+    #[test]
+    fn builtin_tools_write_relative_to_session_workspace() {
+        let (mut executor, workspace) = test_executor(Some("chat"));
+
+        executor
+            .execute(
+                "write_file",
+                r#"{"path":"generated/page.tsx","content":"export default function Page() {}\n"}"#,
+            )
+            .expect("write_file should resolve relative to session workspace");
+
+        assert_eq!(
+            std::fs::read_to_string(workspace.path.join("generated/page.tsx"))
+                .expect("written workspace file should be readable"),
+            "export default function Page() {}\n"
         );
     }
 

@@ -19,7 +19,15 @@
 //   3. Stream handlers are defined once; page only customises onStreamEnd.
 //   4. No duplicate code — every shared pattern lives here.
 
-import { useState, useRef, useCallback, useMemo, useEffect } from "react";
+import {
+  useState,
+  useRef,
+  useCallback,
+  useMemo,
+  useEffect,
+  type ReactNode,
+  type RefObject,
+} from "react";
 import { flushSync } from "react-dom";
 import {
   Typography,
@@ -605,9 +613,59 @@ const HISTORY_PAGE_MAX_BYTES = 256 * 1024;
 const HISTORY_AUTO_LOAD_TOP_THRESHOLD_PX = 72;
 const CHAT_INPUT_MIN_HEIGHT_PX = 44;
 const CHAT_INPUT_MAX_HEIGHT_PX = 120;
-const TYPEWRITER_TICK_MS = 22;
-const TYPEWRITER_MIN_CHARS_PER_TICK = 1;
-const TYPEWRITER_MAX_CHARS_PER_TICK = 10;
+// Coalesce provider deltas before touching React. Streaming content is shown as
+// plain text while it is live, so a 50ms cadence keeps the UI responsive even
+// for very large code blocks.
+const TYPEWRITER_TICK_MS = 50;
+
+function DeferredMessageBubble({
+  rootRef,
+  estimatedHeight,
+  children,
+}: {
+  rootRef: RefObject<HTMLDivElement | null>;
+  estimatedHeight: number;
+  children: ReactNode;
+}) {
+  const [isNearViewport, setIsNearViewport] = useState(false);
+  const elementRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const element = elementRef.current;
+    if (!element) return undefined;
+    if (typeof IntersectionObserver === "undefined") {
+      setIsNearViewport(true);
+      return undefined;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setIsNearViewport(true);
+          observer.disconnect();
+        }
+      },
+      { root: rootRef.current, rootMargin: "1200px 0px" },
+    );
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [rootRef]);
+
+  return (
+    <div
+      ref={elementRef}
+      style={
+        isNearViewport
+          ? undefined
+          : {
+              minHeight: estimatedHeight,
+              contentVisibility: "auto",
+            }
+      }
+    >
+      {isNearViewport ? children : null}
+    </div>
+  );
+}
 const STREAM_STALL_RECOVERY_IDLE_MS = 15_000;
 const STREAM_STALL_RECOVERY_INTERVAL_MS = 5_000;
 const PM_PROVIDER_SOURCE_HOSTS = new Set<string>(["api.search.brave.com"]);
@@ -4170,7 +4228,6 @@ export function ChatCore({
     },
     [syncInputValue],
   );
-  const [streamingText, setStreamingText] = useState("");
   const [visibleStreamingText, setVisibleStreamingText] = useState("");
   const [streamingMessageTimestamp, setStreamingMessageTimestamp] = useState<
     number | null
@@ -5342,7 +5399,6 @@ export function ChatCore({
     typewriterOnDrainedRef.current = null;
     streamingTextRef.current = "";
     visibleStreamingTextRef.current = "";
-    setStreamingText("");
     setVisibleStreamingText("");
     setStreamingMessageTimestamp(null);
   }, [clearTypewriterTimer]);
@@ -5631,12 +5687,11 @@ export function ChatCore({
         return;
       }
 
-      const remaining = raw.length - visible.length;
-      const charsThisTick = Math.min(
-        TYPEWRITER_MAX_CHARS_PER_TICK,
-        Math.max(TYPEWRITER_MIN_CHARS_PER_TICK, Math.ceil(remaining / 48)),
-      );
-      const nextVisible = raw.slice(0, visible.length + charsThisTick);
+      // Publish the complete provider snapshot that arrived since the last
+      // frame. The old character-by-character drain made every long answer
+      // reparse Markdown hundreds of times after the network had already
+      // delivered it.
+      const nextVisible = raw;
       visibleStreamingTextRef.current = nextVisible;
       setVisibleStreamingText(nextVisible);
       if (autoFollowScrollRef.current) {
@@ -5748,7 +5803,6 @@ export function ChatCore({
       if (!finalText) return;
       if (streamingTextRef.current.trim()) {
         streamingTextRef.current = finalText;
-        setStreamingText(finalText);
         flushVisibleStreamingText();
         resetStreamingText();
         streamCommittedRef.current = true;
@@ -6559,11 +6613,13 @@ export function ChatCore({
       clearPmPromptQueue();
 
       try {
-        const [res, memoryCitationsResp] = await Promise.all([
-          agentApi.getSessionHistory(sessionId, {
-            limit_turns: HISTORY_PAGE_LIMIT_TURNS,
-            max_bytes: HISTORY_PAGE_MAX_BYTES,
-          }),
+        const res = await agentApi.getSessionHistory(sessionId, {
+          limit_turns: HISTORY_PAGE_LIMIT_TURNS,
+          max_bytes: HISTORY_PAGE_MAX_BYTES,
+        });
+        // History is the critical path for a session switch. Memory citations
+        // are enrichment and must not delay the first paint of the transcript.
+        const memoryCitationsPromise =
           sessionSource === "chat" ||
           sessionSource === "agent" ||
           sessionSource === "pm"
@@ -6574,8 +6630,7 @@ export function ChatCore({
             : Promise.resolve({
                 sessionId,
                 items: [] as AgentMemoryCitation[],
-              }),
-        ]);
+              });
         if (latestRequestRef.current !== loadToken) return;
         let merged = attachSuperAssistantTurnMetadata(
           mapHistoryMessages(res.messages, {
@@ -6590,10 +6645,9 @@ export function ChatCore({
             res.pm_research.delivery_artifacts,
           );
         }
-        merged = attachMemoryCitationsToMessages(
-          merged,
-          memoryCitationsResp.items ?? [],
-        );
+        if (latestRequestRef.current !== loadToken) return;
+        setDisplayMessages(merged);
+        setActiveSessionId(sessionId);
         void registerHistoricalImagesForSession(merged, sessionId).then(
           (records) => {
             if (
@@ -6826,6 +6880,15 @@ export function ChatCore({
         }
         if (latestRequestRef.current !== loadToken) return;
         setDisplayMessages(merged);
+        void memoryCitationsPromise.then((memoryCitationsResp) => {
+          if (latestRequestRef.current !== loadToken) return;
+          setDisplayMessages((prev) =>
+            attachMemoryCitationsToMessages(
+              prev,
+              memoryCitationsResp.items ?? [],
+            ),
+          );
+        });
         autoFollowScrollRef.current = true;
         if (sessionSource === "chat") {
           void Promise.all([
@@ -6867,7 +6930,6 @@ export function ChatCore({
             pmQualitySnapshotRef.current = restoredQuality;
           }
         }
-        setActiveSessionId(sessionId);
         focusInputAndScrollToBottom();
         if (superAssistantEndpoint) {
           void agentApi
@@ -7071,7 +7133,6 @@ export function ChatCore({
                   onText: (text: string) => {
                     markStreamActivity();
                     streamingTextRef.current += text;
-                    setStreamingText(streamingTextRef.current);
                     scheduleTypewriterDrain();
                   },
                   onToolUseStart: (index: number, id: string, name: string) => {
@@ -7356,7 +7417,6 @@ export function ChatCore({
                       t("chat.noResponse");
                     if (assistantText !== streamingTextRef.current) {
                       streamingTextRef.current = assistantText;
-                      setStreamingText(assistantText);
                       scheduleTypewriterDrain();
                     }
                     const completedToolCalls = Object.values(
@@ -7951,7 +8011,6 @@ export function ChatCore({
       }
       if (streamingTextRef.current.trim()) {
         streamingTextRef.current = finalText;
-        setStreamingText(finalText);
         flushVisibleStreamingText();
         resetStreamingText();
       }
@@ -8705,7 +8764,6 @@ export function ChatCore({
           markStreamActivity();
           const next = streamingTextRef.current + text;
           streamingTextRef.current = next;
-          setStreamingText(next);
           scheduleTypewriterDrain();
           appendPmInlineExcerpt(text);
         },
@@ -9194,7 +9252,6 @@ export function ChatCore({
             fullText || streamingTextRef.current || t("chat.noResponse");
           if (assistantText !== streamingTextRef.current) {
             streamingTextRef.current = assistantText;
-            setStreamingText(assistantText);
             scheduleTypewriterDrain();
           }
           const evidenceSources = evidenceSourcesFromTurn(
@@ -9907,7 +9964,6 @@ export function ChatCore({
       }
       if (streamingTextRef.current.trim()) {
         streamingTextRef.current = finalText;
-        setStreamingText(finalText);
         flushVisibleStreamingText();
         resetStreamingText();
       }
@@ -9958,7 +10014,6 @@ export function ChatCore({
       }
       const next = streamingTextRef.current + delta;
       streamingTextRef.current = next;
-      setStreamingText(next);
       scheduleTypewriterDrain();
       setTimeout(scrollToBottom, 10);
     },
@@ -12062,6 +12117,10 @@ export function ChatCore({
                 </>
               ) : undefined;
             const messageExtraActions = pmReplyExecutionAction;
+            const estimatedMessageHeight =
+              typeof msg.content === "string"
+                ? Math.min(2_400, Math.max(96, Math.ceil(msg.content.length / 4)))
+                : 160;
             return (
               <div
                 key={msg.id}
@@ -12081,27 +12140,32 @@ export function ChatCore({
                   );
                 }}
               >
-                <MessageBubble
-                  message={msg as any}
-                  modelName={
-                    msg.localCommand
-                      ? t("chat.localCommandModel", "AOS command")
-                      : msg.modelName || visibleAssistantModelName
-                  }
-                  variant={
-                    sessionSource === "pm"
-                      ? "pm"
-                      : sessionSource === "agent"
-                        ? "agent"
-                        : "chat"
-                  }
-                  traceEvents={msg.traceEvents}
-                  extraPanel={messageExtraPanel}
-                  extraActions={messageExtraActions}
-                  thinkingExpanded={thinkingExpanded}
-                  onThinkingToggle={handleThinkingToggle}
-                  onReply={handleReply}
-                />
+                <DeferredMessageBubble
+                  rootRef={messageListRef}
+                  estimatedHeight={estimatedMessageHeight}
+                >
+                  <MessageBubble
+                    message={msg as any}
+                    modelName={
+                      msg.localCommand
+                        ? t("chat.localCommandModel", "AOS command")
+                        : msg.modelName || visibleAssistantModelName
+                    }
+                    variant={
+                      sessionSource === "pm"
+                        ? "pm"
+                        : sessionSource === "agent"
+                          ? "agent"
+                          : "chat"
+                    }
+                    traceEvents={msg.traceEvents}
+                    extraPanel={messageExtraPanel}
+                    extraActions={messageExtraActions}
+                    thinkingExpanded={thinkingExpanded}
+                    onThinkingToggle={handleThinkingToggle}
+                    onReply={handleReply}
+                  />
+                </DeferredMessageBubble>
               </div>
             );
           })}
