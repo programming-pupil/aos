@@ -179,3 +179,87 @@ pub(crate) async fn load_setup_status(db: &SqlitePool) -> Result<SetupStatusResp
 pub(crate) async fn is_system_initialized(db: &SqlitePool) -> Result<bool> {
     Ok(load_setup_status(db).await?.initialized)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn test_state(db: SqlitePool) -> AppState {
+        AppState {
+            data_dir: std::env::temp_dir(),
+            platform_lifecycle: None,
+            control_db: db.clone(),
+            telemetry_db: db.clone(),
+            #[cfg(feature = "pm")]
+            pm_telemetry: crate::routes::agent::PmTelemetrySink::for_test(),
+            db,
+            jwt_secret: Arc::new(RwLock::new("setup-test-secret".repeat(2))),
+            base_url: "http://localhost".to_string(),
+            default_model: "test-model".to_string(),
+            setup_initialized_cache: Arc::new(AtomicBool::new(false)),
+            usage_writer: None,
+            agent_manager: None,
+            #[cfg(feature = "projects")]
+            gitlab_manager: None,
+            config_registry: None,
+            #[cfg(feature = "nl2sql")]
+            nl2sql_embedding_store: None,
+            #[cfg(feature = "rd")]
+            rd_embedding_store: None,
+            #[cfg(feature = "nl2sql")]
+            nl2sql_routing_engine: None,
+            #[cfg(feature = "nl2sql")]
+            nl2sql_pool_cache: Arc::new(crate::nl2sql::datasource_pool::PoolCache::new()),
+            #[cfg(feature = "nl2sql")]
+            nl2sql_rate_limiter: Arc::new(crate::nl2sql::rate_limiter::TenantRateLimiter::default()),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_database_setup_issues_a_verifiable_admin_token() {
+        let db = crate::test_sqlite_pool().await;
+        let state = test_state(db.clone());
+
+        let initial = load_setup_status(&db)
+            .await
+            .expect("load initial setup status");
+        assert!(!initial.initialized);
+
+        let Json(response) = setup(
+            State(state.clone()),
+            Json(SetupRequest {
+                tenant_name: "Test Workspace".to_string(),
+                tenant_slug: "test-workspace".to_string(),
+                admin_email: "admin@example.com".to_string(),
+                admin_name: "Test Admin".to_string(),
+                admin_password: "correct-horse-battery-staple".to_string(),
+            }),
+        )
+        .await
+        .expect("complete first-run setup");
+
+        assert!(!response.token.is_empty());
+        assert_eq!(response.token.split('.').count(), 3);
+        assert!(state.setup_initialized_cached());
+
+        let claims = crate::auth::verify_token(&state, &response.token)
+            .await
+            .expect("verify setup JWT");
+        assert_eq!(claims.sub, response.admin_user_id);
+        assert_eq!(claims.email, "admin@example.com");
+        assert_eq!(claims.role, "admin");
+        assert_eq!(claims.tenant_id, response.tenant_id);
+
+        let initialized = load_setup_status(&db)
+            .await
+            .expect("load initialized setup status");
+        assert!(initialized.initialized);
+        assert_eq!(initialized.tenant_count, 1);
+        assert_eq!(initialized.user_count, 1);
+
+        db.close().await;
+    }
+}
