@@ -78,6 +78,12 @@ const PROVIDER_BASE_URL_DEFAULTS: Record<string, string> = {
   custom: '',
 };
 
+function isStructuredProbeFormatWarning(value: string): boolean {
+  const normalized = value.toLowerCase();
+  return normalized.includes('probe returned invalid structured content')
+    || (normalized.includes('probe failed transiently') && normalized.includes('structured'));
+}
+
 const OPENAI_COMPATIBLE_PRESET_PROVIDERS = new Set(['deepseek', 'kimi', 'glm', 'gemini']);
 const EDITABLE_BASE_URL_PRESET_PROVIDERS = new Set([
   ...OPENAI_COMPATIBLE_PRESET_PROVIDERS,
@@ -914,10 +920,21 @@ export default function ApiKeys() {
         confidence: result.confidence,
         requiresProbe: result.confidence !== 'high',
       });
-      if (result.warning) message.warning(result.warning);
+      if (result.warning) {
+        message.warning(
+          isStructuredProbeFormatWarning(result.warning)
+            ? t('apikeys.probeStructuredOutputInvalid')
+            : result.warning,
+        );
+      }
       else message.success(t('apikeys.probeSuccess'));
     } catch (error) {
-      message.error(error instanceof Error ? error.message : t('apikeys.probeFailed'));
+      const detail = error instanceof Error ? error.message : '';
+      message.error(
+        isStructuredProbeFormatWarning(detail)
+          ? t('apikeys.probeStructuredOutputInvalid')
+          : detail || t('apikeys.probeFailed'),
+      );
     } finally {
       setProbingCreate(false);
     }
@@ -945,10 +962,21 @@ export default function ApiKeys() {
         requiresProbe: result.confidence !== 'high',
       });
       qc.invalidateQueries({ queryKey: queryKeys.apiKeys.all });
-      if (result.warning) message.warning(result.warning);
+      if (result.warning) {
+        message.warning(
+          isStructuredProbeFormatWarning(result.warning)
+            ? t('apikeys.probeStructuredOutputInvalid')
+            : result.warning,
+        );
+      }
       else message.success(t('apikeys.probeSuccess'));
     } catch (error) {
-      message.error(error instanceof Error ? error.message : t('apikeys.probeFailed'));
+      const detail = error instanceof Error ? error.message : '';
+      message.error(
+        isStructuredProbeFormatWarning(detail)
+          ? t('apikeys.probeStructuredOutputInvalid')
+          : detail || t('apikeys.probeFailed'),
+      );
     } finally {
       setProbingEdit(false);
     }

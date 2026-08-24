@@ -1,4 +1,5 @@
 import { useState, useCallback, useMemo, useRef, useEffect } from 'react';
+import { useNavigate } from '@/router';
 import {
   Card,
   Table,
@@ -61,6 +62,7 @@ import {
   CodeOutlined,
   FolderOutlined,
   ThunderboltOutlined,
+  SettingOutlined,
 } from '@ant-design/icons';
 
 dayjs.extend(relativeTime);
@@ -154,6 +156,7 @@ function SkillCommandsTab({ skillName, commandsCount }: { skillName: string; com
 
 export default function Skills() {
   const { t } = useTranslation();
+  const navigate = useNavigate();
   const qc = useQueryClient();
   const { hasPermission } = usePermissions();
   const canWrite = hasPermission('skills:write');
@@ -1028,11 +1031,10 @@ export default function Skills() {
           action={(
             <Button
               type="link"
-              href="https://github.com/settings/tokens"
-              target="_blank"
-              rel="noopener noreferrer"
+              icon={<SettingOutlined />}
+              onClick={() => navigate('/config/management')}
             >
-              {t('skills.githubTokenOpenSettings')}
+              {t('skills.githubTokenConfigure')}
             </Button>
           )}
         />

@@ -1065,6 +1065,7 @@
     "discoveryFailed": "获取模型列表失败",
     "probeNeedsModelAndKey": "请先填写模型和 API 密钥",
     "probeSuccess": "模型能力验证通过",
+    "probeStructuredOutputInvalid": "模型未按要求返回有效 JSON。连接正常，但暂时无法确认结构化输出能力。",
     "probeFailed": "模型能力验证失败",
     "capabilitySaveFailed": "保存模型能力档案失败",
     "reasoningEffortValue": {
@@ -2820,7 +2821,7 @@
     "subtitle": "管理 Agent 的 Skill 扩展",
     "githubTokenMissing": "尚未配置 GitHub Token",
     "githubTokenMissingHelp": "Skill 市场仍可使用，但 GitHub 匿名请求容易触发限流，仓库扫描和安装可能变慢或失败。配置 AOSD_GITHUB_TOKEN 后可获得完整体验。",
-    "githubTokenOpenSettings": "前往 GitHub 获取 Token",
+    "githubTokenConfigure": "去配置管理",
     "searchPlaceholder": "搜索 Skill...",
     "add": "添加 Skill",
     "addSkill": "添加 Skill",

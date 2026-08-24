@@ -1163,9 +1163,10 @@ impl ProviderRequestLineageRecorder {
         };
         let context = sqlx::query_as::<
             sqlx::Sqlite,
-            (Option<String>, Option<String>, Option<String>),
+            (Option<String>, Option<i64>, Option<String>, Option<String>),
         >(
-            "SELECT turn_id, raw_manifest_hash, raw_manifest_ciphertext FROM context_packet_manifests
+            "SELECT turn_id, iteration, raw_manifest_hash, raw_manifest_ciphertext
+             FROM context_packet_manifests
              WHERE id = ? AND tenant_id = ? AND thread_id = ?",
         )
         .bind(&context_manifest_id)
@@ -1175,18 +1176,22 @@ impl ProviderRequestLineageRecorder {
         .await
         .map_err(|error| RuntimeError::new(error.to_string()))?
         .ok_or_else(|| RuntimeError::new("provider context manifest does not exist"))?;
+        let expected_iteration = trace
+            .iteration
+            .and_then(|iteration| i64::try_from(iteration).ok());
         if context.0.as_deref() != trace.turn_id.as_deref()
+            || context.1 != expected_iteration
             || trace
                 .context_manifest_hash
                 .as_ref()
-                .is_some_and(|expected| context.1.as_deref() != Some(expected.as_str()))
+                .is_some_and(|expected| context.2.as_deref() != Some(expected.as_str()))
         {
             return Err(RuntimeError::new(
                 "provider context manifest scope or hash does not match the request trace",
             ));
         }
         if trace.turn_id.is_some() {
-            let ciphertext = context.2.as_deref().ok_or_else(|| {
+            let ciphertext = context.3.as_deref().ok_or_else(|| {
                 RuntimeError::new("provider context manifest has no exact encrypted request")
             })?;
             let raw_manifest = crate::crypto::decrypt_scoped(
@@ -1201,7 +1206,7 @@ impl ProviderRequestLineageRecorder {
                 RuntimeError::new(format!("cannot decrypt provider context manifest: {error}"))
             })?;
             let raw_hash = hex::encode(sha2::Sha256::digest(raw_manifest.as_bytes()));
-            if context.1.as_deref() != Some(raw_hash.as_str()) {
+            if context.2.as_deref() != Some(raw_hash.as_str()) {
                 return Err(RuntimeError::new(
                     "provider context manifest ciphertext failed hash verification",
                 ));
@@ -1267,8 +1272,8 @@ impl ProviderRequestLineageRecorder {
             .map_err(|error| RuntimeError::new(error.to_string()))?;
             id
         };
-        let prompt_context = sqlx::query_as::<sqlx::Sqlite, (String, Option<String>)>(
-            "SELECT context_manifest_id, turn_id FROM prompt_manifests
+        let prompt_context = sqlx::query_as::<sqlx::Sqlite, (String, Option<String>, Option<i64>)>(
+            "SELECT context_manifest_id, turn_id, iteration FROM prompt_manifests
              WHERE id = ? AND tenant_id = ? AND thread_id = ?",
         )
         .bind(&prompt_manifest_id)
@@ -1280,6 +1285,7 @@ impl ProviderRequestLineageRecorder {
         .ok_or_else(|| RuntimeError::new("provider prompt manifest does not exist"))?;
         if prompt_context.0 != context_manifest_id
             || prompt_context.1.as_deref() != trace.turn_id.as_deref()
+            || prompt_context.2 != expected_iteration
         {
             return Err(RuntimeError::new(
                 "provider prompt and context manifests have different lineage",

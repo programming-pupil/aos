@@ -1093,6 +1093,7 @@
     "discoveryFailed": "Failed to fetch the model list",
     "probeNeedsModelAndKey": "Enter a model and API key first",
     "probeSuccess": "Model capabilities verified",
+    "probeStructuredOutputInvalid": "The model did not return valid JSON during the structured-output check. The connection is working, but structured output could not be confirmed.",
     "probeFailed": "Model capability verification failed",
     "capabilitySaveFailed": "Failed to save the model capability profile",
     "reasoningEffortValue": {
@@ -2820,7 +2821,7 @@
     "subtitle": "Manage Agent Skill extensions",
     "githubTokenMissing": "GitHub Token is not configured",
     "githubTokenMissingHelp": "The Skill Marketplace remains usable, but anonymous GitHub requests are rate limited and repository scans or installs may become slow or fail. Configure AOSD_GITHUB_TOKEN for the complete experience.",
-    "githubTokenOpenSettings": "Get a GitHub Token",
+    "githubTokenConfigure": "Go to configuration",
     "searchPlaceholder": "Search skills...",
     "add": "Add Skill",
     "addSkill": "Add Skill",

@@ -4054,16 +4054,17 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         }
         sqlx::query::<Sqlite>(
             "INSERT INTO context_packet_manifests
-                (id, tenant_id, thread_id, turn_id, snapshot_version,
+                (id, tenant_id, thread_id, turn_id, iteration, snapshot_version,
                  manifest_hash, manifest_json, model_version,
                  raw_manifest_hash, raw_manifest_ciphertext, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
              ON CONFLICT(id) DO NOTHING",
         )
         .bind(&id)
         .bind(&self.tenant_id)
         .bind(&self.session_id)
         .bind(&input.turn_id)
+        .bind(i64::try_from(input.iteration).unwrap_or(i64::MAX))
         .bind(i64::try_from(semantic_snapshot_version).unwrap_or(i64::MAX))
         .bind(sha256_json(&manifest))
         .bind(
@@ -4074,7 +4075,6 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         .bind(input.model_version.as_deref())
         .bind(&raw_manifest_hash)
         .bind(raw_manifest_ciphertext)
-        .bind(i64::try_from(input.iteration).unwrap_or(i64::MAX))
         .execute(&mut *tx)
         .await
         .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
@@ -4100,17 +4100,18 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                 .expect("prompt row id exists with a prompt manifest");
             sqlx::query::<Sqlite>(
                 "INSERT INTO prompt_manifests
-                    (id, tenant_id, thread_id, turn_id, run_id, prompt_id, version,
+                    (id, tenant_id, thread_id, turn_id, iteration, run_id, prompt_id, version,
                      variant, model, stable_prefix_hash, task_packet_hash,
                      tool_schema_hash, context_manifest_id, input_budget, output_budget,
                      trust_policy_version, eval_suite, manifest_json, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                  ON CONFLICT(id) DO NOTHING",
             )
             .bind(prompt_id)
             .bind(&self.tenant_id)
             .bind(&self.session_id)
             .bind(&input.turn_id)
+            .bind(i64::try_from(input.iteration).unwrap_or(i64::MAX))
             .bind(&input.turn_id)
             .bind(&prompt.prompt_id)
             .bind(&prompt.version)
@@ -4135,7 +4136,6 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                 .0
                 .to_string(),
             )
-            .bind(i64::try_from(input.iteration).unwrap_or(i64::MAX))
             .execute(&mut *tx)
             .await
             .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
@@ -16883,6 +16883,16 @@ mod tests {
             manifest(second.clone(), "turn-b")
         );
         assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+        let persisted_iterations: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT turn_id, iteration FROM context_packet_manifests
+             WHERE tenant_id = 'tenant' AND thread_id = 'session'
+             ORDER BY turn_id",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(persisted_iterations.len(), 1);
+        assert_eq!(persisted_iterations[0].1, 1);
 
         let (available, reserved): (i64, i64) = sqlx::query_as(
             "SELECT available, reserved FROM resource_budget_accounts
