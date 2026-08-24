@@ -33,7 +33,7 @@ tiktoken-rs = "0.12"
 anyhow = { workspace = true, optional = true }
 # 5.13 is the latest release using ONNX Runtime API 23, whose official
 # binaries still cover every AOS release target, including macOS Intel.
-fastembed = { version = "=5.13.0", default-features = false, features = ["ort-load-dynamic"], optional = true }
+fastembed = { version = "=5.13.2", default-features = false, features = ["ort-load-dynamic"], optional = true }
 hex = "0.4"
 parking_lot = { workspace = true, optional = true }
 

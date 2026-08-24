@@ -22,7 +22,7 @@ locked_ort_sys="$(lock_version ort-sys)"
 unix_runtime="$(sed -n 's/^ORT_VERSION="\([^"]*\)"/\1/p' "$ROOT_DIR/scripts/setup-onnxruntime.sh")"
 windows_runtime="$(awk -F"'" '/^\$Version = / { print $2; exit }' "$ROOT_DIR/scripts/setup-onnxruntime.ps1")"
 
-expected_fastembed="5.13.0"
+expected_fastembed="5.13.2"
 expected_ort="2.0.0-rc.11"
 expected_runtime="1.23.2"
 
