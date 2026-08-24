@@ -425,9 +425,9 @@ fn append_own_visibility(sql: &mut String) {
 }
 
 fn bind_own_visibility<'q>(
-    mut query: sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    mut query: sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments>,
     user_id: &'q str,
-) -> sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
+) -> sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments> {
     query = query.bind(user_id).bind(user_id).bind(user_id);
     query
 }
@@ -446,7 +446,7 @@ async fn resolve_visible_task_id(
         append_own_visibility(&mut sql);
     }
     sql.push_str(" LIMIT 1");
-    let mut query = sqlx::query_scalar::<sqlx::Sqlite, String>(&sql)
+    let mut query = sqlx::query_scalar::<sqlx::Sqlite, String>(sqlx::AssertSqlSafe(sql))
         .bind(tenant_id)
         .bind(task_ref)
         .bind(normalize_short_code(task_ref));
@@ -810,7 +810,8 @@ async fn list_tasks(
         sql.push_str(" AND (at.updated_at < ? OR (at.updated_at = ? AND at.id < ?))");
     }
     sql.push_str(" ORDER BY at.updated_at DESC, at.id DESC LIMIT ?");
-    let mut db_query = sqlx::query::<sqlx::Sqlite>(&sql).bind(&claims.tenant_id);
+    let mut db_query =
+        sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(sql)).bind(&claims.tenant_id);
     if scope != "tenant" {
         db_query = bind_own_visibility(db_query, &access.user_id);
     }
@@ -865,9 +866,10 @@ async fn list_tasks(
                 .join(","),
         );
         grant_sql.push(')');
-        let mut grant_query = sqlx::query_scalar::<sqlx::Sqlite, String>(&grant_sql)
-            .bind(&claims.tenant_id)
-            .bind(&access.user_id);
+        let mut grant_query =
+            sqlx::query_scalar::<sqlx::Sqlite, String>(sqlx::AssertSqlSafe(grant_sql))
+                .bind(&claims.tenant_id)
+                .bind(&access.user_id);
         for item in &items {
             grant_query = grant_query.bind(&item.id);
         }
@@ -921,7 +923,7 @@ async fn summary(
         append_own_visibility(&mut sql);
     }
     sql.push_str(" GROUP BY status");
-    let mut query = sqlx::query::<sqlx::Sqlite>(&sql).bind(&claims.tenant_id);
+    let mut query = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(sql)).bind(&claims.tenant_id);
     if scope != "tenant" {
         query = bind_own_visibility(query, &access.user_id);
     }
@@ -961,9 +963,9 @@ async fn task_detail(
 ) -> Result<Json<TaskView>> {
     let access = task_access(&state, &claims).await?;
     let id = resolve_visible_task_id(&state, &claims.tenant_id, &task_ref, &access).await?;
-    let row = sqlx::query::<sqlx::Sqlite>(&format!(
+    let row = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(format!(
         "SELECT {TASK_VIEW_SELECT} FROM agent_tasks at WHERE at.tenant_id = ? AND at.id = ?"
-    ))
+    )))
     .bind(&claims.tenant_id)
     .bind(id)
     .fetch_optional(state.control_db())
@@ -1020,7 +1022,7 @@ async fn task_events(
     );
     sql.push_str(" AND visibility <> 'admin'");
     sql.push_str(" ORDER BY id ASC LIMIT ?");
-    let rows = sqlx::query::<sqlx::Sqlite>(&sql)
+    let rows = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(sql))
         .bind(&claims.tenant_id)
         .bind(id)
         .bind(crate::sqlite_i64(query.after_id.unwrap_or(0)))
@@ -1497,8 +1499,8 @@ async fn list_deliveries(
     let count_sql = format!(
         "SELECT CAST(COUNT(*) AS INTEGER) FROM agent_notification_deliveries deliveries{where_sql}"
     );
-    let mut count_query =
-        sqlx::query_scalar::<sqlx::Sqlite, i64>(&count_sql).bind(&claims.tenant_id);
+    let mut count_query = sqlx::query_scalar::<sqlx::Sqlite, i64>(sqlx::AssertSqlSafe(count_sql))
+        .bind(&claims.tenant_id);
     if scope != "tenant" {
         count_query = count_query.bind(&access.user_id);
     }
@@ -1521,7 +1523,8 @@ async fn list_deliveries(
     );
     sql.push_str(&where_sql);
     sql.push_str(" ORDER BY deliveries.updated_at DESC, deliveries.id DESC LIMIT ? OFFSET ?");
-    let mut db_query = sqlx::query::<sqlx::Sqlite>(&sql).bind(&claims.tenant_id);
+    let mut db_query =
+        sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(sql)).bind(&claims.tenant_id);
     if scope != "tenant" {
         db_query = db_query.bind(&access.user_id);
     }
@@ -1771,7 +1774,7 @@ async fn task_stream(
                 sql.push_str(" AND outbox.visibility <> 'admin'");
             }
             sql.push_str(" ORDER BY outbox.id ASC LIMIT 100");
-            let mut db_query = sqlx::query::<sqlx::Sqlite>(&sql)
+            let mut db_query = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(sql))
                 .bind(&tenant_id)
                 .bind(crate::sqlite_i64(after_id))
                 .bind(crate::sqlite_i64(upper_id));
@@ -4633,7 +4636,7 @@ mod tests {
         let mut sql = String::from("SELECT at.id FROM agent_tasks at WHERE at.tenant_id = ?");
         append_own_visibility(&mut sql);
         sql.push_str(" ORDER BY at.id");
-        sqlx::query_scalar::<sqlx::Sqlite, String>(&sql)
+        sqlx::query_scalar::<sqlx::Sqlite, String>(sqlx::AssertSqlSafe(sql))
             .bind(tenant_id)
             .bind(user_id)
             .bind(user_id)
@@ -5465,15 +5468,16 @@ mod tests {
              WHERE outbox.tenant_id = ? AND outbox.task_id = ?",
         );
         append_own_visibility(&mut shared_event_sql);
-        let visible_before_revoke: i64 = sqlx::query_scalar::<sqlx::Sqlite, _>(&shared_event_sql)
-            .bind(&tenant)
-            .bind(&task_b_child)
-            .bind(&user_a)
-            .bind(&user_a)
-            .bind(&user_a)
-            .fetch_one(&db)
-            .await
-            .expect("shared child event visibility");
+        let visible_before_revoke: i64 =
+            sqlx::query_scalar::<sqlx::Sqlite, _>(sqlx::AssertSqlSafe(shared_event_sql.as_str()))
+                .bind(&tenant)
+                .bind(&task_b_child)
+                .bind(&user_a)
+                .bind(&user_a)
+                .bind(&user_a)
+                .fetch_one(&db)
+                .await
+                .expect("shared child event visibility");
         assert_eq!(visible_before_revoke, 1);
 
         sqlx::query::<sqlx::Sqlite>(
@@ -5483,15 +5487,16 @@ mod tests {
         .execute(&db)
         .await
         .expect("revoke task grant");
-        let visible_after_revoke: i64 = sqlx::query_scalar::<sqlx::Sqlite, _>(&shared_event_sql)
-            .bind(&tenant)
-            .bind(&task_b_child)
-            .bind(&user_a)
-            .bind(&user_a)
-            .bind(&user_a)
-            .fetch_one(&db)
-            .await
-            .expect("revoked child event visibility");
+        let visible_after_revoke: i64 =
+            sqlx::query_scalar::<sqlx::Sqlite, _>(sqlx::AssertSqlSafe(shared_event_sql.as_str()))
+                .bind(&tenant)
+                .bind(&task_b_child)
+                .bind(&user_a)
+                .bind(&user_a)
+                .bind(&user_a)
+                .fetch_one(&db)
+                .await
+                .expect("revoked child event visibility");
         assert_eq!(visible_after_revoke, 0);
         sqlx::query::<sqlx::Sqlite>("DELETE FROM agent_tasks WHERE id = ?")
             .bind(&task_b_child)

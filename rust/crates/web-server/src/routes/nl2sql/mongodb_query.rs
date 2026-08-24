@@ -12,8 +12,8 @@ use mongodb::bson::{doc, Bson, Document};
 use nl2sql_domain::datasource_config::{build_mongodb_uri, MongoConfig};
 use sqlparser::ast::{
     BinaryOperator, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, GroupByExpr, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
-    UnaryOperator, Value,
+    FunctionArguments, GroupByExpr, LimitClause, ObjectNamePart, OrderByKind, Query, Select,
+    SelectItem, SetExpr, Statement, TableFactor, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -125,7 +125,9 @@ fn function_args(function: &Function) -> Result<Vec<&FunctionArgExpr>, String> {
         .iter()
         .map(|arg| match arg {
             FunctionArg::Unnamed(expr) => Ok(expr),
-            FunctionArg::Named { .. } => Err(invalid("named function arguments are not supported")),
+            FunctionArg::Named { .. } | FunctionArg::ExprNamed { .. } => {
+                Err(invalid("named function arguments are not supported"))
+            }
         })
         .collect()
 }
@@ -139,7 +141,7 @@ fn expression_to_bson(expr: &Expr, ctx: &TranslationContext<'_>) -> Result<Bson,
             Ok(Bson::String(format!("${}", field_name(expr, ctx)?)))
         }
         Expr::Value(value) => literal_to_bson(value),
-        Expr::TypedString { value, .. } => Ok(Bson::String(value.clone())),
+        Expr::TypedString(value) => literal_to_bson(&value.value),
         Expr::UnaryOp { op, expr } => {
             let value = expression_to_bson(expr, ctx)?;
             match op {
@@ -177,24 +179,21 @@ fn expression_to_bson(expr: &Expr, ctx: &TranslationContext<'_>) -> Result<Bson,
         Expr::Case {
             operand,
             conditions,
-            results,
             else_result,
+            ..
         } => {
-            if conditions.len() != results.len() {
-                return Err(invalid("malformed CASE expression"));
-            }
             let mut branches = Vec::with_capacity(conditions.len());
-            for (condition, result) in conditions.iter().zip(results) {
+            for branch in conditions {
                 let case = if let Some(operand) = operand {
                     Bson::Document(doc! {
-                        "$eq": [expression_to_bson(operand, ctx)?, expression_to_bson(condition, ctx)?]
+                        "$eq": [expression_to_bson(operand, ctx)?, expression_to_bson(&branch.condition, ctx)?]
                     })
                 } else {
-                    expression_to_bson(condition, ctx)?
+                    expression_to_bson(&branch.condition, ctx)?
                 };
                 branches.push(Bson::Document(doc! {
                     "case": case,
-                    "then": expression_to_bson(result, ctx)?,
+                    "then": expression_to_bson(&branch.result, ctx)?,
                 }));
             }
             Ok(Bson::Document(doc! {
@@ -488,7 +487,10 @@ fn filter_to_document(expr: &Expr, ctx: &TranslationContext<'_>) -> Result<Docum
                 return Err(invalid("LIKE ANY and LIKE ESCAPE are not supported"));
             }
             let field = field_name(expr, ctx)?;
-            let Expr::Value(Value::SingleQuotedString(pattern)) = pattern.as_ref() else {
+            let Expr::Value(pattern) = pattern.as_ref() else {
+                return Err(invalid("LIKE pattern must be a string literal"));
+            };
+            let Value::SingleQuotedString(pattern) = &pattern.value else {
                 return Err(invalid("LIKE pattern must be a string literal"));
             };
             let regex = Bson::RegularExpression(mongodb::bson::Regex {
@@ -536,12 +538,13 @@ fn contains_aggregate(expr: &Expr) -> bool {
         Expr::Case {
             operand,
             conditions,
-            results,
             else_result,
+            ..
         } => {
             operand.as_deref().is_some_and(contains_aggregate)
-                || conditions.iter().any(contains_aggregate)
-                || results.iter().any(contains_aggregate)
+                || conditions.iter().any(|branch| {
+                    contains_aggregate(&branch.condition) || contains_aggregate(&branch.result)
+                })
                 || else_result.as_deref().is_some_and(contains_aggregate)
         }
         _ => false,
@@ -565,7 +568,7 @@ fn aggregate_projection(
     }
     let argument = match &arguments.args[0] {
         FunctionArg::Unnamed(argument) => argument,
-        FunctionArg::Named { .. } => {
+        FunctionArg::Named { .. } | FunctionArg::ExprNamed { .. } => {
             return Err(invalid("named aggregate arguments are unsupported"))
         }
     };
@@ -654,7 +657,7 @@ fn grouped_expression_to_bson(
             scalar_function_from_args(&name, args)
         }
         Expr::Value(value) => literal_to_bson(value),
-        Expr::TypedString { value, .. } => Ok(Bson::String(value.clone())),
+        Expr::TypedString(value) => literal_to_bson(&value.value),
         Expr::Nested(inner) => {
             grouped_expression_to_bson(inner, ctx, group_exprs, group, aggregate_index)
         }
@@ -700,12 +703,9 @@ fn grouped_expression_to_bson(
         Expr::Case {
             operand,
             conditions,
-            results,
             else_result,
+            ..
         } => {
-            if conditions.len() != results.len() {
-                return Err(invalid("malformed CASE expression"));
-            }
             let grouped_operand = operand
                 .as_deref()
                 .map(|value| {
@@ -713,9 +713,9 @@ fn grouped_expression_to_bson(
                 })
                 .transpose()?;
             let mut branches = Vec::with_capacity(conditions.len());
-            for (condition, result) in conditions.iter().zip(results) {
+            for branch in conditions {
                 let condition = grouped_expression_to_bson(
-                    condition,
+                    &branch.condition,
                     ctx,
                     group_exprs,
                     group,
@@ -729,7 +729,7 @@ fn grouped_expression_to_bson(
                 branches.push(Bson::Document(doc! {
                     "case": case,
                     "then": grouped_expression_to_bson(
-                        result,
+                        &branch.result,
                         ctx,
                         group_exprs,
                         group,
@@ -775,7 +775,10 @@ fn default_column_name(expr: &Expr, ctx: &TranslationContext<'_>) -> String {
 }
 
 fn parse_nonnegative_integer(expr: &Expr, label: &str) -> Result<usize, String> {
-    let Expr::Value(Value::Number(raw, _)) = expr else {
+    let Expr::Value(value) = expr else {
+        return Err(invalid(format!("{label} must be a non-negative integer")));
+    };
+    let Value::Number(raw, _) = &value.value else {
         return Err(invalid(format!("{label} must be a non-negative integer")));
     };
     raw.parse::<usize>()
@@ -800,6 +803,7 @@ fn table_and_alias(select: &Select) -> Result<(String, Option<String>), String> 
             let collection = name
                 .0
                 .last()
+                .and_then(ObjectNamePart::as_ident)
                 .map(|ident| ident.value.clone())
                 .ok_or_else(|| invalid("collection name is required"))?;
             Ok((
@@ -840,7 +844,10 @@ fn order_document(
         return Err(invalid("ORDER BY INTERPOLATE is not supported"));
     }
     let mut sort = Document::new();
-    for order in &order_by.exprs {
+    let OrderByKind::Expressions(expressions) = &order_by.kind else {
+        return Err(invalid("ORDER BY ALL is not supported"));
+    };
+    for order in expressions {
         let field = match &order.expr {
             Expr::Identifier(ident)
                 if aliases
@@ -889,14 +896,27 @@ fn order_document(
                 ))
             }
         };
-        sort.insert(field, if order.asc == Some(false) { -1 } else { 1 });
+        sort.insert(
+            field,
+            if order.options.asc == Some(false) {
+                -1
+            } else {
+                1
+            },
+        );
     }
     Ok((!sort.is_empty()).then_some(sort))
 }
 
 fn build_plan_from_query(query: &Query, max_rows: usize) -> Result<MongoQueryPlan, String> {
+    let has_limit_by = query.limit_clause.as_ref().is_some_and(|clause| {
+        matches!(
+            clause,
+            LimitClause::LimitOffset { limit_by, .. } if !limit_by.is_empty()
+        )
+    });
     if query.with.is_some()
-        || !query.limit_by.is_empty()
+        || has_limit_by
         || query.fetch.is_some()
         || !query.locks.is_empty()
         || query.for_clause.is_some()
@@ -1048,18 +1068,25 @@ fn build_plan_from_query(query: &Query, max_rows: usize) -> Result<MongoQueryPla
     }
 
     let count_pipeline = pipeline.clone();
-    let offset = query
-        .offset
-        .as_ref()
-        .map(|offset| parse_nonnegative_integer(&offset.value, "OFFSET"))
-        .transpose()?
-        .unwrap_or(0);
-    let requested_limit = query
-        .limit
-        .as_ref()
-        .map(|limit| parse_nonnegative_integer(limit, "LIMIT"))
-        .transpose()?
-        .unwrap_or(max_rows);
+    let (offset, requested_limit) = match query.limit_clause.as_ref() {
+        Some(LimitClause::LimitOffset { limit, offset, .. }) => (
+            offset
+                .as_ref()
+                .map(|offset| parse_nonnegative_integer(&offset.value, "OFFSET"))
+                .transpose()?
+                .unwrap_or(0),
+            limit
+                .as_ref()
+                .map(|limit| parse_nonnegative_integer(limit, "LIMIT"))
+                .transpose()?
+                .unwrap_or(max_rows),
+        ),
+        Some(LimitClause::OffsetCommaLimit { offset, limit }) => (
+            parse_nonnegative_integer(offset, "OFFSET")?,
+            parse_nonnegative_integer(limit, "LIMIT")?,
+        ),
+        None => (0, max_rows),
+    };
     let effective_limit = requested_limit.min(max_rows.max(1));
     if offset > 0 {
         pipeline.push(doc! { "$skip": i64::try_from(offset).unwrap_or(i64::MAX) });

@@ -213,7 +213,9 @@ pub(super) async fn request_chat_adversarial_cancel(
     if user_id.is_some() {
         query.push_str(" AND user_id = ?");
     }
-    let mut sql = sqlx::query(&query).bind(tenant_id).bind(run_id);
+    let mut sql = sqlx::query(sqlx::AssertSqlSafe(query))
+        .bind(tenant_id)
+        .bind(run_id);
     if let Some(user_id) = user_id {
         sql = sql.bind(user_id);
     }

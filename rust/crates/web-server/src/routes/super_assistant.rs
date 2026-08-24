@@ -4373,7 +4373,9 @@ async fn collect_legacy_session_items(
          WHERE tenant_id = ? AND source IN ({placeholders}) \
          ORDER BY updated_at DESC LIMIT ?"
     );
-    let mut query = sqlx::query_as::<sqlx::Sqlite, (Option<String>, String)>(&sql).bind(tenant_id);
+    let mut query =
+        sqlx::query_as::<sqlx::Sqlite, (Option<String>, String)>(sqlx::AssertSqlSafe(sql))
+            .bind(tenant_id);
     for source in LEGACY_SESSION_SOURCES {
         query = query.bind(*source);
     }
@@ -7730,7 +7732,7 @@ async fn read_base_config_kind(
     // so interpolating it into the read-only COUNT is safe; the tenant filter is
     // still a bound parameter.
     let sql = format!("SELECT COUNT(*) FROM {} WHERE tenant_id = ?", kind.table());
-    match sqlx::query_scalar::<sqlx::Sqlite, i64>(&sql)
+    match sqlx::query_scalar::<sqlx::Sqlite, i64>(sqlx::AssertSqlSafe(sql))
         .bind(tenant_id)
         .fetch_one(db)
         .await
@@ -16460,9 +16462,9 @@ mod dual_channel_extraction_tests {
             "execution_checkpoints",
             "compaction_checkpoints",
         ] {
-            let count: i64 = sqlx::query_scalar(&format!(
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT COUNT(*) FROM {table} WHERE tenant_id = 'tenant'"
-            ))
+            )))
             .fetch_one(&db)
             .await
             .unwrap();

@@ -11487,7 +11487,8 @@ pub(crate) async fn rotate_encrypted_payload_batch_with_data_dir(
             ciphertext = descriptor.ciphertext_column,
             table = descriptor.table,
         );
-        let rows = sqlx::query::<Sqlite>(&select)
+        // Descriptor identifiers come exclusively from the static registry above.
+        let rows = sqlx::query::<Sqlite>(sqlx::AssertSqlSafe(select))
             .bind(cursor)
             .bind(batch_size.max(1))
             .fetch_all(&mut *transaction)
@@ -11564,7 +11565,7 @@ pub(crate) async fn rotate_encrypted_payload_batch_with_data_dir(
                     table = descriptor.table,
                     column = descriptor.ciphertext_column,
                 );
-                let updated = sqlx::query::<Sqlite>(&update)
+                let updated = sqlx::query::<Sqlite>(sqlx::AssertSqlSafe(update))
                     .bind(replacement)
                     .bind(rowid)
                     .bind(old)
@@ -11588,7 +11589,7 @@ pub(crate) async fn rotate_encrypted_payload_batch_with_data_dir(
             table = descriptor.table,
             column = descriptor.ciphertext_column,
         );
-        let reference_count = sqlx::query_scalar::<Sqlite, i64>(&reference_sql)
+        let reference_count = sqlx::query_scalar::<Sqlite, i64>(sqlx::AssertSqlSafe(reference_sql))
             .bind(reference_pattern)
             .fetch_one(&mut *transaction)
             .await?;
@@ -11678,7 +11679,7 @@ pub(crate) async fn issue_key_retirement_certificate(
             tenant = descriptor.tenant_column,
             column = descriptor.ciphertext_column,
         );
-        let rows = sqlx::query::<Sqlite>(&sql)
+        let rows = sqlx::query::<Sqlite>(sqlx::AssertSqlSafe(sql))
             .fetch_all(&mut *transaction)
             .await?;
         let mut references = 0_i64;
@@ -15684,11 +15685,12 @@ mod tests {
             ("pm_final_delivery_artifacts", "task_id = 'pm-task'"),
             ("agent_trace_events", "id = 'trace-session'"),
         ] {
-            let count: i64 =
-                sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE {predicate}"))
-                    .fetch_one(&db)
-                    .await
-                    .unwrap();
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table} WHERE {predicate}"
+            )))
+            .fetch_one(&db)
+            .await
+            .unwrap();
             assert_eq!(count, 0, "session projection remained in {table}");
         }
         let global_memory_count: i64 = sqlx::query_scalar(
@@ -15974,14 +15976,14 @@ mod tests {
             .execute(db)
             .await
             .unwrap();
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE TRIGGER fail_runtime_event
              BEFORE INSERT ON agent_event_ledger
              WHEN NEW.event_type = '{event_type}'
              BEGIN
                SELECT RAISE(ABORT, 'injected ledger failure');
              END"
-        ))
+        )))
         .execute(db)
         .await
         .unwrap();

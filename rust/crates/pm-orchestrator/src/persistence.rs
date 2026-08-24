@@ -937,12 +937,10 @@ pub async fn persist_pm_run_finish(
             "failed" => "parent_failed",
             _ => "parent_completed_without_execution",
         };
-        for (table, id_column) in [
-            ("pm_subtask_runs", "run_id"),
-            ("pm_subtask_attempts", "run_id"),
-        ] {
-            let statement = format!(
-                "UPDATE {table}
+        for (table, statement) in [
+            (
+                "pm_subtask_runs",
+                "UPDATE pm_subtask_runs
                  SET status = ?, error_code = ?,
                      error_message = CASE
                          WHEN error_message IS NULL OR TRIM(error_message) = ''
@@ -951,9 +949,23 @@ pub async fn persist_pm_run_finish(
                      END,
                      ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP),
                      updated_at = CURRENT_TIMESTAMP
-                 WHERE {id_column} = ? AND status IN ('queued','running')"
-            );
-            if let Err(error) = sqlx::query(&statement)
+                 WHERE run_id = ? AND status IN ('queued','running')",
+            ),
+            (
+                "pm_subtask_attempts",
+                "UPDATE pm_subtask_attempts
+                 SET status = ?, error_code = ?,
+                     error_message = CASE
+                         WHEN error_message IS NULL OR TRIM(error_message) = ''
+                         THEN 'Parent PM run reached a terminal state'
+                         ELSE error_message || ' | Parent PM run reached a terminal state'
+                     END,
+                     ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP),
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE run_id = ? AND status IN ('queued','running')",
+            ),
+        ] {
+            if let Err(error) = sqlx::query(statement)
                 .bind(child_status)
                 .bind(child_error_code)
                 .bind(run_id)
@@ -2449,10 +2461,10 @@ mod tests {
             .await
             .expect("insert stage attempt");
             for table in ["pm_subtask_runs", "pm_subtask_attempts"] {
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "INSERT INTO {table} (run_id, status, error_code, error_message)
                      VALUES ('run-1', 'queued', 'old_transient_error', 'existing detail')"
-                ))
+                )))
                 .execute(&db)
                 .await
                 .expect("insert unresolved child");
@@ -2475,10 +2487,10 @@ mod tests {
             .await;
 
             for table in ["pm_subtask_runs", "pm_subtask_attempts"] {
-                let row = sqlx::query(&format!(
+                let row = sqlx::query(sqlx::AssertSqlSafe(format!(
                     "SELECT status, error_code, error_message, ended_at FROM {table}
                      WHERE run_id = 'run-1'"
-                ))
+                )))
                 .fetch_one(&db)
                 .await
                 .expect("load reconciled child");

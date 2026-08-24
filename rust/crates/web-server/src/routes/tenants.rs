@@ -276,7 +276,8 @@ async fn update(
     if !updates.is_empty() {
         let query = format!("UPDATE tenants SET {} WHERE id = ?", updates.join(", "));
 
-        let mut q = sqlx::query(&query);
+        // UPDATE columns are chosen from the fixed allowlist above.
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(query));
         if let Some(ref name) = req.name {
             q = q.bind(name);
         }

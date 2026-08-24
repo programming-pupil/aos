@@ -7276,6 +7276,9 @@ async fn load_subtask(
     selector: &str,
     value: &str,
 ) -> Result<PersistedSubtask> {
+    if !matches!(selector, "tool_call_id = ?" | "id = ?") {
+        return Err(AppError::Internal("invalid subtask selector".to_string()));
+    }
     let sql = format!(
         "SELECT id, engine, status, lease_owner, external_task_id, child_session_id,
                 CAST(result_json AS TEXT) AS result_json, error_message, artifact_ref,
@@ -7283,7 +7286,7 @@ async fn load_subtask(
          FROM super_assistant_subtasks
          WHERE tenant_id = ? AND user_id = ? AND parent_turn_id = ? AND {selector} LIMIT 1"
     );
-    let row = sqlx::query::<sqlx::Sqlite>(&sql)
+    let row = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(sql))
         .bind(&claims.tenant_id)
         .bind(&claims.sub)
         .bind(&parent.turn_id)

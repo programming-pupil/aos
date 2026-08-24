@@ -764,7 +764,8 @@ async fn update_alert(
             "UPDATE usage_alerts SET {} WHERE id = ? AND tenant_id = ?",
             updates.join(", ")
         );
-        let mut q = sqlx::query(&query);
+        // UPDATE columns are chosen from the fixed allowlist above.
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(query));
         for b in &bindings {
             q = q.bind(b);
         }

@@ -257,7 +257,7 @@ pub(crate) async fn update_foreign_key(
 
     query.push_str(" WHERE id = ? AND tenant_id = ? AND datasource_id = ?");
 
-    let mut q = sqlx::query::<sqlx::Sqlite>(&query);
+    let mut q = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(query));
     for binding in &bindings {
         q = q.bind(binding);
     }

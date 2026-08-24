@@ -2655,7 +2655,7 @@ async fn query_watchdog_preview_sessions(
         LIMIT ?
         "
     );
-    let mut query = sqlx::query::<sqlx::Sqlite>(&sql).bind(tenant_id);
+    let mut query = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(sql)).bind(tenant_id);
     for task_id in rd_task_ids {
         query = query.bind(task_id);
     }
@@ -2715,7 +2715,7 @@ async fn query_watchdog_code_intel_sessions(
         LIMIT ?
         "
     );
-    let mut query = sqlx::query::<sqlx::Sqlite>(&sql).bind(tenant_id);
+    let mut query = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(sql)).bind(tenant_id);
     for task_id in rd_task_ids {
         query = query.bind(task_id);
     }
@@ -3136,14 +3136,14 @@ async fn list_task_events_for_watchdog(
     task_id: &str,
     limit: i64,
 ) -> Result<Vec<AgentTaskEventInfo>> {
-    let rows = sqlx::query::<sqlx::Sqlite>(&format!(
+    let rows = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(format!(
         r"
         SELECT {AGENT_TASK_EVENT_SELECT} FROM agent_task_events
         WHERE tenant_id = ? AND task_id = ?
         ORDER BY created_at DESC
         LIMIT ?
         "
-    ))
+    )))
     .bind(tenant_id)
     .bind(task_id)
     .bind(limit.clamp(1, 20))
@@ -4672,8 +4672,8 @@ async fn tasks_inner(
     let count_sql = format!(
         "SELECT CAST(COUNT(*) AS INTEGER) FROM agent_tasks at WHERE at.tenant_id = ?{where_sql}"
     );
-    let mut count_query =
-        sqlx::query_scalar::<sqlx::Sqlite, i64>(&count_sql).bind(&claims.tenant_id);
+    let mut count_query = sqlx::query_scalar::<sqlx::Sqlite, i64>(sqlx::AssertSqlSafe(count_sql))
+        .bind(&claims.tenant_id);
     if let Some(value) = query
         .status
         .as_deref()
@@ -4727,7 +4727,8 @@ async fn tasks_inner(
     let list_sql = format!(
         "SELECT {AGENT_TASK_SELECT} FROM agent_tasks at {AGENT_TASK_RUNTIME_JOIN} WHERE at.tenant_id = ?{where_sql} ORDER BY at.updated_at DESC, at.created_at DESC LIMIT ? OFFSET ?"
     );
-    let mut list_query = sqlx::query::<sqlx::Sqlite>(&list_sql).bind(&claims.tenant_id);
+    let mut list_query =
+        sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(list_sql)).bind(&claims.tenant_id);
     if let Some(value) = query
         .status
         .as_deref()
@@ -4807,9 +4808,9 @@ async fn task_detail_inner(
     id: &str,
 ) -> Result<Json<AgentTaskInfo>> {
     require_watchdog_permission(&state, &claims, "watchdog:read").await?;
-    let row = sqlx::query::<sqlx::Sqlite>(&format!(
+    let row = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(format!(
         "SELECT {AGENT_TASK_SELECT} FROM agent_tasks at {AGENT_TASK_RUNTIME_JOIN} WHERE at.tenant_id = ? AND at.id = ?"
-    ))
+    )))
         .bind(&claims.tenant_id)
         .bind(id)
         .fetch_optional(state.control_db())
@@ -4847,14 +4848,14 @@ async fn task_events_inner(
     .bind(id)
     .fetch_one(state.control_db())
     .await?;
-    let rows = sqlx::query::<sqlx::Sqlite>(&format!(
+    let rows = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(format!(
         r"
         SELECT {AGENT_TASK_EVENT_SELECT} FROM agent_task_events
         WHERE tenant_id = ? AND task_id = ?
         ORDER BY created_at DESC
         LIMIT ? OFFSET ?
         "
-    ))
+    )))
     .bind(&claims.tenant_id)
     .bind(id)
     .bind(pagination.limit())
@@ -4899,14 +4900,14 @@ async fn task_trace_events(
     .bind(&id)
     .fetch_one(state.control_db())
     .await?;
-    let rows = sqlx::query::<sqlx::Sqlite>(&format!(
+    let rows = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(format!(
         r"
         SELECT {AGENT_TRACE_EVENT_SELECT} FROM agent_trace_events
         WHERE tenant_id = ? AND task_id = ?
         ORDER BY created_at DESC
         LIMIT ? OFFSET ?
         "
-    ))
+    )))
     .bind(&claims.tenant_id)
     .bind(&id)
     .bind(pagination.limit())
@@ -5012,8 +5013,8 @@ async fn queue_items(
         ));
     }
     let count_sql = format!("SELECT CAST(COUNT(*) AS INTEGER) FROM agent_tasks at{where_sql}");
-    let mut count_query =
-        sqlx::query_scalar::<sqlx::Sqlite, i64>(&count_sql).bind(&claims.tenant_id);
+    let mut count_query = sqlx::query_scalar::<sqlx::Sqlite, i64>(sqlx::AssertSqlSafe(count_sql))
+        .bind(&claims.tenant_id);
     if !query.dead_only.unwrap_or(false) {
         if let Some(value) = query
             .queue_status
@@ -5044,7 +5045,8 @@ async fn queue_items(
     let list_sql = format!(
         "SELECT {AGENT_TASK_SELECT} FROM agent_tasks at {AGENT_TASK_RUNTIME_JOIN}{where_sql} ORDER BY at.priority ASC, at.available_at ASC, at.updated_at DESC LIMIT ? OFFSET ?"
     );
-    let mut list_query = sqlx::query::<sqlx::Sqlite>(&list_sql).bind(&claims.tenant_id);
+    let mut list_query =
+        sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(list_sql)).bind(&claims.tenant_id);
     if !query.dead_only.unwrap_or(false) {
         if let Some(value) = query
             .queue_status
@@ -5088,7 +5090,7 @@ pub async fn recover_agent_task_queue(
     timeout_secs: i64,
 ) -> Result<Value> {
     let timeout_secs = timeout_secs.clamp(30, 86_400);
-    let dead_rows = sqlx::query::<sqlx::Sqlite>(&format!(
+    let dead_rows = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(format!(
         r"
         SELECT id
         FROM agent_tasks
@@ -5101,11 +5103,11 @@ pub async fn recover_agent_task_queue(
           AND attempt_count >= max_attempts
         ",
         timeout_secs
-    ))
+    )))
     .bind(tenant_id)
     .fetch_all(state.control_db())
     .await?;
-    let recovered_rows = sqlx::query::<sqlx::Sqlite>(&format!(
+    let recovered_rows = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(format!(
         r"
         SELECT id
         FROM agent_tasks
@@ -5118,12 +5120,12 @@ pub async fn recover_agent_task_queue(
           AND attempt_count < max_attempts
         ",
         timeout_secs
-    ))
+    )))
     .bind(tenant_id)
     .fetch_all(state.control_db())
     .await?;
 
-    let dead = sqlx::query::<sqlx::Sqlite>(&format!(
+    let dead = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(format!(
         r"
         UPDATE agent_tasks
         SET status = 'failed',
@@ -5145,11 +5147,11 @@ pub async fn recover_agent_task_queue(
           AND attempt_count >= max_attempts
         ",
         timeout_secs
-    ))
+    )))
     .bind(tenant_id)
     .execute(state.control_db())
     .await?;
-    let recovered = sqlx::query::<sqlx::Sqlite>(&format!(
+    let recovered = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(format!(
         r"
         UPDATE agent_tasks
         SET status = 'queued',
@@ -5170,7 +5172,7 @@ pub async fn recover_agent_task_queue(
           AND attempt_count < max_attempts
         ",
         timeout_secs
-    ))
+    )))
     .bind(tenant_id)
     .execute(state.control_db())
     .await?;
@@ -5255,7 +5257,7 @@ pub async fn claim_agent_task(
 ) -> Result<bool> {
     let lease_secs = lease_secs.clamp(30, 86_400);
     let mut tx = state.control_db().begin().await?;
-    let result = sqlx::query::<sqlx::Sqlite>(&format!(
+    let result = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(format!(
         r"
         UPDATE agent_tasks
         SET status = 'claimed',
@@ -5273,7 +5275,7 @@ pub async fn claim_agent_task(
           AND attempt_count < max_attempts
         ",
         lease_secs
-    ))
+    )))
     .bind(worker_id)
     .bind(tenant_id)
     .bind(task_id)
@@ -5336,7 +5338,7 @@ pub async fn acquire_agent_task_execution_lease(
     lease_secs: i64,
 ) -> Result<bool> {
     let lease_secs = lease_secs.clamp(30, 86_400);
-    let result = sqlx::query::<sqlx::Sqlite>(&format!(
+    let result = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(format!(
         r"
         UPDATE agent_tasks
         SET status = 'running',
@@ -5362,7 +5364,7 @@ pub async fn acquire_agent_task_execution_lease(
           )
         ",
         lease_secs
-    ))
+    )))
     .bind(worker_id)
     .bind(worker_id)
     .bind(tenant_id)
@@ -5398,7 +5400,7 @@ pub async fn heartbeat_agent_task_queue(
     lease_secs: i64,
 ) -> Result<bool> {
     let lease_secs = lease_secs.clamp(30, 86_400);
-    let result = sqlx::query::<sqlx::Sqlite>(&format!(
+    let result = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(format!(
         r"
         UPDATE agent_tasks
         SET lease_expires_at = datetime(CURRENT_TIMESTAMP, '+{} seconds'),
@@ -5410,7 +5412,7 @@ pub async fn heartbeat_agent_task_queue(
           AND queue_status IN ('claimed','running','waiting_input','cancelling')
         ",
         lease_secs
-    ))
+    )))
     .bind(tenant_id)
     .bind(task_id)
     .bind(worker_id)
@@ -5540,7 +5542,7 @@ async fn query_watchdog_tasks(
         sql.push(')');
     }
     sql.push_str(" ORDER BY at.updated_at DESC, at.created_at DESC LIMIT ?");
-    let mut query = sqlx::query::<sqlx::Sqlite>(&sql).bind(tenant_id);
+    let mut query = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(sql)).bind(tenant_id);
     if let Some(value) = external_platform {
         query = query.bind(value);
     }

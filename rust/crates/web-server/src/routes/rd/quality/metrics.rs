@@ -240,7 +240,7 @@ pub(in crate::routes::rd) async fn load_rd_quality_summary_metrics(
         context_sql.push_str(" AND repository_id = ?");
     }
     context_sql.push_str(" GROUP BY scope_type");
-    let mut context_query = sqlx::query(&context_sql).bind(tenant_id);
+    let mut context_query = sqlx::query(sqlx::AssertSqlSafe(context_sql)).bind(tenant_id);
     if let Some(user_id) = user_id {
         context_query = context_query.bind(user_id);
     }
@@ -284,7 +284,7 @@ pub(in crate::routes::rd) async fn load_rd_quality_summary_metrics(
     if repository_id.is_some() {
         file_sql.push_str(" AND repository_id = ?");
     }
-    let mut file_query = sqlx::query(&file_sql).bind(tenant_id);
+    let mut file_query = sqlx::query(sqlx::AssertSqlSafe(file_sql)).bind(tenant_id);
     if let Some(user_id) = user_id {
         file_query = file_query.bind(user_id);
     }
@@ -313,7 +313,7 @@ pub(in crate::routes::rd) async fn load_rd_quality_index_cache_metrics(
     if repository_id.is_some() {
         sql.push_str(" AND repository_id = ?");
     }
-    let mut query = sqlx::query(&sql).bind(tenant_id);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(tenant_id);
     if let Some(user_id) = user_id {
         query = query.bind(user_id);
     }
@@ -369,7 +369,7 @@ pub(in crate::routes::rd) async fn load_rd_quality_observability_metrics(
     }
     sql.push_str(" LIMIT 5000");
 
-    let mut query = sqlx::query(&sql)
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(&claims.tenant_id)
         .bind(tenant_wide)
         .bind(&claims.sub)
@@ -589,7 +589,7 @@ pub(in crate::routes::rd) async fn load_rd_quality_embedding_token_metrics(
     if repository_id.is_some() {
         sql.push_str(" AND (session_id LIKE ? OR request_id LIKE ?)");
     }
-    let mut query = sqlx::query(&sql)
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(tenant_id)
         .bind(tenant_wide)
         .bind(user_id)
@@ -649,7 +649,7 @@ pub(in crate::routes::rd) async fn load_rd_quality_runtime_token_metrics(
         sql.push_str(" AND t.repository_id = ?");
     }
     sql.push_str(") d");
-    let mut query = sqlx::query(&sql)
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(tenant_id)
         .bind(tenant_wide)
         .bind(user_id)

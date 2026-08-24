@@ -4167,7 +4167,8 @@ impl Nl2SqlAgent {
 
         let sql_rows = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            sqlx::query(sql).fetch_all(&pool),
+            // SQL reaches this executor only after the NL2SQL read-only AST guard.
+            sqlx::query(sqlx::AssertSqlSafe(sql)).fetch_all(&pool),
         )
         .await
         .map_err(|_| anyhow::anyhow!("Query execution timed out"))?
@@ -4446,7 +4447,8 @@ impl Nl2SqlAgent {
 
         let sql_rows = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            sqlx::query(sql).fetch_all(&pool),
+            // SQL reaches this executor only after the NL2SQL read-only AST guard.
+            sqlx::query(sqlx::AssertSqlSafe(sql)).fetch_all(&pool),
         )
         .await
         .map_err(|_| anyhow::anyhow!("Query execution timed out"))?

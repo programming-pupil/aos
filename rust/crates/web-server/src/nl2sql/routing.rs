@@ -495,7 +495,7 @@ pub async fn stats_boost(
         placeholders
     );
 
-    let mut q = sqlx::query_as::<_, (String, String, u64, u64)>(&query);
+    let mut q = sqlx::query_as::<_, (String, String, u64, u64)>(sqlx::AssertSqlSafe(query));
     for id in datasource_ids {
         q = q.bind(id);
     }
@@ -1467,7 +1467,7 @@ async fn text_match(
         .collect();
     let pattern = format!("%{}%", escaped_tokens.join("%"));
     // Decode the aggregate as f64 and narrow it to f32 only after normalization.
-    let mut q = sqlx::query_as::<_, (String, f64)>(&query);
+    let mut q = sqlx::query_as::<_, (String, f64)>(sqlx::AssertSqlSafe(query));
     for id in datasource_ids {
         q = q.bind(id);
     }
@@ -1513,7 +1513,7 @@ async fn frequency_boost(
         placeholders
     );
 
-    let mut q = sqlx::query_as::<_, (String, u64)>(&query);
+    let mut q = sqlx::query_as::<_, (String, u64)>(sqlx::AssertSqlSafe(query));
     for id in datasource_ids {
         q = q.bind(id);
     }

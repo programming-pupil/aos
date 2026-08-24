@@ -16,9 +16,11 @@ fn validate_sql_identifier(name: &str) -> Result<String, String> {
     if name.is_empty() || name.len() > 64 {
         return Err(format!("Invalid identifier length: {}", name.len()));
     }
-    if !name
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+    let parts = name.split('.').collect::<Vec<_>>();
+    if parts.len() > 2
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.chars().all(|c| c.is_alphanumeric() || c == '_'))
     {
         return Err(format!(
             "Invalid identifier contains forbidden characters: {}",
@@ -26,6 +28,36 @@ fn validate_sql_identifier(name: &str) -> Result<String, String> {
         ));
     }
     Ok(name.to_string())
+}
+
+#[cfg(test)]
+mod identifier_tests {
+    use super::validate_sql_identifier;
+
+    #[test]
+    fn accepts_simple_and_qualified_identifiers() {
+        assert_eq!(validate_sql_identifier("orders").unwrap(), "orders");
+        assert_eq!(
+            validate_sql_identifier("analytics.orders").unwrap(),
+            "analytics.orders"
+        );
+    }
+
+    #[test]
+    fn rejects_identifier_injection_and_malformed_qualification() {
+        for value in [
+            "orders` WHERE 1=1 --",
+            "orders;DROP TABLE users",
+            ".orders",
+            "analytics..orders",
+            "catalog.analytics.orders",
+        ] {
+            assert!(
+                validate_sql_identifier(value).is_err(),
+                "accepted {value:?}"
+            );
+        }
+    }
 }
 
 // ── Progress reporting ────────────────────────────────────────────────────────────
@@ -1050,7 +1082,7 @@ Description: {}",
         )
         .bind(datasource_id)
         .bind(tenant_id)
-        .bind(table_name)
+        .bind(&table_name)
         .bind(column_name)
         .fetch_optional(&self.db)
         .await
@@ -1658,7 +1690,8 @@ Column definition: {table_name}.{col_name}: {data_type}{nullable}{comment_hint}{
             set_clause = set_clause,
             where_clause = where_clause,
         );
-        let mut q = sqlx::query(&sql);
+        // CASE and WHERE fragments contain placeholders only; all values remain bound.
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
         for w in &when_clauses {
             q = q.bind(w);
         }
@@ -2631,7 +2664,6 @@ async fn collect_mysql_stats(
 
     for table in tables {
         let table_name = &table.table_name;
-        let schema = table_name.split('.').next().unwrap_or("");
 
         // Validate before interpolation to prevent SQL injection.
         let Ok(table_name) = validate_sql_identifier(table_name) else {
@@ -2639,16 +2671,27 @@ async fn collect_mysql_stats(
             continue;
         };
         let table_name_only = table_name.split('.').last().unwrap_or(&table_name);
-        let schema_name = schema.to_string();
+        let schema_name = table_name
+            .split_once('.')
+            .map(|(schema, _)| schema)
+            .unwrap_or("")
+            .to_string();
+        let quoted_table_name = table_name
+            .split('.')
+            .map(|part| format!("`{part}`"))
+            .collect::<Vec<_>>()
+            .join(".");
 
-        let row_count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM `{table_name}`"))
-            .fetch_one(&pool)
-            .await
-            .unwrap_or(0);
+        let row_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {quoted_table_name}"
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
 
-        let size_bytes: i64 = sqlx::query_scalar(&format!(
-            "SELECT COALESCE(SUM(data_length + index_length), 0) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?"
-        ))
+        let size_bytes: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(data_length + index_length), 0) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+        )
         .bind(&schema_name)
         .bind(table_name_only)
         .fetch_one(&pool)
@@ -2687,52 +2730,53 @@ async fn collect_mysql_stats(
                 continue;
             };
 
-            let null_count: i64 = sqlx::query_scalar(&format!(
-                "SELECT SUM(ISNULL(`{col_name}`)) FROM `{table_name}`"
-            ))
+            let null_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT SUM(ISNULL(`{col_name}`)) FROM {quoted_table_name}"
+            )))
             .fetch_one(&pool)
             .await
             .unwrap_or(0);
 
-            let distinct_count: i64 = sqlx::query_scalar(&format!(
-                "SELECT COUNT(DISTINCT `{col_name}`) FROM `{table_name}`"
-            ))
+            let distinct_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(DISTINCT `{col_name}`) FROM {quoted_table_name}"
+            )))
             .fetch_one(&pool)
             .await
             .unwrap_or(0);
 
             let total_rows = row_count.max(1);
-            let null_pct = (null_count as f64 / total_rows as f64 * 100.0) * 100.0;
+            let null_pct = null_count as f64 / total_rows as f64 * 100.0;
 
             let (min_val, max_val, avg_val) = if is_numeric {
-                let min_v: Option<String> = sqlx::query_scalar(&format!(
-                    "SELECT CAST(MIN(`{col_name}`) AS CHAR) FROM `{table_name}`"
-                ))
+                let min_v: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                    "SELECT CAST(MIN(`{col_name}`) AS CHAR) FROM {quoted_table_name}"
+                )))
                 .fetch_one(&pool)
                 .await
                 .ok()
                 .flatten();
-                let max_v: Option<String> = sqlx::query_scalar(&format!(
-                    "SELECT CAST(MAX(`{col_name}`) AS CHAR) FROM `{table_name}`"
-                ))
+                let max_v: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                    "SELECT CAST(MAX(`{col_name}`) AS CHAR) FROM {quoted_table_name}"
+                )))
                 .fetch_one(&pool)
                 .await
                 .ok()
                 .flatten();
-                let avg_v: Option<f64> =
-                    sqlx::query_scalar(&format!("SELECT AVG(`{col_name}`) FROM `{table_name}`"))
-                        .fetch_one(&pool)
-                        .await
-                        .ok()
-                        .flatten();
+                let avg_v: Option<f64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                    "SELECT AVG(`{col_name}`) FROM {quoted_table_name}"
+                )))
+                .fetch_one(&pool)
+                .await
+                .ok()
+                .flatten();
                 (min_v, max_v, avg_v)
             } else {
                 (None, None, None)
             };
 
-            let samples: Vec<String> = sqlx::query_scalar(&format!(
-                "SELECT DISTINCT CAST(`{col_name}` AS CHAR) FROM `{table_name}` WHERE `{col_name}` IS NOT NULL LIMIT 5"
-            ))
+            let samples: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT DISTINCT CAST(`{col_name}` AS CHAR) FROM {quoted_table_name} WHERE `{col_name}` IS NOT NULL LIMIT 5"
+            )))
             .fetch_all(&pool)
             .await
             .unwrap_or_default();
@@ -2795,13 +2839,6 @@ async fn collect_postgres_stats(
 
     for table in tables {
         let table_name = &table.table_name;
-        let (_schema, _name) = if table_name.contains('.') {
-            let parts: Vec<&str> = table_name.splitn(2, '.').collect();
-            (parts[0], parts[1])
-        } else {
-            ("public", table_name.as_str())
-        };
-
         let Ok(table_name) = validate_sql_identifier(table_name) else {
             tracing::warn!(table_name = %table_name,
                 "collect_postgres_stats: skipping invalid table name");
@@ -2814,16 +2851,16 @@ async fn collect_postgres_stats(
             ("public".to_string(), table_name.clone())
         };
 
-        let row_count: i64 = sqlx::query_scalar(&format!(
+        let row_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM \"{schema_str}\".\"{name_str}\""
-        ))
+        )))
         .fetch_one(&pool)
         .await
         .unwrap_or(0);
 
-        let size_bytes: i64 = sqlx::query_scalar(&format!(
+        let size_bytes: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT pg_total_relation_size('\"{schema_str}\".\"{name_str}\"')"
-        ))
+        )))
         .fetch_one(&pool)
         .await
         .unwrap_or(0);
@@ -2860,41 +2897,41 @@ async fn collect_postgres_stats(
                 continue;
             };
 
-            let null_count: i64 = sqlx::query_scalar(&format!(
+            let null_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT COUNT(*) FROM \"{schema_str}\".\"{name_str}\" WHERE \"{col_name}\" IS NULL"
-            ))
+            )))
             .fetch_one(&pool)
             .await
             .unwrap_or(0);
 
-            let distinct_count: i64 = sqlx::query_scalar(&format!(
+            let distinct_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT COUNT(DISTINCT \"{col_name}\") FROM \"{schema_str}\".\"{name_str}\""
-            ))
+            )))
             .fetch_one(&pool)
             .await
             .unwrap_or(0);
 
             let total_rows = row_count.max(1);
-            let null_pct = (null_count as f64 / total_rows as f64 * 100.0) * 100.0;
+            let null_pct = null_count as f64 / total_rows as f64 * 100.0;
 
             let (min_val, max_val, avg_val) = if is_numeric {
-                let min_v: Option<String> = sqlx::query_scalar(&format!(
+                let min_v: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                     "SELECT MIN(\"{col_name}\")::TEXT FROM \"{schema_str}\".\"{name_str}\""
-                ))
+                )))
                 .fetch_one(&pool)
                 .await
                 .ok()
                 .flatten();
-                let max_v: Option<String> = sqlx::query_scalar(&format!(
+                let max_v: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                     "SELECT MAX(\"{col_name}\")::TEXT FROM \"{schema_str}\".\"{name_str}\""
-                ))
+                )))
                 .fetch_one(&pool)
                 .await
                 .ok()
                 .flatten();
-                let avg_v: Option<f64> = sqlx::query_scalar(&format!(
+                let avg_v: Option<f64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                     "SELECT AVG(\"{col_name}\") FROM \"{schema_str}\".\"{name_str}\""
-                ))
+                )))
                 .fetch_one(&pool)
                 .await
                 .ok()
@@ -2904,9 +2941,9 @@ async fn collect_postgres_stats(
                 (None, None, None)
             };
 
-            let samples: Vec<String> = sqlx::query_scalar(&format!(
+            let samples: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT DISTINCT \"{col_name}\"::TEXT FROM \"{schema_str}\".\"{name_str}\" WHERE \"{col_name}\" IS NOT NULL LIMIT 5"
-            ))
+            )))
             .fetch_all(&pool)
             .await
             .unwrap_or_default();
@@ -2958,21 +2995,30 @@ async fn collect_clickhouse_stats(
     let client = Client::default().with_url(url);
 
     for table in tables {
-        let table_name = &table.table_name;
+        let Ok(table_name) = validate_sql_identifier(&table.table_name) else {
+            tracing::warn!(table_name = %table.table_name,
+                "collect_clickhouse_stats: skipping invalid table name");
+            continue;
+        };
+        let quoted_table_name = table_name
+            .split('.')
+            .map(|part| format!("`{part}`"))
+            .collect::<Vec<_>>()
+            .join(".");
         let database = url.split('/').nth(3).unwrap_or("default");
         let table_name_only = table_name.split('.').last().unwrap_or(table_name.as_str());
 
         let row_count: i64 = client
-            .query(&format!("SELECT count() FROM `{table_name}`"))
+            .query(&format!("SELECT count() FROM {quoted_table_name}"))
             .fetch_all::<i64>()
             .await
             .map(|r| r[0])
             .unwrap_or(0);
 
         let size_bytes: i64 = client
-            .query(&format!(
-                "SELECT total_bytes FROM system.tables WHERE database = '{database}' AND name = '{table_name_only}'"
-            ))
+            .query("SELECT total_bytes FROM system.tables WHERE database = ? AND name = ?")
+            .bind(database)
+            .bind(table_name_only)
             .fetch_all::<i64>()
             .await
             .map(|r| r[0])
@@ -2988,7 +3034,7 @@ async fn collect_clickhouse_stats(
         )
         .bind(tenant_id)
         .bind(datasource_id)
-        .bind(table_name)
+        .bind(&table_name)
         .bind(row_count)
         .bind(size_bytes)
         .execute(db)
@@ -2996,7 +3042,12 @@ async fn collect_clickhouse_stats(
         .ok();
 
         for col in &table.columns {
-            let col_name = &col.name;
+            let Ok(col_name) = validate_sql_identifier(&col.name) else {
+                tracing::warn!(col_name = %col.name, table_name = %table_name,
+                    "collect_clickhouse_stats: skipping invalid column name");
+                continue;
+            };
+            let quoted_col_name = format!("`{col_name}`");
             let col_type = col.data_type.to_lowercase();
             let is_numeric = col_type.contains("int")
                 || col_type.contains("float")
@@ -3005,7 +3056,7 @@ async fn collect_clickhouse_stats(
 
             let null_count: i64 = client
                 .query(&format!(
-                    "SELECT count() FROM `{table_name}` WHERE {col_name} IS NULL"
+                    "SELECT count() FROM {quoted_table_name} WHERE {quoted_col_name} IS NULL"
                 ))
                 .fetch_all::<i64>()
                 .await
@@ -3014,7 +3065,7 @@ async fn collect_clickhouse_stats(
 
             let distinct_count: i64 = client
                 .query(&format!(
-                    "SELECT count(distinct {col_name}) FROM `{table_name}`"
+                    "SELECT count(distinct {quoted_col_name}) FROM {quoted_table_name}"
                 ))
                 .fetch_all::<i64>()
                 .await
@@ -3022,23 +3073,29 @@ async fn collect_clickhouse_stats(
                 .unwrap_or(0);
 
             let total_rows = row_count.max(1);
-            let null_pct = (null_count as f64 / total_rows as f64 * 100.0) * 100.0;
+            let null_pct = null_count as f64 / total_rows as f64 * 100.0;
 
             let (min_val, max_val, avg_val) = if is_numeric {
                 let min_v: Option<String> = client
-                    .query(&format!("SELECT min({col_name}) FROM `{table_name}`"))
+                    .query(&format!(
+                        "SELECT min({quoted_col_name}) FROM {quoted_table_name}"
+                    ))
                     .fetch_all::<String>()
                     .await
                     .ok()
                     .and_then(|mut r| r.pop());
                 let max_v: Option<String> = client
-                    .query(&format!("SELECT max({col_name}) FROM `{table_name}`"))
+                    .query(&format!(
+                        "SELECT max({quoted_col_name}) FROM {quoted_table_name}"
+                    ))
                     .fetch_all::<String>()
                     .await
                     .ok()
                     .and_then(|mut r| r.pop());
                 let avg_v: Option<f64> = client
-                    .query(&format!("SELECT avg({col_name}) FROM `{table_name}`"))
+                    .query(&format!(
+                        "SELECT avg({quoted_col_name}) FROM {quoted_table_name}"
+                    ))
                     .fetch_all::<f64>()
                     .await
                     .ok()
@@ -3050,7 +3107,7 @@ async fn collect_clickhouse_stats(
 
             let samples: Vec<String> = client
                 .query(&format!(
-                    "SELECT DISTINCT {col_name} FROM `{table_name}` WHERE isNotNull({col_name}) LIMIT 5"
+                    "SELECT DISTINCT {quoted_col_name} FROM {quoted_table_name} WHERE isNotNull({quoted_col_name}) LIMIT 5"
                 ))
                 .fetch_all::<String>()
                 .await
@@ -3073,7 +3130,7 @@ async fn collect_clickhouse_stats(
             )
             .bind(tenant_id)
             .bind(datasource_id)
-            .bind(table_name)
+            .bind(&table_name)
             .bind(col_name)
             .bind(row_count)
             .bind(null_count)

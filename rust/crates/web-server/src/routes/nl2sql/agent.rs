@@ -244,7 +244,7 @@ async fn ensure_queryable_datasource_exists(state: &AppState, claims: &Claims) -
     let total_sql = format!(
         "SELECT COUNT(*) FROM data_sources WHERE tenant_id = ? AND deleted_at IS NULL AND db_type IN ({EXECUTABLE_TYPES})"
     );
-    let total = sqlx::query_scalar::<_, i64>(&total_sql)
+    let total = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(total_sql))
         .bind(&claims.tenant_id)
         .fetch_one(&state.db)
         .await?;
@@ -261,7 +261,7 @@ async fn ensure_queryable_datasource_exists(state: &AppState, claims: &Claims) -
     let accessible_sql = format!(
         "SELECT COUNT(*) FROM data_sources WHERE tenant_id = ? AND deleted_at IS NULL AND db_type IN ({EXECUTABLE_TYPES}) AND (visibility = 'tenant' OR user_id = ?)"
     );
-    let accessible = sqlx::query_scalar::<_, i64>(&accessible_sql)
+    let accessible = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(accessible_sql))
         .bind(&claims.tenant_id)
         .bind(&claims.sub)
         .fetch_one(&state.db)

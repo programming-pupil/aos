@@ -7314,7 +7314,9 @@ async fn gateway_file_search(
     }
     sql.push_str(" ORDER BY f.updated_at DESC, c.chunk_index ASC LIMIT 1000");
 
-    let mut query_builder = sqlx::query(&sql)
+    // Only fixed SQL fragments and placeholder counts are appended above;
+    // every request-derived value remains a bind parameter.
+    let mut query_builder = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(&context.tenant_id)
         .bind(&context.user_id)
         .bind(&context.session_id);
@@ -7576,7 +7578,9 @@ async fn gateway_file_find(
     sql.push_str(" ORDER BY f.updated_at DESC, c.chunk_index ASC LIMIT 200");
 
     let needle = format!("%{}%", gateway_escape_like(pattern));
-    let mut query_builder = sqlx::query(&sql)
+    // Only fixed SQL fragments and placeholder counts are appended above;
+    // every request-derived value remains a bind parameter.
+    let mut query_builder = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(&context.tenant_id)
         .bind(&context.user_id)
         .bind(&context.session_id);
@@ -8550,7 +8554,8 @@ async fn gateway_search_context_archive_items(
     );
     sql.push_str(&vec!["LOWER(content) LIKE ? ESCAPE '\\\\'"; terms.len()].join(" OR "));
     sql.push_str(") ORDER BY created_at DESC, ordinal ASC LIMIT ?");
-    let mut query = sqlx::query(&sql)
+    // Search terms only determine the number of placeholders and are bound below.
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(&context.tenant_id)
         .bind(&context.user_id)
         .bind(effective_session);

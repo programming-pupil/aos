@@ -156,7 +156,7 @@ pub(super) async fn get_quality_summary(
          CAST(AVG(CASE WHEN started_at IS NOT NULL AND completed_at IS NOT NULL THEN ((julianday(completed_at) - julianday(started_at)) * 86400000000) / 1000 ELSE NULL END) AS DOUBLE) AS avg_task_duration_ms \
          FROM rd_tasks WHERE {task_where}"
     );
-    let mut task_query = sqlx::query(&task_sql)
+    let mut task_query = sqlx::query(sqlx::AssertSqlSafe(task_sql))
         .bind(&claims.tenant_id)
         .bind(tenant_wide)
         .bind(&claims.sub)
@@ -181,7 +181,7 @@ pub(super) async fn get_quality_summary(
          INNER JOIN rd_tasks t ON t.id = c.task_id AND t.tenant_id = c.tenant_id \
          WHERE {change_where}"
     );
-    let mut change_query = sqlx::query(&change_sql)
+    let mut change_query = sqlx::query(sqlx::AssertSqlSafe(change_sql))
         .bind(&claims.tenant_id)
         .bind(tenant_wide)
         .bind(&claims.sub)
@@ -206,7 +206,7 @@ pub(super) async fn get_quality_summary(
          INNER JOIN rd_tasks t ON t.id = r.task_id AND t.tenant_id = r.tenant_id \
          WHERE {test_where}"
     );
-    let mut test_query = sqlx::query(&test_sql)
+    let mut test_query = sqlx::query(sqlx::AssertSqlSafe(test_sql))
         .bind(&claims.tenant_id)
         .bind(tenant_wide)
         .bind(&claims.sub)
@@ -225,7 +225,7 @@ pub(super) async fn get_quality_summary(
          ORDER BY failure_count DESC, MAX(r.created_at) DESC \
          LIMIT 5"
     );
-    let mut top_failed_query = sqlx::query(&top_failed_sql)
+    let mut top_failed_query = sqlx::query(sqlx::AssertSqlSafe(top_failed_sql))
         .bind(&claims.tenant_id)
         .bind(tenant_wide)
         .bind(&claims.sub)
@@ -266,7 +266,7 @@ pub(super) async fn get_quality_summary(
            ) \
          GROUP BY m.metric_name"
     );
-    let mut metric_query = sqlx::query(&metric_sql)
+    let mut metric_query = sqlx::query(sqlx::AssertSqlSafe(metric_sql))
         .bind(&claims.tenant_id)
         .bind(tenant_wide)
         .bind(&claims.sub)

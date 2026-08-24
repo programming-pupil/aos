@@ -133,7 +133,9 @@ pub async fn ensure_task_control_schema(state: &AppState) -> Result<()> {
             "tenant_id, feature_key, mode",
         ),
     ] {
-        sqlx::query::<sqlx::Sqlite>(&format!("SELECT {columns} FROM {table} LIMIT 0"))
+        sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(format!(
+            "SELECT {columns} FROM {table} LIMIT 0"
+        )))
             .execute(state.control_db())
             .await
             .map_err(|error| {
@@ -355,6 +357,11 @@ async fn claim_rows(
     worker_id: &str,
     limit: i64,
 ) -> Result<Vec<String>> {
+    if !claimed_table_supports_heartbeat(table) {
+        return Err(AppError::Internal(
+            "unsupported WatchDog claim table".to_string(),
+        ));
+    }
     let priority = if table == "agent_task_command_requests" {
         "CASE command_type WHEN 'kill' THEN 0 WHEN 'cancel' THEN 1 \
          WHEN 'provide_input' THEN 2 WHEN 'approve' THEN 2 WHEN 'reject' THEN 2 \
@@ -369,7 +376,7 @@ async fn claim_rows(
     );
     let mut tx = state.control_db.begin().await?;
     crate::acquire_sqlite_write_lock(&mut tx).await?;
-    let candidates = sqlx::query_scalar::<sqlx::Sqlite, String>(&select_sql)
+    let candidates = sqlx::query_scalar::<sqlx::Sqlite, String>(sqlx::AssertSqlSafe(select_sql))
         .bind(limit)
         .fetch_all(&mut *tx)
         .await?;
@@ -442,7 +449,7 @@ pub(crate) async fn recover_expired_claims(state: &AppState, table: &str) -> Res
                  available_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
              WHERE status = 'claimed' AND lease_expires_at < CURRENT_TIMESTAMP"
         );
-        sqlx::query::<sqlx::Sqlite>(&recover_sql)
+        sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(recover_sql))
             .execute(state.control_db())
             .await?;
     }
@@ -490,11 +497,11 @@ where
             "unsupported WatchDog claim heartbeat table".to_string(),
         ));
     }
-    let update_sql = format!(
+    let update_sql = Arc::new(format!(
         "UPDATE {table}
          SET lease_expires_at = datetime(CURRENT_TIMESTAMP, printf('%+d seconds', ?)), updated_at = CURRENT_TIMESTAMP
          WHERE id = ? AND status = 'claimed' AND claimed_by = ?"
-    );
+    ));
     let mut heartbeat = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_secs(LEASE_HEARTBEAT_SECONDS),
         Duration::from_secs(LEASE_HEARTBEAT_SECONDS),
@@ -505,7 +512,7 @@ where
         tokio::select! {
             result = &mut future => return result,
             _ = heartbeat.tick() => {
-                let renewed = sqlx::query::<sqlx::Sqlite>(&update_sql)
+                let renewed = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(update_sql.clone()))
                     .bind(LEASE_SECONDS)
                     .bind(id)
                     .bind(worker_id)
@@ -951,6 +958,11 @@ async fn retry_or_fail_claim(
     worker_id: &str,
     error: &str,
 ) -> Result<()> {
+    if !claimed_table_supports_heartbeat(table) {
+        return Err(AppError::Internal(
+            "unsupported WatchDog retry table".to_string(),
+        ));
+    }
     let error_column = if table == "agent_task_command_requests" {
         "error_message"
     } else {
@@ -987,9 +999,9 @@ async fn retry_or_fail_claim(
     let error = error.chars().take(3500).collect::<String>();
     let mut tx = state.control_db.begin().await?;
     crate::acquire_sqlite_write_lock(&mut tx).await?;
-    let attempt_count = sqlx::query_scalar::<sqlx::Sqlite, i64>(&format!(
+    let attempt_count = sqlx::query_scalar::<sqlx::Sqlite, i64>(sqlx::AssertSqlSafe(format!(
         "SELECT attempt_count FROM {table} WHERE id = ? AND status = 'claimed' AND claimed_by = ?"
-    ))
+    )))
     .bind(id)
     .bind(worker_id)
     .fetch_optional(&mut *tx)
@@ -998,7 +1010,7 @@ async fn retry_or_fail_claim(
         tx.rollback().await?;
         return Ok(());
     };
-    let mut query = sqlx::query::<sqlx::Sqlite>(&sql)
+    let mut query = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(sql))
         .bind(retry_backoff_seconds(attempt_count))
         .bind(&error);
     if table == "agent_notification_deliveries" {

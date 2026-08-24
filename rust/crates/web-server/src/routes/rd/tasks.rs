@@ -43,7 +43,7 @@ pub(super) async fn list_tasks(
         where_sql.push_str(" AND mode = ?");
     }
     let count_sql = format!("SELECT COUNT(*) AS c FROM rd_tasks WHERE {where_sql}");
-    let mut count_query = sqlx::query(&count_sql)
+    let mut count_query = sqlx::query(sqlx::AssertSqlSafe(count_sql))
         .bind(&claims.tenant_id)
         .bind(&claims.sub);
     if let Some(v) = &query.status {
@@ -63,7 +63,7 @@ pub(super) async fn list_tasks(
     let list_sql = format!(
         "SELECT id, thread_id, parent_task_id, iteration_no, thread_title, repository_id, spec_id, agent_profile_id, workflow_id, runtime_session_id, mode, context_profile, context_depth, should_deep_scan, status, title, prompt, model, plan_md, answer_md, review_md, pr_title, pr_description, error_message, CAST(created_at AS TEXT) created_at, CAST(updated_at AS TEXT) updated_at, CAST(completed_at AS TEXT) completed_at FROM rd_tasks WHERE {where_sql} ORDER BY created_at DESC LIMIT ? OFFSET ?"
     );
-    let mut list_query = sqlx::query(&list_sql)
+    let mut list_query = sqlx::query(sqlx::AssertSqlSafe(list_sql))
         .bind(&claims.tenant_id)
         .bind(&claims.sub);
     if let Some(v) = &query.status {

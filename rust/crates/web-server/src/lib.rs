@@ -1027,9 +1027,7 @@ mod sqlite_baseline_tests {
                     .cloned()
                     .collect(),
             ),
-            ignore_missing: false,
-            locking: true,
-            no_tx: false,
+            ..sqlx::migrate::Migrator::DEFAULT
         };
         partial
             .run(pool)

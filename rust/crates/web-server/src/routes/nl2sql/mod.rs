@@ -690,7 +690,8 @@ async fn do_record_routing_features(
             .join(", ")
     );
 
-    let mut query = sqlx::query(&sql);
+    // Generated VALUES entries contain placeholders only.
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
     for table in tables {
         query = query.bind(tenant_id).bind(datasource_id).bind(table);
     }

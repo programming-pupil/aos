@@ -70,7 +70,7 @@ impl QueryExecutor {
                 .acquire()
                 .await
                 .map_err(|e| CancelError::ConnectionFailed(e.to_string()))?;
-            sqlx::query(&format!("KILL {tid}"))
+            sqlx::query(sqlx::AssertSqlSafe(format!("KILL {tid}")))
                 .execute(&mut *conn)
                 .await
                 .map_err(|e| CancelError::KillFailed(e.to_string()))?;
@@ -110,10 +110,12 @@ impl QueryExecutor {
                 .acquire()
                 .await
                 .map_err(|e| CancelError::ConnectionFailed(e.to_string()))?;
-            sqlx::query(&format!("SELECT pg_cancel_backend({pid})"))
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| CancelError::KillFailed(e.to_string()))?;
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SELECT pg_cancel_backend({pid})"
+            )))
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| CancelError::KillFailed(e.to_string()))?;
             tracing::info!(
                 pid = pid,
                 "PostgreSQL query cancelled via pg_cancel_backend"
@@ -150,10 +152,14 @@ impl QueryExecutor {
             .acquire()
             .await
             .map_err(|e| CancelError::ConnectionFailed(e.to_string()))?;
-        sqlx::query(&format!("KILL QUERY WHERE query_id = '{}'", self.query_id))
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| CancelError::KillFailed(e.to_string()))?;
+        let query_id = uuid::Uuid::parse_str(&self.query_id)
+            .map_err(|_| CancelError::ConfigError("invalid ClickHouse query id".to_string()))?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "KILL QUERY WHERE query_id = '{query_id}'"
+        )))
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| CancelError::KillFailed(e.to_string()))?;
         tracing::info!(query_id = %self.query_id, "ClickHouse query cancelled");
         Ok(())
     }

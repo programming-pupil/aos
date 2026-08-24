@@ -1236,9 +1236,9 @@ async fn persist_market_skill_files(
     .execute(db)
     .await?;
 
-    let row = sqlx::query_as::<sqlx::Sqlite, SkillRow>(&format!(
+    let row = sqlx::query_as::<sqlx::Sqlite, SkillRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {SKILL_SELECT_COLUMNS} FROM skills_registry WHERE tenant_id = ? AND name = ?"
-    ))
+    )))
     .bind(tenant_id)
     .bind(&skill_name)
     .fetch_one(db)
@@ -1323,14 +1323,14 @@ fn extract_tags_from_frontmatter(content: &str) -> Vec<String> {
 
 /// Load all enabled skills for a tenant from the DB.
 async fn load_skills_for_tenant(db: &SqlitePool, tenant_id: &str) -> Result<Vec<SkillInfo>> {
-    let rows = sqlx::query_as::<sqlx::Sqlite, SkillRow>(&format!(
+    let rows = sqlx::query_as::<sqlx::Sqlite, SkillRow>(sqlx::AssertSqlSafe(format!(
         "
         SELECT {SKILL_SELECT_COLUMNS}
         FROM skills_registry
         WHERE tenant_id = ? AND enabled = 1
         ORDER BY updated_at DESC
         "
-    ))
+    )))
     .bind(tenant_id)
     .fetch_all(db)
     .await?;
@@ -1396,9 +1396,9 @@ async fn persist_skill(params: PersistSkillParams<'_>) -> Result<SkillInfo> {
     .await?;
 
     // Re-fetch the row (to get updated_at, etc.)
-    let row = sqlx::query_as::<sqlx::Sqlite, SkillRow>(&format!(
+    let row = sqlx::query_as::<sqlx::Sqlite, SkillRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {SKILL_SELECT_COLUMNS} FROM skills_registry WHERE tenant_id = ? AND name = ?"
-    ))
+    )))
     .bind(params.tenant_id)
     .bind(&skill_name)
     .fetch_one(params.db)
@@ -1439,7 +1439,7 @@ async fn list(
     let offset = usize::try_from(pagination.offset()).unwrap_or(0);
     let limit = usize::try_from(pagination.limit()).unwrap_or(0);
 
-    let rows = sqlx::query_as::<sqlx::Sqlite, SkillRow>(&format!(
+    let rows = sqlx::query_as::<sqlx::Sqlite, SkillRow>(sqlx::AssertSqlSafe(format!(
         "
         SELECT {SKILL_SELECT_COLUMNS}
         FROM skills_registry
@@ -1447,7 +1447,7 @@ async fn list(
         ORDER BY updated_at DESC
         LIMIT ? OFFSET ?
         "
-    ))
+    )))
     .bind(&claims.tenant_id)
     .bind(i64::try_from(limit).unwrap_or(0))
     .bind(i64::try_from(offset).unwrap_or(0))
@@ -1475,13 +1475,13 @@ async fn get(
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<SkillInfo>> {
     let skill_name = name.to_lowercase().replace(' ', "-");
-    let row = sqlx::query_as::<sqlx::Sqlite, SkillRow>(&format!(
+    let row = sqlx::query_as::<sqlx::Sqlite, SkillRow>(sqlx::AssertSqlSafe(format!(
         "
         SELECT {SKILL_SELECT_COLUMNS}
         FROM skills_registry
         WHERE tenant_id = ? AND name = ?
         "
-    ))
+    )))
     .bind(&claims.tenant_id)
     .bind(&skill_name)
     .fetch_optional(&state.db)
@@ -1638,9 +1638,9 @@ async fn update(
     let skill_name = name.to_lowercase().replace(' ', "-");
 
     // Always fetch the existing row once to get id + path
-    let existing = sqlx::query_as::<sqlx::Sqlite, SkillRow>(&format!(
+    let existing = sqlx::query_as::<sqlx::Sqlite, SkillRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {SKILL_SELECT_COLUMNS} FROM skills_registry WHERE tenant_id = ? AND name = ?"
-    ))
+    )))
     .bind(&claims.tenant_id)
     .bind(&skill_name)
     .fetch_optional(&state.db)
@@ -1694,7 +1694,7 @@ async fn update(
             updates.join(", ")
         );
 
-        let mut q = sqlx::query::<sqlx::Sqlite>(&query);
+        let mut q = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(query));
         if let Some(desc) = &req.description {
             q = q.bind(desc);
         }
@@ -1710,9 +1710,9 @@ async fn update(
     }
 
     // Re-fetch updated row
-    let updated_row = sqlx::query_as::<sqlx::Sqlite, SkillRow>(&format!(
+    let updated_row = sqlx::query_as::<sqlx::Sqlite, SkillRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {SKILL_SELECT_COLUMNS} FROM skills_registry WHERE tenant_id = ? AND name = ?"
-    ))
+    )))
     .bind(&claims.tenant_id)
     .bind(&skill_name)
     .fetch_one(&state.db)
@@ -1824,9 +1824,9 @@ async fn toggle(
         return Err(AppError::NotFound(format!("skill '{name}' not found")));
     }
 
-    let row = sqlx::query_as::<sqlx::Sqlite, SkillRow>(&format!(
+    let row = sqlx::query_as::<sqlx::Sqlite, SkillRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {SKILL_SELECT_COLUMNS} FROM skills_registry WHERE tenant_id = ? AND name = ?"
-    ))
+    )))
     .bind(&claims.tenant_id)
     .bind(&skill_name)
     .fetch_one(&state.db)
@@ -2953,9 +2953,9 @@ async fn upload_zip(
     .await?;
 
     // Re-fetch the row
-    let row = sqlx::query_as::<sqlx::Sqlite, SkillRow>(&format!(
+    let row = sqlx::query_as::<sqlx::Sqlite, SkillRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {SKILL_SELECT_COLUMNS} FROM skills_registry WHERE tenant_id = ? AND name = ?"
-    ))
+    )))
     .bind(&claims.tenant_id)
     .bind(&skill_name)
     .fetch_one(&state.db)

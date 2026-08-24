@@ -636,7 +636,8 @@ async fn update(
 
     if !updates.is_empty() {
         let query = format!("UPDATE users SET {} WHERE id = ?", updates.join(", "));
-        let mut q = sqlx::query(&query);
+        // UPDATE columns are chosen from the fixed allowlist above.
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(query));
         for b in &bindings {
             q = q.bind(b);
         }

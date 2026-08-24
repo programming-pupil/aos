@@ -108,9 +108,9 @@ pub(super) async fn list_specs(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Vec<RdSpecDto>>, AppError> {
-    let rows = sqlx::query(&spec_select_sql(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(spec_select_sql(
         "WHERE tenant_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 100",
-    ))
+    )))
     .bind(&claims.tenant_id)
     .bind(&claims.sub)
     .fetch_all(&state.db)
@@ -1491,7 +1491,7 @@ async fn approve_stage(
     let sql = format!(
         "UPDATE rd_specs SET {field} = COALESCE({field}, CURRENT_TIMESTAMP), approved_by = ?, current_stage = ?, status = 'approved', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND tenant_id = ? AND user_id = ?"
     );
-    sqlx::query(&sql)
+    sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(&claims.sub)
         .bind(next_stage)
         .bind(spec_id)
@@ -1841,9 +1841,9 @@ async fn get_spec_row(
     user_id: &str,
     spec_id: &str,
 ) -> Result<RdSpecDto, AppError> {
-    let row = sqlx::query(&spec_select_sql(
+    let row = sqlx::query(sqlx::AssertSqlSafe(spec_select_sql(
         "WHERE id = ? AND tenant_id = ? AND user_id = ?",
-    ))
+    )))
     .bind(spec_id)
     .bind(tenant_id)
     .bind(user_id)

@@ -2701,7 +2701,8 @@ async fn update(
     let set_sql = set_clauses.join(", ");
     let query = format!("UPDATE api_keys SET {set_sql} WHERE id = ? AND tenant_id = ?");
 
-    let mut q = sqlx::query(&query);
+    // Every SET fragment is selected from the fixed allowlist above.
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(query));
 
     if let Some(v) = &name {
         q = q.bind(v);

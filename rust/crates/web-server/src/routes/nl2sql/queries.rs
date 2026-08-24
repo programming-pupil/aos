@@ -2249,7 +2249,7 @@ async fn execute_once(
                     .map_err(|e| AppError::Internal(e.to_string()))?;
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs as u64),
-                    sqlx::query(&count_sql).fetch_one(&mut *conn),
+                    sqlx::query(sqlx::AssertSqlSafe(count_sql)).fetch_one(&mut *conn),
                 )
                 .await
                 {
@@ -2278,7 +2278,7 @@ async fn execute_once(
                     .map_err(|e| AppError::Internal(e.to_string()))?;
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs as u64),
-                    sqlx::query(&hinted_sql).fetch_all(&mut *conn),
+                    sqlx::query(sqlx::AssertSqlSafe(hinted_sql)).fetch_all(&mut *conn),
                 )
                 .await
                 {
@@ -2686,10 +2686,10 @@ async fn execute_once(
             // pool. sqlx resets session state on release (`DISCARD ALL` is
             // NOT issued by default though, so for paranoia we explicitly
             // reset before releasing — see end of branch).
-            let _ = sqlx::query(&format!(
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SET statement_timeout = {}",
                 (timeout_secs as u64).saturating_mul(1000)
-            ))
+            )))
             .execute(&mut *conn)
             .await;
 
@@ -2702,7 +2702,7 @@ async fn execute_once(
                     .map_err(|e| AppError::Internal(e.to_string()))?;
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs as u64),
-                    sqlx::query(&count_sql).fetch_one(&mut *conn),
+                    sqlx::query(sqlx::AssertSqlSafe(count_sql)).fetch_one(&mut *conn),
                 )
                 .await
                 {
@@ -2725,7 +2725,7 @@ async fn execute_once(
                     .map_err(|e| AppError::Internal(e.to_string()))?;
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs as u64),
-                    sqlx::query(&normalized_sql).fetch_all(&mut *conn),
+                    sqlx::query(sqlx::AssertSqlSafe(normalized_sql)).fetch_all(&mut *conn),
                 )
                 .await
                 {

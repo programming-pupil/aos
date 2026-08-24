@@ -2510,7 +2510,8 @@ async fn search_context_archive_items(
     );
     sql.push_str(&vec!["LOWER(content) LIKE ? ESCAPE '\\\\'"; terms.len()].join(" OR "));
     sql.push_str(") ORDER BY created_at DESC, ordinal ASC LIMIT ?");
-    let mut query = sqlx::query(&sql)
+    // Search terms only determine placeholder count and are bound below.
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(tenant_id)
         .bind(user_id)
         .bind(session_id);

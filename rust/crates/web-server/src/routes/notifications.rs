@@ -114,7 +114,7 @@ async fn list(
             bool,
             chrono::DateTime<chrono::Utc>,
         ),
-    >(&query)
+    >(sqlx::AssertSqlSafe(query))
     .bind(&claims.sub)
     .bind(&claims.tenant_id)
     .bind(&claims.sub)
@@ -125,9 +125,9 @@ async fn list(
 
     let notifications: Vec<NotificationInfo> = rows.into_iter().map(row_to_info).collect();
 
-    let total: (i64,) = sqlx::query_as(&format!(
+    let total: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "{visible_cte} SELECT COUNT(*) FROM visible WHERE duplicate_rank = 1"
-    ))
+    )))
     .bind(&claims.sub)
     .bind(&claims.tenant_id)
     .bind(&claims.sub)

@@ -3711,10 +3711,10 @@ async fn list_missions(
     }
     list_sql.push_str(" ORDER BY updated_at DESC LIMIT ? OFFSET ?");
 
-    let mut count_q = sqlx::query_as::<_, (i64,)>(&count_sql)
+    let mut count_q = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(count_sql))
         .bind(&claims.tenant_id)
         .bind(&claims.sub);
-    let mut list_q = sqlx::query(&list_sql)
+    let mut list_q = sqlx::query(sqlx::AssertSqlSafe(list_sql))
         .bind(&claims.tenant_id)
         .bind(&claims.sub);
     if has_country {
@@ -3915,7 +3915,7 @@ async fn update_mission(
         "UPDATE pm_missions SET {} WHERE id = ? AND tenant_id = ? AND created_by = ?",
         set.join(", ")
     );
-    let mut q = sqlx::query(&sql);
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
     if let Some(v) = req.mission_name {
         q = q.bind(trim_text(v.trim(), 128));
     }
@@ -4127,11 +4127,11 @@ async fn list_mission_task_runs(
     }
     list_sql.push_str(" ORDER BY p.updated_at DESC LIMIT ? OFFSET ?");
 
-    let mut count_q = sqlx::query_as::<_, (i64,)>(&count_sql)
+    let mut count_q = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(count_sql))
         .bind(&claims.tenant_id)
         .bind(&claims.sub)
         .bind(&task_like);
-    let mut list_q = sqlx::query(&list_sql)
+    let mut list_q = sqlx::query(sqlx::AssertSqlSafe(list_sql))
         .bind(&claims.tenant_id)
         .bind(&claims.sub)
         .bind(&task_like);
@@ -4368,10 +4368,10 @@ async fn list_material_jobs(
         list_sql.push_str(" AND status = ?");
     }
     list_sql.push_str(" ORDER BY id DESC LIMIT ? OFFSET ?");
-    let mut count_q = sqlx::query_as::<_, (i64,)>(&count_sql)
+    let mut count_q = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(count_sql))
         .bind(&claims.tenant_id)
         .bind(&claims.sub);
-    let mut list_q = sqlx::query(&list_sql)
+    let mut list_q = sqlx::query(sqlx::AssertSqlSafe(list_sql))
         .bind(&claims.tenant_id)
         .bind(&claims.sub);
     if let Some(mission_run_id) = query.mission_run_id {
@@ -4423,7 +4423,7 @@ async fn material_jobs_summary(
          FROM pm_material_jobs
          WHERE tenant_id = ? AND created_by = ? AND asset_type IN ({PUBLIC_MATERIAL_ASSET_TYPES_SQL})",
     );
-    let job_row = sqlx::query(&job_summary_sql)
+    let job_row = sqlx::query(sqlx::AssertSqlSafe(job_summary_sql))
         .bind(&claims.tenant_id)
         .bind(&claims.sub)
         .fetch_one(&state.db)
@@ -4435,7 +4435,7 @@ async fn material_jobs_summary(
          INNER JOIN pm_material_jobs j ON j.tenant_id = a.tenant_id AND j.id = a.job_id
          WHERE a.tenant_id = ? AND j.created_by = ? AND a.asset_type IN ({PUBLIC_MATERIAL_ASSET_TYPES_SQL}) AND a.created_at >= datetime(CURRENT_TIMESTAMP, '-30 days')",
     );
-    let asset_count_30d = sqlx::query_as::<_, (i64,)>(&asset_count_sql)
+    let asset_count_30d = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(asset_count_sql))
         .bind(&claims.tenant_id)
         .bind(&claims.sub)
         .fetch_one(&state.db)
@@ -4547,7 +4547,7 @@ async fn list_material_threads(
     }
     list_sql.push_str(" ORDER BY j.updated_at DESC, j.id DESC LIMIT ? OFFSET ?");
 
-    let mut count_q = sqlx::query_as::<_, (i64,)>(&count_sql)
+    let mut count_q = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(count_sql))
         .bind(&claims.tenant_id)
         .bind(&claims.sub);
     if let Some(mission_run_id) = query.mission_run_id {
@@ -4568,7 +4568,7 @@ async fn list_material_threads(
     }
     let total = count_q.fetch_one(&state.db).await?.0;
 
-    let mut list_q = sqlx::query(&list_sql)
+    let mut list_q = sqlx::query(sqlx::AssertSqlSafe(list_sql))
         .bind(&claims.tenant_id)
         .bind(&claims.sub);
     if let Some(mission_run_id) = query.mission_run_id {
@@ -6182,7 +6182,7 @@ async fn load_pm_search_provider_rows(
         "{} WHERE tenant_id = ? ORDER BY priority ASC, created_at ASC",
         provider_select_sql()
     );
-    Ok(sqlx::query(&sql)
+    Ok(sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(tenant_id)
         .fetch_all(&state.db)
         .await?)
@@ -6194,7 +6194,7 @@ async fn load_pm_search_provider_row(
     id: &str,
 ) -> Result<sqlx::sqlite::SqliteRow, AppError> {
     let sql = format!("{} WHERE tenant_id = ? AND id = ?", provider_select_sql());
-    sqlx::query(&sql)
+    sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(tenant_id)
         .bind(id)
         .fetch_optional(&state.db)

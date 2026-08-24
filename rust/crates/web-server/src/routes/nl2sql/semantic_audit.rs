@@ -857,7 +857,7 @@ fn bind_query_join_contracts(query: &Query, contracts: &[JoinContract]) -> Vec<J
                 result.push(unverified_join_contract());
                 continue;
             };
-            let is_join = !matches!(join.join_operator, JoinOperator::CrossJoin);
+            let is_join = !matches!(join.join_operator, JoinOperator::CrossJoin(_));
             if is_join {
                 let matches = contracts
                     .iter()
@@ -883,12 +883,15 @@ fn bind_query_join_contracts(query: &Query, contracts: &[JoinContract]) -> Vec<J
 
 fn table_factor_name(factor: &TableFactor) -> Option<String> {
     match factor {
-        TableFactor::Table { name, .. } => name.0.last().map(|ident| {
-            ident
-                .value
-                .trim_matches(|ch| ch == '`' || ch == '"')
-                .to_ascii_lowercase()
-        }),
+        TableFactor::Table { name, .. } => {
+            let ident = name.0.last()?.as_ident()?;
+            Some(
+                ident
+                    .value
+                    .trim_matches(|ch| ch == '`' || ch == '"')
+                    .to_ascii_lowercase(),
+            )
+        }
         _ => None,
     }
 }
@@ -933,6 +936,7 @@ fn select_shape(query: &Query) -> Option<(Vec<String>, Vec<String>, bool)> {
         let text = match item {
             SelectItem::UnnamedExpr(expr) => expr.to_string(),
             SelectItem::ExprWithAlias { expr, alias } => format!("{expr} AS {alias}"),
+            SelectItem::ExprWithAliases { .. } => return None,
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => continue,
         };
         if text.trim().is_empty() {

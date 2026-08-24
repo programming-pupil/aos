@@ -369,7 +369,7 @@ pub(super) async fn load_pm_historical_evidence_hints(
     }
     sql.push_str(") ORDER BY avg_confidence DESC, run_count DESC, updated_at DESC LIMIT 12");
 
-    let mut query = sqlx::query(&sql).bind(tenant_id);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(tenant_id);
     for token in tokens {
         query = query.bind(format!("%{}%", token));
     }

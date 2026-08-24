@@ -214,7 +214,8 @@ pub async fn active_profile_ready_for_datasources(
          WHERE tenant_id = ? AND profile_kind = ? AND active_profile_id = ?
            AND status = 'ready' AND datasource_id IN ({placeholders})"
     );
-    let mut query = sqlx::query_scalar::<_, i64>(&query)
+    // The generated fragment contains placeholders only; ids remain bound below.
+    let mut query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(query))
         .bind(tenant_id)
         .bind(profile.config.profile_kind.as_str())
         .bind(&profile.id);

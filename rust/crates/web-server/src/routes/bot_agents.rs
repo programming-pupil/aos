@@ -6003,7 +6003,7 @@ fn bot_queue_recovery_interval() -> Duration {
 }
 
 async fn recover_stale_bot_queue_claims(state: &AppState, timeout_secs: u64) -> Result<u64> {
-    let stale_rows = sqlx::query::<sqlx::Sqlite>(&format!(
+    let stale_rows = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(format!(
         r"
         SELECT tenant_id, id, CAST(content_json AS TEXT) AS content_json,
                attempt_count, max_attempts
@@ -6014,7 +6014,7 @@ async fn recover_stale_bot_queue_claims(state: &AppState, timeout_secs: u64) -> 
           AND claimed_at < datetime(CURRENT_TIMESTAMP, '-{} seconds')
         ",
         timeout_secs
-    ))
+    )))
     .fetch_all(state.control_db())
     .await?;
     if stale_rows.is_empty() {
@@ -6046,7 +6046,7 @@ async fn recover_stale_bot_queue_claims(state: &AppState, timeout_secs: u64) -> 
         timeout_secs
     );
     let dead_count = if has_dead {
-        sqlx::query::<sqlx::Sqlite>(&dead_sql)
+        sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(dead_sql))
             .execute(state.control_db())
             .await?
             .rows_affected()
@@ -6116,7 +6116,7 @@ async fn recover_stale_bot_queue_claims(state: &AppState, timeout_secs: u64) -> 
         timeout_secs
     );
     let recovered_count = if has_retryable {
-        sqlx::query::<sqlx::Sqlite>(&sql)
+        sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(sql))
             .execute(state.control_db())
             .await?
             .rows_affected()
@@ -7624,7 +7624,7 @@ async fn list_channels(
     }
     sql.push_str(" ORDER BY updated_at DESC LIMIT ? OFFSET ?");
 
-    let mut query = sqlx::query::<sqlx::Sqlite>(&sql).bind(&claims.tenant_id);
+    let mut query = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(sql)).bind(&claims.tenant_id);
     if let Some(agent_id) = &params.agent_id {
         query = query.bind(agent_id);
     }
@@ -7955,7 +7955,7 @@ async fn list_logs(
         sql.push_str(" AND channel_id = ?");
     }
     sql.push_str(" ORDER BY created_at DESC LIMIT ? OFFSET ?");
-    let mut query = sqlx::query::<sqlx::Sqlite>(&sql).bind(&claims.tenant_id);
+    let mut query = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(sql)).bind(&claims.tenant_id);
     if let Some(agent_id) = &params.agent_id {
         query = query.bind(agent_id);
     }

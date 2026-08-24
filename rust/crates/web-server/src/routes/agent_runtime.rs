@@ -701,8 +701,9 @@ async fn list_sessions(
     let list_sql = format!(
         "SELECT {RUNTIME_SESSION_SELECT} FROM agent_runtime_sessions{where_sql} ORDER BY updated_at DESC LIMIT ? OFFSET ?"
     );
-    let mut count = sqlx::query_scalar::<_, i64>(&count_sql).bind(&claims.tenant_id);
-    let mut list = sqlx::query(&list_sql).bind(&claims.tenant_id);
+    let mut count =
+        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql)).bind(&claims.tenant_id);
+    let mut list = sqlx::query(sqlx::AssertSqlSafe(list_sql)).bind(&claims.tenant_id);
     if let Some(value) = query
         .status
         .as_deref()
@@ -768,9 +769,9 @@ async fn list_processes(
     .bind(&id)
     .fetch_one(&state.db)
     .await?;
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT {RUNTIME_PROCESS_SELECT} FROM agent_runtime_processes WHERE tenant_id = ? AND runtime_session_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?"
-    ))
+    )))
     .bind(&claims.tenant_id)
     .bind(&id)
     .bind(pagination.limit())
@@ -798,9 +799,9 @@ async fn list_artifacts(
     .bind(&id)
     .fetch_one(&state.db)
     .await?;
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT {RUNTIME_ARTIFACT_SELECT} FROM agent_runtime_artifacts WHERE tenant_id = ? AND runtime_session_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?"
-    ))
+    )))
     .bind(&claims.tenant_id)
     .bind(&id)
     .bind(pagination.limit())
@@ -999,9 +1000,9 @@ async fn get_runtime_session(
     tenant_id: &str,
     id: &str,
 ) -> Result<AgentRuntimeSessionInfo> {
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT {RUNTIME_SESSION_SELECT} FROM agent_runtime_sessions WHERE tenant_id = ? AND id = ?"
-    ))
+    )))
     .bind(tenant_id)
     .bind(id)
     .fetch_optional(db)

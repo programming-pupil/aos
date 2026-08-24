@@ -199,7 +199,8 @@ pub async fn execute_stream(
     let start = Instant::now();
     let fetch_result = tokio::time::timeout(
         Duration::from_secs(timeout_secs as u64),
-        sqlx::query(&hinted_sql).fetch_all(&pool),
+        // `hinted_sql` is derived from the request after the read-only SQL guard.
+        sqlx::query(sqlx::AssertSqlSafe(hinted_sql)).fetch_all(&pool),
     )
     .await;
 

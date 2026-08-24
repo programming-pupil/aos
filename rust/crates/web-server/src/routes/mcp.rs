@@ -1099,9 +1099,9 @@ async fn db_list_servers(
     offset: i64,
     limit: i64,
 ) -> Result<Vec<McpServerInfo>> {
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "{MCP_SELECT_COLUMNS} WHERE tenant_id = ? ORDER BY name ASC LIMIT ? OFFSET ?",
-    ))
+    )))
     .bind(tenant_id)
     .bind(limit)
     .bind(offset)
@@ -1219,9 +1219,9 @@ async fn db_get_server(
     tenant_id: &str,
     name: &str,
 ) -> Result<Option<McpServerInfo>> {
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "{MCP_SELECT_COLUMNS} WHERE tenant_id = ? AND name = ?",
-    ))
+    )))
     .bind(tenant_id)
     .bind(name)
     .fetch_all(db)

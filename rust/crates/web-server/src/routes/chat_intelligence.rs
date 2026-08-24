@@ -1494,7 +1494,7 @@ pub(crate) async fn search_chat_files_internal(
         rows_query.push(')');
     }
     rows_query.push_str(" ORDER BY f.updated_at DESC, c.chunk_index ASC LIMIT 500");
-    let mut query_builder = sqlx::query::<sqlx::Sqlite>(&rows_query)
+    let mut query_builder = sqlx::query::<sqlx::Sqlite>(sqlx::AssertSqlSafe(rows_query))
         .bind(tenant_id)
         .bind(user_id);
     if let Some(session_id) = session_id {

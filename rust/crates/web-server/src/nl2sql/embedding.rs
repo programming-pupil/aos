@@ -1601,7 +1601,8 @@ impl EmbeddingStore {
              FROM nl2sql_table_semantics WHERE datasource_id IN ({}) AND deleted_at IS NULL",
             placeholders.join(", ")
         );
-        let mut q = sqlx::query_as::<_, (String, String, String)>(&query);
+        // The only generated tokens are one placeholder per datasource id.
+        let mut q = sqlx::query_as::<_, (String, String, String)>(sqlx::AssertSqlSafe(query));
         for ds_id in datasource_ids {
             q = q.bind(ds_id);
         }

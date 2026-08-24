@@ -1086,7 +1086,8 @@ async fn update(
             all_updates.join(", ")
         );
         tracing::debug!("data_sources::update: executing: {}", query,);
-        let mut q = sqlx::query(&query);
+        // UPDATE columns are chosen from the fixed allowlist above.
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(query));
         for b in &bindings {
             match b {
                 SqlBindValue::String(s) => q = q.bind(s.as_str()),
