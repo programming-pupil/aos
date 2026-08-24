@@ -49,7 +49,7 @@ Prompt 渲染统一收口到 `web-server/src/routes/builtin_skills.rs` 里的 `P
 如果要显式测试英文内置 skill prompt：
 
 ```bash
-AOS_BUILTIN_SKILL_RUNTIME_PROMPTS=1 cargo run -p web-server --features full
+AOS_BUILTIN_SKILL_RUNTIME_PROMPTS=1 cargo run -p web-server --bin web-server --features full
 ```
 
 这个开关建议只用于评测，不建议在没有 golden tests 和业务 eval 兜底前直接打开生产。

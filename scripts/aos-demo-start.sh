@@ -78,7 +78,7 @@ export RUST_LOG="${RUST_LOG:-web_server=info,agent_gateway=info,runtime=info,tow
 echo "==> Starting web-server with ${DEMO_DATA_DIR}/aos.db (${API_ADDR})"
 (
   cd "$ROOT_DIR/rust"
-  cargo run -p web-server --features full -- --addr "$API_ADDR" --data-dir "$DEMO_DATA_DIR"
+  cargo run -p web-server --bin web-server --features full -- --addr "$API_ADDR" --data-dir "$DEMO_DATA_DIR"
 ) &
 SERVER_PID="$!"
 

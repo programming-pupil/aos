@@ -57,7 +57,7 @@ Prompt rendering is centralized through `PromptRegistry` in
 To explicitly test English built-in skill prompts at runtime:
 
 ```bash
-AOS_BUILTIN_SKILL_RUNTIME_PROMPTS=1 cargo run -p web-server --features full
+AOS_BUILTIN_SKILL_RUNTIME_PROMPTS=1 cargo run -p web-server --bin web-server --features full
 ```
 
 Use that opt-in only when evaluating prompt behavior. Keep it off for production
