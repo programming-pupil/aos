@@ -19,7 +19,7 @@ regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-sqlparser = { version = "0.52", features = ["visitor"] }
+sqlparser = { version = "0.62", features = ["visitor"] }
 sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
