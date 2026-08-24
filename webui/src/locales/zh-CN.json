@@ -2822,6 +2822,7 @@
     "githubTokenMissing": "尚未配置 GitHub Token",
     "githubTokenMissingHelp": "Skill 市场仍可使用，但 GitHub 匿名请求容易触发限流，仓库扫描和安装可能变慢或失败。配置 AOSD_GITHUB_TOKEN 后可获得完整体验。",
     "githubTokenConfigure": "去配置管理",
+    "githubTokenOpenSettings": "前往 GitHub 获取 Token",
     "searchPlaceholder": "搜索 Skill...",
     "add": "添加 Skill",
     "addSkill": "添加 Skill",

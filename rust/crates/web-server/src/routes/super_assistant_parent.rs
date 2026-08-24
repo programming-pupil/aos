@@ -8924,14 +8924,33 @@ async fn persist_parent_final(
     }
     let committed_events =
         commit_parent_final(state, claims, input, &committed_result, elapsed).await?;
-    crate::agent_team::acknowledge_pending_mailbox(
-        &state.db,
-        &claims.tenant_id,
-        &input.session_id,
-        &input.turn_id,
-        None,
+    // A normal Super Assistant session is not an Agent Team coordinator.  Its
+    // parent finalization still shares the mailbox acknowledgement helper with
+    // team-backed turns, but that helper intentionally rejects unregistered
+    // callers.  Only acknowledge when this session actually has a team
+    // membership; otherwise a successful chat would emit a spurious terminal
+    // error after the answer was already committed.
+    let has_agent_team_membership = sqlx::query_scalar::<sqlx::Sqlite, i64>(
+        "SELECT EXISTS(
+             SELECT 1 FROM agent_team_members
+             WHERE tenant_id = ? AND thread_id = ?
+         )",
     )
-    .await?;
+    .bind(&claims.tenant_id)
+    .bind(&input.session_id)
+    .fetch_one(&state.db)
+    .await?
+        != 0;
+    if has_agent_team_membership {
+        crate::agent_team::acknowledge_pending_mailbox(
+            &state.db,
+            &claims.tenant_id,
+            &input.session_id,
+            &input.turn_id,
+            None,
+        )
+        .await?;
+    }
     let newly_committed = !committed_events.is_empty();
     for (seq, event_type, data) in committed_events {
         broadcast_committed_super_assistant_event(

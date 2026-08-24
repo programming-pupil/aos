@@ -38,7 +38,7 @@ use runtime::{
 };
 use serde_json::json;
 use serde_json::Value;
-use sha2::Digest;
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::{timeout, Duration};
@@ -1081,6 +1081,16 @@ impl ProviderRequestLineageRecorder {
             .begin()
             .await
             .map_err(|error| RuntimeError::new(error.to_string()))?;
+        // Acquire the platform writer fence before inserting the immutable
+        // lineage rows. Without this first write, a concurrent checkpoint can
+        // hold SQLite's write lock between our individual inserts and turn a
+        // valid provider attempt into a transient `database is locked` error.
+        sqlx::query::<sqlx::Sqlite>(
+            "UPDATE aos_setup_lock SET lock_id = lock_id WHERE lock_id = 1",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| RuntimeError::new(error.to_string()))?;
         sqlx::query::<sqlx::Sqlite>(
             "INSERT INTO tool_schema_manifests
                 (id, tenant_id, session_id, turn_id, iteration, schema_hash,
@@ -1219,7 +1229,61 @@ impl ProviderRequestLineageRecorder {
             Self::assert_context_request_matches_manifest(&raw_manifest, request)?;
         }
         let prompt_manifest_id = if let Some(id) = trace.prompt_manifest_id.as_ref() {
-            id.clone()
+            // A provider retry may legitimately change the wire model or tool
+            // surface (for example, native web search filters AOS tools and a
+            // fallback key may target another model). Keep the original prompt
+            // immutable, but derive a matching prompt manifest in the same
+            // context lineage for that concrete provider attempt.
+            let prompt_lineage = sqlx::query_as::<sqlx::Sqlite, (String, String)>(
+                "SELECT model, tool_schema_hash
+                 FROM prompt_manifests
+                 WHERE id = ? AND tenant_id = ? AND thread_id = ?",
+            )
+            .bind(id)
+            .bind(&self.tenant_id)
+            .bind(&self.session_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|error| RuntimeError::new(error.to_string()))?
+            .ok_or_else(|| RuntimeError::new("provider prompt manifest does not exist"))?;
+            if prompt_lineage.0 == request.model && prompt_lineage.1 == tool_schema_hash {
+                id.clone()
+            } else {
+                let derived_id = format!(
+                    "provider-prompt:{}",
+                    hex::encode(sha2::Sha256::digest(
+                        format!(
+                            "{}\0{}\0{}\0{}\0{}",
+                            self.tenant_id, self.session_id, id, request.model, tool_schema_hash,
+                        )
+                        .as_bytes(),
+                    ))
+                );
+                sqlx::query::<sqlx::Sqlite>(
+                    "INSERT OR IGNORE INTO prompt_manifests
+                        (id, tenant_id, thread_id, turn_id, iteration, run_id,
+                         prompt_id, version, variant, model, stable_prefix_hash,
+                         task_packet_hash, tool_schema_hash, context_manifest_id,
+                         input_budget, output_budget, trust_policy_version, eval_suite,
+                         manifest_json)
+                     SELECT ?, tenant_id, thread_id, turn_id, iteration, run_id,
+                            prompt_id, version, variant, ?, stable_prefix_hash,
+                            task_packet_hash, ?, context_manifest_id, input_budget,
+                            output_budget, trust_policy_version, eval_suite, manifest_json
+                     FROM prompt_manifests
+                     WHERE id = ? AND tenant_id = ? AND thread_id = ?",
+                )
+                .bind(&derived_id)
+                .bind(&request.model)
+                .bind(&tool_schema_hash)
+                .bind(id)
+                .bind(&self.tenant_id)
+                .bind(&self.session_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                derived_id
+            }
         } else if trace.turn_id.is_some() {
             return Err(RuntimeError::new(
                 "provider dispatch is missing its immutable prompt manifest ID",
@@ -4074,6 +4138,21 @@ impl ApiClient for GatewayApiClient {
             .into_iter()
             .map(|definition| definition.name)
             .collect()
+    }
+
+    fn active_tool_schema_hash(&self) -> Option<String> {
+        let tools_enabled = self.scoped_tools_enabled.unwrap_or(self.enable_tools);
+        let native_search_primary_request = self.request_will_use_native_web_search(
+            &self.provider,
+            &self.model,
+            &self.capabilities,
+        );
+        let tools = tools_enabled.then(|| {
+            self.filter_tool_specs_with_native_search_guard(native_search_primary_request)
+        });
+        serde_json::to_string(&tools)
+            .ok()
+            .map(|schema| hex::encode(Sha256::digest(schema.as_bytes())))
     }
 
     fn active_tool_snapshot_is_authoritative(&self) -> bool {
@@ -12766,6 +12845,7 @@ mod tests {
         .await
         .expect("create provider attempt table");
         for statement in [
+            "CREATE TABLE aos_setup_lock (lock_id INTEGER PRIMARY KEY)",
             "CREATE TABLE context_packet_manifests (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, thread_id TEXT NOT NULL, turn_id TEXT, iteration INTEGER, snapshot_version INTEGER, manifest_hash TEXT NOT NULL, manifest_json TEXT NOT NULL, model_version TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, raw_manifest_hash TEXT, raw_manifest_ciphertext TEXT)",
             "CREATE TABLE prompt_manifests (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, thread_id TEXT NOT NULL, turn_id TEXT, iteration INTEGER, run_id TEXT NOT NULL, prompt_id TEXT NOT NULL, version TEXT NOT NULL, variant TEXT NOT NULL, model TEXT NOT NULL, stable_prefix_hash TEXT NOT NULL, task_packet_hash TEXT NOT NULL, tool_schema_hash TEXT NOT NULL, context_manifest_id TEXT NOT NULL, input_budget INTEGER NOT NULL, output_budget INTEGER NOT NULL, trust_policy_version TEXT NOT NULL, eval_suite TEXT NOT NULL, manifest_json TEXT)",
             "CREATE TABLE tool_schema_manifests (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, turn_id TEXT, iteration INTEGER, schema_hash TEXT NOT NULL, schema_ciphertext TEXT NOT NULL, tool_count INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
@@ -12775,6 +12855,10 @@ mod tests {
         ] {
             sqlx::query(statement).execute(&db).await.unwrap();
         }
+        sqlx::query("INSERT INTO aos_setup_lock (lock_id) VALUES (1)")
+            .execute(&db)
+            .await
+            .expect("seed provider lineage write fence");
         sqlx::query(
             r#"
             CREATE TRIGGER provider_attempt_manifest_lineage_insert
@@ -12927,6 +13011,7 @@ mod tests {
         assert!(first.is_err());
 
         let mut expanded_request = request.clone();
+        expanded_request.model = "gpt-lineage-fallback".to_string();
         expanded_request.max_tokens = 1024;
         let second_db = db.clone();
         let second = run_recorded_provider_attempt(
@@ -13012,6 +13097,11 @@ mod tests {
             assert!(row.get::<Option<String>, _>("prompt_manifest_id").is_some());
             assert!(row.get::<Option<String>, _>("tool_manifest_id").is_some());
         }
+        assert_ne!(
+            rows[0].get::<Option<String>, _>("prompt_manifest_id"),
+            rows[1].get::<Option<String>, _>("prompt_manifest_id"),
+            "a retry with a different wire model must use a derived prompt manifest"
+        );
         let schema_rows: Vec<(String, String, i64, String)> = sqlx::query_as(
             "SELECT id, schema_hash, iteration, schema_ciphertext
              FROM tool_schema_manifests
@@ -13095,11 +13185,24 @@ mod tests {
         assert_eq!(lineage_rows.len(), 3);
         assert!(lineage_rows.iter().all(|row| {
             row.0 == "context-lineage"
-                && row.1 == "prompt-lineage"
                 && !row.2.is_empty()
                 && !row.3.is_empty()
                 && row.4 == rows[0].get::<String, _>("tool_schema_hash")
         }));
+        assert_eq!(lineage_rows[0].1, "prompt-lineage");
+        assert_ne!(lineage_rows[1].1, lineage_rows[0].1);
+        assert_eq!(lineage_rows[2].1, "prompt-lineage");
+        let derived_prompt: (String, String) =
+            sqlx::query_as("SELECT model, tool_schema_hash FROM prompt_manifests WHERE id = ?")
+                .bind(&lineage_rows[1].1)
+                .fetch_one(&db)
+                .await
+                .expect("derived prompt manifest must be persisted");
+        assert_eq!(derived_prompt.0, "gpt-lineage-fallback");
+        assert_eq!(
+            derived_prompt.1,
+            rows[1].get::<String, _>("tool_schema_hash")
+        );
         let artifacts: Vec<(String, i64, String)> = sqlx::query_as(
             "SELECT terminal_status, stream_event_count, payload_ciphertext
              FROM provider_attempt_artifacts AS artifact

@@ -5,7 +5,6 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 DEMO_DATA_DIR="${AOS_DEMO_DATA_DIR:-$ROOT_DIR/.aos-demo-data}"
-DEMO_ENV_FILE="${AOS_DEMO_ENV_FILE:-$DEMO_DATA_DIR/.env}"
 WEB_PORT="${AOS_DEMO_WEB_PORT:-5173}"
 API_ADDR="${AOS_DEMO_API_ADDR:-0.0.0.0:3001}"
 
@@ -37,6 +36,16 @@ if [ "$#" -ne 0 ]; then
   exit 2
 fi
 
+# Runtime workspace validation requires an absolute data directory. Normalize
+# both the default and user-supplied relative overrides before deriving paths.
+case "$DEMO_DATA_DIR" in
+  /*) ;;
+  *) DEMO_DATA_DIR="$ROOT_DIR/$DEMO_DATA_DIR" ;;
+esac
+mkdir -p "$DEMO_DATA_DIR"
+DEMO_DATA_DIR="$(cd "$DEMO_DATA_DIR" && pwd -P)"
+DEMO_ENV_FILE="${AOS_DEMO_ENV_FILE:-$DEMO_DATA_DIR/.env}"
+
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "missing required command: $1" >&2
@@ -58,7 +67,6 @@ require_cmd cargo
 require_cmd npm
 require_cmd openssl
 
-mkdir -p "$DEMO_DATA_DIR"
 if [[ ! -f "$DEMO_ENV_FILE" ]]; then
   "$ROOT_DIR/scripts/generate-env.sh" "$DEMO_ENV_FILE"
 fi

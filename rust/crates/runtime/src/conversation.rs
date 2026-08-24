@@ -438,6 +438,13 @@ pub trait ApiClient: Send + Sync {
         Vec::new()
     }
 
+    /// Hash of the exact serialized tool schema the provider client will put
+    /// on the wire for this sampling step. Production clients should provide
+    /// this so prompt lineage is tied to schemas, not only tool names.
+    fn active_tool_schema_hash(&self) -> Option<String> {
+        None
+    }
+
     /// Whether [`Self::active_tool_names`] is the complete tool surface shown
     /// to the model for this sampling step. Production clients should opt in so
     /// tool availability can be frozen before provider dispatch; compatibility
@@ -2197,9 +2204,14 @@ where
                 hard_input_budget,
             )?;
             let prompt_manifest = prompt_variant.as_ref().map(|variant| {
-                let tool_schema_hash = hex::encode(Sha256::digest(
-                    serde_json::to_vec(&active_tools).unwrap_or_default(),
-                ));
+                let tool_schema_hash =
+                    self.api_client
+                        .active_tool_schema_hash()
+                        .unwrap_or_else(|| {
+                            hex::encode(Sha256::digest(
+                                serde_json::to_vec(&active_tools).unwrap_or_default(),
+                            ))
+                        });
                 agent_protocol::PromptRegistry::manifest(
                     variant,
                     &tool_schema_hash,

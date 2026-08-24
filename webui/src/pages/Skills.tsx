@@ -1029,13 +1029,24 @@ export default function Skills() {
           message={t('skills.githubTokenMissing')}
           description={t('skills.githubTokenMissingHelp')}
           action={(
-            <Button
-              type="link"
-              icon={<SettingOutlined />}
-              onClick={() => navigate('/config/management')}
-            >
-              {t('skills.githubTokenConfigure')}
-            </Button>
+            <Space size="small">
+              <Button
+                type="link"
+                icon={<SettingOutlined />}
+                onClick={() => navigate('/config/management')}
+              >
+                {t('skills.githubTokenConfigure')}
+              </Button>
+              <Button
+                type="link"
+                icon={<LinkOutlined />}
+                href="https://github.com/settings/tokens"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                {t('skills.githubTokenOpenSettings')}
+              </Button>
+            </Space>
           )}
         />
       )}

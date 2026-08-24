@@ -2822,6 +2822,7 @@
     "githubTokenMissing": "GitHub Token is not configured",
     "githubTokenMissingHelp": "The Skill Marketplace remains usable, but anonymous GitHub requests are rate limited and repository scans or installs may become slow or fail. Configure AOSD_GITHUB_TOKEN for the complete experience.",
     "githubTokenConfigure": "Go to configuration",
+    "githubTokenOpenSettings": "Get a GitHub Token",
     "searchPlaceholder": "Search skills...",
     "add": "Add Skill",
     "addSkill": "Add Skill",
