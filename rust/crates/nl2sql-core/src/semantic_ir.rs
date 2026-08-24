@@ -7,8 +7,9 @@
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{
     BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, JoinConstraint, JoinOperator, Query, Select, SelectItem, SetExpr, Statement,
-    TableFactor, TableWithJoins, UnaryOperator, Value,
+    GroupByExpr, JoinConstraint, JoinOperator, LimitClause, OrderByKind, Query, Select,
+    SelectFlavor, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, UnaryOperator,
+    Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -573,15 +574,20 @@ fn parse_normalized_relational_plan(
         filters: Vec::new(),
         group_by: Vec::new(),
         order_by: Vec::new(),
-        limit: query
-            .limit
-            .as_ref()
-            .and_then(|value| value.to_string().parse::<u64>().ok()),
+        limit: normalized_query_limit(query),
         unsupported: Vec::new(),
     };
     compile_query_into_plan(query, &mut plan);
     canonicalize_plan_relations(&mut plan);
     Ok(plan)
+}
+
+fn normalized_query_limit(query: &Query) -> Option<u64> {
+    let limit = match query.limit_clause.as_ref()? {
+        LimitClause::LimitOffset { limit, .. } => limit.as_ref()?,
+        LimitClause::OffsetCommaLimit { limit, .. } => limit,
+    };
+    limit.to_string().parse::<u64>().ok()
 }
 
 fn canonicalize_plan_relations(plan: &mut NormalizedRelationalPlan) {
@@ -860,17 +866,47 @@ fn compile_query_into_plan(query: &Query, plan: &mut NormalizedRelationalPlan) {
         if order_by.interpolate.is_some() {
             plan.unsupported.push("order_by_interpolate".into());
         }
-        plan.order_by.extend(
-            order_by
-                .exprs
-                .iter()
-                .map(|item| (normalize_expression(&item.expr), item.asc.unwrap_or(true))),
-        );
+        match &order_by.kind {
+            OrderByKind::Expressions(expressions) => {
+                if expressions.iter().any(|item| item.with_fill.is_some()) {
+                    plan.unsupported.push("order_by_with_fill".into());
+                }
+                if expressions.iter().any(|item| {
+                    matches!(
+                        &item.expr,
+                        Expr::Identifier(identifier)
+                            if identifier.quote_style.is_none()
+                                && identifier.value.eq_ignore_ascii_case("all")
+                    )
+                }) {
+                    plan.unsupported.push("order_by_all".into());
+                }
+                plan.order_by.extend(expressions.iter().map(|item| {
+                    (
+                        normalize_expression(&item.expr),
+                        item.options.asc.unwrap_or(true),
+                    )
+                }));
+            }
+            OrderByKind::All(_) => plan.unsupported.push("order_by_all".into()),
+        }
     }
-    if query.offset.is_some()
+    let unsupported_limit_clause = query
+        .limit_clause
+        .as_ref()
+        .is_some_and(|clause| match clause {
+            LimitClause::LimitOffset {
+                offset, limit_by, ..
+            } => offset.is_some() || !limit_by.is_empty(),
+            LimitClause::OffsetCommaLimit { .. } => true,
+        });
+    if unsupported_limit_clause
         || query.fetch.is_some()
         || !query.locks.is_empty()
-        || !query.limit_by.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+        || !query.pipe_operators.is_empty()
     {
         plan.unsupported.push("query_pagination_or_locking".into());
     }
@@ -906,7 +942,11 @@ fn compile_select_into_plan(select: &Select, plan: &mut NormalizedRelationalPlan
         || !select.cluster_by.is_empty()
         || !select.distribute_by.is_empty()
         || !select.sort_by.is_empty()
-        || select.connect_by.is_some()
+        || !select.connect_by.is_empty()
+        || select.select_modifiers.is_some()
+        || select.exclude.is_some()
+        || select.value_table_mode.is_some()
+        || select.flavor != SelectFlavor::Standard
     {
         plan.unsupported.push("vendor_select_extension".into());
     }
@@ -925,7 +965,9 @@ fn compile_select_into_plan(select: &Select, plan: &mut NormalizedRelationalPlan
                 expression: normalize_expression(expr),
                 alias: Some(normalize_identifier(&alias.value)),
             },
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => ProjectionBinding {
+            SelectItem::ExprWithAliases { .. }
+            | SelectItem::Wildcard(_)
+            | SelectItem::QualifiedWildcard(_, _) => ProjectionBinding {
                 expression: NormalizedExpression::Unsupported {
                     sql: item.to_string(),
                 },
@@ -982,6 +1024,12 @@ fn compile_select_into_plan(select: &Select, plan: &mut NormalizedRelationalPlan
     if select.distinct.is_some() {
         plan.nodes.push(RelationalPlanNode::Distinct);
     }
+    if !select.named_window.is_empty() {
+        plan.unsupported.push("named_window_definition".into());
+    }
+    if select.qualify.is_some() {
+        plan.unsupported.push("qualify_clause".into());
+    }
     if !select.named_window.is_empty()
         || select.qualify.is_some()
         || plan.projections.iter().any(|projection| {
@@ -1007,29 +1055,31 @@ fn compile_table_with_joins(table: &TableWithJoins, plan: &mut NormalizedRelatio
     for join in &table.joins {
         let relation = compile_table_factor(&join.relation, plan);
         let (join_type, predicate) = match &join.join_operator {
-            JoinOperator::Inner(constraint) => ("inner", normalize_join_constraint(constraint)),
-            JoinOperator::LeftOuter(constraint) => {
+            JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => {
+                ("inner", normalize_join_constraint(constraint))
+            }
+            JoinOperator::Left(constraint) | JoinOperator::LeftOuter(constraint) => {
                 ("left_outer", normalize_join_constraint(constraint))
             }
-            JoinOperator::RightOuter(constraint) => {
+            JoinOperator::Right(constraint) | JoinOperator::RightOuter(constraint) => {
                 ("right_outer", normalize_join_constraint(constraint))
             }
             JoinOperator::FullOuter(constraint) => {
                 ("full_outer", normalize_join_constraint(constraint))
             }
-            JoinOperator::LeftSemi(constraint) => {
+            JoinOperator::Semi(constraint) | JoinOperator::LeftSemi(constraint) => {
                 ("left_semi", normalize_join_constraint(constraint))
             }
             JoinOperator::RightSemi(constraint) => {
                 ("right_semi", normalize_join_constraint(constraint))
             }
-            JoinOperator::LeftAnti(constraint) => {
+            JoinOperator::Anti(constraint) | JoinOperator::LeftAnti(constraint) => {
                 ("left_anti", normalize_join_constraint(constraint))
             }
             JoinOperator::RightAnti(constraint) => {
                 ("right_anti", normalize_join_constraint(constraint))
             }
-            JoinOperator::CrossJoin => ("cross", None),
+            JoinOperator::CrossJoin(constraint) => ("cross", normalize_join_constraint(constraint)),
             JoinOperator::AsOf {
                 match_condition,
                 constraint,
@@ -1046,9 +1096,18 @@ fn compile_table_with_joins(table: &TableWithJoins, plan: &mut NormalizedRelatio
                 });
                 ("as_of", predicate)
             }
+            JoinOperator::StraightJoin(constraint) => {
+                ("inner", normalize_join_constraint(constraint))
+            }
             JoinOperator::CrossApply | JoinOperator::OuterApply => {
                 plan.unsupported.push("apply_join".into());
                 ("unsupported_apply", None)
+            }
+            JoinOperator::ArrayJoin
+            | JoinOperator::LeftArrayJoin
+            | JoinOperator::InnerArrayJoin => {
+                plan.unsupported.push("array_join".into());
+                ("unsupported_array_join", None)
             }
         };
         if predicate
@@ -1077,19 +1136,35 @@ fn compile_table_factor(
             args,
             with_hints,
             version,
-            ..
-        } if args.is_none() && with_hints.is_empty() && version.is_none() => RelationBinding {
-            relation: normalize_object_name(name),
-            alias: alias
-                .as_ref()
-                .map(|value| normalize_identifier(&value.name.value)),
-            derived: false,
-        },
+            with_ordinality,
+            partitions,
+            json_path,
+            sample,
+            index_hints,
+        } if args.is_none()
+            && with_hints.is_empty()
+            && version.is_none()
+            && !with_ordinality
+            && partitions.is_empty()
+            && json_path.is_none()
+            && sample.is_none()
+            && index_hints.is_empty()
+            && name.0.iter().all(|part| part.as_ident().is_some()) =>
+        {
+            RelationBinding {
+                relation: normalize_object_name(name),
+                alias: alias
+                    .as_ref()
+                    .map(|value| normalize_identifier(&value.name.value)),
+                derived: false,
+            }
+        }
         TableFactor::Derived {
             lateral,
             subquery,
             alias,
-        } if !lateral => {
+            sample,
+        } if !lateral && sample.is_none() => {
             compile_query_into_plan(subquery, plan);
             RelationBinding {
                 relation: alias.as_ref().map_or_else(
@@ -1134,9 +1209,18 @@ fn normalize_join_constraint(constraint: &JoinConstraint) -> Option<NormalizedEx
             name: "using".into(),
             arguments: columns
                 .iter()
-                .map(|column| NormalizedExpression::Column {
-                    relation: None,
-                    name: normalize_identifier(&column.value),
+                .map(|column| {
+                    if column.0.len() == 1 {
+                        if let Some(identifier) = column.0[0].as_ident() {
+                            return NormalizedExpression::Column {
+                                relation: None,
+                                name: normalize_identifier(&identifier.value),
+                            };
+                        }
+                    }
+                    NormalizedExpression::Unsupported {
+                        sql: column.to_string(),
+                    }
                 })
                 .collect(),
             distinct: false,
@@ -1170,8 +1254,12 @@ fn normalize_expression(expression: &Expr) -> NormalizedExpression {
         Expr::Value(value) => NormalizedExpression::Literal {
             value: normalize_literal(value),
         },
-        Expr::TypedString { data_type, value } => NormalizedExpression::Literal {
-            value: format!("{}:{}", data_type.to_string().to_ascii_lowercase(), value),
+        Expr::TypedString(value) => NormalizedExpression::Literal {
+            value: format!(
+                "{}:{}",
+                value.data_type.to_string().to_ascii_lowercase(),
+                normalize_literal(&value.value)
+            ),
         },
         Expr::Nested(inner) => normalize_expression(inner),
         Expr::BinaryOp { left, op, right } => NormalizedExpression::Binary {
@@ -1273,17 +1361,16 @@ fn normalize_expression(expression: &Expr) -> NormalizedExpression {
         Expr::Case {
             operand,
             conditions,
-            results,
             else_result,
-        } if conditions.len() == results.len() => NormalizedExpression::Case {
+            ..
+        } => NormalizedExpression::Case {
             operand: operand.as_deref().map(normalize_expression).map(Box::new),
             branches: conditions
                 .iter()
-                .zip(results)
-                .map(|(condition, result)| {
+                .map(|branch| {
                     (
-                        normalize_expression(condition),
-                        normalize_expression(result),
+                        normalize_expression(&branch.condition),
+                        normalize_expression(&branch.result),
                     )
                 })
                 .collect(),
@@ -1339,7 +1426,12 @@ fn normalize_object_name(value: &sqlparser::ast::ObjectName) -> String {
     value
         .0
         .iter()
-        .map(|part| normalize_identifier(&part.value))
+        .map(|part| {
+            part.as_ident().map_or_else(
+                || normalize_sql_fragment(&part.to_string()),
+                |identifier| normalize_identifier(&identifier.value),
+            )
+        })
         .collect::<Vec<_>>()
         .join(".")
 }
@@ -1647,7 +1739,9 @@ fn parse_normalized_expression(value: &str) -> Option<NormalizedExpression> {
         | SelectItem::ExprWithAlias {
             expr: expression, ..
         } => Some(normalize_expression(expression)),
-        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => None,
+        SelectItem::ExprWithAliases { .. }
+        | SelectItem::Wildcard(_)
+        | SelectItem::QualifiedWildcard(_, _) => None,
     }
 }
 
@@ -3908,6 +4002,52 @@ mod tests {
             ),
             Err(RelationalPlanError::UnsupportedForSemanticProof(_))
         ));
+    }
+
+    #[test]
+    fn sqlparser_upgrade_preserves_supported_relational_semantics() {
+        let plan = compile_normalized_relational_plan(
+            "SELECT CASE WHEN amount > 0 THEN DATE '2026-08-15' ELSE DATE '2026-08-16' END AS bucket \
+             FROM sales ORDER BY bucket DESC LIMIT 10",
+        )
+        .unwrap();
+        assert_eq!(plan.limit, Some(10));
+        assert_eq!(plan.order_by.len(), 1);
+        assert!(!plan.order_by[0].1);
+        assert!(matches!(
+            plan.projections[0].expression,
+            NormalizedExpression::Case { .. }
+        ));
+
+        let join = compile_normalized_relational_plan(
+            "SELECT a.id FROM accounts a LEFT JOIN events e ON a.id = e.account_id \
+             ORDER BY a.id LIMIT 5",
+        )
+        .unwrap();
+        assert_eq!(join.limit, Some(5));
+        assert!(join.nodes.iter().any(|node| matches!(
+            node,
+            RelationalPlanNode::Join { join_type, .. } if join_type == "left_outer"
+        )));
+    }
+
+    #[test]
+    fn sqlparser_upgrade_extensions_fail_closed() {
+        for sql in [
+            "SELECT id FROM sales ORDER BY ALL",
+            "SELECT id FROM sales QUALIFY row_number() OVER (ORDER BY id) = 1",
+            "SELECT amount, SUM(amount) OVER w FROM sales WINDOW w AS (ORDER BY day)",
+            "SELECT id FROM sales TABLESAMPLE SYSTEM (10)",
+            "SELECT id FROM sales LIMIT 5 OFFSET 1",
+        ] {
+            assert!(
+                matches!(
+                    compile_normalized_relational_plan(sql),
+                    Err(RelationalPlanError::UnsupportedForSemanticProof(_))
+                ),
+                "expected semantic proof to reject {sql}"
+            );
+        }
     }
 
     #[test]
