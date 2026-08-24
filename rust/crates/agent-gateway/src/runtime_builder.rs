@@ -1038,6 +1038,30 @@ impl ProviderRequestLineageRecorder {
             RuntimeError::new(format!("cannot serialize provider tool schema: {error}"))
         })?;
         let tool_schema_hash = hex::encode(sha2::Sha256::digest(tool_schema_json.as_bytes()));
+        let tool_manifest_id = format!(
+            "tool-manifest:{}",
+            hex::encode(sha2::Sha256::digest(
+                format!(
+                    "{}:{}:{}:{}",
+                    self.tenant_id, self.session_id, trace.request_group_id, tool_schema_hash
+                )
+                .as_bytes(),
+            )),
+        );
+        let tool_schema_ciphertext = crate::crypto::encrypt_scoped(
+            &tool_schema_json,
+            &crate::crypto::scoped_aad(
+                "tool_schema_manifest.schema",
+                &self.tenant_id,
+                &tool_manifest_id,
+            ),
+        )
+        .map_err(|error| {
+            RuntimeError::new(format!("cannot protect tool schema manifest: {error}"))
+        })?;
+        let tool_count = request.tools.as_ref().map_or(0_i64, |tools| {
+            i64::try_from(tools.len()).unwrap_or(i64::MAX)
+        });
         let extra_body_hash = request.extra_body.as_ref().map(|extra_body| {
             hex::encode(sha2::Sha256::digest(
                 serde_json::to_vec(extra_body).unwrap_or_default(),
@@ -1057,6 +1081,24 @@ impl ProviderRequestLineageRecorder {
             .begin()
             .await
             .map_err(|error| RuntimeError::new(error.to_string()))?;
+        sqlx::query::<sqlx::Sqlite>(
+            "INSERT INTO tool_schema_manifests
+                (id, tenant_id, session_id, turn_id, iteration, schema_hash,
+                 schema_ciphertext, tool_count, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(&tool_manifest_id)
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(&trace.turn_id)
+        .bind(trace.iteration.and_then(|value| i64::try_from(value).ok()))
+        .bind(&tool_schema_hash)
+        .bind(&tool_schema_ciphertext)
+        .bind(tool_count)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| RuntimeError::new(error.to_string()))?;
         let context_manifest_id = if let Some(id) = trace.context_manifest_id.as_ref() {
             id.clone()
         } else if trace.turn_id.is_some() {
@@ -1258,12 +1300,6 @@ impl ProviderRequestLineageRecorder {
         let parent_attempt_id = latest.map(|(id, _)| id);
         let id = uuid::Uuid::new_v4().to_string();
         let provider_kind = format!("{:?}", provider.provider_kind());
-        let tool_manifest_id = format!(
-            "tool-manifest:{}",
-            hex::encode(sha2::Sha256::digest(
-                format!("{}\0{}\0{}", self.tenant_id, id, tool_schema_hash).as_bytes()
-            ))
-        );
         let wire_manifest_id = format!(
             "wire-manifest:{}",
             hex::encode(sha2::Sha256::digest(
@@ -1338,7 +1374,8 @@ impl ProviderRequestLineageRecorder {
                 (id, tenant_id, session_id, turn_id, context_manifest_id,
                  prompt_manifest_id, provider_kind, model, canonical_schema_hash,
                  schema_ciphertext, permission_policy_version, tool_search_revision)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'gateway-permission-toolsearch-v1', ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'gateway-permission-toolsearch-v1', ?)
+             ON CONFLICT(id) DO NOTHING",
         )
         .bind(&tool_manifest_id)
         .bind(&self.tenant_id)
@@ -12723,14 +12760,52 @@ mod tests {
         .await
         .expect("create provider attempt table");
         for statement in [
-            "CREATE TABLE context_packet_manifests (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, thread_id TEXT NOT NULL, turn_id TEXT, snapshot_version INTEGER, manifest_hash TEXT NOT NULL, manifest_json TEXT NOT NULL, model_version TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, raw_manifest_hash TEXT, raw_manifest_ciphertext TEXT)",
-            "CREATE TABLE prompt_manifests (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, thread_id TEXT NOT NULL, turn_id TEXT, run_id TEXT NOT NULL, prompt_id TEXT NOT NULL, version TEXT NOT NULL, variant TEXT NOT NULL, model TEXT NOT NULL, stable_prefix_hash TEXT NOT NULL, task_packet_hash TEXT NOT NULL, tool_schema_hash TEXT NOT NULL, context_manifest_id TEXT NOT NULL, input_budget INTEGER NOT NULL, output_budget INTEGER NOT NULL, trust_policy_version TEXT NOT NULL, eval_suite TEXT NOT NULL, manifest_json TEXT)",
+            "CREATE TABLE context_packet_manifests (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, thread_id TEXT NOT NULL, turn_id TEXT, iteration INTEGER, snapshot_version INTEGER, manifest_hash TEXT NOT NULL, manifest_json TEXT NOT NULL, model_version TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, raw_manifest_hash TEXT, raw_manifest_ciphertext TEXT)",
+            "CREATE TABLE prompt_manifests (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, thread_id TEXT NOT NULL, turn_id TEXT, iteration INTEGER, run_id TEXT NOT NULL, prompt_id TEXT NOT NULL, version TEXT NOT NULL, variant TEXT NOT NULL, model TEXT NOT NULL, stable_prefix_hash TEXT NOT NULL, task_packet_hash TEXT NOT NULL, tool_schema_hash TEXT NOT NULL, context_manifest_id TEXT NOT NULL, input_budget INTEGER NOT NULL, output_budget INTEGER NOT NULL, trust_policy_version TEXT NOT NULL, eval_suite TEXT NOT NULL, manifest_json TEXT)",
+            "CREATE TABLE tool_schema_manifests (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, turn_id TEXT, iteration INTEGER, schema_hash TEXT NOT NULL, schema_ciphertext TEXT NOT NULL, tool_count INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
             "CREATE TABLE tool_manifests (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, turn_id TEXT, context_manifest_id TEXT NOT NULL, prompt_manifest_id TEXT, provider_kind TEXT NOT NULL, model TEXT NOT NULL, canonical_schema_hash TEXT NOT NULL, schema_ciphertext TEXT NOT NULL, permission_policy_version TEXT NOT NULL, tool_search_revision TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)",
             "CREATE TABLE wire_attempt_manifests (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, turn_id TEXT, attempt_id TEXT NOT NULL UNIQUE, context_manifest_id TEXT NOT NULL, prompt_manifest_id TEXT, tool_manifest_id TEXT NOT NULL, provider_kind TEXT NOT NULL, model TEXT NOT NULL, endpoint_hash TEXT, capability_profile_version TEXT NOT NULL, request_hash TEXT NOT NULL, wire_tool_schema_hash TEXT NOT NULL, parent_attempt_id TEXT, retry_reason TEXT, cache_key_hash TEXT, cache_status TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)",
             "CREATE TABLE provider_attempt_artifacts (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, attempt_id TEXT NOT NULL UNIQUE, terminal_status TEXT NOT NULL, stream_event_count INTEGER NOT NULL, payload_hash TEXT NOT NULL, payload_ciphertext TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)",
         ] {
             sqlx::query(statement).execute(&db).await.unwrap();
         }
+        sqlx::query(
+            r#"
+            CREATE TRIGGER provider_attempt_manifest_lineage_insert
+            BEFORE INSERT ON provider_request_attempts
+            BEGIN
+              SELECT CASE
+                WHEN NEW.tool_manifest_id IS NULL OR NOT EXISTS (
+                  SELECT 1 FROM tool_schema_manifests
+                  WHERE id = NEW.tool_manifest_id AND tenant_id = NEW.tenant_id
+                    AND session_id = NEW.session_id
+                    AND turn_id IS NEW.turn_id AND iteration IS NEW.iteration
+                    AND schema_hash = NEW.tool_schema_hash
+                ) THEN RAISE(ABORT, 'provider attempt tool manifest is missing')
+                WHEN (NEW.context_manifest_id IS NULL) <> (NEW.prompt_manifest_id IS NULL)
+                  THEN RAISE(ABORT, 'provider attempt context/prompt lineage is incomplete')
+                WHEN NEW.context_manifest_id IS NOT NULL AND NOT EXISTS (
+                  SELECT 1 FROM context_packet_manifests
+                  WHERE id = NEW.context_manifest_id AND tenant_id = NEW.tenant_id
+                    AND thread_id = NEW.session_id
+                    AND turn_id IS NEW.turn_id AND iteration IS NEW.iteration
+                ) THEN RAISE(ABORT, 'provider attempt context manifest is missing')
+                WHEN NEW.prompt_manifest_id IS NOT NULL AND NOT EXISTS (
+                  SELECT 1 FROM prompt_manifests
+                  WHERE id = NEW.prompt_manifest_id AND tenant_id = NEW.tenant_id
+                    AND thread_id = NEW.session_id
+                    AND turn_id IS NEW.turn_id AND iteration IS NEW.iteration
+                    AND model = NEW.model
+                    AND tool_schema_hash = NEW.tool_schema_hash
+                    AND context_manifest_id IS NEW.context_manifest_id
+                ) THEN RAISE(ABORT, 'provider attempt prompt manifest is missing')
+              END;
+            END;
+            "#,
+        )
+        .execute(&db)
+        .await
+        .expect("create provider manifest lineage trigger");
         let exact_context = json!({
             "schemaVersion": "context-manifest-v2",
             "systemSections": [],
@@ -12743,13 +12818,13 @@ mod tests {
             &crate::crypto::scoped_aad("context_manifest.raw", "tenant-lineage", "context-lineage"),
         )
         .expect("encrypt exact provider context fixture");
-        sqlx::query("INSERT INTO context_packet_manifests (id, tenant_id, thread_id, turn_id, snapshot_version, manifest_hash, manifest_json, raw_manifest_hash, raw_manifest_ciphertext) VALUES ('context-lineage', 'tenant-lineage', 'session-lineage', 'turn-lineage', 1, 'redacted-hash', '{}', ?, ?)")
+        sqlx::query("INSERT INTO context_packet_manifests (id, tenant_id, thread_id, turn_id, iteration, snapshot_version, manifest_hash, manifest_json, raw_manifest_hash, raw_manifest_ciphertext) VALUES ('context-lineage', 'tenant-lineage', 'session-lineage', 'turn-lineage', 7, 1, 'redacted-hash', '{}', ?, ?)")
             .bind(&exact_context_hash)
             .bind(exact_context_ciphertext)
             .execute(&db)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO prompt_manifests (id, tenant_id, thread_id, turn_id, run_id, prompt_id, version, variant, model, stable_prefix_hash, task_packet_hash, tool_schema_hash, context_manifest_id, input_budget, output_budget, trust_policy_version, eval_suite) VALUES ('prompt-lineage', 'tenant-lineage', 'session-lineage', 'turn-lineage', 'run-lineage', 'test', '1', 'test', 'gpt-lineage', 'stable', 'task', 'tools', 'context-lineage', 1000, 512, 'test', 'test')")
+        sqlx::query("INSERT INTO prompt_manifests (id, tenant_id, thread_id, turn_id, iteration, run_id, prompt_id, version, variant, model, stable_prefix_hash, task_packet_hash, tool_schema_hash, context_manifest_id, input_budget, output_budget, trust_policy_version, eval_suite) VALUES ('prompt-lineage', 'tenant-lineage', 'session-lineage', 'turn-lineage', 7, 'run-lineage', 'test', '1', 'test', 'gpt-lineage', 'stable', 'task', 'tools', 'context-lineage', 1000, 512, 'test', 'test')")
             .execute(&db)
             .await
             .unwrap();
@@ -12810,6 +12885,15 @@ mod tests {
             reasoning_effort: Some("high".to_string()),
             ..Default::default()
         };
+        let request_tool_schema_json =
+            serde_json::to_string(&request.tools).expect("serialize lineage tool schema");
+        let request_tool_schema_hash =
+            hex::encode(sha2::Sha256::digest(request_tool_schema_json.as_bytes()));
+        sqlx::query("UPDATE prompt_manifests SET tool_schema_hash = ? WHERE id = 'prompt-lineage'")
+            .bind(request_tool_schema_hash)
+            .execute(&db)
+            .await
+            .expect("align prompt fixture tool schema hash");
 
         let first_db = db.clone();
         let first = run_recorded_provider_attempt(
@@ -12884,7 +12968,7 @@ mod tests {
             },
         )
         .await;
-        assert!(third.is_ok());
+        assert!(third.is_ok(), "third attempt failed: {third:?}");
 
         let rows = sqlx::query(
             "SELECT id, parent_attempt_id, attempt_index, status, search_stage,
@@ -12922,6 +13006,40 @@ mod tests {
             assert!(row.get::<Option<String>, _>("prompt_manifest_id").is_some());
             assert!(row.get::<Option<String>, _>("tool_manifest_id").is_some());
         }
+        let schema_rows: Vec<(String, String, i64, String)> = sqlx::query_as(
+            "SELECT id, schema_hash, iteration, schema_ciphertext
+             FROM tool_schema_manifests
+             WHERE tenant_id = 'tenant-lineage'
+               AND session_id = 'session-lineage'
+               AND turn_id = 'turn-lineage'",
+        )
+        .fetch_all(&db)
+        .await
+        .expect("load durable tool schema manifest");
+        assert_eq!(schema_rows.len(), 1);
+        assert_eq!(
+            schema_rows[0].0,
+            rows[0]
+                .get::<Option<String>, _>("tool_manifest_id")
+                .unwrap()
+        );
+        assert_eq!(
+            schema_rows[0].1,
+            rows[0].get::<String, _>("tool_schema_hash")
+        );
+        assert_eq!(schema_rows[0].2, 7);
+        assert_eq!(
+            crate::crypto::decrypt_scoped(
+                &schema_rows[0].3,
+                &crate::crypto::scoped_aad(
+                    "tool_schema_manifest.schema",
+                    "tenant-lineage",
+                    &schema_rows[0].0,
+                ),
+            )
+            .expect("decrypt durable tool schema manifest"),
+            request_tool_schema_json
+        );
         assert_eq!(
             rows[2].get::<Option<String>, _>("context_manifest_key"),
             trace.context_manifest_key

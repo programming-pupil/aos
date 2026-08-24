@@ -11224,6 +11224,13 @@ const CIPHERTEXT_STORES: &[CiphertextStoreDescriptor] = &[
         "tool_schema_ciphertext",
     ),
     ciphertext_store(
+        "tool_schema_manifest.schema",
+        "tool_schema_manifests",
+        "id",
+        "tenant_id",
+        "schema_ciphertext",
+    ),
+    ciphertext_store(
         "tool_manifest.schema",
         "tool_manifests",
         "id",
