@@ -7,6 +7,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 DEMO_DATA_DIR="${AOS_DEMO_DATA_DIR:-$ROOT_DIR/.aos-demo-data}"
 WEB_PORT="${AOS_DEMO_WEB_PORT:-5173}"
 API_ADDR="${AOS_DEMO_API_ADDR:-0.0.0.0:3001}"
+API_READY_TIMEOUT_SECS="${AOS_DEMO_API_READY_TIMEOUT_SECS:-1800}"
 
 usage() {
   cat <<'USAGE'
@@ -19,6 +20,9 @@ Environment overrides:
   AOS_DEMO_ENV_FILE=.aos-demo-data/.env
   AOS_DEMO_WEB_PORT=5173
   AOS_DEMO_API_ADDR=0.0.0.0:3001
+  AOS_DEMO_API_READY_TIMEOUT_SECS=1800
+  AOS_DEMO_API_READY_URL=http://127.0.0.1:3001/api/v1/setup/check
+  AOS_DEMO_API_PROXY_TARGET=http://127.0.0.1:3001
   JWT_SECRET=...
   ENCRYPTION_KEY=...
   TOKEN_ENCRYPTION_KEY=...
@@ -53,6 +57,45 @@ require_cmd() {
   fi
 }
 
+process_is_running() {
+  local target_pid="$1"
+  local process_state
+  kill -0 "$target_pid" >/dev/null 2>&1 || return 1
+  process_state="$(ps -p "$target_pid" -o stat= 2>/dev/null | awk '{print $1}')"
+  case "$process_state" in
+    ""|Z*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+wait_for_backend() {
+  local pid="$1"
+  local started_at="$(date +%s)"
+  local elapsed=0
+  local server_status=0
+
+  echo "==> Waiting for web-server readiness at ${API_READY_URL}"
+  while [ "$elapsed" -lt "$API_READY_TIMEOUT_SECS" ]; do
+    if ! process_is_running "$pid"; then
+      wait "$pid" || server_status="$?"
+      echo "web-server exited before becoming ready (status ${server_status})" >&2
+      return 1
+    fi
+    if curl --connect-timeout 1 --max-time 2 -fsS "$API_READY_URL" >/dev/null 2>&1; then
+      echo "==> Web-server is ready"
+      return 0
+    fi
+    sleep 1
+    elapsed=$(( $(date +%s) - started_at ))
+    if [ $((elapsed % 15)) -eq 0 ]; then
+      echo "    still waiting for web-server (${elapsed}s elapsed)"
+    fi
+  done
+
+  echo "web-server did not become ready within ${API_READY_TIMEOUT_SECS}s" >&2
+  return 1
+}
+
 cleanup() {
   if [ -n "${SERVER_PID:-}" ] && kill -0 "$SERVER_PID" >/dev/null 2>&1; then
     kill "$SERVER_PID" >/dev/null 2>&1 || true
@@ -66,6 +109,33 @@ trap cleanup EXIT INT TERM
 require_cmd cargo
 require_cmd npm
 require_cmd openssl
+require_cmd curl
+
+case "$API_READY_TIMEOUT_SECS" in
+  ''|*[!0-9]*)
+    echo "AOS_DEMO_API_READY_TIMEOUT_SECS must be a positive integer" >&2
+    exit 2
+    ;;
+esac
+if [ "$API_READY_TIMEOUT_SECS" -lt 1 ]; then
+  echo "AOS_DEMO_API_READY_TIMEOUT_SECS must be a positive integer" >&2
+  exit 2
+fi
+
+API_PORT="${API_ADDR##*:}"
+API_PORT="${API_PORT%]}"
+case "$API_PORT" in
+  ''|*[!0-9]*)
+    echo "cannot derive readiness port from AOS_DEMO_API_ADDR=${API_ADDR}" >&2
+    exit 2
+    ;;
+esac
+if [ "$API_PORT" -lt 1 ] || [ "$API_PORT" -gt 65535 ]; then
+  echo "AOS_DEMO_API_ADDR port must be between 1 and 65535" >&2
+  exit 2
+fi
+API_READY_URL="${AOS_DEMO_API_READY_URL:-http://127.0.0.1:${API_PORT}/api/v1/setup/check}"
+export AOS_DEMO_API_PROXY_TARGET="${AOS_DEMO_API_PROXY_TARGET:-http://127.0.0.1:${API_PORT}}"
 
 if [[ ! -f "$DEMO_ENV_FILE" ]]; then
   "$ROOT_DIR/scripts/generate-env.sh" "$DEMO_ENV_FILE"
@@ -86,7 +156,7 @@ export RUST_LOG="${RUST_LOG:-web_server=info,agent_gateway=info,runtime=info,tow
 echo "==> Starting web-server with ${DEMO_DATA_DIR}/aos.db (${API_ADDR})"
 (
   cd "$ROOT_DIR/rust"
-  cargo run -p web-server --bin web-server --features full -- --addr "$API_ADDR" --data-dir "$DEMO_DATA_DIR"
+  exec cargo run -p web-server --bin web-server --features full -- --addr "$API_ADDR" --data-dir "$DEMO_DATA_DIR"
 ) &
 SERVER_PID="$!"
 
@@ -98,6 +168,8 @@ echo "==> Installing WebUI dependencies if needed"
   fi
 )
 
+wait_for_backend "$SERVER_PID"
+
 echo "==> Starting WebUI on http://localhost:${WEB_PORT}"
 (
   cd "$ROOT_DIR/webui"
@@ -107,7 +179,7 @@ WEB_PID="$!"
 
 cat <<EOF
 
-AOS demo is starting.
+AOS demo is ready.
 
 Open:
   http://localhost:${WEB_PORT}

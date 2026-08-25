@@ -2,6 +2,8 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
 
+const apiProxyTarget = process.env.AOS_DEMO_API_PROXY_TARGET?.trim() || 'http://localhost:3001';
+
 export default defineConfig({
   plugins: [
     // The entry module owns the React root and must be reloaded as a document,
@@ -77,11 +79,11 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:3001',
+        target: apiProxyTarget,
         changeOrigin: true,
       },
       '/ws': {
-        target: 'http://localhost:3001',
+        target: apiProxyTarget,
         ws: true,
         changeOrigin: true,
       },
