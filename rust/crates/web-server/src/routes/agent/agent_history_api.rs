@@ -312,6 +312,7 @@ fn durable_history_plain_content(content: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn visible_history_user_content(content: &str) -> String {
     let plain = durable_history_plain_content(content);
     let cutoff = [
@@ -326,6 +327,7 @@ fn visible_history_user_content(content: &str) -> String {
     plain[..cutoff].trim().to_string()
 }
 
+#[cfg(test)]
 fn history_user_identity_content(content: &str) -> String {
     let visible = visible_history_user_content(content);
     let Some(command) = visible.strip_prefix('/') else {

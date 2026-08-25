@@ -462,10 +462,7 @@ mod tests {
             ("agent_context_archives", "idx_context_archive_keyset"),
             ("chat_turn_artifacts", "idx_chat_artifact_keyset"),
             ("agent_workspace_entries", "idx_workspace_shared_keyset"),
-            (
-                "agent_event_ledger",
-                "idx_agent_event_ledger_checkpoint",
-            ),
+            ("agent_event_ledger", "idx_agent_event_ledger_checkpoint"),
         ] {
             let count = sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM sqlite_schema \
