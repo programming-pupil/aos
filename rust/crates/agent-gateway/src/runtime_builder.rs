@@ -1920,6 +1920,12 @@ impl GatewayApiClient {
                 "AskUserQuestion",
                 "ToolSearch",
                 "complete_turn",
+                // Codex-aligned execution primitives. They remain subject to the
+                // session permission policy and scenario-specific blocking below:
+                // bash is classified per command and Agent runs with its own
+                // restricted sub-agent tool set.
+                "bash",
+                "Agent",
                 "read_file",
                 "write_file",
                 "edit_file",
@@ -12685,6 +12691,12 @@ mod tests {
         let default_chat_tools = client.filter_tool_specs();
         assert!(default_chat_tools
             .iter()
+            .any(|definition| definition.name == "bash"));
+        assert!(default_chat_tools
+            .iter()
+            .any(|definition| definition.name == "Agent"));
+        assert!(default_chat_tools
+            .iter()
             .any(|definition| definition.name == "write_file"));
         assert!(default_chat_tools
             .iter()
@@ -12730,6 +12742,14 @@ mod tests {
             .filter_tool_specs()
             .iter()
             .any(|definition| definition.name == deferred));
+        assert!(!client
+            .filter_tool_specs()
+            .iter()
+            .any(|definition| definition.name == "bash"));
+        assert!(!client
+            .filter_tool_specs()
+            .iter()
+            .any(|definition| definition.name == "Agent"));
     }
 
     #[test]
