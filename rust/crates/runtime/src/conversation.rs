@@ -1318,6 +1318,13 @@ where
         cancellation
     }
 
+    /// Attach a coordinator-owned cancellation authority to the next turn.
+    /// This is used by durable parent/child orchestration so cancelling a
+    /// child task reaches the provider loop and every tool invocation it owns.
+    pub fn begin_cancellable_turn_with(&mut self, cancellation: RuntimeCancellationToken) {
+        self.turn_cancellation = cancellation;
+    }
+
     #[must_use]
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
         self.max_iterations = max_iterations;

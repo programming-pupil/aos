@@ -43,6 +43,7 @@ mod sandbox_backend;
 mod session;
 pub mod session_control;
 pub use session_control::SessionStore;
+pub mod agent_coordinator;
 pub mod egress;
 pub mod execution_kernel;
 pub mod isolation;
@@ -79,6 +80,15 @@ pub(crate) fn behavior_trace(case_id: &str) {
         }
     }
 }
+
+/// Process cwd is global to the process. All tool executors that temporarily
+/// switch it must share this lock across runtime consumers and crates.
+pub fn tool_cwd_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+pub use agent_coordinator::AgentCoordinator;
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
 pub use compact::{

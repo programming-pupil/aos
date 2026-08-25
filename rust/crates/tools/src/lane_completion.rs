@@ -109,6 +109,7 @@ mod tests {
             completed_at: Some("2024-01-01T00:00:00Z".to_string()),
             lane_events: vec![],
             derived_state: "working".to_string(),
+            coordinator_task_id: None,
             current_blocker: None,
             error: None,
         }

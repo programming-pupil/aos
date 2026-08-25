@@ -1926,6 +1926,20 @@ impl GatewayApiClient {
                 // restricted sub-agent tool set.
                 "bash",
                 "Agent",
+                "TodoWrite",
+                "TaskCreate",
+                "TaskStart",
+                "TaskGet",
+                "TaskList",
+                "TaskStop",
+                "TaskUpdate",
+                "TaskOutput",
+                "TaskPlan",
+                "TaskPlanStep",
+                "TaskRequestApproval",
+                "TaskApprove",
+                "TaskReject",
+                "TaskRetry",
                 "read_file",
                 "write_file",
                 "edit_file",
@@ -5738,11 +5752,6 @@ async fn gateway_thread_memory_state(
     ))
 }
 
-fn tool_cwd_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
 fn rd_runtime_tools_enabled(scenario: Option<&str>) -> bool {
     scenario.is_some_and(|scenario| scenario.eq_ignore_ascii_case("rd"))
 }
@@ -6754,7 +6763,7 @@ impl GatewayToolExecutor {
         let workspace = self.path_validator.workspace_root().to_path_buf();
         let joined = std::thread::scope(|s| {
             s.spawn(|| {
-                let _guard = tool_cwd_lock()
+                let _guard = runtime::tool_cwd_lock()
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
                 let original_dir = std::env::current_dir().map_err(|error| {
@@ -6895,7 +6904,7 @@ impl GatewayToolExecutor {
         let workspace = self.path_validator.workspace_root().to_path_buf();
         let joined = std::thread::scope(|s| {
             s.spawn(|| {
-                let _guard = tool_cwd_lock()
+                let _guard = runtime::tool_cwd_lock()
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
                 let original_dir = std::env::current_dir().map_err(|error| {

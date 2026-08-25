@@ -14,6 +14,7 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
+    agent_coordinator::AgentCoordinator,
     check_freshness, dedupe_superseded_commit_events, edit_file, edit_file_with_cancellation,
     execute_bash, execute_bash_with_cancellation, glob_search, grep_search, load_system_prompt,
     lsp_client::LspRegistry,
@@ -21,7 +22,7 @@ use runtime::{
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
     read_file,
     summary_compression::compress_summary_text,
-    task_registry::TaskRegistry,
+    task_registry::{PlanStepStatus, TaskRegistry, TaskStatus},
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
     write_file, write_file_with_cancellation, ApiClient, ApiRequest, AssistantEvent,
@@ -29,14 +30,21 @@ use runtime::{
     ConversationMessage, ConversationRuntime, GrepSearchInput, LaneCommitProvenance, LaneEvent,
     LaneEventBlocker, LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport,
     MessageRole, PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig,
-    RuntimeError, RuntimeToolCancellationContract, RuntimeToolContract, RuntimeToolRetryPolicy,
-    RuntimeToolRiskLevel, RuntimeToolSideEffectClass, Session, TaskPacket, ToolError, ToolExecutor,
+    RuntimeCancellationToken, RuntimeError, RuntimeToolCancellationContract, RuntimeToolContract,
+    RuntimeToolRetryPolicy, RuntimeToolRiskLevel, RuntimeToolSideEffectClass, Session, TaskPacket,
+    ToolError, ToolExecutor,
 };
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Global task registry shared across tool invocations within a session.
+fn global_agent_coordinator() -> &'static AgentCoordinator {
+    use std::sync::OnceLock;
+    static COORDINATOR: OnceLock<AgentCoordinator> = OnceLock::new();
+    COORDINATOR.get_or_init(AgentCoordinator::new)
+}
+
 fn global_lsp_registry() -> &'static LspRegistry {
     use std::sync::OnceLock;
     static REGISTRY: OnceLock<LspRegistry> = OnceLock::new();
@@ -62,9 +70,7 @@ fn global_cron_registry() -> &'static CronRegistry {
 }
 
 fn global_task_registry() -> &'static TaskRegistry {
-    use std::sync::OnceLock;
-    static REGISTRY: OnceLock<TaskRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(TaskRegistry::new)
+    global_agent_coordinator().registry()
 }
 
 fn global_worker_registry() -> &'static WorkerRegistry {
@@ -856,7 +862,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "prompt": { "type": "string" },
                     "subagent_type": { "type": "string" },
                     "name": { "type": "string" },
-                    "model": { "type": "string" }
+                    "model": { "type": "string" },
+                    "parent_task_id": { "type": "string" }
                 },
                 "required": ["description", "prompt"],
                 "additionalProperties": false
@@ -1023,14 +1030,31 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskCreate",
-            description: "Create a background task that runs in a separate subprocess.",
+            description: "Create a coordinator-owned task record with an optional plan and retry budget.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "prompt": { "type": "string" },
-                    "description": { "type": "string" }
+                    "description": { "type": "string" },
+                    "max_attempts": { "type": "integer", "minimum": 1, "maximum": 8 },
+                    "plan": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+                    "parent_task_id": { "type": "string" }
                 },
                 "required": ["prompt"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "TaskStart",
+            description: "Start a created or ready coordinator task after its plan and approvals are satisfied.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "revision": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["task_id"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::DangerFullAccess,
@@ -1129,6 +1153,94 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "TaskPlan",
+            description: "Set or replace the ordered execution plan for a coordinator task.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "steps": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+                },
+                "required": ["task_id", "steps"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "TaskPlanStep",
+            description: "Advance one coordinator plan step with an explicit lifecycle status.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "step_id": { "type": "string" },
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "in_progress", "completed", "blocked"]
+                    }
+                },
+                "required": ["task_id", "step_id", "status"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "TaskRequestApproval",
+            description: "Suspend a coordinator task until its exact approval request is resolved.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "approval_id": { "type": "string" },
+                    "tool_name": { "type": "string" },
+                    "reason": { "type": "string" },
+                    "expires_at": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["task_id", "approval_id", "tool_name", "reason"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "TaskApprove",
+            description: "Approve one pending coordinator task approval exactly once.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "approval_id": { "type": "string" }
+                },
+                "required": ["task_id", "approval_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "TaskReject",
+            description: "Reject one pending coordinator task approval exactly once.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "approval_id": { "type": "string" }
+                },
+                "required": ["task_id", "approval_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "TaskRetry",
+            description: "Retry a failed, stopped, cancelled, or timed-out task within its retry budget.",
+            input_schema: json!({
+                "type": "object",
+                "properties": { "task_id": { "type": "string" } },
+                "required": ["task_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
             name: "WorkerCreate",
@@ -1769,12 +1881,25 @@ fn execute_tool_with_enforcer(
             from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
         }
         "TaskCreate" => from_value::<TaskCreateInput>(input).and_then(run_task_create),
+        "TaskStart" => from_value::<TaskStartInput>(input).and_then(run_task_start),
         "RunTaskPacket" => from_value::<TaskPacket>(input).and_then(run_task_packet),
         "TaskGet" => from_value::<TaskIdInput>(input).and_then(run_task_get),
         "TaskList" => run_task_list(input.clone()),
         "TaskStop" => from_value::<TaskIdInput>(input).and_then(run_task_stop),
         "TaskUpdate" => from_value::<TaskUpdateInput>(input).and_then(run_task_update),
         "TaskOutput" => from_value::<TaskIdInput>(input).and_then(run_task_output),
+        "TaskPlan" => from_value::<TaskPlanInput>(input).and_then(run_task_plan),
+        "TaskPlanStep" => from_value::<TaskPlanStepInput>(input).and_then(run_task_plan_step),
+        "TaskRequestApproval" => {
+            from_value::<TaskRequestApprovalInput>(input).and_then(run_task_request_approval)
+        }
+        "TaskApprove" => {
+            from_value::<TaskApprovalInput>(input).and_then(|input| run_task_approval(input, true))
+        }
+        "TaskReject" => {
+            from_value::<TaskApprovalInput>(input).and_then(|input| run_task_approval(input, false))
+        }
+        "TaskRetry" => from_value::<TaskIdInput>(input).and_then(run_task_retry),
         "WorkerCreate" => from_value::<WorkerCreateInput>(input).and_then(run_worker_create),
         "WorkerGet" => from_value::<WorkerIdInput>(input).and_then(run_worker_get),
         "WorkerObserve" => from_value::<WorkerObserveInput>(input).and_then(run_worker_observe),
@@ -1890,14 +2015,33 @@ fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> 
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_create(input: TaskCreateInput) -> Result<String, String> {
     let registry = global_task_registry();
-    let task = registry.create(&input.prompt, input.description.as_deref());
+    let task = match input.parent_task_id.as_deref() {
+        Some(parent_task_id) => {
+            registry.create_child(parent_task_id, &input.prompt, input.description.as_deref())?
+        }
+        None => registry.create(&input.prompt, input.description.as_deref()),
+    };
+    if let Some(max_attempts) = input.max_attempts {
+        registry.set_max_attempts(&task.task_id, max_attempts)?;
+    }
+    if let Some(steps) = input.plan {
+        registry.set_plan(&task.task_id, steps)?;
+    }
+    let task = registry
+        .get(&task.task_id)
+        .ok_or_else(|| "task disappeared while being created".to_string())?;
     to_pretty_json(json!({
         "task_id": task.task_id,
         "status": task.status,
         "prompt": task.prompt,
         "description": task.description,
         "task_packet": task.task_packet,
-        "created_at": task.created_at
+        "created_at": task.created_at,
+        "revision": task.revision,
+        "attempt": task.attempt,
+        "max_attempts": task.max_attempts,
+        "parent_task_id": task.parent_task_id,
+        "plan": task.plan,
     }))
 }
 
@@ -1914,7 +2058,27 @@ fn run_task_packet(input: TaskPacket) -> Result<String, String> {
         "prompt": task.prompt,
         "description": task.description,
         "task_packet": task.task_packet,
-        "created_at": task.created_at
+        "created_at": task.created_at,
+        "updated_at": task.updated_at,
+        "revision": task.revision,
+        "attempt": task.attempt,
+        "max_attempts": task.max_attempts,
+        "parent_task_id": task.parent_task_id,
+        "plan": task.plan,
+        "pending_approval": task.pending_approval,
+        "events": task.events,
+    }))
+}
+
+fn run_task_start(input: TaskStartInput) -> Result<String, String> {
+    let task = global_task_registry().start(&input.task_id, input.revision)?;
+    to_pretty_json(json!({
+        "task_id": task.task_id,
+        "status": task.status,
+        "revision": task.revision,
+        "attempt": task.attempt,
+        "max_attempts": task.max_attempts,
+        "parent_task_id": task.parent_task_id,
     }))
 }
 
@@ -1927,11 +2091,18 @@ fn run_task_get(input: TaskIdInput) -> Result<String, String> {
             "status": task.status,
             "prompt": task.prompt,
             "description": task.description,
-            "task_packet": task.task_packet,
-            "created_at": task.created_at,
-            "updated_at": task.updated_at,
-            "messages": task.messages,
-            "team_id": task.team_id
+        "task_packet": task.task_packet,
+        "created_at": task.created_at,
+        "revision": task.revision,
+        "attempt": task.attempt,
+        "max_attempts": task.max_attempts,
+        "parent_task_id": task.parent_task_id,
+        "updated_at": task.updated_at,
+        "messages": task.messages,
+        "team_id": task.team_id,
+        "plan": task.plan,
+        "pending_approval": task.pending_approval,
+        "events": task.events,
         })),
         None => Err(format!("task not found: {}", input.task_id)),
     }
@@ -1951,7 +2122,13 @@ fn run_task_list(_input: Value) -> Result<String, String> {
                 "task_packet": t.task_packet,
                 "created_at": t.created_at,
                 "updated_at": t.updated_at,
-                "team_id": t.team_id
+                "team_id": t.team_id,
+                "revision": t.revision,
+                "attempt": t.attempt,
+                "max_attempts": t.max_attempts,
+                "parent_task_id": t.parent_task_id,
+                "plan": t.plan,
+                "pending_approval": t.pending_approval,
             })
         })
         .collect();
@@ -1974,6 +2151,17 @@ fn run_task_stop(input: TaskIdInput) -> Result<String, String> {
     }
 }
 
+fn run_task_retry(input: TaskIdInput) -> Result<String, String> {
+    let task = global_task_registry().retry(&input.task_id)?;
+    to_pretty_json(json!({
+        "task_id": task.task_id,
+        "status": task.status,
+        "revision": task.revision,
+        "attempt": task.attempt,
+        "max_attempts": task.max_attempts,
+    }))
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
     let registry = global_task_registry();
@@ -1981,11 +2169,61 @@ fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
         Ok(task) => to_pretty_json(json!({
             "task_id": task.task_id,
             "status": task.status,
+            "revision": task.revision,
             "message_count": task.messages.len(),
             "last_message": input.message
         })),
         Err(e) => Err(e),
     }
+}
+
+fn run_task_plan(input: TaskPlanInput) -> Result<String, String> {
+    let task = global_task_registry().set_plan(&input.task_id, input.steps)?;
+    to_pretty_json(json!({
+        "task_id": task.task_id,
+        "status": task.status,
+        "revision": task.revision,
+        "plan": task.plan,
+    }))
+}
+
+fn run_task_plan_step(input: TaskPlanStepInput) -> Result<String, String> {
+    let task =
+        global_task_registry().advance_plan_step(&input.task_id, &input.step_id, input.status)?;
+    to_pretty_json(json!({
+        "task_id": task.task_id,
+        "status": task.status,
+        "revision": task.revision,
+        "plan": task.plan,
+    }))
+}
+
+fn run_task_approval(input: TaskApprovalInput, approved: bool) -> Result<String, String> {
+    let task =
+        global_task_registry().resolve_approval(&input.task_id, &input.approval_id, approved)?;
+    to_pretty_json(json!({
+        "task_id": task.task_id,
+        "status": task.status,
+        "revision": task.revision,
+        "approval": task.pending_approval,
+        "approved": approved,
+    }))
+}
+
+fn run_task_request_approval(input: TaskRequestApprovalInput) -> Result<String, String> {
+    let task = global_task_registry().request_approval(
+        &input.task_id,
+        &input.approval_id,
+        &input.tool_name,
+        &input.reason,
+        input.expires_at,
+    )?;
+    to_pretty_json(json!({
+        "task_id": task.task_id,
+        "status": task.status,
+        "revision": task.revision,
+        "pending_approval": task.pending_approval,
+    }))
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -3091,6 +3329,8 @@ struct AgentInput {
     subagent_type: Option<String>,
     name: Option<String>,
     model: Option<String>,
+    #[serde(default)]
+    parent_task_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3195,6 +3435,12 @@ struct TaskCreateInput {
     prompt: String,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    max_attempts: Option<u32>,
+    #[serde(default)]
+    plan: Option<Vec<String>>,
+    #[serde(default)]
+    parent_task_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3203,9 +3449,45 @@ struct TaskIdInput {
 }
 
 #[derive(Debug, Deserialize)]
+struct TaskStartInput {
+    task_id: String,
+    #[serde(default)]
+    revision: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct TaskUpdateInput {
     task_id: String,
     message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskPlanInput {
+    task_id: String,
+    steps: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskPlanStepInput {
+    task_id: String,
+    step_id: String,
+    status: PlanStepStatus,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskApprovalInput {
+    task_id: String,
+    approval_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskRequestApprovalInput {
+    task_id: String,
+    approval_id: String,
+    tool_name: String,
+    reason: String,
+    #[serde(default)]
+    expires_at: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3470,6 +3752,10 @@ struct AgentOutput {
     current_blocker: Option<LaneEventBlocker>,
     #[serde(rename = "derivedState")]
     derived_state: String,
+    /// Coordinator task owning this child-agent lifecycle. Keeping the link in
+    /// the manifest makes recovery and parent result collection deterministic.
+    #[serde(rename = "coordinatorTaskId", skip_serializing_if = "Option::is_none")]
+    coordinator_task_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -3477,9 +3763,12 @@ struct AgentOutput {
 #[derive(Debug, Clone)]
 struct AgentJob {
     manifest: AgentOutput,
+    task_id: String,
+    workspace: PathBuf,
     prompt: String,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
+    cancellation: RuntimeCancellationToken,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -8000,11 +8289,35 @@ where
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| slugify_agent_name(&input.description));
     let created_at = iso8601_now();
-    let system_prompt = build_agent_system_prompt(&normalized_subagent_type, &model)?;
-    let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
+    let coordinator = global_agent_coordinator();
+    let coordinator_task = match input.parent_task_id.as_deref() {
+        Some(parent_task_id) => {
+            coordinator.create_child(parent_task_id, &input.prompt, Some(&input.description))?
+        }
+        None => coordinator.create_root(&input.prompt, Some(&input.description)),
+    };
+    if let Err(error) =
+        coordinator.start(&coordinator_task.task_id, Some(coordinator_task.revision))
+    {
+        let error = format!("failed to start coordinator task: {error}");
+        let _ = coordinator.fail(&coordinator_task.task_id, &error);
+        return Err(error);
+    }
+    let cancellation = match coordinator.cancellation_token(&coordinator_task.task_id) {
+        Ok(cancellation) => cancellation,
+        Err(error) => {
+            let error = format!("failed to allocate coordinator cancellation: {error}");
+            let _ = coordinator.fail(&coordinator_task.task_id, &error);
+            return Err(error);
+        }
+    };
+    let setup = (|| -> Result<(PathBuf, Vec<String>, BTreeSet<String>, AgentOutput), String> {
+        let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
+        let system_prompt = build_agent_system_prompt(&normalized_subagent_type, &model)?;
+        let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
 
-    let output_contents = format!(
-        "# Agent Task
+        let output_contents = format!(
+            "# Agent Task
 
 - id: {}
 - name: {}
@@ -8016,38 +8329,57 @@ where
 
 {}
 ",
-        agent_id, agent_name, input.description, normalized_subagent_type, created_at, input.prompt
-    );
-    std::fs::write(&output_file, output_contents).map_err(|error| error.to_string())?;
+            agent_id,
+            agent_name,
+            input.description,
+            normalized_subagent_type,
+            created_at,
+            input.prompt
+        );
+        std::fs::write(&output_file, output_contents).map_err(|error| error.to_string())?;
 
-    let manifest = AgentOutput {
-        agent_id,
-        name: agent_name,
-        description: input.description,
-        subagent_type: Some(normalized_subagent_type),
-        model: Some(model),
-        status: String::from("running"),
-        output_file: output_file.display().to_string(),
-        manifest_file: manifest_file.display().to_string(),
-        created_at: created_at.clone(),
-        started_at: Some(created_at),
-        completed_at: None,
-        lane_events: vec![LaneEvent::started(iso8601_now())],
-        current_blocker: None,
-        derived_state: String::from("working"),
-        error: None,
+        let manifest = AgentOutput {
+            agent_id: agent_id.clone(),
+            name: agent_name.clone(),
+            description: input.description.clone(),
+            subagent_type: Some(normalized_subagent_type.clone()),
+            model: Some(model.clone()),
+            status: String::from("running"),
+            output_file: output_file.display().to_string(),
+            manifest_file: manifest_file.display().to_string(),
+            created_at: created_at.clone(),
+            started_at: Some(created_at.clone()),
+            completed_at: None,
+            lane_events: vec![LaneEvent::started(iso8601_now())],
+            current_blocker: None,
+            derived_state: String::from("working"),
+            coordinator_task_id: Some(coordinator_task.task_id.clone()),
+            error: None,
+        };
+        write_agent_manifest(&manifest)?;
+        Ok((workspace, system_prompt, allowed_tools, manifest))
+    })();
+    let (workspace, system_prompt, allowed_tools, manifest) = match setup {
+        Ok(setup) => setup,
+        Err(error) => {
+            let _ = coordinator.fail(&coordinator_task.task_id, &error);
+            return Err(error);
+        }
     };
-    write_agent_manifest(&manifest)?;
 
     let manifest_for_spawn = manifest.clone();
     let job = AgentJob {
         manifest: manifest_for_spawn,
+        task_id: coordinator_task.task_id.clone(),
+        workspace,
         prompt: input.prompt,
         system_prompt,
         allowed_tools,
+        cancellation,
     };
     if let Err(error) = spawn_fn(job) {
         let error = format!("failed to spawn sub-agent: {error}");
+        let _ = coordinator.fail(&coordinator_task.task_id, &error);
         persist_agent_terminal_state(&manifest, "failed", None, Some(error.clone()))?;
         return Err(error);
     }
@@ -8065,16 +8397,43 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    let _ =
-                        persist_agent_terminal_state(&job.manifest, "failed", None, Some(error));
+                    if job.cancellation.is_cancelled() {
+                        let _ = global_agent_coordinator().cancel(&job.task_id);
+                        let _ = persist_agent_terminal_state(
+                            &job.manifest,
+                            "cancelled",
+                            Some("sub-agent cancelled by coordinator"),
+                            None,
+                        );
+                    } else {
+                        let _ = global_agent_coordinator().fail(&job.task_id, &error);
+                        let _ = persist_agent_terminal_state(
+                            &job.manifest,
+                            "failed",
+                            None,
+                            Some(error),
+                        );
+                    }
                 }
                 Err(_) => {
-                    let _ = persist_agent_terminal_state(
-                        &job.manifest,
-                        "failed",
-                        None,
-                        Some(String::from("sub-agent thread panicked")),
-                    );
+                    if job.cancellation.is_cancelled() {
+                        let _ = global_agent_coordinator().cancel(&job.task_id);
+                        let _ = persist_agent_terminal_state(
+                            &job.manifest,
+                            "cancelled",
+                            Some("sub-agent cancelled by coordinator"),
+                            None,
+                        );
+                    } else {
+                        let _ = global_agent_coordinator()
+                            .fail(&job.task_id, "sub-agent thread panicked");
+                        let _ = persist_agent_terminal_state(
+                            &job.manifest,
+                            "failed",
+                            None,
+                            Some(String::from("sub-agent thread panicked")),
+                        );
+                    }
                 }
             }
         })
@@ -8084,9 +8443,22 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
 
 fn run_agent_job(job: &AgentJob) -> Result<(), String> {
     let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
-    let summary = futures::executor::block_on(runtime.run_turn(job.prompt.clone(), None, ()))
+    runtime.begin_cancellable_turn_with(job.cancellation.clone());
+    let async_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("failed to build sub-agent runtime: {error}"))?;
+    let summary = async_runtime
+        .block_on(runtime.run_turn(job.prompt.clone(), None, ()))
         .map_err(|error| error.to_string())?;
     let final_text = final_assistant_text(&summary);
+    if job.cancellation.is_cancelled() {
+        let _ = global_agent_coordinator().cancel(&job.task_id);
+        return Err("sub-agent cancelled by coordinator".to_string());
+    }
+    global_agent_coordinator()
+        .complete(&job.task_id, &final_text)
+        .map_err(|error| format!("failed to complete coordinator task: {error}"))?;
     persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
 }
 
@@ -8102,6 +8474,8 @@ fn build_agent_runtime(
     let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
     let permission_policy = agent_permission_policy();
     let tool_executor = SubagentToolExecutor::new(allowed_tools)
+        .with_cancellation(job.cancellation.clone())
+        .with_workspace(job.workspace.clone())
         .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
     Ok(ConversationRuntime::new(
         Session::new(),
@@ -8241,6 +8615,20 @@ fn persist_agent_terminal_state(
     error: Option<String>,
 ) -> Result<(), String> {
     let blocker = error.as_deref().map(classify_lane_blocker);
+    if let Some(task_id) = manifest.coordinator_task_id.as_deref() {
+        let coordinator = global_agent_coordinator();
+        let (terminal_status, detail) = match status {
+            "completed" => (TaskStatus::Completed, result),
+            "cancelled" => (TaskStatus::Cancelled, None),
+            "timed_out" => (TaskStatus::TimedOut, error.as_deref()),
+            _ => (TaskStatus::Failed, error.as_deref().or(result)),
+        };
+        coordinator
+            .settle_terminal(task_id, terminal_status, detail)
+            .map_err(|settle_error| {
+                format!("failed to settle coordinator task {task_id}: {settle_error}")
+            })?;
+    }
     append_agent_output(
         &manifest.output_file,
         &format_agent_terminal_output(status, result, blocker.as_ref(), error.as_deref()),
@@ -9204,6 +9592,8 @@ async fn stream_with_provider(
 struct SubagentToolExecutor {
     allowed_tools: BTreeSet<String>,
     enforcer: Option<PermissionEnforcer>,
+    cancellation: Option<RuntimeCancellationToken>,
+    workspace: Option<PathBuf>,
 }
 
 impl SubagentToolExecutor {
@@ -9211,7 +9601,19 @@ impl SubagentToolExecutor {
         Self {
             allowed_tools,
             enforcer: None,
+            cancellation: None,
+            workspace: None,
         }
+    }
+
+    fn with_cancellation(mut self, cancellation: RuntimeCancellationToken) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    fn with_workspace(mut self, workspace: PathBuf) -> Self {
+        self.workspace = Some(workspace);
+        self
     }
 
     fn with_enforcer(mut self, enforcer: PermissionEnforcer) -> Self {
@@ -9247,8 +9649,44 @@ impl ToolExecutor for SubagentToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        execute_tool_with_enforcer(self.enforcer.as_ref(), tool_name, &value, None)
-            .map_err(ToolError::new)
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(RuntimeCancellationToken::is_cancelled)
+        {
+            return Err(ToolError::new("sub-agent task cancelled by coordinator"));
+        }
+        let workspace = self.workspace.clone();
+        let result = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _cwd_guard = runtime::tool_cwd_lock()
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let original = std::env::current_dir().map_err(|error| error.to_string())?;
+                    if let Some(workspace) = workspace {
+                        std::env::set_current_dir(&workspace).map_err(|error| error.to_string())?;
+                    }
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        execute_tool_with_enforcer(
+                            self.enforcer.as_ref(),
+                            tool_name,
+                            &value,
+                            self.cancellation
+                                .as_ref()
+                                .map(RuntimeCancellationToken::atomic_flag)
+                                .as_ref(),
+                        )
+                    }))
+                    .map_err(|_| "sub-agent tool worker panicked".to_string())?;
+                    let restore =
+                        std::env::set_current_dir(original).map_err(|error| error.to_string());
+                    restore.and(result)
+                })
+                .join()
+                .map_err(|_| "sub-agent tool worker panicked".to_string())?
+        });
+        result.map_err(ToolError::new)
     }
 }
 
@@ -10679,7 +11117,7 @@ mod tests {
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
         PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -13819,6 +14257,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("ship-audit".to_string()),
                 model: None,
+                parent_task_id: None,
             },
             move |job| {
                 *captured_for_spawn
@@ -13900,6 +14339,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("complete-task".to_string()),
                 model: Some("claude-sonnet-4-6".to_string()),
+                parent_task_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -13957,6 +14397,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("fail-task".to_string()),
                 model: None,
+                parent_task_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -14004,6 +14445,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("summary-floor".to_string()),
                 model: None,
+                parent_task_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -14049,6 +14491,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("recovery-lane".to_string()),
                 model: None,
+                parent_task_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -14097,6 +14540,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("review-lane".to_string()),
                 model: None,
+                parent_task_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -14137,6 +14581,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("backlog-scan".to_string()),
                 model: None,
+                parent_task_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -14183,6 +14628,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("artifact-lane".to_string()),
                 model: None,
+                parent_task_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -14253,6 +14699,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("cron-closeout".to_string()),
                 model: None,
+                parent_task_id: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -14294,6 +14741,7 @@ mod tests {
                 subagent_type: None,
                 name: Some("spawn-error".to_string()),
                 model: None,
+                parent_task_id: None,
             },
             |_| Err(String::from("thread creation failed")),
         )
@@ -14553,6 +15001,41 @@ mod tests {
             )));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn subagent_tool_workspace_is_serialized_and_cwd_is_restored() {
+        let _guard = env_guard();
+        let original = std::env::current_dir().expect("current cwd");
+        let workspace_a = temp_path("workspace-a");
+        let workspace_b = temp_path("workspace-b");
+        std::fs::create_dir_all(&workspace_a).expect("workspace a");
+        std::fs::create_dir_all(&workspace_b).expect("workspace b");
+        std::fs::write(workspace_a.join("marker.txt"), "workspace-a").expect("marker a");
+        std::fs::write(workspace_b.join("marker.txt"), "workspace-b").expect("marker b");
+
+        let thread_a = std::thread::spawn(move || {
+            let mut executor =
+                SubagentToolExecutor::new(BTreeSet::from([String::from("read_file")]))
+                    .with_workspace(workspace_a);
+            executor
+                .execute("read_file", r#"{"path":"marker.txt"}"#)
+                .expect("workspace a read")
+        });
+        let thread_b = std::thread::spawn(move || {
+            let mut executor =
+                SubagentToolExecutor::new(BTreeSet::from([String::from("read_file")]))
+                    .with_workspace(workspace_b);
+            executor
+                .execute("read_file", r#"{"path":"marker.txt"}"#)
+                .expect("workspace b read")
+        });
+
+        let output_a = thread_a.join().expect("workspace a thread");
+        let output_b = thread_b.join().expect("workspace b thread");
+        assert!(output_a.contains("workspace-a"));
+        assert!(output_b.contains("workspace-b"));
+        assert_eq!(std::env::current_dir().expect("restored cwd"), original);
     }
 
     #[test]
@@ -15715,6 +16198,146 @@ printf 'pwsh:%s' "$1"
             output["task_packet"]["acceptance_tests"][1],
             "cargo test --workspace"
         );
+        assert!(output["revision"].as_u64().is_some());
+        assert_eq!(output["attempt"], 0);
+        assert_eq!(output["max_attempts"], 1);
+        assert!(output["events"]
+            .as_array()
+            .is_some_and(|events| !events.is_empty()));
+    }
+
+    #[test]
+    fn coordinator_tools_share_plan_approval_retry_and_child_lifecycle() {
+        let invoke = |name: &str, input: Value| -> Value {
+            let output = execute_tool(name, &input)
+                .unwrap_or_else(|error| panic!("{name} should succeed for {input}: {error}"));
+            serde_json::from_str(&output).expect("tool output should be valid JSON")
+        };
+
+        let parent = invoke(
+            "TaskCreate",
+            json!({
+                "prompt": "coordinate a governed task",
+                "description": "coordinator integration",
+                "max_attempts": 3
+            }),
+        );
+        let parent_id = parent["task_id"]
+            .as_str()
+            .expect("parent task id")
+            .to_string();
+        let parent_revision = parent["revision"].as_u64().expect("parent revision");
+
+        let planned = invoke(
+            "TaskPlan",
+            json!({"task_id": parent_id, "steps": ["inspect", "verify"]}),
+        );
+        assert_eq!(planned["status"], "planned");
+        invoke(
+            "TaskPlanStep",
+            json!({"task_id": parent_id, "step_id": "step-1", "status": "completed"}),
+        );
+        let ready = invoke(
+            "TaskPlanStep",
+            json!({"task_id": parent_id, "step_id": "step-2", "status": "completed"}),
+        );
+        assert_eq!(ready["status"], "ready");
+
+        let child = invoke(
+            "TaskCreate",
+            json!({
+                "prompt": "inspect as child",
+                "parent_task_id": parent_id,
+            }),
+        );
+        assert_eq!(child["parent_task_id"], parent_id);
+        let child_id = child["task_id"]
+            .as_str()
+            .expect("child task id")
+            .to_string();
+
+        let stale = execute_tool(
+            "TaskStart",
+            &json!({"task_id": parent_id, "revision": parent_revision}),
+        )
+        .expect_err("plan mutation must reject stale start revision");
+        assert!(stale.contains("stale task revision"));
+
+        let current = invoke("TaskGet", json!({"task_id": parent_id}));
+        let running = invoke(
+            "TaskStart",
+            json!({
+                "task_id": parent_id,
+                "revision": current["revision"].as_u64().expect("current revision")
+            }),
+        );
+        assert_eq!(running["status"], "running");
+
+        let waiting = invoke(
+            "TaskRequestApproval",
+            json!({
+                "task_id": parent_id,
+                "approval_id": "approval-a",
+                "tool_name": "bash",
+                "reason": "run verification"
+            }),
+        );
+        assert_eq!(waiting["status"], "waiting_approval");
+        let blocked_start = execute_tool("TaskStart", &json!({"task_id": parent_id}))
+            .expect_err("pending approval must block a second start");
+        assert!(blocked_start.contains("approval is pending"));
+
+        let approved = invoke(
+            "TaskApprove",
+            json!({"task_id": parent_id, "approval_id": "approval-a"}),
+        );
+        assert_eq!(approved["status"], "running");
+        let second_waiting = invoke(
+            "TaskRequestApproval",
+            json!({
+                "task_id": parent_id,
+                "approval_id": "approval-b",
+                "tool_name": "write_file",
+                "reason": "write result"
+            }),
+        );
+        assert_eq!(second_waiting["status"], "waiting_approval");
+        let stale_approval = execute_tool(
+            "TaskApprove",
+            &json!({"task_id": parent_id, "approval_id": "approval-a"}),
+        )
+        .expect_err("an approval id can only be resolved once");
+        assert!(stale_approval.contains("stale"));
+
+        let stopped = invoke("TaskStop", json!({"task_id": parent_id}));
+        assert_eq!(stopped["status"], "stopped");
+        let child_after_stop = invoke("TaskGet", json!({"task_id": child_id}));
+        assert_eq!(child_after_stop["status"], "cancelled");
+
+        let retry = invoke("TaskRetry", json!({"task_id": parent_id}));
+        assert_eq!(retry["status"], "ready");
+        assert_eq!(retry["attempt"], 1);
+        let restarted = invoke("TaskStart", json!({"task_id": parent_id}));
+        assert_eq!(restarted["status"], "running");
+
+        invoke(
+            "TaskRequestApproval",
+            json!({
+                "task_id": parent_id,
+                "approval_id": "approval-expired",
+                "tool_name": "bash",
+                "reason": "expire this request",
+                "expires_at": 0
+            }),
+        );
+        let expired = invoke(
+            "TaskApprove",
+            json!({"task_id": parent_id, "approval_id": "approval-expired"}),
+        );
+        assert_eq!(expired["status"], "timed_out");
+        let final_retry = invoke("TaskRetry", json!({"task_id": parent_id}));
+        assert_eq!(final_retry["attempt"], 2);
+        assert!(execute_tool("TaskRetry", &json!({"task_id": parent_id})).is_err());
     }
 
     struct TestServer {
