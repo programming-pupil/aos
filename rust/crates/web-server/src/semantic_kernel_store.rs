@@ -2434,6 +2434,114 @@ async fn load_canonical_surface_in_transaction(
     fold_surface(&events).map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))
 }
 
+/// Return the event-sequence identity of the current canonical surface without
+/// folding the entire ledger. A context-manifest replacement is a complete
+/// surface boundary, so only that latest boundary and its short event tail are
+/// needed when constructing the next replacement operation.
+async fn load_current_surface_event_sequences_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    tenant_id: &str,
+    thread_id: &str,
+) -> Result<Vec<u64>, SemanticStoreError> {
+    let rows = sqlx::query::<Sqlite>(
+        "SELECT sequence, event_id, payload_json, payload_hash
+         FROM agent_event_ledger
+         WHERE tenant_id = ? AND thread_id = ?
+           AND sequence >= COALESCE(
+             (SELECT MAX(sequence) FROM agent_event_ledger
+              WHERE tenant_id = ? AND thread_id = ?
+                AND event_type = 'runtime.context_manifest_committed'),
+             1
+           )
+         ORDER BY sequence ASC",
+    )
+    .bind(tenant_id)
+    .bind(thread_id)
+    .bind(tenant_id)
+    .bind(thread_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut nodes = Vec::<u64>::new();
+    let mut previous_sequence = None;
+    for row in rows {
+        let sequence = u64::try_from(row.try_get::<i64, _>("sequence")?).map_err(|_| {
+            SemanticStoreError::Corruption {
+                sequence: 0,
+                kind: "negative_sequence".into(),
+            }
+        })?;
+        if previous_sequence.is_some_and(|previous| sequence != previous + 1) {
+            return Err(SemanticStoreError::Corruption {
+                sequence,
+                kind: "surface_tail_sequence_gap".into(),
+            });
+        }
+        previous_sequence = Some(sequence);
+        let event: AgentEventEnvelope =
+            serde_json::from_str(&row.try_get::<String, _>("payload_json")?).map_err(|error| {
+                SemanticStoreError::Corruption {
+                    sequence,
+                    kind: format!("invalid_envelope:{error}"),
+                }
+            })?;
+        if event.sequence != sequence
+            || event.thread_id != thread_id
+            || event.event_id != row.try_get::<String, _>("event_id")?
+            || event.payload_hash != row.try_get::<String, _>("payload_hash")?
+            || event.verify_hash().is_err()
+        {
+            return Err(SemanticStoreError::Corruption {
+                sequence,
+                kind: "envelope_or_hash_mismatch".into(),
+            });
+        }
+        let Some(operation) = event.surface_op else {
+            continue;
+        };
+        match operation {
+            SurfaceOperation::Append { .. } => nodes.push(sequence),
+            SurfaceOperation::Replace {
+                messages,
+                source_event_sequences,
+            } => {
+                if messages.is_empty() || source_event_sequences.is_empty() {
+                    return Err(SemanticStoreError::InvalidEvent(
+                        "canonical surface replacement is empty".into(),
+                    ));
+                }
+                if nodes.is_empty() {
+                    // The query starts at the latest complete context boundary.
+                    // Its prior source nodes were validated when it committed.
+                    nodes.resize(messages.len(), sequence);
+                    continue;
+                }
+                let requested = source_event_sequences
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>();
+                let indexes = nodes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, node)| requested.contains(node).then_some(index))
+                    .collect::<Vec<_>>();
+                if indexes.len() != requested.len()
+                    || indexes.is_empty()
+                    || indexes
+                        .windows(2)
+                        .any(|window| window[1] != window[0].saturating_add(1))
+                {
+                    return Err(SemanticStoreError::InvalidEvent(
+                        "canonical surface replacement tail is inconsistent".into(),
+                    ));
+                }
+                let first = indexes[0];
+                let last = *indexes.last().expect("validated non-empty indexes");
+                nodes.splice(first..=last, std::iter::repeat_n(sequence, messages.len()));
+            }
+        }
+    }
+    Ok(nodes)
+}
+
 fn assert_surface_request(
     surface: &CanonicalSurface,
     expected: &[ModelSurfaceMessage],
@@ -3074,6 +3182,71 @@ pub(crate) async fn append_agent_team_domain_in_transaction(
         None,
     )
     .await
+}
+
+/// Settle turns that were left `running` when a previous server process ended.
+/// Suspended turns are durable resumable work and are intentionally excluded.
+/// Recovery appends the same terminal ledger fact used by live cancellation and
+/// releases every model/protected reservation in the same transaction.
+pub(crate) async fn recover_abandoned_runtime_turns(
+    db: &SqlitePool,
+) -> Result<usize, SemanticStoreError> {
+    let mut tx = db.begin().await?;
+    acquire_sqlite_write_lock(&mut tx).await?;
+    let rows = sqlx::query_as::<Sqlite, (String, String, String, Option<String>)>(
+        "SELECT turns.tenant_id, turns.thread_id, turns.id, threads.owner_user_id
+         FROM agent_turns AS turns
+         JOIN agent_threads AS threads
+           ON threads.id = turns.thread_id AND threads.tenant_id = turns.tenant_id
+         WHERE turns.status = 'running'
+         ORDER BY turns.started_at ASC",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    for (tenant_id, thread_id, turn_id, owner_user_id) in &rows {
+        let owner_user_id = owner_user_id.as_deref().ok_or_else(|| {
+            SemanticStoreError::InvalidEvent(format!(
+                "abandoned runtime turn {turn_id} has no thread owner"
+            ))
+        })?;
+        release_turn_model_budgets_in_transaction(&mut tx, tenant_id, thread_id, turn_id)
+            .await
+            .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
+        let updated = sqlx::query::<Sqlite>(
+            "UPDATE agent_turns
+             SET status = 'cancelled', ended_at = CURRENT_TIMESTAMP,
+                 terminal_outcome = 'process_restart', revision = revision + 1
+             WHERE tenant_id = ? AND thread_id = ? AND id = ? AND status = 'running'",
+        )
+        .bind(tenant_id)
+        .bind(thread_id)
+        .bind(turn_id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(SemanticStoreError::InvalidEvent(format!(
+                "abandoned turn {turn_id} changed during startup recovery"
+            )));
+        }
+        append_runtime_domain_event_in_transaction(
+            &mut tx,
+            tenant_id,
+            owner_user_id,
+            thread_id,
+            Some(turn_id),
+            &format!("turn-terminal:{turn_id}:cancelled"),
+            "turn_terminal",
+            serde_json::json!({
+                "status": "cancelled",
+                "detail": "server restart recovered an abandoned running turn",
+            }),
+            format!("turn-terminal:{turn_id}:cancelled"),
+            None,
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(rows.len())
 }
 
 async fn ensure_runtime_thread(
@@ -3896,24 +4069,31 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             )
         });
         let model_reservation_id = format!("model:{}:{}", input.turn_id, input.iteration);
-        let mut tx = self
-            .db
-            .begin()
-            .await
-            .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
-        acquire_sqlite_write_lock(&mut tx)
-            .await
-            .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
         let semantic_snapshot_version = match input.semantic_snapshot_version {
             Some(version) => version,
-            None => ensure_current_semantic_snapshot(
-                &mut tx,
-                &self.tenant_id,
-                &self.user_id,
-                &self.session_id,
-            )
-            .await
-            .map_err(|e| runtime::RuntimeError::new(e.to_string()))?,
+            None => {
+                let mut snapshot_tx = self
+                    .db
+                    .begin()
+                    .await
+                    .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+                acquire_sqlite_write_lock(&mut snapshot_tx)
+                    .await
+                    .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+                let version = ensure_current_semantic_snapshot(
+                    &mut snapshot_tx,
+                    &self.tenant_id,
+                    &self.user_id,
+                    &self.session_id,
+                )
+                .await
+                .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+                snapshot_tx
+                    .commit()
+                    .await
+                    .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+                version
+            }
         };
         context_packet.manifest.snapshot_version = Some(semantic_snapshot_version);
         let context_packet_hash = semantic_core::ContextCompiler::hash(&context_packet);
@@ -3969,6 +4149,18 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             .clamp(256, 131_072);
         let output_reserve =
             model_output_reserve_for_stage(input.budget_stage, configured_output_reserve);
+        // All large serialization, protection and encryption above happens
+        // before acquiring SQLite's single writer. Keep the transaction below
+        // limited to immutable lineage rows, budget accounting and one ledger
+        // append.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+        acquire_sqlite_write_lock(&mut tx)
+            .await
+            .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
         ensure_protected_model_budgets(&mut tx, &self.tenant_id, &self.session_id, &input.turn_id)
             .await?;
         for (dimension, amount, initial) in [
@@ -4189,15 +4381,13 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                 }
             }
         } else {
-            let before =
-                load_canonical_surface_in_transaction(&mut tx, &self.tenant_id, &self.session_id)
-                    .await
-                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
-            let mut source_event_sequences = before
-                .nodes
-                .iter()
-                .map(|node| node.event_sequence)
-                .collect::<Vec<_>>();
+            let mut source_event_sequences = load_current_surface_event_sequences_in_transaction(
+                &mut tx,
+                &self.tenant_id,
+                &self.session_id,
+            )
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
             source_event_sequences.sort_unstable();
             source_event_sequences.dedup();
             if source_event_sequences.is_empty() {
@@ -4221,22 +4411,19 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                 "semanticSnapshotVersion": semantic_snapshot_version,
                 "rawManifestHash": raw_manifest_hash,
                 "contextPacketHash": context_packet_hash,
-                "manifest": raw_manifest_value,
             }),
             format!("context:{id}"),
             Some(surface_op),
         )
         .await
         .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
-        let folded =
-            load_canonical_surface_in_transaction(&mut tx, &self.tenant_id, &self.session_id)
-                .await
-                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
         let expected_model_messages = expected_surface_messages
             .iter()
             .map(SurfaceMessage::model_view)
             .collect::<Vec<_>>();
-        assert_surface_request(&folded, &expected_model_messages)
+        validate_model_messages(&expected_model_messages)
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        hash_model_messages(&expected_model_messages)
             .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
         tx.commit()
             .await
@@ -6246,134 +6433,13 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             )));
         }
         if !matches!(status, runtime::RuntimeTurnTerminalStatus::Suspended) {
-            let reservation_prefix = format!("model:{turn_id}:");
-            let rows = sqlx::query::<Sqlite>(
-                "SELECT dimension, amount, parent_reservation_id
-                 FROM resource_budget_entries
-                 WHERE tenant_id = ? AND owner_scope = ?
-                   AND substr(reservation_id, 1, length(?)) = ?
-                   AND state = 'reserved'",
+            release_turn_model_budgets_in_transaction(
+                &mut tx,
+                &self.tenant_id,
+                &self.session_id,
+                turn_id,
             )
-            .bind(&self.tenant_id)
-            .bind(&self.session_id)
-            .bind(&reservation_prefix)
-            .bind(&reservation_prefix)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
-            sqlx::query::<Sqlite>(
-                "UPDATE resource_budget_entries SET state = 'released'
-                 WHERE tenant_id = ? AND owner_scope = ?
-                   AND substr(reservation_id, 1, length(?)) = ? AND state = 'reserved'",
-            )
-            .bind(&self.tenant_id)
-            .bind(&self.session_id)
-            .bind(&reservation_prefix)
-            .bind(&reservation_prefix)
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
-            for row in rows {
-                let dimension = row
-                    .try_get::<String, _>(0)
-                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
-                let amount = row
-                    .try_get::<i64, _>(1)
-                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
-                let parent_reservation_id = row
-                    .try_get::<Option<String>, _>(2)
-                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
-                if let Some(parent_reservation_id) = parent_reservation_id {
-                    let restored = sqlx::query::<Sqlite>(
-                        "UPDATE resource_budget_entries SET amount = amount + ?
-                         WHERE tenant_id = ? AND owner_scope = ? AND reservation_id = ?
-                           AND dimension = ? AND state = 'protected'",
-                    )
-                    .bind(amount)
-                    .bind(&self.tenant_id)
-                    .bind(&self.session_id)
-                    .bind(parent_reservation_id)
-                    .bind(&dimension)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
-                    if restored.rows_affected() != 1 {
-                        return Err(runtime::RuntimeError::new(
-                            "protected model budget parent missing during turn settlement",
-                        ));
-                    }
-                } else {
-                    sqlx::query::<Sqlite>(
-                        "UPDATE resource_budget_accounts
-                         SET reserved = MAX(reserved - ?, 0), available = available + ?
-                         WHERE tenant_id = ? AND owner_scope = ? AND dimension = ?",
-                    )
-                    .bind(amount)
-                    .bind(amount)
-                    .bind(&self.tenant_id)
-                    .bind(&self.session_id)
-                    .bind(&dimension)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
-                }
-            }
-            let protected_prefix = format!("model-protected:{turn_id}:");
-            let protected_rows = sqlx::query::<Sqlite>(
-                "SELECT dimension, amount, committed_amount
-                 FROM resource_budget_entries
-                 WHERE tenant_id = ? AND owner_scope = ?
-                   AND substr(reservation_id, 1, length(?)) = ?
-                   AND state = 'protected'",
-            )
-            .bind(&self.tenant_id)
-            .bind(&self.session_id)
-            .bind(&protected_prefix)
-            .bind(&protected_prefix)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
-            for row in protected_rows {
-                let dimension = row
-                    .try_get::<String, _>(0)
-                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
-                let available = row
-                    .try_get::<i64, _>(1)
-                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
-                let committed = row
-                    .try_get::<i64, _>(2)
-                    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
-                sqlx::query::<Sqlite>(
-                    "UPDATE resource_budget_accounts
-                     SET reserved = MAX(reserved - ?, 0),
-                         available = available + ?,
-                         committed = committed + ?
-                     WHERE tenant_id = ? AND owner_scope = ? AND dimension = ?",
-                )
-                .bind(available.saturating_add(committed))
-                .bind(available)
-                .bind(committed)
-                .bind(&self.tenant_id)
-                .bind(&self.session_id)
-                .bind(&dimension)
-                .execute(&mut *tx)
-                .await
-                .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
-            }
-            sqlx::query::<Sqlite>(
-                "UPDATE resource_budget_entries
-                 SET state = CASE WHEN committed_amount > 0 THEN 'committed' ELSE 'released' END
-                 WHERE tenant_id = ? AND owner_scope = ?
-                   AND substr(reservation_id, 1, length(?)) = ?
-                   AND state = 'protected'",
-            )
-            .bind(&self.tenant_id)
-            .bind(&self.session_id)
-            .bind(&protected_prefix)
-            .bind(&protected_prefix)
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            .await?;
         }
         let updated = sqlx::query::<Sqlite>("UPDATE agent_turns SET status = ?, ended_at = CASE WHEN ? <> 'suspended' THEN CURRENT_TIMESTAMP ELSE ended_at END, terminal_outcome = CASE WHEN ? <> 'suspended' THEN ? ELSE terminal_outcome END, revision = revision + 1 WHERE tenant_id = ? AND thread_id = ? AND id = ? AND revision = ? AND status = ?")
             .bind(status_text).bind(status_text).bind(status_text).bind(status_text)
@@ -6724,6 +6790,126 @@ fn model_output_reserve_for_stage(stage: runtime::RuntimeModelBudgetStage, confi
         .find_map(|(dimension, amount, _)| (dimension == "token_output").then_some(amount))
         .unwrap_or(configured);
     configured.min(protected_output)
+}
+
+async fn release_turn_model_budgets_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    tenant_id: &str,
+    owner_scope: &str,
+    turn_id: &str,
+) -> Result<(), runtime::RuntimeError> {
+    let reservation_prefix = format!("model:{turn_id}:");
+    let rows = sqlx::query_as::<Sqlite, (String, i64, Option<String>)>(
+        "SELECT dimension, amount, parent_reservation_id
+         FROM resource_budget_entries
+         WHERE tenant_id = ? AND owner_scope = ?
+           AND substr(reservation_id, 1, length(?)) = ?
+           AND state = 'reserved'",
+    )
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .bind(&reservation_prefix)
+    .bind(&reservation_prefix)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+    sqlx::query::<Sqlite>(
+        "UPDATE resource_budget_entries SET state = 'released'
+         WHERE tenant_id = ? AND owner_scope = ?
+           AND substr(reservation_id, 1, length(?)) = ? AND state = 'reserved'",
+    )
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .bind(&reservation_prefix)
+    .bind(&reservation_prefix)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+    for (dimension, amount, parent_reservation_id) in rows {
+        if let Some(parent_reservation_id) = parent_reservation_id {
+            let restored = sqlx::query::<Sqlite>(
+                "UPDATE resource_budget_entries SET amount = amount + ?
+                 WHERE tenant_id = ? AND owner_scope = ? AND reservation_id = ?
+                   AND dimension = ? AND state = 'protected'",
+            )
+            .bind(amount)
+            .bind(tenant_id)
+            .bind(owner_scope)
+            .bind(parent_reservation_id)
+            .bind(&dimension)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            if restored.rows_affected() != 1 {
+                return Err(runtime::RuntimeError::new(
+                    "protected model budget parent missing during turn settlement",
+                ));
+            }
+        } else {
+            sqlx::query::<Sqlite>(
+                "UPDATE resource_budget_accounts
+                 SET reserved = MAX(reserved - ?, 0), available = available + ?
+                 WHERE tenant_id = ? AND owner_scope = ? AND dimension = ?",
+            )
+            .bind(amount)
+            .bind(amount)
+            .bind(tenant_id)
+            .bind(owner_scope)
+            .bind(&dimension)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        }
+    }
+
+    let protected_prefix = format!("model-protected:{turn_id}:");
+    let protected_rows = sqlx::query_as::<Sqlite, (String, i64, i64)>(
+        "SELECT dimension, amount, committed_amount
+         FROM resource_budget_entries
+         WHERE tenant_id = ? AND owner_scope = ?
+           AND substr(reservation_id, 1, length(?)) = ?
+           AND state = 'protected'",
+    )
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .bind(&protected_prefix)
+    .bind(&protected_prefix)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+    for (dimension, available, committed) in protected_rows {
+        sqlx::query::<Sqlite>(
+            "UPDATE resource_budget_accounts
+             SET reserved = MAX(reserved - ?, 0),
+                 available = available + ?,
+                 committed = committed + ?
+             WHERE tenant_id = ? AND owner_scope = ? AND dimension = ?",
+        )
+        .bind(available.saturating_add(committed))
+        .bind(available)
+        .bind(committed)
+        .bind(tenant_id)
+        .bind(owner_scope)
+        .bind(&dimension)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+    }
+    sqlx::query::<Sqlite>(
+        "UPDATE resource_budget_entries
+         SET state = CASE WHEN committed_amount > 0 THEN 'committed' ELSE 'released' END
+         WHERE tenant_id = ? AND owner_scope = ?
+           AND substr(reservation_id, 1, length(?)) = ?
+           AND state = 'protected'",
+    )
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .bind(&protected_prefix)
+    .bind(&protected_prefix)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+    Ok(())
 }
 
 async fn ensure_protected_model_budgets(
@@ -11971,6 +12157,72 @@ mod tests {
         .execute(db)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_cancels_abandoned_turn_and_releases_protected_budgets() {
+        let db = db().await;
+        seed_agent_thread(&db, "tenant", "user", "abandoned-session").await;
+        sqlx::query(
+            "INSERT INTO agent_turns
+                (id, tenant_id, thread_id, status, started_at, revision)
+             VALUES ('abandoned-turn', 'tenant', 'abandoned-session', 'running',
+                     CURRENT_TIMESTAMP, 0)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let mut tx = db.begin().await.unwrap();
+        acquire_sqlite_write_lock(&mut tx).await.unwrap();
+        ensure_protected_model_budgets(&mut tx, "tenant", "abandoned-session", "abandoned-turn")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let reserved_before: i64 = sqlx::query_scalar(
+            "SELECT reserved FROM resource_budget_accounts
+             WHERE tenant_id = 'tenant' AND owner_scope = 'abandoned-session'
+               AND dimension = 'token_input'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(reserved_before > 0);
+
+        assert_eq!(recover_abandoned_runtime_turns(&db).await.unwrap(), 1);
+        assert_eq!(recover_abandoned_runtime_turns(&db).await.unwrap(), 0);
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM agent_turns WHERE id = 'abandoned-turn'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(status, "cancelled");
+        let active_entries: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM resource_budget_entries
+             WHERE owner_scope = 'abandoned-session' AND state IN ('reserved', 'protected')",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(active_entries, 0);
+        let account: (i64, i64) = sqlx::query_as(
+            "SELECT available, reserved FROM resource_budget_accounts
+             WHERE tenant_id = 'tenant' AND owner_scope = 'abandoned-session'
+               AND dimension = 'token_input'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(account.1, 0);
+        assert_eq!(account.0, 2_000_000);
+        let terminal_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_event_ledger
+             WHERE thread_id = 'abandoned-session'
+               AND event_type = 'runtime.turn_terminal'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(terminal_events, 1);
     }
 
     async fn seed_compaction_test_source(

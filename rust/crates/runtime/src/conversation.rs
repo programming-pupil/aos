@@ -2968,9 +2968,8 @@ where
         let Some(turn) = self
             .session
             .turns
-            .iter()
-            .rev()
-            .find(|turn| {
+            .last()
+            .filter(|turn| {
                 matches!(
                     turn.status,
                     SessionTurnStatus::Running
@@ -5288,6 +5287,44 @@ mod tests {
                 SessionTurnStatus::Cancelled
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn outer_cancellation_never_reopens_an_older_rolled_back_turn() {
+        let kernel = Arc::new(ApprovalTestKernel::new());
+        let mut session = Session::new();
+        let older_turn = session.begin_turn("older").unwrap();
+        session.push_user_text("older").unwrap();
+        assert!(session.rollback_latest_turn_started_at(0).unwrap());
+        let latest_turn = session.begin_turn("latest").unwrap();
+        session.push_user_text("latest").unwrap();
+        session
+            .complete_turn(&latest_turn, SessionTurnStatus::Failed)
+            .unwrap();
+        let mut runtime = ConversationRuntime::new(
+            session,
+            ApprovalApiClient { call_count: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::ReadOnly),
+            Vec::new(),
+        )
+        .with_execution_kernel(kernel.clone());
+
+        runtime
+            .finish_latest_kernel_turn(
+                RuntimeTurnTerminalStatus::Cancelled,
+                Some("late cancellation after terminal settlement"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.session().turns[0].turn_id, older_turn);
+        assert_eq!(
+            runtime.session().turns[0].status,
+            SessionTurnStatus::RolledBack
+        );
+        assert_eq!(runtime.session().turns[1].status, SessionTurnStatus::Failed);
+        assert!(kernel.state.lock().unwrap().terminal_checkpoints.is_empty());
     }
 
     #[tokio::test]

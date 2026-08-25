@@ -303,15 +303,86 @@ impl GovernedMessageStream {
 }
 
 pub(crate) async fn recover_incomplete_dispatches(db: &SqlitePool) -> anyhow::Result<u64> {
-    Ok(sqlx::query(
+    let mut tx = db.begin().await?;
+    acquire_write_lock(&mut tx).await?;
+    let mut recovered = sqlx::query(
         "UPDATE model_dispatch_surfaces
          SET status = 'failed', error_projection = 'worker_restarted',
              completed_at = CURRENT_TIMESTAMP
          WHERE status = 'dispatched'",
     )
-    .execute(db)
+    .execute(&mut *tx)
     .await?
-    .rows_affected())
+    .rows_affected();
+
+    let runtime_attempts = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT id, tenant_id, session_id
+         FROM provider_request_attempts
+         WHERE status = 'dispatched'
+         ORDER BY created_at, id",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let artifact_payload = serde_json::json!({
+        "ok": false,
+        "errorClass": "worker_restarted",
+    });
+    let artifact_bytes = serde_json::to_vec(&artifact_payload)?;
+    let artifact_hash = sha256(&artifact_bytes);
+    let artifact_text = String::from_utf8(artifact_bytes)?;
+    for (attempt_id, tenant_id, session_id) in runtime_attempts {
+        let artifact_id = format!("provider-attempt-artifact:{attempt_id}");
+        let artifact_ciphertext = agent_gateway::crypto::encrypt_scoped(
+            &artifact_text,
+            &agent_gateway::crypto::scoped_aad("provider_attempt.stream", &tenant_id, &artifact_id),
+        )?;
+        sqlx::query(
+            "INSERT INTO provider_attempt_artifacts
+                (id, tenant_id, session_id, attempt_id, terminal_status,
+                 stream_event_count, payload_hash, payload_ciphertext)
+             VALUES (?, ?, ?, ?, 'failed', 0, ?, ?)",
+        )
+        .bind(&artifact_id)
+        .bind(&tenant_id)
+        .bind(&session_id)
+        .bind(&attempt_id)
+        .bind(&artifact_hash)
+        .bind(artifact_ciphertext)
+        .execute(&mut *tx)
+        .await?;
+        let updated = sqlx::query(
+            "UPDATE provider_request_attempts
+             SET status = 'failed', error_class = 'worker_restarted',
+                 completed_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND tenant_id = ? AND session_id = ?
+               AND status = 'dispatched'",
+        )
+        .bind(&attempt_id)
+        .bind(&tenant_id)
+        .bind(&session_id)
+        .execute(&mut *tx)
+        .await?;
+        anyhow::ensure!(
+            updated.rows_affected() == 1,
+            "runtime provider attempt changed during startup recovery"
+        );
+        recovered = recovered.saturating_add(1);
+    }
+
+    recovered = recovered.saturating_add(
+        sqlx::query(
+            "UPDATE provider_compaction_attempts
+             SET status = 'failed', error_class = 'worker_restarted',
+                 fallback_reason = 'previous_compaction_attempt_lost_its_worker',
+                 completed_at = CURRENT_TIMESTAMP
+             WHERE status = 'dispatched'",
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected(),
+    );
+    tx.commit().await?;
+    Ok(recovered)
 }
 
 async fn acquire_write_lock(tx: &mut Transaction<'_, Sqlite>) -> Result<(), sqlx::Error> {
@@ -430,7 +501,42 @@ mod tests {
             .await
             .unwrap();
         let pending = client.begin_dispatch(&request("pending")).await.unwrap();
-        assert_eq!(recover_incomplete_dispatches(&db).await.unwrap(), 1);
+        sqlx::query(
+            "INSERT INTO tool_schema_manifests
+                (id, tenant_id, session_id, schema_hash, schema_ciphertext,
+                 tool_count, created_at)
+             VALUES ('runtime-tool', 'tenant', 'session', 'tools',
+                     'fixture-ciphertext', 0, CURRENT_TIMESTAMP)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_request_attempts
+                (id, tenant_id, user_id, session_id, request_group_id,
+                 attempt_index, provider_kind, model, search_stage, request_hash,
+                 tool_schema_hash, native_search_mode, max_output_tokens, stream,
+                 status, tool_manifest_id)
+             VALUES ('runtime-pending', 'tenant', 'owner', 'session', 'group',
+                     1, 'openai', 'test-model', 'chat_completions_stream', 'request',
+                     'tools', 'none', 32, 1, 'dispatched', 'runtime-tool')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_compaction_attempts
+                (id, tenant_id, user_id, session_id, trigger, protocol,
+                 provider_kind, model, endpoint_hash, request_hash,
+                 attempt_index, status)
+             VALUES ('compaction-pending', 'tenant', 'owner', 'session', 'manual',
+                     'responses_compact_v1', 'openai', 'test-model', 'endpoint',
+                     'request', 1, 'dispatched')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        assert_eq!(recover_incomplete_dispatches(&db).await.unwrap(), 3);
 
         let rows = sqlx::query(
             "SELECT attempt_index, status, request_ciphertext, request_hash,
@@ -461,6 +567,40 @@ mod tests {
         ] {
             assert_eq!(rows[0].get::<String, _>(column).len(), 64);
         }
+        let runtime_attempt = sqlx::query(
+            "SELECT status, error_class FROM provider_request_attempts
+             WHERE id = 'runtime-pending'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(runtime_attempt.get::<String, _>("status"), "failed");
+        assert_eq!(
+            runtime_attempt.get::<String, _>("error_class"),
+            "worker_restarted"
+        );
+        let artifact = sqlx::query(
+            "SELECT id, terminal_status, payload_ciphertext
+             FROM provider_attempt_artifacts WHERE attempt_id = 'runtime-pending'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let artifact_id = artifact.get::<String, _>("id");
+        assert_eq!(artifact.get::<String, _>("terminal_status"), "failed");
+        let plaintext = agent_gateway::crypto::decrypt_scoped(
+            &artifact.get::<String, _>("payload_ciphertext"),
+            &agent_gateway::crypto::scoped_aad("provider_attempt.stream", "tenant", &artifact_id),
+        )
+        .unwrap();
+        assert!(plaintext.contains("worker_restarted"));
+        let compaction_status: String = sqlx::query_scalar(
+            "SELECT status FROM provider_compaction_attempts WHERE id = 'compaction-pending'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(compaction_status, "failed");
         drop(pending);
     }
 }

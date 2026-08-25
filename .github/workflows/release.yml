@@ -13,6 +13,7 @@ on:
       - scripts/aos-package-windows.ps1
       - scripts/check-onnxruntime-contract.sh
       - scripts/aos-start.sh
+      - scripts/lib/local-embedding-runtime.sh
       - scripts/aos-start.ps1
       - scripts/aos-stop.sh
       - scripts/aos-stop.ps1

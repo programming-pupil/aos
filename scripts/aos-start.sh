@@ -142,78 +142,9 @@ if [ -n "$PORT_OVERRIDE" ]; then
 fi
 export BASE_URL="${BASE_URL:-http://localhost:$WEB_PORT}"
 export RUST_LOG="${RUST_LOG:-web_server=info,agent_gateway=info,runtime=info,tower_http=info,billing=info}"
-case "$(uname -s)" in
-  Darwin) ort_library="$ROOT_DIR/runtime/onnxruntime/lib/libonnxruntime.dylib" ;;
-  Linux) ort_library="$ROOT_DIR/runtime/onnxruntime/lib/libonnxruntime.so" ;;
-  *) ort_library="" ;;
-esac
-if [ -z "$ort_library" ] || [ ! -f "$ort_library" ]; then
-  if [ "$SOURCE_LAYOUT" = "1" ]; then
-    ort_runtime_dir="$ROOT_DIR/.aos-runtime/onnxruntime"
-    "$ROOT_DIR/scripts/setup-onnxruntime.sh" --dir "$ort_runtime_dir"
-    case "$(uname -s)" in
-      Darwin) ort_library="$ort_runtime_dir/lib/libonnxruntime.dylib" ;;
-      Linux) ort_library="$ort_runtime_dir/lib/libonnxruntime.so" ;;
-    esac
-  else
-    echo "AOS Offline package is incomplete: bundled ONNX Runtime is missing" >&2
-    echo "Runtime downloads are disabled. Re-extract a complete AOS Offline archive." >&2
-    exit 1
-  fi
-fi
-export ORT_DYLIB_PATH="${ORT_DYLIB_PATH:-$ort_library}"
-
-if [ "$SOURCE_LAYOUT" = "0" ]; then
-  export AOS_LOCAL_EMBEDDING_CACHE_DIR="${AOS_LOCAL_EMBEDDING_CACHE_DIR:-$ROOT_DIR/models/fastembed}"
-else
-  export AOS_LOCAL_EMBEDDING_CACHE_DIR="${AOS_LOCAL_EMBEDDING_CACHE_DIR:-$ROOT_DIR/.aos-runtime/models/fastembed}"
-fi
-model_snapshot="$AOS_LOCAL_EMBEDDING_CACHE_DIR/models--Qdrant--paraphrase-multilingual-MiniLM-L12-v2-onnx-Q/snapshots/faf4aa4225822f3bc6376869cb1164e8e3feedd0"
-expected_model_sha() {
-  case "$1" in
-    model_optimized.onnx) echo "634d0f66c29dc934c8fa72b8a4fe91dd4d420a22f1d82a241058d4316e659a99" ;;
-    tokenizer.json) echo "fa685fc160bbdbab64058d4fc91b60e62d207e8dc60b9af5c002c5ab946ded00" ;;
-    config.json) echo "c8ec081fdad2df991bf5abbf18418fec7a5cdaa421f60ffb060a30040b8c376f" ;;
-    special_tokens_map.json) echo "8c785abebea9ae3257b61681b4e6fd8365ceafde980c21970d001e834cf10835" ;;
-    tokenizer_config.json) echo "0666eebf692422757e1dddf3c9fb1ded73ba3dc726c5828671fc89e45bf3609f" ;;
-    *) return 1 ;;
-  esac
-}
-sha256_file() {
-  if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" | awk '{print $1}'
-  elif command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{print $1}'
-  else
-    echo "shasum or sha256sum is required to verify the bundled model" >&2
-    return 1
-  fi
-}
-model_complete="1"
-for model_file in model_optimized.onnx tokenizer.json config.json special_tokens_map.json tokenizer_config.json; do
-  if [ ! -f "$model_snapshot/$model_file" ]; then
-    model_complete="0"
-  fi
-done
-if [ "$model_complete" != "1" ]; then
-  if [ "$SOURCE_LAYOUT" = "1" ]; then
-    echo "==> Downloading the pinned local embedding model for this source checkout"
-    "$ROOT_DIR/scripts/download-local-embedding.sh" --dir "$AOS_LOCAL_EMBEDDING_CACHE_DIR"
-    "$BACKEND_BIN" --warm-local-embedding "$AOS_LOCAL_EMBEDDING_CACHE_DIR"
-  else
-    echo "AOS Offline package is incomplete: bundled local embedding files are missing" >&2
-    echo "Runtime downloads are disabled. Re-extract a complete AOS Offline archive." >&2
-    exit 1
-  fi
-fi
-for model_file in model_optimized.onnx tokenizer.json config.json special_tokens_map.json tokenizer_config.json; do
-  actual_model_sha="$(sha256_file "$model_snapshot/$model_file")"
-  expected_sha="$(expected_model_sha "$model_file")"
-  [ "$actual_model_sha" = "$expected_sha" ] || {
-    echo "AOS local embedding checksum mismatch for $model_file; refusing to start" >&2
-    exit 1
-  }
-done
+# shellcheck disable=SC1091
+. "$ROOT_DIR/scripts/lib/local-embedding-runtime.sh"
+aos_prepare_local_embedding_runtime "$ROOT_DIR" "$SOURCE_LAYOUT" "$BACKEND_BIN"
 
 mkdir -p "$RUN_DIR"
 if [ -f "$PID_FILE" ]; then

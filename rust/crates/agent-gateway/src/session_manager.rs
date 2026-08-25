@@ -393,6 +393,193 @@ async fn load_durable_ledger_session(
         .map_err(GatewayError::RuntimeBuild)
 }
 
+/// Rebuild only the user-visible message projection. Unlike runtime recovery,
+/// this query deliberately excludes context manifests and session checkpoints:
+/// those rows can be several megabytes each and are not needed to render chat
+/// history. Every selected row still passes the same envelope, hash, scope and
+/// encrypted recovery-payload validation as the authoritative recovery path.
+async fn load_durable_visible_ledger_session(
+    db: &sqlx::SqlitePool,
+    session_id: &str,
+    tenant_id: &str,
+    user_id: &str,
+) -> Result<Option<runtime::Session>> {
+    let rows = sqlx::query(
+        "SELECT sequence, event_type, payload_json, payload_hash, raw_payload_ciphertext
+         FROM agent_event_ledger
+         WHERE tenant_id = ? AND thread_id = ? AND durable = 1
+           AND event_type IN (
+             'runtime.turn_started',
+             'runtime.assistant_message',
+             'runtime.visible_message',
+             'runtime.tool_outcome'
+           )
+         ORDER BY sequence ASC",
+    )
+    .bind(tenant_id)
+    .bind(session_id)
+    .fetch_all(db)
+    .await?
+    .into_iter()
+    .map(|row| {
+        Ok((
+            row.try_get::<i64, _>(0)?,
+            row.try_get::<String, _>(1)?,
+            row.try_get::<String, _>(2)?,
+            row.try_get::<String, _>(3)?,
+            row.try_get::<Option<String>, _>(4)?,
+        ))
+    })
+    .collect::<std::result::Result<Vec<_>, sqlx::Error>>()?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let mut session = runtime::Session::new();
+    session.session_id = session_id.to_string();
+    session.tenant_id = Some(tenant_id.to_string());
+    session.user_id = Some(user_id.to_string());
+    let mut previous_sequence = None;
+    for (stored_sequence, event_type, raw, stored_hash, recovery_ciphertext) in rows {
+        let sequence = u64::try_from(stored_sequence)
+            .map_err(|_| GatewayError::RuntimeBuild("negative ledger sequence".into()))?;
+        if previous_sequence.is_some_and(|previous| sequence <= previous) {
+            return Err(GatewayError::RuntimeBuild(
+                "visible ledger projection is not strictly ordered".into(),
+            ));
+        }
+        previous_sequence = Some(sequence);
+        let envelope =
+            serde_json::from_str::<agent_protocol::AgentEventEnvelope>(&raw).map_err(|error| {
+                GatewayError::RuntimeBuild(format!("invalid execution-ledger envelope: {error}"))
+            })?;
+        if envelope.sequence != sequence
+            || envelope.schema_version != 1
+            || envelope.thread_id != session_id
+            || envelope.payload_hash != stored_hash
+        {
+            return Err(GatewayError::RuntimeBuild(format!(
+                "visible execution-ledger envelope mismatch at sequence {sequence}"
+            )));
+        }
+        envelope.verify_hash().map_err(|error| {
+            GatewayError::RuntimeBuild(format!(
+                "visible execution-ledger envelope failed hash verification: {error}"
+            ))
+        })?;
+        let agent_protocol::AgentEventV1::Domain(domain) = &envelope.event else {
+            return Err(GatewayError::RuntimeBuild(
+                "visible execution-ledger row is not a domain event".into(),
+            ));
+        };
+        let expected_event_type = format!("{}.{}", domain.domain, domain.kind);
+        if expected_event_type != event_type || domain.domain != "runtime" {
+            return Err(GatewayError::RuntimeBuild(format!(
+                "visible execution-ledger event type mismatch at sequence {sequence}"
+            )));
+        }
+        let recovery_ciphertext = recovery_ciphertext.ok_or_else(|| {
+            GatewayError::RuntimeBuild(format!(
+                "visible execution-ledger row is missing exact recovery payload at sequence {sequence}"
+            ))
+        })?;
+        let recovery_raw = crate::crypto::decrypt_scoped(
+            &recovery_ciphertext,
+            &crate::crypto::scoped_aad("ledger.raw_payload", tenant_id, &envelope.event_id),
+        )
+        .map_err(|error| {
+            GatewayError::RuntimeBuild(format!(
+                "cannot decrypt visible runtime recovery payload: {error}"
+            ))
+        })?;
+        let expected_recovery_hash = domain
+            .payload
+            .get("_recoveryPayloadHash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                GatewayError::RuntimeBuild(
+                    "visible recovery payload is not bound to its ledger envelope".into(),
+                )
+            })?;
+        let actual_recovery_hash = format!("{:x}", sha2::Sha256::digest(recovery_raw.as_bytes()));
+        if actual_recovery_hash != expected_recovery_hash {
+            return Err(GatewayError::RuntimeBuild(format!(
+                "visible recovery payload hash mismatch at sequence {sequence}"
+            )));
+        }
+        let payload = serde_json::from_str::<Value>(&recovery_raw).map_err(|error| {
+            GatewayError::RuntimeBuild(format!("invalid visible runtime recovery payload: {error}"))
+        })?;
+        let turn_id = envelope.turn_id.as_deref().unwrap_or("visible-turn");
+        let message = match domain.kind.as_str() {
+            "turn_started" => {
+                let input = payload
+                    .get("userInput")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !session.turns.iter().any(|turn| turn.turn_id == turn_id) {
+                    session.restore_turn(
+                        turn_id,
+                        input,
+                        session.messages.len(),
+                        None,
+                        runtime::SessionTurnStatus::Running,
+                    );
+                }
+                Some(runtime::ConversationMessage::user_text(input))
+            }
+            "assistant_message" => payload
+                .get("message")
+                .and_then(|value| value.get("message"))
+                .and_then(|value| {
+                    serde_json::from_value::<runtime::ConversationMessage>(value.clone()).ok()
+                }),
+            "visible_message" => payload.get("message").and_then(|value| {
+                serde_json::from_value::<runtime::ConversationMessage>(value.clone()).ok()
+            }),
+            "tool_outcome" => {
+                let invocation_id = payload
+                    .get("invocationId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        GatewayError::RuntimeBuild("tool_outcome is missing invocationId".into())
+                    })?;
+                let tool_name = payload
+                    .get("toolName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool");
+                let output = payload
+                    .get("modelOutput")
+                    .and_then(Value::as_str)
+                    .unwrap_or("[tool result recovered from execution ledger]");
+                Some(runtime::ConversationMessage::tool_result(
+                    invocation_id.to_string(),
+                    tool_name.to_string(),
+                    output.to_string(),
+                    payload
+                        .get("outcome")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| value != "completed"),
+                ))
+            }
+            _ => {
+                return Err(GatewayError::RuntimeBuild(format!(
+                    "unsupported visible runtime event {}",
+                    domain.kind
+                )))
+            }
+        };
+        if let Some(message) = message {
+            session.push_message(message).map_err(|_| {
+                GatewayError::RuntimeBuild(
+                    "visible execution ledger produced an invalid message sequence".into(),
+                )
+            })?;
+        }
+    }
+    Ok(Some(session))
+}
+
 fn token_usage_delta(after: RuntimeTokenUsage, before: RuntimeTokenUsage) -> RuntimeTokenUsage {
     RuntimeTokenUsage {
         input_tokens: after.input_tokens.saturating_sub(before.input_tokens),
@@ -3883,6 +4070,48 @@ impl AgentSessionManager {
         }
     }
 
+    /// Get the integrity-checked, user-visible ledger projection for history
+    /// rendering without materializing model context manifests or checkpoints.
+    pub async fn get_session_history_messages(
+        &self,
+        session_id: &str,
+        tenant_id: Option<&str>,
+        user_id: Option<&str>,
+    ) -> Option<runtime::Session> {
+        let record = self
+            .config_registry
+            .get_agent_session_record(session_id)
+            .await
+            .ok()
+            .flatten()?;
+        if !session_owner_matches(&record.tenant_id, &record.user_id, tenant_id, user_id) {
+            return None;
+        }
+        match load_durable_visible_ledger_session(
+            &self.config_registry.database(),
+            session_id,
+            &record.tenant_id,
+            &record.user_id,
+        )
+        .await
+        {
+            Ok(Some(session)) => Some(session),
+            Ok(None) => {
+                self.get_session_messages(session_id, tenant_id, user_id)
+                    .await
+            }
+            Err(error) => {
+                tracing::error!(
+                    session_id,
+                    tenant_id = record.tenant_id,
+                    error = %error,
+                    "durable visible history projection failed validation"
+                );
+                None
+            }
+        }
+    }
+
     /// Returns a reference to the per-tenant MCP managers map.
     /// Each tenant gets its own isolated manager to prevent cross-tenant state leakage.
     #[must_use]
@@ -5130,6 +5359,55 @@ mod tests {
             recovered.turns[0].status,
             runtime::SessionTurnStatus::Completed
         );
+
+        for (sequence, kind) in [
+            (5_u64, "context_manifest_committed"),
+            (6_u64, "session_checkpoint"),
+        ] {
+            let recovery_payload = serde_json::json!({
+                "largeRuntimeOnlyState": "x".repeat(4 * 1024 * 1024),
+            });
+            let recovery_payload_raw = recovery_payload.to_string();
+            let mut event = runtime_ledger_envelope(
+                "session",
+                kind,
+                serde_json::json!({
+                    "_recoveryPayloadHash": format!(
+                        "{:x}",
+                        sha2::Sha256::digest(recovery_payload_raw.as_bytes())
+                    ),
+                }),
+                sequence,
+            );
+            event.payload_hash = event.compute_payload_hash().unwrap();
+            sqlx::query(
+                "INSERT INTO agent_event_ledger
+                 (tenant_id, thread_id, sequence, event_type, payload_json, payload_hash,
+                  raw_payload_ciphertext, durable)
+                 VALUES ('tenant', 'session', ?, ?, ?, ?, ?, 1)",
+            )
+            .bind(i64::try_from(sequence).unwrap())
+            .bind(ledger_event_type(&event))
+            .bind(serde_json::to_string(&event).unwrap())
+            .bind(&event.payload_hash)
+            .bind(crate::crypto::encrypt(&recovery_payload_raw).unwrap())
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        let visible_projection =
+            load_durable_visible_ledger_session(&db, "session", "tenant", "user")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(visible_projection.messages.len(), 3);
+        assert_eq!(visible_projection.messages[0], recovered.messages[0]);
+        assert_eq!(visible_projection.messages[1], recovered.messages[1]);
+        assert_eq!(visible_projection.messages[2], recovered.messages[2]);
+        sqlx::query("DELETE FROM agent_event_ledger WHERE sequence >= 5")
+            .execute(&db)
+            .await
+            .unwrap();
 
         let workspace =
             std::env::temp_dir().join(format!("aos-ledger-runtime-{}", uuid::Uuid::new_v4()));

@@ -757,7 +757,7 @@ pub(super) async fn get_session_history(
     );
 
     match get_agent_manager(&state)
-        .get_session_messages(&session_id, Some(&claims.tenant_id), Some(&claims.sub))
+        .get_session_history_messages(&session_id, Some(&claims.tenant_id), Some(&claims.sub))
         .await
     {
         Some(session) => {

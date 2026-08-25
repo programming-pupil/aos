@@ -46,7 +46,7 @@ temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/aos-package.XXXXXX")"
 stage="$temporary_root/$package_name"
 trap 'rm -rf -- "$temporary_root"' EXIT
 
-mkdir -p "$stage/bin" "$stage/web" "$stage/scripts" "$stage/docs/evals" "$stage/licenses" "$stage/models/fastembed"
+mkdir -p "$stage/bin" "$stage/web" "$stage/scripts/lib" "$stage/docs/evals" "$stage/licenses" "$stage/models/fastembed"
 mkdir -p "$stage/docs/assets"
 cp "$BACKEND_BIN" "$stage/bin/web-server"
 cp -R "$WEB_DIR"/. "$stage/web/"
@@ -75,6 +75,7 @@ cp "$ROOT_DIR/scripts/generate-env.sh" \
   "$ROOT_DIR/scripts/reset-local-data.sh" \
   "$ROOT_DIR/scripts/setup-onnxruntime.sh" \
   "$stage/scripts/"
+cp "$ROOT_DIR/scripts/lib/local-embedding-runtime.sh" "$stage/scripts/lib/"
 chmod +x "$stage/bin/web-server" "$stage/scripts/"*.sh
 
 echo "==> Bundling the built-in multilingual embedding model"

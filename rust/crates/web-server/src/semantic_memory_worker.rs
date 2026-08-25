@@ -140,7 +140,13 @@ pub(crate) fn start_memory_governance_worker(db: SqlitePool) {
 }
 
 fn is_transient_sqlite_lock(error: &MemoryWorkerError) -> bool {
-    let MemoryWorkerError::Database(sqlx::Error::Database(database_error)) = error else {
+    let MemoryWorkerError::Database(database_error) = error else {
+        return false;
+    };
+    if matches!(database_error, sqlx::Error::PoolTimedOut) {
+        return true;
+    }
+    let sqlx::Error::Database(database_error) = database_error else {
         return false;
     };
     let message = database_error.message().to_ascii_lowercase();

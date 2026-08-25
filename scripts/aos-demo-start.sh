@@ -111,6 +111,13 @@ require_cmd npm
 require_cmd openssl
 require_cmd curl
 
+# Keep demo and production launchers on the same pinned, checksum-verified
+# local embedding runtime. The server process remains network-isolated and
+# never downloads model files while serving requests.
+# shellcheck disable=SC1091
+. "$ROOT_DIR/scripts/lib/local-embedding-runtime.sh"
+aos_prepare_local_embedding_runtime "$ROOT_DIR" "1"
+
 case "$API_READY_TIMEOUT_SECS" in
   ''|*[!0-9]*)
     echo "AOS_DEMO_API_READY_TIMEOUT_SECS must be a positive integer" >&2

@@ -8431,6 +8431,11 @@ fn render_current_turn_attachment_context(attachment_context: &[String]) -> Stri
 }
 
 #[cfg(feature = "bot-agents")]
+fn has_current_turn_attachments(input_context: Option<&PmTaskInputContext>) -> bool {
+    input_context.is_some_and(|context| !context.documents.is_empty() || !context.images.is_empty())
+}
+
+#[cfg(feature = "bot-agents")]
 fn super_assistant_execution_message(user_message: &str, attachment_context: &[String]) -> String {
     let attachments = render_current_turn_attachment_context(attachment_context);
     if attachments.is_empty() {
@@ -12999,7 +13004,24 @@ async fn prepare_and_start_super_assistant_stream_turn(
         build_super_assistant_routing_message(&text, exact_recent_tail.as_deref());
     let newly_established = extract_key_info(&new_messages);
     let threshold = bot_router_confidence_threshold(router_config.as_ref());
+    let current_turn_has_attachments = has_current_turn_attachments(input_context.as_ref());
     let route_future = async {
+        if current_turn_has_attachments {
+            // Attachment identity and authorization were already validated by
+            // the request adapter. Route directly into the shared parent loop;
+            // a model-backed classifier/key-info extraction in this critical
+            // gate adds latency but cannot improve that deterministic choice.
+            return fallback_super_assistant_route_outcome(
+                effective_explicit_capability,
+                &enabled,
+                threshold,
+                &turn_id,
+                &created_at,
+                &SessionContextSnapshot::new(),
+                &newly_established,
+                "current-turn attachments use the deterministic parent route",
+            );
+        }
         route_message_with_evidence_contract(
             &state,
             &tenant_id,
@@ -13046,9 +13068,10 @@ async fn prepare_and_start_super_assistant_stream_turn(
             Ok(Ok(injection)) => Ok(injection),
             Ok(Err(error)) => Err(format!("injection worker failed: {error}")),
             Err(_) => {
-                // Dropping a JoinHandle detaches the task. Let any in-flight DB
-                // response drain normally instead of cancelling it mid-packet and
-                // returning a desynchronized connection to sqlx's pool.
+                // A timed-out retrieval must not remain detached and consume a
+                // database connection after the interactive turn has moved on.
+                task.abort();
+                let _ = task.await;
                 Err(format!(
                     "injection retrieval exceeded {}s",
                     super_assistant_injection_timeout().as_secs()
@@ -13090,7 +13113,7 @@ async fn prepare_and_start_super_assistant_stream_turn(
     let injection = match injection_result {
         Ok(injection) => injection,
         Err(reason) => {
-            tracing::warn!(
+            tracing::info!(
                 session_id = %session_id,
                 turn_id = %turn_id,
                 timeout_secs = super_assistant_injection_timeout().as_secs(),
@@ -14090,6 +14113,25 @@ mod compose_cache_optimized_context_tests {
         let execution = super_assistant_execution_message("读取我刚上传的文件", &attachments);
         assert!(execution.contains("fileId=file-current"));
         assert!(execution.ends_with("读取我刚上传的文件"));
+    }
+
+    #[test]
+    fn current_turn_attachment_presence_selects_the_bounded_route() {
+        assert!(!has_current_turn_attachments(None));
+        assert!(!has_current_turn_attachments(Some(
+            &PmTaskInputContext::default()
+        )));
+        let context = PmTaskInputContext {
+            documents: vec![PmTaskDocumentInput {
+                url: "/api/v1/chat/files/file-1".to_string(),
+                file_id: Some("file-1".to_string()),
+                media_type: Some("text/plain".to_string()),
+                name: Some("notes.txt".to_string()),
+                size_bytes: Some(32),
+            }],
+            ..PmTaskInputContext::default()
+        };
+        assert!(has_current_turn_attachments(Some(&context)));
     }
 
     #[test]

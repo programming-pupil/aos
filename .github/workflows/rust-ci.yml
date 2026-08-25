@@ -262,7 +262,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Check deployment scripts
-        run: bash -n scripts/generate-env.sh scripts/aos-demo-start.sh
+        run: bash -n scripts/generate-env.sh scripts/aos-demo-start.sh scripts/aos-start.sh scripts/lib/local-embedding-runtime.sh
       - name: Validate compose file
         run: |
           ./scripts/generate-env.sh

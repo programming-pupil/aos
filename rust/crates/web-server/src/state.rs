@@ -153,8 +153,9 @@ fn required_startup_secret(
 pub struct AppState {
     pub data_dir: PathBuf,
     pub(crate) platform_lifecycle: Option<Arc<PlatformLifecycle>>,
-    /// AOS platform database. The three handles clone one physical SQLite pool;
-    /// the accessor names remain during migration to avoid changing scheduler APIs.
+    /// AOS platform database with workload-isolated connection pools. All three
+    /// pools share one WAL database, while background and telemetry work cannot
+    /// consume the interactive request connection budget.
     pub db: SqlitePool,
     pub control_db: SqlitePool,
     pub telemetry_db: SqlitePool,
@@ -228,27 +229,28 @@ impl AppState {
             .max_connections(max_connections)
             .min_connections(1)
             .acquire_timeout(Duration::from_secs(acquire_timeout_secs))
-            .connect_with(connect_options)
+            .connect_with(connect_options.clone())
             .await?;
         sqlx::migrate!("./sqlite-migrations").run(&db).await?;
         crate::semantic_kernel_store::process_fault_point("migration.after_commit");
+        let recovered_turns =
+            crate::semantic_kernel_store::recover_abandoned_runtime_turns(&db).await?;
+        if recovered_turns > 0 {
+            tracing::warn!(
+                recovered_turns,
+                "recovered abandoned runtime turns and released their budgets"
+            );
+        }
         let recovered_dispatches =
             crate::governed_provider::recover_incomplete_dispatches(&db).await?;
         if recovered_dispatches > 0 {
             tracing::warn!(
                 recovered_dispatches,
-                "recovered model dispatches left non-terminal by the previous process"
+                "recovered provider dispatches left non-terminal by the previous process"
             );
         }
         let internal_process_tck = cfg!(debug_assertions)
             && std::env::var("AOS_INTERNAL_PROCESS_TCK").as_deref() == Ok("1");
-        if !internal_process_tck {
-            crate::semantic_kernel_store::start_encryption_key_rotation_worker(
-                db.clone(),
-                data_dir.clone(),
-            );
-            crate::semantic_memory_worker::start_memory_governance_worker(db.clone());
-        }
         let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
             .fetch_one(&db)
             .await?;
@@ -264,8 +266,25 @@ impl AppState {
             }
             tracing::warn!("previous AOS shutdown was unclean; SQLite quick_check passed");
         }
-        let control_db = db.clone();
-        let telemetry_db = db.clone();
+        let control_db = SqlitePoolOptions::new()
+            .max_connections(max_connections.clamp(1, 2))
+            .min_connections(1)
+            .acquire_timeout(Duration::from_secs(acquire_timeout_secs))
+            .connect_with(connect_options.clone())
+            .await?;
+        let telemetry_db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .min_connections(1)
+            .acquire_timeout(Duration::from_secs(acquire_timeout_secs))
+            .connect_with(connect_options)
+            .await?;
+        if !internal_process_tck {
+            crate::semantic_kernel_store::start_encryption_key_rotation_worker(
+                control_db.clone(),
+                data_dir.clone(),
+            );
+            crate::semantic_memory_worker::start_memory_governance_worker(control_db.clone());
+        }
         start_database_pool_metrics(db.clone());
 
         let default_model = default_model.unwrap_or_else(|| {

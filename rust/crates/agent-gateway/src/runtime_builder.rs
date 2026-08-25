@@ -1541,6 +1541,17 @@ impl ProviderRequestLineageRecorder {
             .begin()
             .await
             .map_err(|error| RuntimeError::new(error.to_string()))?;
+        // Terminal settlement is a read-modify-write transaction. Acquire the
+        // platform writer fence before the idempotency read so a concurrent
+        // checkpoint or ciphertext rotation cannot invalidate the SQLite WAL
+        // snapshot and surface SQLITE_BUSY_SNAPSHOT after provider I/O already
+        // succeeded.
+        sqlx::query::<sqlx::Sqlite>(
+            "UPDATE aos_setup_lock SET lock_id = lock_id WHERE lock_id = 1",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| RuntimeError::new(error.to_string()))?;
         let existing_artifact = sqlx::query_as::<sqlx::Sqlite, (String, String)>(
             "SELECT terminal_status, payload_hash FROM provider_attempt_artifacts
              WHERE tenant_id = ? AND session_id = ? AND attempt_id = ?",
@@ -12983,6 +12994,94 @@ mod tests {
             )
             .expect_err("Gateway must reject the terminal-only question tool");
         assert!(error.to_string().contains("terminal-only"));
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_terminal_settlement_waits_before_reading_under_writer_contention() {
+        let database_path = std::env::temp_dir().join(format!(
+            "aos-provider-terminal-contention-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(2));
+        let db = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .expect("connect provider terminal contention database");
+        for statement in [
+            "CREATE TABLE aos_setup_lock (lock_id INTEGER PRIMARY KEY)",
+            "CREATE TABLE rotation_probe (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE provider_request_attempts (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, status TEXT NOT NULL, error_class TEXT, completed_at TEXT)",
+            "CREATE TABLE provider_attempt_artifacts (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, session_id TEXT NOT NULL, attempt_id TEXT NOT NULL UNIQUE, terminal_status TEXT NOT NULL, stream_event_count INTEGER NOT NULL, payload_hash TEXT NOT NULL, payload_ciphertext TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)",
+        ] {
+            sqlx::query(statement).execute(&db).await.unwrap();
+        }
+        sqlx::query("INSERT INTO aos_setup_lock (lock_id) VALUES (1)")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_request_attempts
+             (id, tenant_id, session_id, status)
+             VALUES ('attempt', 'tenant', 'session', 'dispatched')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let mut blocker = db.begin().await.unwrap();
+        sqlx::query("UPDATE aos_setup_lock SET lock_id = lock_id WHERE lock_id = 1")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO rotation_probe (id) VALUES (1)")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+
+        let recorder = ProviderRequestLineageRecorder {
+            db: db.clone(),
+            tenant_id: "tenant".to_string(),
+            user_id: "user".to_string(),
+            session_id: "session".to_string(),
+        };
+        let settlement = tokio::spawn(async move {
+            let result = Ok(Vec::<AssistantEvent>::new());
+            recorder.finish_attempt("attempt", &result).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !settlement.is_finished(),
+            "terminal settlement must wait at the writer fence"
+        );
+        blocker.commit().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), settlement)
+            .await
+            .expect("terminal settlement timed out")
+            .expect("terminal settlement task panicked")
+            .expect("terminal settlement failed after writer released");
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM provider_request_attempts WHERE id = 'attempt'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(status, "completed");
+        let artifacts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provider_attempt_artifacts WHERE attempt_id = 'attempt'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(artifacts, 1);
+        db.close().await;
+        let _ = std::fs::remove_file(&database_path);
+        let _ = std::fs::remove_file(database_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(database_path.with_extension("db-shm"));
     }
 
     #[tokio::test]

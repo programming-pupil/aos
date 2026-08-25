@@ -3909,7 +3909,11 @@ async fn load_reference_import_task(
     Ok(reference_import_task_from_row(row))
 }
 
-pub(crate) fn start_sql_knowledge_import_worker(state: AppState) {
+pub(crate) fn start_sql_knowledge_import_worker(mut state: AppState) {
+    // Import parsing, indexing, and progress persistence are all background
+    // work. Rebind the worker's default handle so every downstream helper uses
+    // the control pool, including helpers that only receive `&AppState`.
+    state.db = state.control_db().clone();
     tokio::spawn(async move {
         let _ = sqlx::query::<sqlx::Sqlite>(
             "UPDATE nl2sql_reference_import_tasks SET status = 'pending', current_filename = NULL, \
@@ -3962,7 +3966,13 @@ pub(crate) fn start_sql_knowledge_import_worker(state: AppState) {
 }
 
 fn is_transient_sqlite_lock(error: &AppError) -> bool {
-    let AppError::Database(sqlx::Error::Database(database_error)) = error else {
+    let AppError::Database(database_error) = error else {
+        return false;
+    };
+    if matches!(database_error, sqlx::Error::PoolTimedOut) {
+        return true;
+    }
+    let sqlx::Error::Database(database_error) = database_error else {
         return false;
     };
     let code = database_error.code();
@@ -5730,6 +5740,13 @@ fn sha256_hex_bytes(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_import_pool_timeout_is_transient_contention() {
+        assert!(is_transient_sqlite_lock(&AppError::Database(
+            sqlx::Error::PoolTimedOut,
+        )));
+    }
 
     async fn import_task_test_pool() -> sqlx::SqlitePool {
         let db = sqlx::sqlite::SqlitePoolOptions::new()

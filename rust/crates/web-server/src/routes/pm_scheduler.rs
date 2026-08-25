@@ -10,11 +10,15 @@ use crate::state::AppState;
 const DEFAULT_PM_SCHEDULER_INTERVAL_SECS: u64 = 120;
 
 pub fn start_periodic_pm_scheduler(
-    state: AppState,
+    mut state: AppState,
 ) -> (
     tokio::sync::watch::Sender<bool>,
     tokio::task::JoinHandle<()>,
 ) {
+    // Everything launched by this scheduler is background control-plane work.
+    // Rebind its default database handle so downstream helpers that accept an
+    // AppState cannot accidentally consume the interactive request pool.
+    state.db = state.control_db().clone();
     let interval_secs = std::env::var("PM_SCHEDULER_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
