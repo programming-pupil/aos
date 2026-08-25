@@ -159,6 +159,11 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+.aos-language-switcher .ant-select-selection-item,
+.aos-language-switcher .ant-select-arrow {
+  color: var(--text-primary) !important;
+}
+
 /* Text selection */
 ::selection {
   background: rgba(124, 58, 237, 0.35);

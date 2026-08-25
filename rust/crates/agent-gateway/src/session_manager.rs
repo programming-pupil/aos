@@ -121,7 +121,14 @@ fn rebuild_session_from_ledger_rows(
     session.session_id = session_id.to_string();
     session.tenant_id = Some(tenant_id.to_string());
     session.user_id = Some(user_id.to_string());
-    let mut expected_sequence = 1_u64;
+    // A session checkpoint contains the complete validated projection up to
+    // its sequence. Recovery can therefore start at the newest checkpoint and
+    // replay only the tail, avoiding an O(total-ledger-size) scan on every
+    // history request. Full-ledger callers still start at sequence one.
+    let mut expected_sequence = rows
+        .first()
+        .and_then(|row| u64::try_from(row.0).ok())
+        .unwrap_or(1);
     for (stored_sequence, _event_type, raw, stored_hash, recovery_ciphertext) in rows {
         let sequence = u64::try_from(*stored_sequence)
             .map_err(|_| "execution ledger contains a negative sequence".to_string())?;
@@ -357,8 +364,16 @@ async fn load_durable_ledger_session(
         "SELECT sequence, event_type, payload_json, payload_hash, raw_payload_ciphertext
          FROM agent_event_ledger
          WHERE tenant_id = ? AND thread_id = ? AND durable = 1
+           AND sequence >= COALESCE(
+             (SELECT MAX(sequence) FROM agent_event_ledger
+              WHERE tenant_id = ? AND thread_id = ? AND durable = 1
+                AND event_type = 'runtime.session_checkpoint'),
+             1
+           )
          ORDER BY sequence ASC",
     )
+    .bind(tenant_id)
+    .bind(session_id)
     .bind(tenant_id)
     .bind(session_id)
     .fetch_all(db)

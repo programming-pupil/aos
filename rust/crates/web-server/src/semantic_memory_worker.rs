@@ -93,11 +93,40 @@ pub(crate) fn start_memory_governance_worker(db: SqlitePool) {
     tokio::spawn(async move {
         let worker_id = format!("memory-worker:{}", uuid::Uuid::new_v4());
         loop {
-            match run_memory_maintenance_once(&db, &worker_id).await {
+            let mut transient_attempt = 0_u32;
+            let result = loop {
+                match run_memory_maintenance_once(&db, &worker_id).await {
+                    Err(error) if is_transient_sqlite_lock(&error) && transient_attempt < 6 => {
+                        transient_attempt += 1;
+                        let delay = Duration::from_millis(50 * (1_u64 << transient_attempt));
+                        tracing::debug!(
+                            worker_id,
+                            attempt = transient_attempt,
+                            delay_ms = delay.as_millis(),
+                            "memory governance worker hit transient SQLite contention; retrying"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    result => break result,
+                }
+            };
+            match result {
                 Ok(stats) if stats == MemoryMaintenanceStats::default() => {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
                 Ok(_) => tokio::task::yield_now().await,
+                Err(error) if is_transient_sqlite_lock(&error) => {
+                    // A long-running interactive write can outlive the bounded
+                    // retry window. Defer this maintenance pass quietly; the
+                    // next iteration will retry it without polluting service
+                    // error logs.
+                    tracing::debug!(
+                        worker_id,
+                        error = %error,
+                        "memory governance worker deferred by SQLite contention"
+                    );
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
                 Err(error) => {
                     if db.is_closed() {
                         break;
@@ -108,6 +137,20 @@ pub(crate) fn start_memory_governance_worker(db: SqlitePool) {
             }
         }
     });
+}
+
+fn is_transient_sqlite_lock(error: &MemoryWorkerError) -> bool {
+    let MemoryWorkerError::Database(sqlx::Error::Database(database_error)) = error else {
+        return false;
+    };
+    let message = database_error.message().to_ascii_lowercase();
+    database_error
+        .code()
+        .as_deref()
+        .is_some_and(|code| matches!(code, "5" | "6" | "SQLITE_BUSY" | "SQLITE_LOCKED"))
+        || message.contains("database is locked")
+        || message.contains("database table is locked")
+        || message.contains("database is busy")
 }
 
 pub(crate) async fn run_memory_maintenance_once(

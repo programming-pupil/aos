@@ -866,8 +866,26 @@ fn build_repository_dto(
         detected_build_command: detection.and_then(|d| d.detected_build_command.clone()),
         auto_sync_enabled: setting.map_or(true, |s| s.auto_sync_enabled),
         auto_sync_interval_minutes: setting.map_or(60, |s| s.auto_sync_interval_minutes),
-        last_auto_sync_at: setting.and_then(|s| s.last_auto_sync_at.clone()),
+        // SQLite CURRENT_TIMESTAMP is UTC without an explicit offset. Expose
+        // it as RFC3339 so browsers do not interpret it as local time (which
+        // made a brand-new repository appear to have its last attempt 8 hours
+        // ago in UTC+8 locales).
+        last_auto_sync_at: setting
+            .and_then(|s| s.last_auto_sync_at.as_deref())
+            .and_then(sqlite_timestamp_to_rfc3339),
         last_sync_error: setting.and_then(|s| s.last_sync_error.clone()),
+    }
+}
+
+fn sqlite_timestamp_to_rfc3339(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.contains('T') || value.ends_with('Z') || value.contains('+') {
+        Some(value.to_string())
+    } else {
+        Some(format!("{}Z", value.replace(' ', "T")))
     }
 }
 
@@ -1194,7 +1212,22 @@ async fn upsert_repository_index(
 
 #[cfg(test)]
 mod repository_auto_sync_tests {
-    use super::{normalize_auto_sync_interval, recover_interrupted_repository_syncs};
+    use super::{
+        normalize_auto_sync_interval, recover_interrupted_repository_syncs,
+        sqlite_timestamp_to_rfc3339,
+    };
+
+    #[test]
+    fn sqlite_auto_sync_timestamp_is_explicitly_utc() {
+        assert_eq!(
+            sqlite_timestamp_to_rfc3339("2026-08-25 03:54:56").as_deref(),
+            Some("2026-08-25T03:54:56Z")
+        );
+        assert_eq!(
+            sqlite_timestamp_to_rfc3339("2026-08-25T03:54:56+00:00").as_deref(),
+            Some("2026-08-25T03:54:56+00:00")
+        );
+    }
 
     #[test]
     fn repository_auto_sync_interval_is_bounded() {

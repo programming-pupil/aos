@@ -35,6 +35,26 @@ function normalizeLanguage(language?: string): string {
     case 'html':
     case 'xml':
       return 'markup';
+    case 'kt':
+    case 'kts':
+      return 'kotlin';
+    case 'c++':
+    case 'cxx':
+    case 'cc':
+    case 'hxx':
+      return 'cpp';
+    case 'c#':
+    case 'cs':
+      return 'csharp';
+    case 'h':
+    case 'hh':
+      return 'c';
+    case 'rb':
+      return 'ruby';
+    case 'gql':
+      return 'graphql';
+    case 'dockerfile':
+      return 'docker';
     default:
       return normalized || 'text';
   }
@@ -56,6 +76,16 @@ const Highlighter = lazy(async () => {
     yaml,
     css,
     markup,
+    java,
+    kotlin,
+    c,
+    cpp,
+    csharp,
+    php,
+    ruby,
+    swift,
+    graphql,
+    docker,
   ] = await Promise.all([
     import('react-syntax-highlighter/dist/esm/prism-light'),
     import('react-syntax-highlighter/dist/esm/styles/prism'),
@@ -71,6 +101,16 @@ const Highlighter = lazy(async () => {
     import('react-syntax-highlighter/dist/esm/languages/prism/yaml'),
     import('react-syntax-highlighter/dist/esm/languages/prism/css'),
     import('react-syntax-highlighter/dist/esm/languages/prism/markup'),
+    import('react-syntax-highlighter/dist/esm/languages/prism/java'),
+    import('react-syntax-highlighter/dist/esm/languages/prism/kotlin'),
+    import('react-syntax-highlighter/dist/esm/languages/prism/c'),
+    import('react-syntax-highlighter/dist/esm/languages/prism/cpp'),
+    import('react-syntax-highlighter/dist/esm/languages/prism/csharp'),
+    import('react-syntax-highlighter/dist/esm/languages/prism/php'),
+    import('react-syntax-highlighter/dist/esm/languages/prism/ruby'),
+    import('react-syntax-highlighter/dist/esm/languages/prism/swift'),
+    import('react-syntax-highlighter/dist/esm/languages/prism/graphql'),
+    import('react-syntax-highlighter/dist/esm/languages/prism/docker'),
   ]);
   SyntaxHighlighter.registerLanguage('javascript', javascript.default);
   SyntaxHighlighter.registerLanguage('typescript', typescript.default);
@@ -84,6 +124,16 @@ const Highlighter = lazy(async () => {
   SyntaxHighlighter.registerLanguage('yaml', yaml.default);
   SyntaxHighlighter.registerLanguage('css', css.default);
   SyntaxHighlighter.registerLanguage('markup', markup.default);
+  SyntaxHighlighter.registerLanguage('java', java.default);
+  SyntaxHighlighter.registerLanguage('kotlin', kotlin.default);
+  SyntaxHighlighter.registerLanguage('c', c.default);
+  SyntaxHighlighter.registerLanguage('cpp', cpp.default);
+  SyntaxHighlighter.registerLanguage('csharp', csharp.default);
+  SyntaxHighlighter.registerLanguage('php', php.default);
+  SyntaxHighlighter.registerLanguage('ruby', ruby.default);
+  SyntaxHighlighter.registerLanguage('swift', swift.default);
+  SyntaxHighlighter.registerLanguage('graphql', graphql.default);
+  SyntaxHighlighter.registerLanguage('docker', docker.default);
 
   const Component = ({
     code,

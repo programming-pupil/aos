@@ -202,7 +202,11 @@ impl AppState {
             acquire_platform_lifecycle(&data_dir)?;
         let database_path = data_dir.join("aos.db");
         let max_connections = env_u32("AOS_SQLITE_MAX_CONNECTIONS", 4).clamp(1, 8);
-        let busy_timeout_ms = env_u64("AOS_SQLITE_BUSY_TIMEOUT_MS", 10_000).clamp(1_000, 60_000);
+        // Background governance, task, and encryption workers share this
+        // SQLite pool with interactive requests. Give short write
+        // transactions enough time to serialize instead of surfacing
+        // avoidable `database is locked` errors to worker loops.
+        let busy_timeout_ms = env_u64("AOS_SQLITE_BUSY_TIMEOUT_MS", 30_000).clamp(1_000, 60_000);
         let acquire_timeout_secs = env_u64("AOS_SQLITE_ACQUIRE_TIMEOUT_SECS", 30).clamp(1, 300);
         tracing::info!(
             database_path = %database_path.display(),
@@ -216,8 +220,9 @@ impl AppState {
             .create_if_missing(true)
             .foreign_keys(true)
             .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Full)
+            .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(Duration::from_millis(busy_timeout_ms))
+            .pragma("wal_autocheckpoint", "1000")
             .pragma("temp_store", "MEMORY");
         let db = SqlitePoolOptions::new()
             .max_connections(max_connections)
@@ -457,6 +462,10 @@ mod tests {
             ("agent_context_archives", "idx_context_archive_keyset"),
             ("chat_turn_artifacts", "idx_chat_artifact_keyset"),
             ("agent_workspace_entries", "idx_workspace_shared_keyset"),
+            (
+                "agent_event_ledger",
+                "idx_agent_event_ledger_checkpoint",
+            ),
         ] {
             let count = sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM sqlite_schema \

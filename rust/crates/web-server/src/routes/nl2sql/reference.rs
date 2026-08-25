@@ -3949,12 +3949,29 @@ pub(crate) fn start_sql_knowledge_import_worker(state: AppState) {
                     }
                 }
                 Ok(None) => {}
+                Err(error) if is_transient_sqlite_lock(&error) => {
+                    tracing::debug!(error = %error, "SQL knowledge import claim deferred by SQLite contention");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
                 Err(error) => {
                     tracing::warn!(error = %error, "failed to claim SQL knowledge import task")
                 }
             }
         }
     });
+}
+
+fn is_transient_sqlite_lock(error: &AppError) -> bool {
+    let AppError::Database(sqlx::Error::Database(database_error)) = error else {
+        return false;
+    };
+    let code = database_error.code();
+    let message = database_error.message().to_ascii_lowercase();
+    code.as_deref()
+        .is_some_and(|value| matches!(value, "5" | "6" | "SQLITE_BUSY" | "SQLITE_LOCKED"))
+        || message.contains("database is locked")
+        || message.contains("database table is locked")
+        || message.contains("database is busy")
 }
 
 #[derive(Debug)]

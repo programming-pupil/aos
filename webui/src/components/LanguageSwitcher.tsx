@@ -22,7 +22,8 @@ export function LanguageSwitcher() {
       options={languages}
       size="small"
       variant="borderless"
-      style={{ width: 80, color: 'var(--text-muted)' }}
+      className="aos-language-switcher"
+      style={{ width: 80, color: 'var(--text-primary)' }}
       onChange={(val) => {
         setValue(val);
         changeLanguage(val);

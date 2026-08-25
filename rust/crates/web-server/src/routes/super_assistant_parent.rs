@@ -2563,6 +2563,14 @@ async fn run_runtime_step(
                     )
                     .await
                     {
+                        if is_transient_sqlite_lock_app_error(&error) {
+                            tracing::debug!(
+                                turn_id = %lease_input.turn_id,
+                                error = %error,
+                                "independent parent lease heartbeat deferred by SQLite contention"
+                            );
+                            continue;
+                        }
                         tracing::warn!(
                             turn_id = %lease_input.turn_id,
                             error = %error,
@@ -2696,11 +2704,19 @@ async fn run_runtime_step(
                         let _ = manager.cancel_running_turn(&input.session_id).await;
                         return Err(error);
                     }
-                    tracing::warn!(
-                        turn_id = %input.turn_id,
-                        error = %error,
-                        "failed to renew parent turn lease; runtime remains active"
-                    );
+                    if is_transient_sqlite_lock_app_error(&error) {
+                        tracing::debug!(
+                            turn_id = %input.turn_id,
+                            error = %error,
+                            "parent turn lease renewal deferred by SQLite contention"
+                        );
+                    } else {
+                        tracing::warn!(
+                            turn_id = %input.turn_id,
+                            error = %error,
+                            "failed to renew parent turn lease; runtime remains active"
+                        );
+                    }
                 }
                 if last_runtime_activity.elapsed() >= Duration::from_secs(15) {
                     if native_search_recovery_pending {
@@ -9728,25 +9744,54 @@ async fn heartbeat_parent_turn(
     claims: &Claims,
     input: &UnifiedParentTurnInput,
 ) -> Result<()> {
-    let result = sqlx::query::<sqlx::Sqlite>(
-        "UPDATE super_assistant_turns
-         SET lease_expires_at = datetime(CURRENT_TIMESTAMP, printf('%+d seconds', ?)),
-             last_heartbeat_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-         WHERE tenant_id = ? AND user_id = ? AND session_id = ? AND turn_id = ?
-           AND cancel_requested = 0
-           AND status NOT IN ('completed','failed','cancelled')",
-    )
-    .bind(PARENT_LEASE_SECS)
-    .bind(&claims.tenant_id)
-    .bind(&claims.sub)
-    .bind(&input.session_id)
-    .bind(&input.turn_id)
-    .execute(&state.db)
-    .await?;
+    let result = {
+        let mut attempt = 0_u32;
+        loop {
+            let result = sqlx::query::<sqlx::Sqlite>(
+                "UPDATE super_assistant_turns
+                 SET lease_expires_at = datetime(CURRENT_TIMESTAMP, printf('%+d seconds', ?)),
+                     last_heartbeat_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                 WHERE tenant_id = ? AND user_id = ? AND session_id = ? AND turn_id = ?
+                   AND cancel_requested = 0
+                   AND status NOT IN ('completed','failed','cancelled')",
+            )
+            .bind(PARENT_LEASE_SECS)
+            .bind(&claims.tenant_id)
+            .bind(&claims.sub)
+            .bind(&input.session_id)
+            .bind(&input.turn_id)
+            .execute(&state.db)
+            .await;
+            match result {
+                Err(error) if is_transient_sqlite_lock(&error) && attempt < 8 => {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(25 * (1_u64 << attempt))).await;
+                }
+                result => break result.map_err(AppError::Database),
+            }
+        }
+    }?;
     if result.rows_affected() == 0 {
         return Err(AppError::Conflict("parent turn was cancelled".to_string()));
     }
     Ok(())
+}
+
+fn is_transient_sqlite_lock(error: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(database_error) = error else {
+        return false;
+    };
+    let code = database_error.code();
+    let message = database_error.message().to_ascii_lowercase();
+    code.as_deref()
+        .is_some_and(|value| matches!(value, "5" | "6" | "SQLITE_BUSY" | "SQLITE_LOCKED"))
+        || message.contains("database is locked")
+        || message.contains("database table is locked")
+        || message.contains("database is busy")
+}
+
+fn is_transient_sqlite_lock_app_error(error: &AppError) -> bool {
+    matches!(error, AppError::Database(database_error) if is_transient_sqlite_lock(database_error))
 }
 
 async fn transition_parent_state(

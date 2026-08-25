@@ -5706,6 +5706,10 @@ pub(crate) struct GatewayFileContext {
     user_id: String,
     session_id: String,
     app: String,
+    /// Server-managed data root used as a bounded fallback while a newly
+    /// uploaded text file is still being indexed.  Normal reads remain
+    /// DB-backed and never trust a caller supplied physical path.
+    data_root: Option<PathBuf>,
 }
 
 impl GatewayFileContext {
@@ -7297,6 +7301,18 @@ fn gateway_file_id_from_path(path: &str) -> Option<String> {
         return None;
     }
     if !trimmed.starts_with("aos-files://") {
+        let virtual_path = trimmed.trim_start_matches('/');
+        let mut parts = virtual_path.split('/');
+        if parts
+            .next()
+            .is_some_and(|root| root.eq_ignore_ascii_case("uploads"))
+        {
+            return parts
+                .next()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+        }
         return Some(trimmed.to_string());
     }
     trimmed
@@ -7305,6 +7321,15 @@ fn gateway_file_id_from_path(path: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn is_unified_upload_path(path: &str) -> bool {
+    let normalized = path.trim().trim_start_matches('/');
+    let mut parts = normalized.split('/');
+    parts
+        .next()
+        .is_some_and(|root| root.eq_ignore_ascii_case("uploads"))
+        && parts.next().is_some_and(|id| !id.trim().is_empty())
 }
 
 #[derive(Debug, Clone)]
@@ -7580,7 +7605,7 @@ async fn gateway_file_read(
     let mut rows = if let (Some(start), Some(end)) = (line_start, line_end) {
         sqlx::query(
             r#"
-            SELECT f.filename, f.media_type, c.chunk_index, c.line_start, c.line_end, c.sheet_name, c.content
+            SELECT f.filename, f.media_type, f.status, f.url, c.chunk_index, c.line_start, c.line_end, c.sheet_name, c.content
             FROM chat_file_workspace_chunks c
             JOIN chat_file_workspace_files f
               ON f.tenant_id = c.tenant_id AND f.user_id = c.user_id AND f.file_id = c.file_id
@@ -7603,7 +7628,7 @@ async fn gateway_file_read(
     } else {
         sqlx::query(
             r#"
-            SELECT f.filename, f.media_type, c.chunk_index, c.line_start, c.line_end, c.sheet_name, c.content
+            SELECT f.filename, f.media_type, f.status, f.url, c.chunk_index, c.line_start, c.line_end, c.sheet_name, c.content
             FROM chat_file_workspace_chunks c
             JOIN chat_file_workspace_files f
               ON f.tenant_id = c.tenant_id AND f.user_id = c.user_id AND f.file_id = c.file_id
@@ -7625,9 +7650,122 @@ async fn gateway_file_read(
     .map_err(|error| format!("failed to read uploaded file: {error}"))?;
 
     if rows.is_empty() {
-        return Err(format!(
-            "no indexed content found for fileId `{file_id}` in this session"
-        ));
+        // A just-uploaded text file can be visible to the workspace tree before
+        // the background indexer commits chunks. Read the original bounded
+        // upload in that short window so tool execution remains reliable.
+        let metadata = sqlx::query(
+            "SELECT filename, media_type, status, url, CAST(size_bytes AS INTEGER) AS size_bytes
+             FROM chat_file_workspace_files
+             WHERE tenant_id = ? AND user_id = ? AND file_id = ?
+               AND (session_id = ? OR session_id IS NULL) LIMIT 1",
+        )
+        .bind(&context.tenant_id)
+        .bind(&context.user_id)
+        .bind(&file_id)
+        .bind(&context.session_id)
+        .fetch_optional(&context.db)
+        .await
+        .map_err(|error| format!("failed to read uploaded file metadata: {error}"))?;
+        let Some(metadata) = metadata else {
+            return Err(format!("uploaded file not found for fileId `{file_id}`"));
+        };
+        let status: String = metadata.get("status");
+        let url: String = metadata.get("url");
+        let Some(data_root) = context.data_root.as_ref() else {
+            return Err(format!(
+                "uploaded file `{file_id}` is not indexed yet (status: {status})"
+            ));
+        };
+        let marker = "/api/v1/uploads/";
+        let Some(rest) = url.split_once(marker).map(|(_, value)| value) else {
+            return Err(format!(
+                "uploaded file `{file_id}` has an invalid storage URL"
+            ));
+        };
+        let Some((owner, filename)) = rest.split_once('/') else {
+            return Err(format!(
+                "uploaded file `{file_id}` has an invalid storage URL"
+            ));
+        };
+        if owner != context.user_id || filename.is_empty() || filename.contains("..") {
+            return Err("uploaded file storage scope mismatch".to_string());
+        }
+        let raw_path = data_root
+            .join(".aos")
+            .join("uploads")
+            .join(owner)
+            .join(filename);
+        let canonical_root = data_root
+            .join(".aos")
+            .join("uploads")
+            .join(owner)
+            .canonicalize()
+            .map_err(|error| format!("uploaded file storage is unavailable: {error}"))?;
+        let canonical_path = raw_path
+            .canonicalize()
+            .map_err(|error| format!("uploaded file is unavailable: {error}"))?;
+        if !canonical_path.starts_with(&canonical_root) || !canonical_path.is_file() {
+            return Err("uploaded file storage path is invalid".to_string());
+        }
+        let bytes = std::fs::read(&canonical_path)
+            .map_err(|error| format!("failed to read uploaded file: {error}"))?;
+        let content = String::from_utf8(bytes).map_err(|_| {
+            format!("uploaded file `{file_id}` is not UTF-8 text (status: {status})")
+        })?;
+        // Match indexed `file_read` semantics for both line ranges and chunk
+        // windows while the background indexer is still catching up.
+        const RAW_UPLOAD_CHUNK_CHARS: usize = 1_800;
+        let (start_line, selected) = if line_start.is_none() && line_end.is_none() {
+            let char_offset = usize::try_from(offset)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(RAW_UPLOAD_CHUNK_CHARS);
+            let char_limit = usize::try_from(limit)
+                .unwrap_or(4)
+                .saturating_mul(RAW_UPLOAD_CHUNK_CHARS);
+            (
+                1,
+                content
+                    .chars()
+                    .skip(char_offset)
+                    .take(char_limit)
+                    .collect::<String>(),
+            )
+        } else {
+            let start_line =
+                usize::try_from(line_start.unwrap_or(1).saturating_sub(1)).unwrap_or(0);
+            let line_count = line_end
+                .map(|end| {
+                    usize::try_from(end.max(1))
+                        .unwrap_or(usize::MAX)
+                        .saturating_sub(start_line)
+                })
+                .unwrap_or(usize::MAX);
+            (
+                line_start.unwrap_or(1),
+                content
+                    .lines()
+                    .skip(start_line)
+                    .take(line_count)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        };
+        let selected = if selected.len() > max_chars {
+            selected.chars().take(max_chars).collect::<String>()
+        } else {
+            selected
+        };
+        return serde_json::to_string_pretty(&json!({
+            "fileId": file_id,
+            "filename": metadata.get::<String, _>("filename"),
+            "mediaType": metadata.get::<String, _>("media_type"),
+            "status": status,
+            "lineStart": start_line,
+            "content": selected,
+            "truncated": selected.len() < content.len(),
+            "source": "upload_original"
+        }))
+        .map_err(|error| format!("failed to serialize uploaded file: {error}"));
     }
     let filename: String = rows[0].get("filename");
     let media_type: String = rows[0].get("media_type");
@@ -9675,6 +9813,21 @@ impl ToolExecutor for GatewayToolExecutor {
             let mut parsed: Value = serde_json::from_str(input)
                 .map_err(|e| ToolError::new(format!("invalid tool input JSON: {e}")))?;
 
+            // `workspace_find` returns canonical virtual upload paths. Route
+            // those paths to the authenticated DB-backed reader when a model
+            // calls the legacy physical-workspace `read_file` tool.
+            if tool_name.eq_ignore_ascii_case("read_file")
+                && parsed
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_unified_upload_path)
+                && self.file_context.is_some()
+            {
+                return self
+                    .execute_file_tool("file_read", &parsed.to_string())
+                    .map_err(ToolError::new);
+            }
+
             self.validate_paths(tool_name, &parsed)
                 .map_err(|e| ToolError::new(e.to_string()))?;
 
@@ -10640,6 +10793,7 @@ impl RuntimeBuilder {
                     .scenario
                     .clone()
                     .unwrap_or_else(|| "chat".to_string()),
+                data_root: infer_agent_data_root(&self.workspace),
             }),
             self.config.pm_search_providers.clone(),
             tool_registry.clone(),
@@ -10924,6 +11078,7 @@ impl RuntimeBuilder {
                     .scenario
                     .clone()
                     .unwrap_or_else(|| "chat".to_string()),
+                data_root: infer_agent_data_root(&self.workspace),
             };
             sections.push(build_gateway_file_developer_instructions(&context));
         }
@@ -14832,6 +14987,22 @@ mod tests {
             output.contains("workspace-ok"),
             "read_file output should come from the session workspace: {output}"
         );
+    }
+
+    #[test]
+    fn unified_upload_paths_resolve_to_file_ids() {
+        assert!(is_unified_upload_path(
+            "/uploads/788b0c14-2a47-4383-aee8-b0fb072f996c/query.sql"
+        ));
+        assert!(is_unified_upload_path(
+            "uploads/788b0c14-2a47-4383-aee8-b0fb072f996c/query.sql"
+        ));
+        assert_eq!(
+            gateway_file_id_from_path("/uploads/788b0c14-2a47-4383-aee8-b0fb072f996c/query.sql")
+                .as_deref(),
+            Some("788b0c14-2a47-4383-aee8-b0fb072f996c")
+        );
+        assert!(!is_unified_upload_path("/projects/session/query.sql"));
     }
 
     #[test]

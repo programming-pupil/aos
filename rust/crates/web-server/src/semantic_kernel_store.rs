@@ -11817,6 +11817,11 @@ pub(crate) fn start_encryption_key_rotation_worker(db: SqlitePool, data_dir: std
                     tokio::task::yield_now().await;
                 }
                 Err(error) => {
+                    if is_transient_sqlite_lock(&error) {
+                        tracing::debug!(error = %error, "durable ciphertext rotation deferred by SQLite contention");
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
                     tracing::error!(
                         error = %error,
                         "durable ciphertext rotation stopped; keep retired keys configured and retry"
@@ -11855,17 +11860,38 @@ pub(crate) fn start_encryption_key_rotation_worker(db: SqlitePool, data_dir: std
                         break;
                     }
                     Err(error) => {
-                        tracing::error!(
-                            key_id = %key_id,
-                            error = %error,
-                            "encryption key retirement refused; keep the old key configured and retry after remediation"
-                        );
+                        if is_transient_sqlite_lock(&error) {
+                            tracing::debug!(
+                                key_id = %key_id,
+                                error = %error,
+                                "encryption key retirement deferred by SQLite contention"
+                            );
+                        } else {
+                            tracing::error!(
+                                key_id = %key_id,
+                                error = %error,
+                                "encryption key retirement refused; keep the old key configured and retry after remediation"
+                            );
+                        }
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     }
                 }
             }
         }
     });
+}
+
+fn is_transient_sqlite_lock(error: &SemanticStoreError) -> bool {
+    let SemanticStoreError::Database(sqlx::Error::Database(database_error)) = error else {
+        return false;
+    };
+    let code = database_error.code();
+    let message = database_error.message().to_ascii_lowercase();
+    code.as_deref()
+        .is_some_and(|value| matches!(value, "5" | "6" | "SQLITE_BUSY" | "SQLITE_LOCKED"))
+        || message.contains("database is locked")
+        || message.contains("database table is locked")
+        || message.contains("database is busy")
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import {
   Alert,
@@ -21,6 +21,8 @@ import {
 } from 'antd';
 import {
   BranchesOutlined,
+  CaretDownOutlined,
+  CaretRightOutlined,
   CheckCircleOutlined,
   CodeOutlined,
   DeleteOutlined,
@@ -56,6 +58,23 @@ function isGitRepositoryUrl(value?: string): boolean {
     /^ssh:\/\/\S+$/i.test(normalized) ||
     /^git@[^:]+:.+$/i.test(normalized)
   );
+}
+
+function repositoryNameFromUrl(value?: string): string | undefined {
+  const normalized = value?.trim();
+  if (!normalized) return undefined;
+  const scpLikePath = normalized.match(/^git@[^:]+:(.+)$/)?.[1];
+  if (scpLikePath) {
+    return scpLikePath.split(/[/?#]/).filter(Boolean).pop()?.replace(/\.git$/i, '').trim() || undefined;
+  }
+  try {
+    const parsed = new URL(normalized.includes('://') ? normalized : `https://${normalized}`);
+    const segment = parsed.pathname.split('/').filter(Boolean).pop()?.replace(/\.git$/i, '');
+    return segment?.trim() || undefined;
+  } catch {
+    const segment = normalized.split(/[?#]/)[0].split('/').filter(Boolean).pop();
+    return segment?.replace(/\.git$/i, '').trim() || undefined;
+  }
 }
 
 const FILE_ICON: Record<string, ReactNode> = {
@@ -153,15 +172,25 @@ function FileTreeItem({
 }) {
   const isFile = node.nodeType === 'file';
   const selected = selectedPath === node.path;
+  const [expanded, setExpanded] = useState(true);
+  const hasChildren = !isFile && Boolean(node.children?.length);
+
+  const handleClick = () => {
+    if (isFile) {
+      onSelect(node);
+      return;
+    }
+    if (hasChildren) setExpanded((value) => !value);
+  };
   return (
     <>
       <div
-        onClick={() => onSelect(node)}
+        onClick={handleClick}
         style={{
           display: 'flex',
           alignItems: 'center',
           gap: 8,
-          cursor: isFile ? 'pointer' : 'default',
+          cursor: isFile || hasChildren ? 'pointer' : 'default',
           padding: '6px 10px',
           paddingLeft: 10 + depth * 16,
           borderRadius: 8,
@@ -170,11 +199,16 @@ function FileTreeItem({
           fontSize: 13,
         }}
       >
-        {isFile ? getFileIcon(node.language) : <FolderOpenOutlined style={{ color: '#d6a62a' }} />}
+        {isFile ? getFileIcon(node.language) : (
+          <Space size={2}>
+            {hasChildren ? (expanded ? <CaretDownOutlined /> : <CaretRightOutlined />) : null}
+            <FolderOpenOutlined style={{ color: '#d6a62a' }} />
+          </Space>
+        )}
         <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{node.name}</span>
         {isFile ? <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{formatSize(node.sizeBytes)}</span> : null}
       </div>
-      {node.children?.map((child) => (
+      {expanded && node.children?.map((child) => (
         <FileTreeItem key={child.path} node={child} depth={depth + 1} selectedPath={selectedPath} onSelect={onSelect} />
       ))}
     </>
@@ -307,6 +341,19 @@ export default function Projects() {
   const [syncingId, setSyncingId] = useState<string | null>(null);
   const [form] = Form.useForm();
   const [editForm] = Form.useForm();
+  const watchedRepositoryUrl = Form.useWatch('url', form);
+  const lastAutoRepositoryName = useRef<string | undefined>(undefined);
+
+  useEffect(() => {
+    const candidate = repositoryNameFromUrl(watchedRepositoryUrl);
+    if (!candidate) return;
+    const currentName = form.getFieldValue('name') as string | undefined;
+    const previousAutoName = lastAutoRepositoryName.current;
+    if (!form.isFieldTouched('name') || !currentName || currentName === previousAutoName) {
+      form.setFieldValue('name', candidate);
+      lastAutoRepositoryName.current = candidate;
+    }
+  }, [form, watchedRepositoryUrl]);
 
   const repositoriesQuery = useQuery({
     queryKey: queryKeys.rd.repositories(),

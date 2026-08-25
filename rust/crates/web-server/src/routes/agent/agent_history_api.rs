@@ -962,41 +962,28 @@ pub(super) async fn get_session_history(
             );
 
             if has_durable_visible_history {
-                let durable_visible = load_durable_visible_history(
-                    &state,
-                    &claims.tenant_id,
-                    &claims.sub,
-                    &session_id,
-                );
-                let durable_user_count = durable_visible
-                    .iter()
-                    .filter(|message| message.role == "user")
-                    .count();
                 let runtime_user_count = messages
                     .iter()
                     .filter(|message| message.role == "user")
                     .count();
-                if !durable_visible.is_empty() && durable_user_count >= runtime_user_count {
-                    let mut recovered = durable_visible;
-                    let mut durable_occurrences = std::collections::HashMap::new();
-                    for message in &recovered {
-                        if message.role == "user" {
-                            *durable_occurrences
-                                .entry(history_user_identity_content(&message.content))
-                                .or_insert(0usize) += 1;
-                        }
+
+                // The Agent Ledger (and its checkpoint projection) is the
+                // canonical recovery surface. Reading the compatibility JSONL
+                // archive here made every history request scan and deserialize
+                // the entire session, which is especially expensive for large
+                // sessions. Only consult the archive when the durable ledger
+                // contains no visible user messages at all, which covers old
+                // sessions created before visible events were ledgered.
+                if runtime_user_count == 0 {
+                    let durable_visible = load_durable_visible_history(
+                        &state,
+                        &claims.tenant_id,
+                        &claims.sub,
+                        &session_id,
+                    );
+                    if !durable_visible.is_empty() {
+                        messages = durable_visible;
                     }
-                    let mut runtime_occurrences = std::collections::HashMap::new();
-                    for message in messages.iter().filter(|message| message.role == "user") {
-                        let content = history_user_identity_content(&message.content);
-                        let occurrence =
-                            runtime_occurrences.entry(content.clone()).or_insert(0usize);
-                        *occurrence += 1;
-                        if *occurrence > durable_occurrences.get(&content).copied().unwrap_or(0) {
-                            recovered.push(message.clone());
-                        }
-                    }
-                    messages = recovered;
                 }
             }
 

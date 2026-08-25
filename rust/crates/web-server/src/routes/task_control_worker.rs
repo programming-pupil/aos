@@ -287,7 +287,7 @@ async fn run_worker_loop<F, Fut>(
         let mut transient_attempt = 0_u32;
         let result = loop {
             match run().await {
-                Err(error) if is_sqlite_transient_lock_error(&error) && transient_attempt < 3 => {
+                Err(error) if is_sqlite_transient_lock_error(&error) && transient_attempt < 8 => {
                     transient_attempt += 1;
                     let retry_delay = Duration::from_millis(25 * (1_u64 << transient_attempt));
                     tracing::debug!(
@@ -307,7 +307,7 @@ async fn run_worker_loop<F, Fut>(
                 next_delay = next_worker_delay(next_delay, interval, max_idle_interval, processed);
             }
             Err(error) if is_sqlite_transient_lock_error(&error) => {
-                tracing::warn!(worker = name, error = %error, "WatchDog worker SQLite contention persisted after retries");
+                tracing::debug!(worker = name, error = %error, "WatchDog worker SQLite contention persisted after retries; backing off");
                 next_delay = Duration::from_millis(500).min(max_idle_interval);
             }
             Err(error) => {
