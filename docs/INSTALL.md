@@ -132,8 +132,11 @@ Open the Vite URL, normally `http://localhost:5173`. It proxies `/api` and
   online backup that includes the WAL state.
 - A clean shutdown checkpoints the WAL. After an unclean shutdown, AOS runs
   `PRAGMA quick_check` before starting workers.
-- `AOS_SQLITE_MAX_CONNECTIONS` defaults to `4` and is limited to `1..8`.
-- `AOS_SQLITE_BUSY_TIMEOUT_MS` defaults to `10000` and is limited to
+- `AOS_SQLITE_MAX_CONNECTIONS` defaults to `8` and is limited to `8..16`.
+- `AOS_SQLITE_CONTROL_MAX_CONNECTIONS` controls background/control workers,
+  defaults to `8`, and is limited to `8..16` independently of interactive
+  requests.
+- `AOS_SQLITE_BUSY_TIMEOUT_MS` defaults to `30000` and is limited to
   `1000..60000`.
 - To reset a pre-release native installation, stop AOS and remove its chosen
   data directory. This deletes all users, configuration, tasks, and history.

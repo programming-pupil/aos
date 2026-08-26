@@ -2173,16 +2173,8 @@ export default function Nl2sql() {
     includeAllReferences || selectedReferencePackIds.length > 0 || selectedReferenceFileIds.length > 0;
 
   const buildReferenceBindings = useCallback((): Nl2sqlReferenceBindings | undefined => {
-    if (includeAllReferences) return { includeAll: true, packIds: [], fileIds: [] };
-    if (selectedReferencePackIds.length === 0 && selectedReferenceFileIds.length === 0) {
-      return undefined;
-    }
-    return {
-      includeAll: false,
-      packIds: selectedReferencePackIds,
-      fileIds: selectedReferenceFileIds,
-    };
-  }, [includeAllReferences, selectedReferenceFileIds, selectedReferencePackIds]);
+    return { includeAll: true, packIds: [], fileIds: [] };
+  }, []);
 
   const createReferencePackMutation = useMutation({
     mutationFn: (name: string) => {
@@ -4926,11 +4918,6 @@ export default function Nl2sql() {
               >
                 {t('nl2sql.advancedSettings')}
               </Button>
-              {!advancedSettingsOpen && referenceOverrideActive && (
-                <Tag color="blue" style={{ marginInlineEnd: 0, fontSize: 10 }}>
-                  {selectedReferenceSummary}
-                </Tag>
-              )}
             </div>
 
             {advancedSettingsOpen && (
@@ -4943,87 +4930,9 @@ export default function Nl2sql() {
                 display: 'grid',
                 gap: 8,
               }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
-                  <div style={{ minWidth: 0 }}>
-                    <Text style={{ display: 'block', fontSize: 12, color: 'var(--text-primary)' }}>
-                      {t('nl2sql.references.overrideTitle')}
-                    </Text>
-                    <Text style={{ display: 'block', fontSize: 11, color: 'var(--text-muted)' }}>
-                      {t('nl2sql.references.overrideHint')}
-                    </Text>
-                  </div>
-                  <Popover
-                    trigger="click"
-                    placement="topLeft"
-                    open={referencePopoverOpen}
-                    onOpenChange={(open) => {
-                      if (!selectedDataSourceId && open) {
-                        message.info(t('nl2sql.references.selectDataSourceFirst'));
-                        return;
-                      }
-                      setReferencePopoverOpen(open);
-                    }}
-                    content={
-                      selectedDataSourceId ? (
-                        <ReferenceBindingPopover
-                          packs={referencePacks}
-                          selectedPackIds={selectedReferencePackIds}
-                          selectedFileIds={selectedReferenceFileIds}
-                          includeAll={includeAllReferences}
-                          loading={referencePacksLoading}
-                          uploadingPackId={uploadingReferencePackId}
-                          onToggleAll={(checked) => {
-                            setIncludeAllReferences(checked);
-                            if (checked) {
-                              setSelectedReferencePackIds([]);
-                              setSelectedReferenceFileIds([]);
-                            }
-                          }}
-                          onChangePacks={setSelectedReferencePackIds}
-                          onChangeFiles={setSelectedReferenceFileIds}
-                          onCreatePack={(name) => createReferencePackMutation.mutate(name)}
-                          onUploadFile={(packId, file) => uploadReferenceMutation.mutate({ packId, file })}
-                          onTogglePackEnabled={(pack) =>
-                            updateReferencePackMutation.mutate({ pack, enabled: !pack.enabled })
-                          }
-                          onDeletePack={(pack) => deleteReferencePackMutation.mutate(pack)}
-                          onDeleteFile={(fileId) => deleteReferenceFileMutation.mutate(fileId)}
-                          t={t}
-                        />
-                      ) : null
-                    }
-                  >
-                    <Button
-                      size="small"
-                      icon={<PaperClipOutlined />}
-                      disabled={!selectedDataSourceId}
-                      type={referenceOverrideActive ? 'primary' : 'default'}
-                      style={{ height: 26, fontSize: 11, borderRadius: 6 }}
-                    >
-                      {t('nl2sql.references.bindButton')}
-                    </Button>
-                  </Popover>
-                </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                  <Tag style={{ marginInlineEnd: 0, fontSize: 10 }}>
-                    {selectedReferenceSummary}
-                  </Tag>
-                  {!includeAllReferences && selectedReferencePackIds.slice(0, 2).map((id) => (
-                    <Tag key={`ref-pack-chip-${id}`} color="blue" style={{ marginInlineEnd: 0, fontSize: 10 }}>
-                      {referencePackNameById.get(id) ?? id}
-                    </Tag>
-                  ))}
-                  {!includeAllReferences && selectedReferenceFileIds.slice(0, 2).map((id) => (
-                    <Tag key={`ref-file-chip-${id}`} color="cyan" style={{ marginInlineEnd: 0, fontSize: 10 }}>
-                      {referenceFileNameById.get(id) ?? id}
-                    </Tag>
-                  ))}
-                  {!includeAllReferences && selectedReferencePackIds.length + selectedReferenceFileIds.length > 4 && (
-                    <Text style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                      +{selectedReferencePackIds.length + selectedReferenceFileIds.length - 4}
-                    </Text>
-                  )}
-                </div>
+                <Text style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                  {t('nl2sql.references.autoBoundHint')}
+                </Text>
               </div>
             )}
           </div>

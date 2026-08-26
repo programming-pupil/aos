@@ -312,7 +312,6 @@ fn durable_history_plain_content(content: &str) -> String {
     }
 }
 
-#[cfg(test)]
 fn visible_history_user_content(content: &str) -> String {
     let plain = durable_history_plain_content(content);
     let cutoff = [
@@ -342,6 +341,32 @@ fn history_user_identity_content(content: &str) -> String {
     } else {
         prompt.to_string()
     }
+}
+
+fn super_adversarial_command_body(content: &str) -> Option<String> {
+    let visible = visible_history_user_content(content);
+    let command = visible.strip_prefix('/')?;
+    let aliases = [
+        "超级对抗",
+        "对抗",
+        "super-adversarial",
+        "super_adversarial",
+        "superadversarial",
+        "adversarial",
+        "debate",
+    ];
+    let alias = aliases.iter().find(|alias| {
+        command
+            .strip_prefix(**alias)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+    })?;
+    Some(
+        command
+            .strip_prefix(*alias)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+    )
 }
 
 fn is_pm_orch_question_stop_line(line: &str) -> bool {
@@ -539,6 +564,26 @@ mod pm_history_tests {
             history_user_identity_content(execution)
         );
         assert_eq!(visible_history_user_content(display), display);
+    }
+
+    #[test]
+    fn super_adversarial_history_parser_only_matches_explicit_commands() {
+        assert_eq!(
+            super_adversarial_command_body("/超级对抗 比较方案 A 和方案 B"),
+            Some("比较方案 A 和方案 B".to_string())
+        );
+        assert_eq!(
+            super_adversarial_command_body("/adversarial\n比较方案 A 和方案 B"),
+            Some("比较方案 A 和方案 B".to_string())
+        );
+        assert_eq!(
+            super_adversarial_command_body("普通问题：比较方案 A 和方案 B"),
+            None
+        );
+        assert_eq!(
+            super_adversarial_command_body("/超级对抗"),
+            Some(String::new())
+        );
     }
 
     #[test]
@@ -797,6 +842,44 @@ pub(super) async fn get_session_history(
             let mut hide_next_parent_protocol_assistant = false;
             let mut pending_pm_question: Option<String> = None;
             let mut pending_pm_assistant: Option<MessageDto> = None;
+            // Runtime execution prompts may intentionally omit slash commands,
+            // while `super_assistant_turns.user_message` retains the exact
+            // user-visible display text. Keep a bounded multiset of those
+            // displays so restored history identifies adversarial turns without
+            // incorrectly prefixing ordinary duplicate questions.
+            let mut adversarial_displays_by_body =
+                std::collections::HashMap::<String, std::collections::VecDeque<String>>::new();
+            if supports_pm_research_replay {
+                match sqlx::query_scalar::<sqlx::Sqlite, String>(
+                    "SELECT user_message FROM super_assistant_turns
+                     WHERE tenant_id = ? AND user_id = ? AND session_id = ?
+                       AND route_capability = 'super_adversarial'
+                       AND user_message IS NOT NULL AND LENGTH(TRIM(user_message)) > 0
+                     ORDER BY started_at ASC, id ASC LIMIT 512",
+                )
+                .bind(&claims.tenant_id)
+                .bind(&claims.sub)
+                .bind(&session_id)
+                .fetch_all(&state.db)
+                .await
+                {
+                    Ok(displays) => {
+                        for display in displays {
+                            if let Some(body) = super_adversarial_command_body(&display) {
+                                adversarial_displays_by_body
+                                    .entry(body)
+                                    .or_default()
+                                    .push_back(display);
+                            }
+                        }
+                    }
+                    Err(error) => tracing::warn!(
+                        session_id = %session_id,
+                        error = %error,
+                        "failed to load adversarial history display metadata"
+                    ),
+                }
+            }
             for m in session.messages.iter().filter(|m| {
                 m.role != runtime::MessageRole::System && m.role != runtime::MessageRole::Tool
             }) {
@@ -892,10 +975,18 @@ pub(super) async fn get_session_history(
                     );
                     hide_next_internal_assistant = false;
 
-                    let stripped =
+                    let mut stripped =
                         strip_pm_retrieval_hint(&strip_pm_orch_internal_message(&stripped));
                     if stripped.trim().is_empty() {
                         continue;
+                    }
+                    if !stripped.trim_start().starts_with("/超级对抗") {
+                        let body = stripped.trim().to_string();
+                        if let Some(displays) = adversarial_displays_by_body.get_mut(&body) {
+                            if let Some(display) = displays.pop_front() {
+                                stripped = display;
+                            }
+                        }
                     }
                     push_history_message_dedup(
                         &mut messages,

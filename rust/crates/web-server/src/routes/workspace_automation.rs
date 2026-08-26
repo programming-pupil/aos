@@ -128,7 +128,7 @@ pub(crate) struct WorkspaceCommandResult {
     cwd: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CreateWorkspaceScheduleInput {
     pub name: String,
@@ -260,14 +260,84 @@ const fn default_timeout_seconds() -> u64 {
     120
 }
 
+/// Convert model/client paths into the canonical virtual workspace path.
+/// Schedules execute in the sandbox's `/workspace` mount, so host paths and
+/// API-only `/projects/session` paths are normalized before persistence.
+fn normalize_schedule_workspace_path(
+    state: &AppState,
+    tenant_id: &str,
+    user_id: &str,
+    raw: &str,
+    require_file: bool,
+) -> AppResult<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(AppError::ValidationError(
+            "workspace path is required".to_string(),
+        ));
+    }
+    let root =
+        super::personal_workspace::ensure_workspace_root_for_user(state, tenant_id, user_id)?;
+    let root_display = root.to_string_lossy();
+    let virtual_path = if raw == "/workspace" || raw == "/workspace/" {
+        DEFAULT_CWD.to_string()
+    } else if let Some(relative) = raw.strip_prefix("/workspace/") {
+        format!("{DEFAULT_CWD}/{relative}")
+    } else if raw == DEFAULT_CWD || raw == format!("{DEFAULT_CWD}/") {
+        DEFAULT_CWD.to_string()
+    } else if let Some(relative) = raw.strip_prefix(&format!("{DEFAULT_CWD}/")) {
+        format!("{DEFAULT_CWD}/{relative}")
+    } else if raw == root_display.as_ref() || raw.starts_with(&format!("{root_display}/")) {
+        let relative = raw.strip_prefix(root_display.as_ref()).unwrap_or_default();
+        let relative = relative.trim_start_matches('/');
+        if relative.is_empty() {
+            DEFAULT_CWD.to_string()
+        } else {
+            format!("{DEFAULT_CWD}/{relative}")
+        }
+    } else if FsPath::new(raw).is_absolute() {
+        return Err(AppError::ValidationError(
+            "workspace path must stay inside the authenticated workspace".to_string(),
+        ));
+    } else {
+        format!("{DEFAULT_CWD}/{raw}")
+    };
+    super::personal_workspace::validate_workspace_file_or_directory_for_user(
+        state,
+        tenant_id,
+        user_id,
+        &virtual_path,
+        require_file,
+    )
+}
+
+fn normalize_schedule_command(command: &str, workspace_root: &FsPath) -> AppResult<String> {
+    let mut normalized = command.trim().to_string();
+    if normalized.is_empty() {
+        return Err(AppError::ValidationError(
+            "workspace schedule command is required".to_string(),
+        ));
+    }
+    let host_prefix = workspace_root.to_string_lossy();
+    if host_prefix.len() > 1 {
+        normalized = normalized.replace(host_prefix.as_ref(), ".");
+    }
+    normalized = normalized.replace("/projects/session/", "./");
+    normalized = normalized.replace("/workspace/", "./");
+    normalized = normalized.replace("/projects/session", ".");
+    normalized = normalized.replace("/workspace", ".");
+    Ok(normalized)
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/commands", post(execute_command))
         .route("/schedules", get(list_schedules).post(create_schedule))
         .route(
             "/schedules/{schedule_id}",
-            patch(update_schedule).delete(cancel_schedule),
+            patch(update_schedule).delete(delete_schedule),
         )
+        .route("/schedules/{schedule_id}/cancel", post(cancel_schedule))
 }
 
 async fn execute_command(
@@ -329,6 +399,18 @@ async fn cancel_schedule(
     Ok(Json(
         cancel_schedule_for_user(&state, &claims.tenant_id, &claims.sub, &schedule_id).await?,
     ))
+}
+
+async fn delete_schedule(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(schedule_id): Path<String>,
+) -> AppResult<Json<serde_json::Value>> {
+    delete_schedule_for_user(&state, &claims.tenant_id, &claims.sub, &schedule_id).await?;
+    Ok(Json(serde_json::json!({
+        "deleted": true,
+        "scheduleId": schedule_id,
+    })))
 }
 
 fn validate_command(command: &str) -> AppResult<String> {
@@ -423,6 +505,24 @@ fn ensure_command_isolation() -> AppResult<()> {
     Ok(())
 }
 
+fn is_transient_database_error(error: &AppError) -> bool {
+    if matches!(error, AppError::Database(sqlx::Error::PoolTimedOut)) {
+        return true;
+    }
+    let AppError::Database(sqlx::Error::Database(database_error)) = error else {
+        return false;
+    };
+    let code_matches = database_error
+        .code()
+        .as_deref()
+        .is_some_and(|code| matches!(code, "5" | "6" | "SQLITE_BUSY" | "SQLITE_LOCKED"));
+    let message = database_error.message().to_ascii_lowercase();
+    code_matches
+        || message.contains("database is locked")
+        || message.contains("database is busy")
+        || message.contains("database table is locked")
+}
+
 async fn execute_workspace_command(
     state: &AppState,
     tenant_id: &str,
@@ -496,7 +596,7 @@ pub(crate) async fn list_schedules_for_user(
     let rows = sqlx::query_as::<_, WorkspaceScheduleRow>(sqlx::AssertSqlSafe(query))
         .bind(tenant_id)
         .bind(user_id)
-        .fetch_all(&state.db)
+        .fetch_all(state.control_db())
         .await?;
     Ok(rows.into_iter().map(WorkspaceSchedule::from).collect())
 }
@@ -509,19 +609,16 @@ pub(crate) async fn create_schedule_for_user(
 ) -> AppResult<WorkspaceSchedule> {
     ensure_command_isolation()?;
     let name = validate_name(&input.name)?;
-    let command = validate_command(&input.command)?;
+    let root =
+        super::personal_workspace::ensure_workspace_root_for_user(state, tenant_id, user_id)?;
+    let command = normalize_schedule_command(&input.command, &root)?;
+    let command = validate_command(&command)?;
     let timeout_seconds = validate_timeout(input.timeout_seconds)?;
-    let (_, _, cwd) = super::personal_workspace::resolve_workspace_directory_for_user(
-        state, tenant_id, user_id, &input.cwd,
-    )?;
+    let cwd = normalize_schedule_workspace_path(state, tenant_id, user_id, &input.cwd, false)?;
     let script_path = input
         .script_path
         .as_deref()
-        .map(|path| {
-            super::personal_workspace::validate_workspace_file_for_user(
-                state, tenant_id, user_id, path,
-            )
-        })
+        .map(|path| normalize_schedule_workspace_path(state, tenant_id, user_id, path, true))
         .transpose()?;
     let (cron_expression, schedule) = parse_schedule(&input.cron_expression)?;
     let (timezone, parsed_timezone) = parse_timezone(&input.timezone)?;
@@ -545,9 +642,9 @@ pub(crate) async fn create_schedule_for_user(
     .bind(timezone)
     .bind(i64::try_from(timeout_seconds).unwrap_or(120))
     .bind(next_run_at)
-    .execute(&state.db)
+    .execute(state.control_db())
     .await?;
-    load_owned_schedule(&state.db, tenant_id, user_id, &id)
+    load_owned_schedule(state.control_db(), tenant_id, user_id, &id)
         .await
         .map(WorkspaceSchedule::from)
 }
@@ -578,26 +675,28 @@ pub(crate) async fn update_schedule_for_user(
     schedule_id: &str,
     input: UpdateWorkspaceScheduleInput,
 ) -> AppResult<WorkspaceSchedule> {
-    let current = load_owned_schedule(&state.db, tenant_id, user_id, schedule_id).await?;
+    let current = load_owned_schedule(state.control_db(), tenant_id, user_id, schedule_id).await?;
     let name = input
         .name
         .as_deref()
         .map(validate_name)
         .transpose()?
         .unwrap_or(current.name);
+    let root =
+        super::personal_workspace::ensure_workspace_root_for_user(state, tenant_id, user_id)?;
     let command = input
         .command
         .as_deref()
-        .map(validate_command)
+        .map(|value| normalize_schedule_command(value, &root))
+        .transpose()?
+        .map(|value| validate_command(&value))
         .transpose()?
         .unwrap_or(current.command);
     let cwd_input = input.cwd.unwrap_or(current.cwd);
-    let (_, _, cwd) = super::personal_workspace::resolve_workspace_directory_for_user(
-        state, tenant_id, user_id, &cwd_input,
-    )?;
+    let cwd = normalize_schedule_workspace_path(state, tenant_id, user_id, &cwd_input, false)?;
     let script_path = match input.script_path {
-        Some(Some(path)) => Some(super::personal_workspace::validate_workspace_file_for_user(
-            state, tenant_id, user_id, &path,
+        Some(Some(path)) => Some(normalize_schedule_workspace_path(
+            state, tenant_id, user_id, &path, true,
         )?),
         Some(None) => None,
         None => current.script_path,
@@ -640,7 +739,7 @@ pub(crate) async fn update_schedule_for_user(
     .bind(schedule_id)
     .bind(tenant_id)
     .bind(user_id)
-    .execute(&state.db)
+    .execute(state.control_db())
     .await?;
     if result.rows_affected() != 1 {
         return Err(AppError::NotFound(
@@ -648,7 +747,7 @@ pub(crate) async fn update_schedule_for_user(
         ));
     }
     cancel_active_execution(schedule_id);
-    load_owned_schedule(&state.db, tenant_id, user_id, schedule_id)
+    load_owned_schedule(state.control_db(), tenant_id, user_id, schedule_id)
         .await
         .map(WorkspaceSchedule::from)
 }
@@ -669,7 +768,7 @@ pub(crate) async fn cancel_schedule_for_user(
     .bind(schedule_id)
     .bind(tenant_id)
     .bind(user_id)
-    .execute(&state.db)
+    .execute(state.control_db())
     .await?;
     if result.rows_affected() != 1 {
         return Err(AppError::NotFound(
@@ -677,9 +776,39 @@ pub(crate) async fn cancel_schedule_for_user(
         ));
     }
     cancel_active_execution(schedule_id);
-    load_owned_schedule(&state.db, tenant_id, user_id, schedule_id)
+    load_owned_schedule(state.control_db(), tenant_id, user_id, schedule_id)
         .await
         .map(WorkspaceSchedule::from)
+}
+
+/// Permanently remove a schedule owned by the authenticated user. Active
+/// executions are cancelled first; their fencing check then prevents a late
+/// worker result from recreating or mutating the deleted row.
+pub(crate) async fn delete_schedule_for_user(
+    state: &AppState,
+    tenant_id: &str,
+    user_id: &str,
+    schedule_id: &str,
+) -> AppResult<()> {
+    // Resolve ownership before cancellation so an attacker cannot use this
+    // endpoint to signal an execution belonging to another tenant/user.
+    let _ = load_owned_schedule(state.control_db(), tenant_id, user_id, schedule_id).await?;
+    cancel_active_execution(schedule_id);
+    let result = sqlx::query(
+        "DELETE FROM workspace_scheduled_jobs
+         WHERE id = ? AND tenant_id = ? AND user_id = ?",
+    )
+    .bind(schedule_id)
+    .bind(tenant_id)
+    .bind(user_id)
+    .execute(state.control_db())
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(AppError::NotFound(
+            "workspace schedule not found".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn start_workspace_schedule_worker(state: AppState) {
@@ -702,8 +831,12 @@ pub fn start_workspace_schedule_worker(state: AppState) {
                 };
                 let claimed = match claim_due_schedule(&state, &worker_id).await {
                     Ok(claimed) => claimed,
+                    Err(error) if is_transient_database_error(&error) => {
+                        tracing::debug!(%error, "workspace schedule claim deferred by database contention");
+                        break;
+                    }
                     Err(error) => {
-                        tracing::warn!(%error, "workspace schedule claim failed");
+                        tracing::error!(%error, "workspace schedule claim failed");
                         break;
                     }
                 };
@@ -1113,6 +1246,42 @@ mod tests {
         assert!(!cancelled.enabled);
         assert_eq!(cancelled.status, "cancelled");
         assert!(cancelled.next_run_at.is_none());
+
+        let deletable = create_schedule_for_user(
+            &state,
+            "tenant-a",
+            "user-a",
+            CreateWorkspaceScheduleInput {
+                name: "deletable report".to_string(),
+                command: "printf deleted > should-not-run.txt".to_string(),
+                cwd: DEFAULT_CWD.to_string(),
+                cron_expression: "* * * * *".to_string(),
+                timezone: "UTC".to_string(),
+                timeout_seconds: 10,
+                script_path: None,
+                session_id: Some("session-a".to_string()),
+            },
+        )
+        .await
+        .expect("create deletable schedule");
+        let registration = ActiveExecutionRegistration::register(&deletable.id);
+        let deleted = delete_schedule_for_user(&state, "tenant-a", "user-a", &deletable.id).await;
+        assert!(deleted.is_ok());
+        assert!(registration.cancellation.load(Ordering::Acquire));
+        let deleted_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workspace_scheduled_jobs WHERE id = ?")
+                .bind(&deletable.id)
+                .fetch_one(state.control_db())
+                .await
+                .expect("count deleted schedule");
+        assert_eq!(deleted_count, 0);
+        let missing_for_other_owner =
+            delete_schedule_for_user(&state, "tenant-b", "user-b", &deletable.id).await;
+        assert!(matches!(
+            missing_for_other_owner,
+            Err(AppError::NotFound(_))
+        ));
+        drop(registration);
 
         db.close().await;
         let _ = std::fs::remove_dir_all(data_dir);

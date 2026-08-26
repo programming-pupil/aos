@@ -275,6 +275,16 @@ export default function Workspace() {
     }
   };
 
+  const deleteSchedule = async (schedule: WorkspaceSchedule) => {
+    try {
+      await personalWorkspaceApi.deleteSchedule(schedule.id);
+      await invalidateSchedules();
+      message.success(t('workspace.scheduleDeleted', 'Schedule deleted'));
+    } catch (error) {
+      message.error(`${t('common.operationFailed')}: ${(error as Error).message}`);
+    }
+  };
+
   const openEditor = async (item: WorkspaceFileItem) => {
     setEditorOpen(true);
     setEditorPath(item.path);
@@ -466,7 +476,7 @@ export default function Workspace() {
     { title: t('workspace.lastRun', 'Last run'), dataIndex: 'lastFinishedAt', width: 180, render: formatTime },
     { title: t('common.status'), dataIndex: 'status', width: 110, render: (status) => <Tag color={status === 'failed' ? 'red' : status === 'running' ? 'blue' : status === 'cancelled' ? 'default' : 'green'}>{String(t(`workspace.scheduleStatus.${status}`, status))}</Tag> },
     {
-      title: t('common.actions'), width: 150, fixed: 'right', align: 'right', render: (_, schedule) => (
+      title: t('common.actions'), width: 180, fixed: 'right', align: 'right', render: (_, schedule) => (
         <Space size={2}>
           <Tooltip title={schedule.enabled ? t('workspace.disableSchedule', 'Disable') : t('workspace.enableSchedule', 'Enable')}>
             <Switch size="small" checked={schedule.enabled} onChange={(enabled) => void setScheduleEnabled(schedule, enabled)} />
@@ -474,6 +484,9 @@ export default function Workspace() {
           <Tooltip title={t('common.edit')}><Button type="text" icon={<EditOutlined />} onClick={() => openScheduleEditor(schedule)} /></Tooltip>
           <Popconfirm title={t('workspace.cancelScheduleConfirm', 'Cancel this schedule?')} onConfirm={() => void cancelSchedule(schedule)}>
             <Tooltip title={t('common.cancel')}><Button type="text" danger icon={<StopOutlined />} /></Tooltip>
+          </Popconfirm>
+          <Popconfirm title={t('workspace.deleteScheduleConfirm', 'Delete this schedule permanently?')} onConfirm={() => void deleteSchedule(schedule)}>
+            <Tooltip title={t('common.delete')}><Button type="text" danger icon={<DeleteOutlined />} /></Tooltip>
           </Popconfirm>
         </Space>
       ),

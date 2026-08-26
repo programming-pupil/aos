@@ -445,6 +445,47 @@ pub(crate) fn applied_rules_json_value(applied_rules: &[AppliedRuleHit]) -> serd
     serde_json::to_value(applied_rules).unwrap_or_else(|_| serde_json::json!([]))
 }
 
+fn semantic_clarification_question(audit: &semantic_audit::SemanticAudit) -> String {
+    let verification = semantic_audit::verification_json(audit);
+    let labels = [
+        ("metric_equivalence", "指标定义"),
+        ("denominator_equivalence", "分母口径"),
+        ("population_equivalence", "统计人群"),
+        ("grain_consistency", "分组粒度"),
+        ("time_consistency", "时间范围与时区"),
+        ("comparison_consistency", "对比基准"),
+        ("join_cardinality", "表关联关系"),
+        ("filter_completeness", "筛选条件"),
+        ("schema_binding", "表和字段绑定"),
+    ];
+    let mut missing = Vec::new();
+    for (key, label) in labels {
+        let status = verification
+            .get(key)
+            .and_then(|value| value.get("status"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if !status.eq_ignore_ascii_case("pass") && !status.eq_ignore_ascii_case("notchecked") {
+            missing.push(label.to_string());
+        }
+    }
+    for ambiguity in audit.intent.unresolved.iter().take(3) {
+        let field = ambiguity.field.trim();
+        if !field.is_empty() && !missing.iter().any(|item| field.contains(item)) {
+            missing.push(field.to_string());
+        }
+    }
+    if missing.is_empty() {
+        "当前 SQL 的语义校验未能确认完整口径。请补充指标、时间范围、统计人群、分组粒度和表关联关系后重试。"
+            .to_string()
+    } else {
+        format!(
+            "为了避免生成错误数据，请确认以下信息：{}。确认后重新提交问题即可。",
+            missing.join("、")
+        )
+    }
+}
+
 async fn persist_reference_usages_for_query(
     state: &AppState,
     claims: &Claims,
@@ -4909,11 +4950,9 @@ pub(crate) async fn query(
     );
     self::query_async::emit_stage("query_understanding", "意图分析完成");
 
-    let references_active = req
-        .reference_bindings
-        .as_ref()
-        .map(ReferenceBindingRequest::is_active)
-        .unwrap_or(false);
+    // The server always binds enabled references; client overrides only narrow
+    // that set and never turn reference context off.
+    let references_active = true;
     self::query_async::emit_stage("load_context", "正在检索绑定参考");
     let mut reference_snippets = resolve_query_references(
         &state,
@@ -6273,9 +6312,74 @@ pub(crate) async fn query(
         );
     }
     if let Err(reason) = semantic_audit::require_execution_validation_decision(&release_decision) {
-        return Err(AppError::ValidationError(format!(
-            "{reason}. Resolve the metric, grain, population, time or join ambiguity and retry."
-        )));
+        let clarification_question = semantic_clarification_question(&audit);
+        push_rule_hit(
+            &mut applied_rules,
+            "semantic_clarification_required",
+            "Semantic Clarification",
+            Some(reason.clone()),
+        );
+        tracing::warn!(
+            tenant_id = %claims.tenant_id,
+            user_id = %claims.sub,
+            datasource_id = %req.data_source_id,
+            query_id = %query_id,
+            release_decision = %release_decision,
+            clarification = %clarification_question,
+            "NL2SQL semantic verifier requires user clarification; SQL candidate withheld"
+        );
+        sqlx::query(
+            "INSERT INTO nl2sql_queries \
+             (id, tenant_id, user_id, data_source_id, conversation_id, question, generated_sql, executed, error_message, planning_ms, route_confidence, routing_method, semantic_context, applied_rules_json) \
+             VALUES (?, ?, ?, ?, ?, ?, NULL, 0, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&query_id)
+        .bind(&claims.tenant_id)
+        .bind(&claims.sub)
+        .bind(&req.data_source_id)
+        .bind(&conversation_id)
+        .bind(&req.question)
+        .bind(format!("{reason}; {clarification_question}"))
+        .bind(planning_ms)
+        .bind(route_confidence)
+        .bind(routing_method.as_deref())
+        .bind(semantic_context.clone())
+        .bind(applied_rules_json_value(&applied_rules))
+        .execute(&state.db)
+        .await?;
+        persist_reference_usages_for_query(
+            &state,
+            &claims,
+            &query_id,
+            &req.data_source_id,
+            &req.question,
+            &reference_snippets,
+        )
+        .await;
+        upsert_nl2sql_conversation(
+            &state.db,
+            &claims.tenant_id,
+            &claims.sub,
+            &conversation_id,
+            &req.question,
+        )
+        .await;
+        return Ok(Json(QueryResponse {
+            sql: None,
+            explanation: Some(reason),
+            error: None,
+            clarification_question: Some(clarification_question),
+            confirmed_requirements: None,
+            missing_requirements: None,
+            query_id,
+            conversation_id: Some(conversation_id.clone()),
+            summary_version: fetch_summary_version_i32(&state.db, &conversation_id).await,
+            query_understanding: qu_result.clone(),
+            intent: qu_result.as_ref().map(|q| q.intent.to_string()),
+            cache_hit: false,
+            applied_rules,
+            used_references,
+        }));
     }
 
     let persist_started = std::time::Instant::now();

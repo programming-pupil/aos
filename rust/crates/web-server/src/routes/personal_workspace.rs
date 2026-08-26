@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::Row;
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -356,19 +357,29 @@ pub(crate) fn resolve_workspace_directory_for_user(
     Ok((root, directory, normalized))
 }
 
-pub(crate) fn validate_workspace_file_for_user(
+/// Validate an existing workspace path while preserving its canonical virtual
+/// representation.  Schedule APIs use this for both scripts and directories.
+pub(crate) fn validate_workspace_file_or_directory_for_user(
     state: &AppState,
     tenant_id: &str,
     user_id: &str,
     virtual_path: &str,
+    require_file: bool,
 ) -> AppResult<String> {
     let root = ensure_workspace_root_for_user(state, tenant_id, user_id)?;
     let (normalized, segments) = normalize_virtual_path(virtual_path)?;
-    let file = existing_path(&root, &segments)?;
-    if !file.is_file() {
-        return Err(AppError::ValidationError(
-            "scheduled script must be a workspace file".to_string(),
-        ));
+    let path = existing_path(&root, &segments)?;
+    let valid = if require_file {
+        path.is_file()
+    } else {
+        path.is_file() || path.is_dir()
+    };
+    if !valid {
+        return Err(AppError::ValidationError(if require_file {
+            "workspace path must be a file".to_string()
+        } else {
+            "workspace path must be a file or directory".to_string()
+        }));
     }
     Ok(normalized)
 }
@@ -491,7 +502,11 @@ async fn list_files(
     }
     let after = decode_file_cursor(query.cursor.as_deref())?;
     let limit = query.limit.unwrap_or(100).clamp(1, 200);
-    let mut items = Vec::new();
+    // Keep only the requested window plus one look-ahead item.  Directory
+    // pagination remains deterministic without retaining/sorting an entire
+    // multi-thousand-file workspace in memory.
+    let window_size = limit.saturating_add(1);
+    let mut window = BTreeMap::<String, WorkspaceFileItem>::new();
     for entry in fs::read_dir(&directory)? {
         let entry = entry?;
         let metadata = fs::symlink_metadata(entry.path())?;
@@ -511,7 +526,7 @@ async fn list_files(
         } else {
             "file"
         };
-        items.push(WorkspaceFileItem {
+        let item = WorkspaceFileItem {
             path: virtual_child(&virtual_path, &name),
             name,
             kind: kind.to_string(),
@@ -522,12 +537,23 @@ async fn list_files(
             },
             updated_at: modified_at(&metadata),
             editable: metadata.is_file() && is_editable_file(&entry.path(), metadata.len()),
-        });
+        };
+        let key = item_key(&item);
+        if after
+            .as_ref()
+            .is_some_and(|cursor| key.as_str() <= cursor.as_str())
+        {
+            continue;
+        }
+        window.insert(key, item);
+        if window.len() > window_size {
+            if let Some(last) = window.keys().next_back().cloned() {
+                window.remove(&last);
+            }
+        }
     }
+    let mut items = window.into_values().collect::<Vec<_>>();
     items.sort_by(item_order);
-    if let Some(after) = after {
-        items.retain(|item| item_key(item) > after);
-    }
     let has_more = items.len() > limit;
     items.truncate(limit);
     let next_cursor = has_more

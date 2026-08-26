@@ -56,12 +56,25 @@ pub fn start(db: SqlitePool, registry: Arc<EmbeddingStoreRegistry>) {
                     }
                 }
                 Ok(None) => {}
+                Err(error) if is_transient_database_error(&error) => {
+                    tracing::debug!(error = %error, "embedding reindex claim deferred by database contention");
+                }
                 Err(error) => {
-                    tracing::warn!(error = %error, "failed to claim embedding reindex job");
+                    tracing::error!(error = %error, "failed to claim embedding reindex job");
                 }
             }
         }
     });
+}
+
+fn is_transient_database_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("pool timed out")
+        || message.contains("database is locked")
+        || message.contains("database is busy")
+        || message.contains("database table is locked")
+        || message.contains("sqlite_busy")
+        || message.contains("sqlite_locked")
 }
 
 async fn warm_active_profiles(

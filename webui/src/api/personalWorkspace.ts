@@ -153,5 +153,8 @@ export const personalWorkspaceApi = {
     client.patch<WorkspaceSchedule>(`/workspace/schedules/${encodeURIComponent(id)}`, data).then((response) => response.data),
 
   cancelSchedule: (id: string) =>
-    client.delete<WorkspaceSchedule>(`/workspace/schedules/${encodeURIComponent(id)}`).then((response) => response.data),
+    client.post<WorkspaceSchedule>(`/workspace/schedules/${encodeURIComponent(id)}/cancel`).then((response) => response.data),
+
+  deleteSchedule: (id: string) =>
+    client.delete<{ deleted: boolean; scheduleId: string }>(`/workspace/schedules/${encodeURIComponent(id)}`).then((response) => response.data),
 };

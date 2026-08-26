@@ -196,6 +196,8 @@
     "disableSchedule": "停用",
     "enableSchedule": "启用",
     "cancelScheduleConfirm": "确定取消这个定时任务？",
+    "deleteScheduleConfirm": "确定永久删除这个定时任务？",
+    "scheduleDeleted": "定时任务已删除",
     "scheduleStatus": {
       "scheduled": "等待运行",
       "running": "运行中",
@@ -3658,6 +3660,7 @@
       "hint": "绑定 SQL Demo、README、脚本或指标模板，作为可复用查询上下文。",
       "overrideTitle": "指定参考资料",
       "overrideHint": "默认会自动召回 SQL 知识库；这里只在需要强制限定资料范围时使用。",
+      "autoBoundHint": "系统会自动绑定当前数据源下全部已启用参考资料，并按相关性限制上下文窗口。",
       "uploadGuideTitle": "上传入口在参考包里",
       "uploadGuide": "先创建一个参考包，再在参考包右侧点击“上传文件”。支持 README、SQL、Python、CSV、JSON、TXT、日志等文本型资料。",
       "bindButton": "绑定参考",

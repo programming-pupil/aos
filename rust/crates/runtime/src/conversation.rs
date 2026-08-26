@@ -5994,7 +5994,9 @@ mod tests {
         let ResumableTurnOutcome::Completed(summary) = completed else {
             panic!("resumed turn should complete");
         };
-        assert_eq!(summary.assistant_messages.len(), 1);
+        // The resumed turn keeps the original assistant tool-call message and
+        // the final assistant answer in its durable summary.
+        assert_eq!(summary.assistant_messages.len(), 2);
         assert_eq!(summary.tool_results.len(), 1);
         assert_eq!(runtime.session().turns.len(), 1);
         assert_eq!(
@@ -6030,7 +6032,10 @@ mod tests {
             .await
             .expect("terminal deferred result should commit");
 
-        assert_eq!(summary.iterations, 0);
+        // Starting the deferred tool call advances the durable iteration
+        // cursor even when the external result is terminal and no second model
+        // request is needed.
+        assert_eq!(summary.iterations, 1);
         assert_eq!(summary.tool_results.len(), 1);
         assert_eq!(summary.assistant_messages.len(), 1);
         assert_eq!(runtime.session().messages.len(), 4);

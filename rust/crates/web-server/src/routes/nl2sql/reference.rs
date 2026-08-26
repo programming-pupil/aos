@@ -1506,23 +1506,26 @@ pub(crate) async fn resolve_query_references(
     bindings: Option<&ReferenceBindingRequest>,
     limit: usize,
 ) -> Result<Vec<ReferencePromptSnippet>> {
-    let mut references = if let Some(bindings) = bindings {
-        if bindings.is_active() {
-            resolve_bound_query_references(
-                &state.db,
-                tenant_id,
-                datasource_id,
-                question,
-                bindings,
-                limit,
-            )
-            .await?
-        } else {
-            resolve_auto_query_references(state, tenant_id, datasource_id, question, limit).await?
-        }
-    } else {
-        resolve_auto_query_references(state, tenant_id, datasource_id, question, limit).await?
+    // Every query is bound to the enabled tenant/datasource knowledge by
+    // default.  An empty or omitted client override must not silently disable
+    // first-party SQL references; the prompt/result window remains bounded by
+    // `limit` and the existing relevance scorer.
+    let default_bindings = ReferenceBindingRequest {
+        include_all: true,
+        ..ReferenceBindingRequest::default()
     };
+    let effective_bindings = bindings
+        .filter(|value| value.is_active())
+        .unwrap_or(&default_bindings);
+    let mut references = resolve_bound_query_references(
+        &state.db,
+        tenant_id,
+        datasource_id,
+        question,
+        effective_bindings,
+        limit,
+    )
+    .await?;
     append_approved_feedback_references(
         &state.db,
         tenant_id,

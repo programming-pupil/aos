@@ -323,6 +323,9 @@ async fn run_worker_loop<F, Fut>(
 }
 
 fn is_sqlite_transient_lock_error(error: &AppError) -> bool {
+    if matches!(error, AppError::Database(sqlx::Error::PoolTimedOut)) {
+        return true;
+    }
     let AppError::Database(sqlx::Error::Database(database_error)) = error else {
         return false;
     };

@@ -196,6 +196,8 @@
     "disableSchedule": "Disable",
     "enableSchedule": "Enable",
     "cancelScheduleConfirm": "Cancel this schedule?",
+    "deleteScheduleConfirm": "Delete this schedule permanently?",
+    "scheduleDeleted": "Schedule deleted",
     "scheduleStatus": {
       "scheduled": "Scheduled",
       "running": "Running",
@@ -3656,6 +3658,7 @@
       "hint": "Bind SQL demos, README files, scripts, or metric templates as reusable context.",
       "overrideTitle": "Pin reference material",
       "overrideHint": "AOS retrieves SQL Knowledge automatically by default. Use this only to force a narrower reference scope.",
+      "autoBoundHint": "All enabled references for the selected data source are bound automatically and ranked within a bounded context window.",
       "uploadGuideTitle": "Uploads live inside reference packs",
       "uploadGuide": "Create a reference pack first, then click Upload file on the pack. Text assets such as README, SQL, Python, CSV, JSON, TXT, and logs are supported.",
       "bindButton": "References",

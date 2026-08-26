@@ -4213,6 +4213,16 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             let parent_reservation_id = if input.budget_stage.is_protected() {
                 let parent_reservation_id =
                     protected_model_reservation_id(&input.turn_id, input.budget_stage);
+                expand_protected_model_budget_if_needed(
+                    &mut tx,
+                    &self.tenant_id,
+                    &self.session_id,
+                    input.budget_stage,
+                    dimension,
+                    amount,
+                    &parent_reservation_id,
+                )
+                .await?;
                 let updated = sqlx::query::<Sqlite>(
                     "UPDATE resource_budget_entries
                      SET amount = amount - ?
@@ -6733,6 +6743,98 @@ pub(crate) async fn create_memory_conflict_question_in_transaction(
     .bind(event_key)
     .execute(&mut **tx)
     .await?;
+    Ok(())
+}
+
+/// Extend a protected model-budget parent when a real context is larger than
+/// its minimum reserve. The extension transfers capacity from the same session
+/// account under the caller's write transaction, so concurrent turns cannot
+/// oversell the shared input/output budget and rollback restores both sides.
+async fn expand_protected_model_budget_if_needed(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    tenant_id: &str,
+    owner_scope: &str,
+    stage: runtime::RuntimeModelBudgetStage,
+    dimension: &str,
+    required_amount: i64,
+    reservation_id: &str,
+) -> Result<(), runtime::RuntimeError> {
+    let Some(maximum_amount) = protected_model_budget_amounts(stage).into_iter().find_map(
+        |(candidate_dimension, _minimum, maximum)| {
+            (candidate_dimension == dimension).then_some(maximum)
+        },
+    ) else {
+        return Err(runtime::RuntimeError::new(format!(
+            "protected model budget dimension {dimension} is not configured for {}",
+            stage.as_str()
+        )));
+    };
+    let current_amount = sqlx::query_scalar::<Sqlite, i64>(
+        "SELECT amount FROM resource_budget_entries
+         WHERE tenant_id = ? AND owner_scope = ? AND reservation_id = ?
+           AND dimension = ? AND state = 'protected'",
+    )
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .bind(reservation_id)
+    .bind(dimension)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?
+    .ok_or_else(|| {
+        runtime::RuntimeError::new(format!(
+            "protected model budget parent missing for reservation {reservation_id}"
+        ))
+    })?;
+    if required_amount <= current_amount {
+        return Ok(());
+    }
+    if required_amount > maximum_amount {
+        return Err(runtime::RuntimeError::new(format!(
+            "budget_exhausted dimension={dimension} reservation={reservation_id} stage={} required={required_amount} maximum={maximum_amount} suggestion=reduce_context_or_retry",
+            stage.as_str()
+        )));
+    }
+    let deficit = required_amount - current_amount;
+    let account = sqlx::query::<Sqlite>(
+        "UPDATE resource_budget_accounts
+         SET available = available - ?, reserved = reserved + ?
+         WHERE tenant_id = ? AND owner_scope = ? AND dimension = ? AND available >= ?",
+    )
+    .bind(deficit)
+    .bind(deficit)
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .bind(dimension)
+    .bind(deficit)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+    if account.rows_affected() != 1 {
+        return Err(runtime::RuntimeError::new(format!(
+            "budget_exhausted dimension={dimension} reservation={reservation_id} stage={} required={required_amount} available_session_capacity=false suggestion=reduce_context_or_retry",
+            stage.as_str()
+        )));
+    }
+    let parent = sqlx::query::<Sqlite>(
+        "UPDATE resource_budget_entries SET amount = amount + ?
+         WHERE tenant_id = ? AND owner_scope = ? AND reservation_id = ?
+           AND dimension = ? AND state = 'protected' AND amount = ?",
+    )
+    .bind(deficit)
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .bind(reservation_id)
+    .bind(dimension)
+    .bind(current_amount)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+    if parent.rows_affected() != 1 {
+        return Err(runtime::RuntimeError::new(
+            "protected model budget parent changed during capacity extension",
+        ));
+    }
     Ok(())
 }
 
@@ -17504,6 +17606,129 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(child_entries, (3, 1));
+    }
+
+    #[tokio::test]
+    async fn final_synthesis_expands_protected_input_budget_atomically() {
+        let db = db().await;
+        let kernel = RuntimeExecutionKernel::new(db.clone(), "tenant", "user", "large-session");
+        kernel
+            .start_turn(runtime::RuntimeTurnStart {
+                turn_id: "large-turn".into(),
+                user_input: "large final synthesis".into(),
+            })
+            .await
+            .unwrap();
+
+        let estimated_tokens = 300_000_usize;
+        kernel
+            .record_context_manifest(runtime::RuntimeContextManifestInput {
+                turn_id: "large-turn".into(),
+                iteration: 1,
+                budget_stage: runtime::RuntimeModelBudgetStage::FinalSynthesis,
+                system_sections: vec!["system".into()],
+                messages: vec![runtime::ConversationMessage::user_text("query")],
+                estimated_tokens,
+                max_input_tokens: 500_000,
+                model_version: Some("test-model".into()),
+                active_tools: vec!["complete_turn".into()],
+                semantic_snapshot_version: None,
+                context_packet: test_context_packet(500_000, estimated_tokens as u64),
+                prompt_manifest: None,
+            })
+            .await
+            .expect("a large but bounded final context should reserve successfully");
+
+        let parent_amount: i64 = sqlx::query_scalar(
+            "SELECT amount FROM resource_budget_entries
+             WHERE tenant_id = 'tenant' AND owner_scope = 'large-session'
+               AND reservation_id = 'model-protected:large-turn:final_synthesis'
+               AND dimension = 'token_input' AND state = 'protected'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(parent_amount, 0);
+        let child_amount: i64 = sqlx::query_scalar(
+            "SELECT amount FROM resource_budget_entries
+             WHERE tenant_id = 'tenant' AND owner_scope = 'large-session'
+               AND reservation_id = 'model:large-turn:1' AND dimension = 'token_input'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(child_amount, estimated_tokens as i64);
+
+        let assistant =
+            runtime::ConversationMessage::assistant(vec![runtime::ContentBlock::Text {
+                text: "final answer".into(),
+            }]);
+        kernel
+            .record_assistant_message("large-turn", 1, &assistant)
+            .await
+            .unwrap();
+        kernel
+            .finish_turn(
+                "large-turn",
+                runtime::RuntimeTurnTerminalStatus::Completed,
+                None,
+            )
+            .await
+            .unwrap();
+        let (available, reserved): (i64, i64) = sqlx::query_as(
+            "SELECT available, reserved FROM resource_budget_accounts
+             WHERE tenant_id = 'tenant' AND owner_scope = 'large-session'
+               AND dimension = 'token_input'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!((available, reserved), (2_000_000, 0));
+
+        kernel
+            .start_turn(runtime::RuntimeTurnStart {
+                turn_id: "too-large-turn".into(),
+                user_input: "over budget".into(),
+            })
+            .await
+            .unwrap();
+        let too_large = kernel
+            .record_context_manifest(runtime::RuntimeContextManifestInput {
+                turn_id: "too-large-turn".into(),
+                iteration: 1,
+                budget_stage: runtime::RuntimeModelBudgetStage::FinalSynthesis,
+                system_sections: vec!["system".into()],
+                messages: vec![runtime::ConversationMessage::user_text("query")],
+                estimated_tokens: 2_000_001,
+                max_input_tokens: 2_100_000,
+                model_version: Some("test-model".into()),
+                active_tools: vec!["complete_turn".into()],
+                semantic_snapshot_version: None,
+                context_packet: test_context_packet(2_100_000, 2_000_001),
+                prompt_manifest: None,
+            })
+            .await;
+        assert!(too_large
+            .expect_err("context over the protected stage maximum must fail")
+            .to_string()
+            .contains("maximum=2000000"));
+        let manifest_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM context_packet_manifests
+             WHERE tenant_id = 'tenant' AND thread_id = 'large-session'
+               AND turn_id = 'too-large-turn'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(manifest_count, 0);
+        kernel
+            .finish_turn(
+                "too-large-turn",
+                runtime::RuntimeTurnTerminalStatus::Failed,
+                Some("over budget"),
+            )
+            .await
+            .unwrap();
     }
 
     fn approval_request(turn_id: &str, invocation_id: &str) -> runtime::RuntimeApprovalRequest {

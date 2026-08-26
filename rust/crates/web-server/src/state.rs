@@ -214,7 +214,11 @@ impl AppState {
         let (platform_lifecycle, recovered_from_unclean_shutdown) =
             acquire_platform_lifecycle(&data_dir)?;
         let database_path = data_dir.join("aos.db");
-        let max_connections = env_u32("AOS_SQLITE_MAX_CONNECTIONS", 4).clamp(1, 8);
+        // Keep interactive capacity separate from background/control work. Four
+        // connections are easily exhausted by a long context projection plus
+        // concurrent session history reads; eight is still conservative for a
+        // single SQLite WAL database and remains configurable for small hosts.
+        let max_connections = env_u32("AOS_SQLITE_MAX_CONNECTIONS", 8).clamp(8, 16);
         // Interactive requests have a dedicated pool. Short writes still need
         // time to serialize with the independent control/telemetry pools.
         let busy_timeout_ms = env_u64("AOS_SQLITE_BUSY_TIMEOUT_MS", 30_000).clamp(1_000, 60_000);
@@ -276,7 +280,7 @@ impl AppState {
             }
             tracing::warn!("previous AOS shutdown was unclean; SQLite quick_check passed");
         }
-        let control_max_connections = env_u32("AOS_SQLITE_CONTROL_MAX_CONNECTIONS", 4).clamp(1, 8);
+        let control_max_connections = env_u32("AOS_SQLITE_CONTROL_MAX_CONNECTIONS", 8).clamp(8, 16);
         let control_db = SqlitePoolOptions::new()
             .max_connections(control_max_connections)
             .min_connections(1)
@@ -284,7 +288,7 @@ impl AppState {
             .connect_with(connect_options.clone())
             .await?;
         let telemetry_db = SqlitePoolOptions::new()
-            .max_connections(1)
+            .max_connections(2)
             .min_connections(1)
             .acquire_timeout(Duration::from_secs(acquire_timeout_secs))
             .connect_with(connect_options)

@@ -483,17 +483,67 @@ impl GitlabProjectManager {
             .join(user_id)
             .join("workspace");
 
-        let clone_dir = project
-            .clone_path
-            .as_deref()
-            .map(PathBuf::from)
-            .filter(|path| path.exists())
-            .unwrap_or_else(|| workspace.join(sanitize_dir_name(&project.name)));
+        let configured_clone_dir = project.clone_path.as_deref().map(|configured| {
+            let path = PathBuf::from(configured);
+            if path.is_absolute() {
+                path
+            } else {
+                workspace.join(path)
+            }
+        });
 
         // Ensure workspace exists
         tokio::fs::create_dir_all(&workspace)
             .await
             .map_err(GatewayError::Io)?;
+
+        let workspace_root = tokio::fs::canonicalize(&workspace)
+            .await
+            .map_err(GatewayError::Io)?;
+        let clone_candidate = configured_clone_dir
+            .unwrap_or_else(|| workspace.join(sanitize_dir_name(&project.name)));
+        let clone_dir = match tokio::fs::symlink_metadata(&clone_candidate).await {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(GatewayError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "project clone path is not a directory: {}",
+                            clone_candidate.display()
+                        ),
+                    )));
+                }
+                let canonical = tokio::fs::canonicalize(&clone_candidate)
+                    .await
+                    .map_err(GatewayError::Io)?;
+                if !canonical.starts_with(&workspace_root) {
+                    return Err(GatewayError::Io(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "project clone path must stay inside the user's workspace",
+                    )));
+                }
+                canonical
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let parent = clone_candidate.parent().unwrap_or(&workspace);
+                let canonical_parent = tokio::fs::canonicalize(parent)
+                    .await
+                    .map_err(GatewayError::Io)?;
+                if !canonical_parent.starts_with(&workspace_root) {
+                    return Err(GatewayError::Io(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "project clone path must stay inside the user's workspace",
+                    )));
+                }
+                canonical_parent.join(clone_candidate.file_name().ok_or_else(|| {
+                    GatewayError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "project clone path has no directory name",
+                    ))
+                })?)
+            }
+            Err(error) => return Err(GatewayError::Io(error)),
+        };
 
         let auth = self
             .prepare_git_auth(&workspace, &project.url, project.gitlab_token.as_deref())

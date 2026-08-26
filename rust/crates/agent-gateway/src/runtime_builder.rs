@@ -6354,6 +6354,7 @@ fn deferred_parent_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "properties": {
                     "name": { "type": "string", "minLength": 1, "maxLength": 160 },
                     "command": { "type": "string", "minLength": 1, "maxLength": 32000 },
+                    "scriptPath": { "type": "string", "description": "Existing script in the workspace, such as gen_hello.sh. Relative paths are resolved against the current workspace." },
                     "cronExpression": { "type": "string", "description": "Standard 5-field minute hour day month weekday expression" },
                     "timezone": { "type": "string", "description": "IANA timezone such as Asia/Shanghai" },
                     "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 600 }
@@ -13155,7 +13156,7 @@ mod tests {
             .as_object()
             .expect("schedule create properties");
         assert!(!properties.contains_key("cwd"));
-        assert!(!properties.contains_key("scriptPath"));
+        assert!(properties.contains_key("scriptPath"));
         assert!(create
             .description
             .as_deref()

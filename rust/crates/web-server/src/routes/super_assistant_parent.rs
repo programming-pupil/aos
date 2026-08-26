@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path as FsPath;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -1637,6 +1638,11 @@ async fn run_parent_loop(
                 }
                 total_iterations = total_iterations.saturating_add(turn.iterations);
                 all_tool_calls.extend(turn.tool_calls);
+                if let Some(auto_schedule) =
+                    ensure_workspace_schedule_commit(state, claims, input, &all_tool_calls).await?
+                {
+                    all_tool_calls.push(auto_schedule);
+                }
                 let completion_issues =
                     model_completion_issues(&candidate_answer, active_model_stop_reason.as_deref());
                 let model_output_complete = completion_issues.is_empty();
@@ -1841,6 +1847,149 @@ async fn run_parent_loop(
             }
         }
     }
+}
+
+/// A model can successfully write the requested script and still stop before
+/// issuing the deferred schedule tool.  For an explicit automation contract,
+/// commit the schedule server-side from that successful write.  This is
+/// idempotent per parent session and keeps the operation usable for people who
+/// do not know the internal tool protocol.
+async fn ensure_workspace_schedule_commit(
+    state: &AppState,
+    claims: &Claims,
+    parent: &UnifiedParentTurnInput,
+    tool_calls: &[ToolCallRecord],
+) -> Result<Option<ToolCallRecord>> {
+    if !parent
+        .required_evidence
+        .iter()
+        .any(|requirement| requirement == "workspace_automation")
+        || tool_calls.iter().any(|call| {
+            matches!(
+                call.tool_name.as_str(),
+                "workspace_schedule_create"
+                    | "workspace_schedule_update"
+                    | "workspace_schedule_cancel"
+            ) && tool_call_effectively_succeeded(call)
+        })
+    {
+        return Ok(None);
+    }
+    let existing =
+        super::workspace_automation::list_schedules_for_user(state, &claims.tenant_id, &claims.sub)
+            .await?;
+    if existing
+        .iter()
+        .any(|schedule| schedule.session_id.as_deref() == Some(parent.session_id.as_str()))
+    {
+        return Ok(None);
+    }
+
+    let mut script: Option<(String, String)> = None;
+    for call in tool_calls.iter().filter(|call| {
+        call.tool_name.eq_ignore_ascii_case("write_file") && tool_call_effectively_succeeded(call)
+    }) {
+        let Ok(input) = serde_json::from_str::<Value>(&call.input) else {
+            continue;
+        };
+        let Some(path) = input
+            .get("path")
+            .or_else(|| input.get("filePath"))
+            .or_else(|| input.get("file_path"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let path = path.trim();
+        let extension = FsPath::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !matches!(
+            extension.as_str(),
+            "sh" | "bash" | "zsh" | "py" | "js" | "mjs"
+        ) {
+            continue;
+        }
+        let command_path = path
+            .strip_prefix("/projects/session/")
+            .or_else(|| path.strip_prefix("/workspace/"))
+            .unwrap_or(path)
+            .trim_start_matches("./")
+            .to_string();
+        if command_path.is_empty() || command_path.contains("..") {
+            continue;
+        }
+        script = Some((command_path, extension));
+        break;
+    }
+    let Some((script_path, extension)) = script else {
+        return Ok(None);
+    };
+    let (cron_expression, timezone) = recurring_schedule_defaults(&parent.visible_user_message);
+    let interpreter = match extension.as_str() {
+        "py" => "python3",
+        "js" | "mjs" => "node",
+        _ => "bash",
+    };
+    let quoted_script_path = format!("'{}'", script_path.replace('\'', "'\\''"));
+    let request = super::workspace_automation::CreateWorkspaceScheduleInput {
+        name: format!("AOS recurring task: {}", script_path),
+        command: format!("{interpreter} ./{quoted_script_path}"),
+        cwd: "/projects/session".to_string(),
+        cron_expression,
+        timezone,
+        timeout_seconds: 120,
+        script_path: Some(script_path.clone()),
+        session_id: Some(parent.session_id.clone()),
+    };
+    let schedule = super::workspace_automation::create_schedule_for_user(
+        state,
+        &claims.tenant_id,
+        &claims.sub,
+        request.clone(),
+    )
+    .await?;
+    tracing::info!(
+        tenant_id = %claims.tenant_id,
+        user_id = %claims.sub,
+        session_id = %parent.session_id,
+        schedule_id = %schedule.id,
+        script_path,
+        "workspace schedule committed from successful script write"
+    );
+    Ok(Some(ToolCallRecord {
+        index: u32::MAX,
+        tool_name: "workspace_schedule_create".to_string(),
+        source: "server".to_string(),
+        source_name: "workspace_automation_fallback".to_string(),
+        input: serde_json::to_string(&request).unwrap_or_default(),
+        output: serde_json::to_string(&schedule).unwrap_or_default(),
+        is_error: false,
+        duration_ms: 0,
+    }))
+}
+
+fn recurring_schedule_defaults(text: &str) -> (String, String) {
+    let lower = text.to_ascii_lowercase();
+    let cron = if text.contains("每分钟") || lower.contains("every minute") {
+        "* * * * *"
+    } else if text.contains("每小时") || lower.contains("every hour") {
+        "0 * * * *"
+    } else if text.contains("每天") || lower.contains("every day") {
+        "0 0 * * *"
+    } else if text.contains("每周") || lower.contains("every week") {
+        "0 0 * * 0"
+    } else {
+        "* * * * *"
+    };
+    let timezone = if text.contains("北京") || lower.contains("beijing") {
+        "Asia/Shanghai"
+    } else {
+        "UTC"
+    };
+    (cron.to_string(), timezone.to_string())
 }
 
 async fn accept_direct_response_candidate(
@@ -5020,9 +5169,12 @@ async fn execute_or_join_subtask(
                     None,
                     None,
                     Some(parent.session_id.clone()),
-                    parent.web_search_needed,
-                    (!parent.web_search_query.trim().is_empty())
-                        .then(|| parent.web_search_query.clone()),
+                    // Super adversarial is a distinct multi-model capability.
+                    // Never silently turn it into a parent-level web lookup;
+                    // evidence retrieval, when explicitly requested, belongs
+                    // to the adversarial engine's own bounded policy.
+                    false,
+                    None,
                 )
                 .await?;
                 if !set_subtask_external(
@@ -5045,6 +5197,29 @@ async fn execute_or_join_subtask(
                             .to_string(),
                     ));
                 }
+                persist_and_broadcast_super_assistant_event_required(
+                    &state.db,
+                    &claims.tenant_id,
+                    &claims.sub,
+                    &parent.session_id,
+                    &parent.turn_id,
+                    0,
+                    "super_assistant_answer",
+                    json!({
+                        "kind": "deepAnalysis",
+                        "answer": {
+                            "link": "chatAdversarialRun",
+                            "taskId": started.task_id,
+                            "sessionId": parent.session_id,
+                            "status": started.status
+                        }
+                    })
+                    .to_string(),
+                )
+                .await
+                .map_err(|error| AppError::Internal(format!(
+                    "failed to publish adversarial task handle: {error}"
+                )))?;
             }
             "nl2sql" => {
                 let lease_owner = claimed_lease_owner
