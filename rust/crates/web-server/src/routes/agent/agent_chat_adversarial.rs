@@ -955,8 +955,7 @@ fn chat_adversarial_should_stop_after_round(
     configured_models: &[String],
 ) -> bool {
     round >= max_rounds
-        || (round >= 2
-            && participant_consensus.reached
+        || ((round == 1 || participant_consensus.reached)
             && judge.resolved
             && judge.claim_audit_complete
             && judge.critical_conflicts.is_empty()
@@ -3264,80 +3263,83 @@ async fn run_chat_adversarial_job(
                 evaluate_participant_consensus(&configured_models, &previous_answers);
             round_value["participantConsensus"] =
                 participant_consensus_to_json(&last_participant_consensus);
-            if last_participant_consensus.reached {
-                ensure_chat_adversarial_not_cancelled(
-                    &state,
-                    &tenant_id,
-                    &user_id,
-                    &run_id,
-                    Some(&trace),
-                )
-                .await?;
-                let judge_evidence_prompt =
-                    format_adversarial_evidence_for_judge(&configured_models, &evidence_by_model);
-                last_judge = judge_round_resolution(
-                    &state,
-                    &tenant_id,
-                    &user_id,
-                    &run_id,
-                    &thread_id,
-                    &question,
-                    parent_context.as_deref(),
-                    parent_debate_state.as_ref(),
-                    memory_context.as_ref(),
-                    &judge_evidence_prompt,
-                    &judge_runtime,
-                    &previous_answers,
-                    &debate_memory,
-                    &last_participant_consensus,
-                    round,
-                )
-                .await
-                .unwrap_or_else(|e| JudgeDecision {
-                    resolved: false,
-                    claim_audit_complete: false,
-                    critical_conflicts: vec![format!("judge failed: {e}")],
-                    winner_model: None,
-                    winner_reason: Some(format!("judge failed: {e}")),
-                    raw: String::new(),
-                });
-                if last_judge.resolved
-                    && (!last_judge.claim_audit_complete
-                        || !last_judge.critical_conflicts.is_empty()
-                        || !is_configured_winner(
-                            last_judge.winner_model.as_deref(),
-                            &configured_models,
-                        ))
-                {
-                    last_judge.resolved = false;
-                    last_judge.winner_reason = Some(
-                        "裁判未完成关键 claim 审计、仍发现关键冲突，或未返回有效参赛模型，本轮继续对抗。"
-                            .to_string(),
-                    );
-                }
-                round_value["judge"] = serde_json::json!({
-                    "resolved": last_judge.resolved,
-                    "claimAuditComplete": last_judge.claim_audit_complete,
-                    "criticalConflicts": last_judge.critical_conflicts,
-                    "winnerModel": last_judge.winner_model,
-                    "winnerReason": last_judge.winner_reason,
-                    "raw": last_judge.raw,
-                });
-            } else {
-                last_judge = JudgeDecision {
-                    resolved: false,
-                    claim_audit_complete: false,
-                    critical_conflicts: Vec::new(),
-                    winner_model: None,
-                    winner_reason: Some(
-                        "参与模型尚未全部明确认可共同结论，本轮不进入终局裁决。".to_string(),
-                    ),
-                    raw: String::new(),
-                };
-                round_value["judgeSkipped"] = serde_json::json!({
-                    "reason": "participant_consensus_not_reached",
-                });
+        }
+        if round == 1 || last_participant_consensus.reached {
+            ensure_chat_adversarial_not_cancelled(
+                &state,
+                &tenant_id,
+                &user_id,
+                &run_id,
+                Some(&trace),
+            )
+            .await?;
+            let judge_evidence_prompt =
+                format_adversarial_evidence_for_judge(&configured_models, &evidence_by_model);
+            last_judge = judge_round_resolution(
+                &state,
+                &tenant_id,
+                &user_id,
+                &run_id,
+                &thread_id,
+                &question,
+                parent_context.as_deref(),
+                parent_debate_state.as_ref(),
+                memory_context.as_ref(),
+                &judge_evidence_prompt,
+                &judge_runtime,
+                &previous_answers,
+                &debate_memory,
+                &last_participant_consensus,
+                round,
+            )
+            .await
+            .unwrap_or_else(|e| JudgeDecision {
+                resolved: false,
+                claim_audit_complete: false,
+                critical_conflicts: vec![format!("judge failed: {e}")],
+                winner_model: None,
+                winner_reason: Some(format!("judge failed: {e}")),
+                raw: String::new(),
+            });
+            let incomplete_initial_roster =
+                round == 1 && successful_count != configured_models.len();
+            if last_judge.resolved
+                && (incomplete_initial_roster
+                    || !last_judge.claim_audit_complete
+                    || !last_judge.critical_conflicts.is_empty()
+                    || !is_configured_winner(
+                        last_judge.winner_model.as_deref(),
+                        &configured_models,
+                    ))
+            {
+                last_judge.resolved = false;
+                last_judge.winner_reason = Some(
+                    "裁判未完成关键 claim 审计、参赛模型未全部成功、仍发现关键冲突，或未返回有效参赛模型，本轮继续对抗。"
+                        .to_string(),
+                );
             }
+            round_value["judge"] = serde_json::json!({
+                "resolved": last_judge.resolved,
+                "claimAuditComplete": last_judge.claim_audit_complete,
+                "criticalConflicts": last_judge.critical_conflicts,
+                "winnerModel": last_judge.winner_model,
+                "winnerReason": last_judge.winner_reason,
+                "raw": last_judge.raw,
+            });
+        } else {
+            last_judge = JudgeDecision {
+                resolved: false,
+                claim_audit_complete: false,
+                critical_conflicts: last_participant_consensus.remaining_objections.clone(),
+                winner_model: None,
+                winner_reason: Some(
+                    "参与模型尚未逐项处理异议并给出有理由的一致认可票，本轮继续对抗。".to_string(),
+                ),
+                raw: String::new(),
+            };
+            round_value["judgeSkipped"] = serde_json::json!({
+                "reason": "reasoned_participant_consensus_not_reached",
+            });
         }
 
         let Some(rounds) = trace["rounds"].as_array_mut() else {
@@ -3383,8 +3385,12 @@ async fn run_chat_adversarial_job(
             &last_judge,
             &configured_models,
         ) {
-            if last_participant_consensus.reached && last_judge.resolved {
-                termination_reason = "unanimous_consensus";
+            if last_judge.resolved {
+                termination_reason = if round == 1 {
+                    "independent_answers_aligned"
+                } else {
+                    "reasoned_unanimous_consensus"
+                };
             }
             break;
         }
@@ -3759,7 +3765,7 @@ async fn run_parallel_review_answers(
             let model = runtime.model.clone();
             let system = build_review_system_prompt(&runtime.model, round);
             let prompt = format!(
-                "{followup_context}{debate_state_prompt}{memory_prompt}{evidence_prompt}\n\n---\n\n用户问题：\n{question}\n\n历史多轮观点轨迹摘要（重点展示其他专家/模型第 1 到上一轮的演进）：\n{history_context}\n\n你自己的上一轮完整答案：\n{own_previous_answer}\n\n其他行业专家/模型在上一轮的完整答案与一致认可状态（不包含你的上一轮回答）：\n{peer_context}\n\n上一轮终局裁判反馈：\n{previous_judge_feedback}\n\n请基于“证据层 + 自己上一轮原文 + 其他模型完整答案与异议 + 裁判反馈 + 历史轨迹 + 原问题”进行定向对抗审查：\n1. 先判断其他专家观点中哪些值得吸收，哪些存在事实、逻辑、适用边界或证据问题。\n2. 明确说明本轮相对上一轮新增/修正了什么，避免每轮重复同一段话。\n3. 逐项处理其他模型的重大未决异议和裁判反馈；不能处理的要保留为不确定性。\n4. 如果其他专家观点错误，请明确指出关键原因，不要泛泛反驳。\n5. 输出你本轮修订后的最佳答案，必须可直接作为最终答案候选。\n6. 正文之后必须原样追加一行机器可读投票：{vote_start}{{\"acceptConsensus\":true|false,\"preferredWinnerModel\":\"参赛模型名或null\",\"remainingObjections\":[\"仍属重大的未决异议\"],\"evidenceQueries\":[\"只有该异议必须依赖新外部证据才能解决时才填写的具体查询\"]}}{vote_end}\n只有当你认可当前共同核心结论、没有重大未决异议时 acceptConsensus 才能为 true；没有异议时 remainingObjections 和 evidenceQueries 必须都是空数组。能够通过逻辑、用户上下文或已有证据解决时不得请求补搜。不要把这行投票写进正文或 Markdown 代码块。",
+                "{followup_context}{debate_state_prompt}{memory_prompt}{evidence_prompt}\n\n---\n\n用户问题：\n{question}\n\n历史多轮观点轨迹摘要（重点展示其他专家/模型第 1 到上一轮的演进）：\n{history_context}\n\n你自己的上一轮完整答案：\n{own_previous_answer}\n\n其他行业专家/模型在上一轮的完整答案与一致认可状态（不包含你的上一轮回答）：\n{peer_context}\n\n上一轮终局裁判反馈：\n{previous_judge_feedback}\n\n以下每个具名模型的不同结论都代表它不认可你的对应观点。请基于“证据层 + 自己上一轮原文 + 其他模型完整答案与异议 + 裁判反馈 + 历史轨迹 + 原问题”进行定向对抗审查：\n1. 按模型名和关键 claim 逐项说明对方哪里对、哪里错，不得用笼统的“都有道理”回避冲突。\n2. 对仍坚持的观点给出可检验的反驳理由；不得为了维持面子重复已经被证据推翻的说法。\n3. 如果对方说服了你，明确写出你放弃的原 claim、说服你的模型/证据和认输理由；吸收后给出修订结论。\n4. 明确说明本轮相对上一轮新增/修正了什么；不能解决的重大异议必须保留，不得伪造一致。\n5. 输出你本轮修订后的最佳答案，必须可直接作为最终答案候选。\n6. 正文之后必须原样追加一行机器可读投票：{vote_start}{{\"acceptConsensus\":true|false,\"consensusReason\":\"认可共同结论或放弃原观点的具体理由\",\"preferredWinnerModel\":\"参赛模型名或null\",\"remainingObjections\":[\"仍属重大的未决异议\"],\"evidenceQueries\":[\"只有该异议必须依赖新外部证据才能解决时才填写的具体查询\"]}}{vote_end}\n只有当你真正认可当前共同核心结论、给出具体 consensusReason 且没有重大未决异议时 acceptConsensus 才能为 true；没有异议时 remainingObjections 和 evidenceQueries 必须都是空数组。能够通过逻辑、用户上下文或已有证据解决时不得请求补搜。不要把这行投票写进正文或 Markdown 代码块。",
                 vote_start = CHAT_ADV_CONSENSUS_VOTE_START,
                 vote_end = CHAT_ADV_CONSENSUS_VOTE_END,
             );
@@ -3836,7 +3842,7 @@ async fn call_adversarial_model(
     })?;
     let provider = crate::governed_provider::GovernedProviderClient::new(
         provider,
-        state.db.clone(),
+        state.control_db().clone(),
         tenant_id,
         user_id,
         format!("agent:adversarial:{run_id}:{}", context.phase),
@@ -4136,8 +4142,13 @@ async fn judge_round_resolution(
     let memory_prompt = format_adversarial_memory_prompt(memory_context);
     let history_context = debate_memory.format_history_summary(None, 4800);
     let participant_consensus = participant_consensus_to_json(participant_consensus);
+    let entry_contract = if round == 1 {
+        "这是彼此不可见的独立首轮。先判断所有健康参赛模型的核心结论是否实质一致，而不是只比较措辞。只要关键建议、事实、因果、边界或风险存在实质分歧，resolved 必须为 false，并在 critical_conflicts 中写出带模型名的具体冲突，供下一轮互相反驳。只有全部配置模型均成功、核心结论实质一致且逐项 claim 审计通过时，才可 resolved=true。"
+    } else {
+        "这是参与模型互相看到并逐项反驳后的收敛审查。服务端已验证所有健康参与者提供了有具体理由的一致认可票且无重大未决异议；仍须独立审计事实，不能把投票当作正确性证据。"
+    };
     let prompt = format!(
-        "{followup_context}{debate_state_prompt}{memory_prompt}{evidence_prompt}\n\n---\n\n用户问题：\n{question}\n\n历史多轮观点轨迹摘要：\n{history_context}\n\n第 {round} 轮各模型答案：\n{}\n\n服务端校验的参与模型一致认可状态：\n{participant_consensus}\n\n参与模型已经明确认可共同核心结论且没有重大未决异议。请逐项抽取并审计关键 claim，尤其检查数字、日期、因果、否定关系、适用边界和证据是否冲突。只有审计完成且 critical_conflicts 为空，同时不存在明显事实冲突、逻辑缺口或未披露的关键不确定性时 resolved 才能为 true。resolved=true 时 winner_model 必须是本轮真实参赛模型之一，选择答案最准确、完整、清晰的一方；不能返回角色名、占位名或 null。多模型一致不等于事实正确，证据不足必须在 winner_reason 中明确降低置信。返回 JSON：{{\"resolved\": boolean, \"claim_audit_complete\": true, \"critical_conflicts\": [\"仍未解决的关键 claim 冲突\"], \"winner_model\": string|null, \"winner_reason\": string}}",
+        "{followup_context}{debate_state_prompt}{memory_prompt}{evidence_prompt}\n\n---\n\n用户问题：\n{question}\n\n历史多轮观点轨迹摘要：\n{history_context}\n\n第 {round} 轮各模型答案：\n{}\n\n服务端校验的参与模型一致认可状态：\n{participant_consensus}\n\n{entry_contract}\n\n请逐项抽取并审计关键 claim，尤其检查数字、日期、因果、否定关系、适用边界和证据是否冲突。只有审计完成且 critical_conflicts 为空，同时不存在明显事实冲突、逻辑缺口或未披露的关键不确定性时 resolved 才能为 true。resolved=true 时 winner_model 必须是本轮真实参赛模型之一，选择答案最准确、完整、清晰的一方；不能返回角色名、占位名或 null。多模型一致不等于事实正确，证据不足必须在 winner_reason 中明确降低置信。返回 JSON：{{\"resolved\": boolean, \"claim_audit_complete\": true, \"critical_conflicts\": [\"仍未解决的关键 claim 冲突\"], \"winner_model\": string|null, \"winner_reason\": string}}",
         format_peer_answers(answers)
     );
     let context = ChatAdversarialCallContext {
@@ -4351,6 +4362,39 @@ mod tests {
         };
         assert!(chat_adversarial_should_stop_after_round(
             2, 5, &consensus, &decision, &models,
+        ));
+    }
+
+    #[test]
+    fn independent_first_round_can_end_only_after_a_complete_judge_audit() {
+        let models = vec!["model-a".to_string(), "model-b".to_string()];
+        let no_participant_vote_in_independent_round = ParticipantConsensus::default();
+        let aligned = JudgeDecision {
+            resolved: true,
+            claim_audit_complete: true,
+            critical_conflicts: Vec::new(),
+            winner_model: Some("model-b".to_string()),
+            winner_reason: Some("independent answers are materially aligned".to_string()),
+            raw: String::new(),
+        };
+        assert!(chat_adversarial_should_stop_after_round(
+            1,
+            5,
+            &no_participant_vote_in_independent_round,
+            &aligned,
+            &models,
+        ));
+
+        let incomplete_audit = JudgeDecision {
+            claim_audit_complete: false,
+            ..aligned
+        };
+        assert!(!chat_adversarial_should_stop_after_round(
+            1,
+            5,
+            &no_participant_vote_in_independent_round,
+            &incomplete_audit,
+            &models,
         ));
     }
 

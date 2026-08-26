@@ -24,7 +24,7 @@ Required JSON fields:
 - webSearchQuery: concise search query when needsWebSearch=true, otherwise null
 - webSearchReason: short reason for the web-search decision, otherwise null
 - requiredEvidence: array containing only web, workspace, code_change,
-  data_execution, deep_research, or super_adversarial; use an empty array when
+  data_execution, deep_research, super_adversarial, or workspace_automation; use an empty array when
   no tool-backed evidence is required
 - needsClarification: boolean
 - clarificationQuestion: short question when clarification is needed, otherwise null
@@ -60,6 +60,9 @@ Routing policy:
   traceable research deliverable.
 - Include super_adversarial only for an explicit multi-plan confrontation,
   opposing-argument analysis, or arbitration deliverable.
+- Include workspace_automation when the user asks to actually create, change,
+  enable, disable, or cancel a workspace schedule. Do not include it for a
+  conceptual explanation of cron or scheduling.
 - If the highest confidence is below {{threshold}}, set needsClarification=true.
 - Never select a capability that is not in the available list.
 <!-- /aos:section -->

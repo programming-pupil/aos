@@ -33,7 +33,7 @@ mod tests {
     use std::sync::{atomic::AtomicBool, Arc};
     use std::time::Duration;
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn unsupported_host_never_advertises_workspace_execution() {
         assert!(!isolation_available());
@@ -55,7 +55,7 @@ mod tests {
         assert!(error.contains("command was not executed"));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn probed_backend_hides_host_and_limits_writes() {
         if !isolation_available() {
@@ -67,7 +67,11 @@ mod tests {
         let output = execute(
             &root,
             Path::new("/workspace"),
-            "test ! -e /etc/passwd && test ! -w /workspace && touch /workspace/generated/ok",
+            if cfg!(target_os = "linux") {
+                "test ! -e /etc/passwd && test ! -w /workspace && touch /workspace/generated/ok"
+            } else {
+                "test ! -r /Users/Shared && test ! -w /tmp && touch generated/ok"
+            },
             Duration::from_secs(5),
             Arc::new(AtomicBool::new(false)),
         )

@@ -35,6 +35,50 @@ export interface WorkspaceUploadPage {
   hasMore: boolean;
 }
 
+export interface WorkspaceCommandResult {
+  status: 'succeeded' | 'failed' | 'timed_out' | 'cancelled';
+  exitCode?: number | null;
+  timedOut: boolean;
+  cancelled: boolean;
+  durationMs: number;
+  stdout: string;
+  stderr: string;
+  cwd: string;
+}
+
+export interface WorkspaceSchedule {
+  id: string;
+  sessionId?: string | null;
+  name: string;
+  scriptPath?: string | null;
+  command: string;
+  cwd: string;
+  cronExpression: string;
+  timezone: string;
+  timeoutSeconds: number;
+  enabled: boolean;
+  status: string;
+  nextRunAt?: string | null;
+  lastStartedAt?: string | null;
+  lastFinishedAt?: string | null;
+  lastExitCode?: number | null;
+  lastStdout?: string | null;
+  lastStderr?: string | null;
+  runCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WorkspaceScheduleInput {
+  name: string;
+  command: string;
+  cwd: string;
+  cronExpression: string;
+  timezone: string;
+  timeoutSeconds: number;
+  scriptPath?: string | null;
+}
+
 export const personalWorkspaceApi = {
   listFiles: (params: { path: string; cursor?: string | null; limit?: number }) =>
     client
@@ -92,4 +136,22 @@ export const personalWorkspaceApi = {
     const path = url.startsWith('/api/v1/') ? url.slice('/api/v1'.length) : url;
     return client.get<Blob>(path, { responseType: 'blob' }).then((response) => response.data);
   },
+
+  executeCommand: (
+    data: { command: string; cwd: string; timeoutSeconds: number },
+    signal?: AbortSignal,
+  ) =>
+    client.post<WorkspaceCommandResult>('/workspace/commands', data, { signal }).then((response) => response.data),
+
+  listSchedules: () =>
+    client.get<WorkspaceSchedule[]>('/workspace/schedules').then((response) => response.data),
+
+  createSchedule: (data: WorkspaceScheduleInput) =>
+    client.post<WorkspaceSchedule>('/workspace/schedules', data).then((response) => response.data),
+
+  updateSchedule: (id: string, data: Partial<WorkspaceScheduleInput> & { enabled?: boolean }) =>
+    client.patch<WorkspaceSchedule>(`/workspace/schedules/${encodeURIComponent(id)}`, data).then((response) => response.data),
+
+  cancelSchedule: (id: string) =>
+    client.delete<WorkspaceSchedule>(`/workspace/schedules/${encodeURIComponent(id)}`).then((response) => response.data),
 };

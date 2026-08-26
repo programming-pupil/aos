@@ -66,6 +66,7 @@ pub mod tenants;
 pub mod unified_workspace;
 pub mod upload;
 pub mod users;
+pub mod workspace_automation;
 
 use crate::auth::Claims;
 use crate::error::Result;

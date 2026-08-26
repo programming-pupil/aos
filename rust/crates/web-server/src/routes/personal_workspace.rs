@@ -132,6 +132,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         )
         .route("/uploads", get(list_indexed_uploads))
         .route("/uploads/{file_id}", delete(delete_indexed_upload))
+        .merge(crate::routes::workspace_automation::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_workspace_menu_permission,
@@ -214,13 +215,17 @@ fn ensure_directory_child(parent: &FsPath, name: &str) -> AppResult<PathBuf> {
     Ok(canonical)
 }
 
-fn ensure_workspace_root(state: &AppState, claims: &Claims) -> AppResult<PathBuf> {
-    validate_storage_component(&claims.tenant_id)?;
-    validate_storage_component(&claims.sub)?;
+pub(crate) fn ensure_workspace_root_for_user(
+    state: &AppState,
+    tenant_id: &str,
+    user_id: &str,
+) -> AppResult<PathBuf> {
+    validate_storage_component(tenant_id)?;
+    validate_storage_component(user_id)?;
     fs::create_dir_all(&state.data_dir)?;
     let data_root = state.data_dir.canonicalize()?;
-    let tenant_root = ensure_directory_child(&data_root, &claims.tenant_id)?;
-    let user_root = ensure_directory_child(&tenant_root, &claims.sub)?;
+    let tenant_root = ensure_directory_child(&data_root, tenant_id)?;
+    let user_root = ensure_directory_child(&tenant_root, user_id)?;
     let root = ensure_directory_child(&user_root, "workspace")?;
     #[cfg(unix)]
     {
@@ -228,6 +233,10 @@ fn ensure_workspace_root(state: &AppState, claims: &Claims) -> AppResult<PathBuf
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
     }
     Ok(root)
+}
+
+fn ensure_workspace_root(state: &AppState, claims: &Claims) -> AppResult<PathBuf> {
+    ensure_workspace_root_for_user(state, &claims.tenant_id, &claims.sub)
 }
 
 fn normalize_virtual_path(raw: &str) -> AppResult<(String, Vec<String>)> {
@@ -328,6 +337,40 @@ fn existing_path(root: &FsPath, segments: &[String]) -> AppResult<PathBuf> {
         return Err(AppError::NotFound("workspace item not found".to_string()));
     }
     Ok(canonical)
+}
+
+pub(crate) fn resolve_workspace_directory_for_user(
+    state: &AppState,
+    tenant_id: &str,
+    user_id: &str,
+    virtual_path: &str,
+) -> AppResult<(PathBuf, PathBuf, String)> {
+    let root = ensure_workspace_root_for_user(state, tenant_id, user_id)?;
+    let (normalized, segments) = normalize_virtual_path(virtual_path)?;
+    let directory = existing_path(&root, &segments)?;
+    if !directory.is_dir() {
+        return Err(AppError::ValidationError(
+            "workspace command cwd must be a directory".to_string(),
+        ));
+    }
+    Ok((root, directory, normalized))
+}
+
+pub(crate) fn validate_workspace_file_for_user(
+    state: &AppState,
+    tenant_id: &str,
+    user_id: &str,
+    virtual_path: &str,
+) -> AppResult<String> {
+    let root = ensure_workspace_root_for_user(state, tenant_id, user_id)?;
+    let (normalized, segments) = normalize_virtual_path(virtual_path)?;
+    let file = existing_path(&root, &segments)?;
+    if !file.is_file() {
+        return Err(AppError::ValidationError(
+            "scheduled script must be a workspace file".to_string(),
+        ));
+    }
+    Ok(normalized)
 }
 
 fn create_path(root: &FsPath, segments: &[String]) -> AppResult<PathBuf> {

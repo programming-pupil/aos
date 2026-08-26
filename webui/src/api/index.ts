@@ -63,4 +63,7 @@ export type {
   WorkspaceFilePage,
   WorkspaceUploadItem,
   WorkspaceUploadPage,
+  WorkspaceCommandResult,
+  WorkspaceSchedule,
+  WorkspaceScheduleInput,
 } from './personalWorkspace';

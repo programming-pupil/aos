@@ -1175,10 +1175,14 @@ fn parent_turn_options(input: &UnifiedParentTurnInput) -> AgentTurnOptions {
             "workspace_open".to_string(),
             "workspace_stat".to_string(),
             "workspace_execute".to_string(),
+            "workspace_schedule_create".to_string(),
+            "workspace_schedule_list".to_string(),
+            "workspace_schedule_update".to_string(),
+            "workspace_schedule_cancel".to_string(),
         ]);
     } else {
         options.system_instructions.push(
-            "Authenticated workspace protocol: this session has an isolated per-user workspace. When the user asks you to create, update, or repair a code/document file, use the authorized write_file or edit_file tool directly inside that workspace; do not claim that file-writing tools are unavailable. Keep every path relative to the workspace or otherwise prove it stays inside the workspace. Use read_file/grep_search first when existing content must be preserved, and report the exact files changed after the write. Do not write outside the authenticated workspace or use host paths."
+            "Authenticated workspace protocol: this session has an isolated per-user workspace. When the user asks you to create, update, or repair a code/document file, use the authorized write_file or edit_file tool directly inside that workspace; do not claim that file-writing tools are unavailable. Keep every path relative to the workspace or otherwise prove it stays inside the workspace. Use read_file/grep_search first when existing content must be preserved, and report the exact files changed after the write. Do not write outside the authenticated workspace or use host paths. For recurring commands, create and maintain an AOS durable workspace schedule with workspace_schedule_create/list/update/cancel; never claim that system crontab is required."
                 .to_string(),
         );
     }
@@ -1245,7 +1249,7 @@ fn parent_turn_options(input: &UnifiedParentTurnInput) -> AgentTurnOptions {
                 .to_string()
         } else {
             format!(
-                "Server evidence contract for this turn: [{}]. Satisfy every applicable requirement with successful tools before complete_turn. web requires retrieved public sources and cited URLs; workspace requires reading the exact authorized file/archive/knowledge source and citing its returned path or id; code_change requires an actual edit, diff review, and focused verification; data_execution requires nl2sql_analyze with recorded SQL, schema validation, and successful execution; deep_research requires a completed sourced deep-research subtask; super_adversarial requires a completed multi-model adversarial subtask. Do not downgrade or omit this contract in complete_turn.",
+                "Server evidence contract for this turn: [{}]. Satisfy every applicable requirement with successful tools before complete_turn. web requires retrieved public sources and cited URLs; workspace requires reading the exact authorized file/archive/knowledge source and citing its returned path or id; code_change requires an actual edit, diff review, and focused verification; data_execution requires nl2sql_analyze with recorded SQL, schema validation, and successful execution; deep_research requires a completed sourced deep-research subtask; super_adversarial requires a completed multi-model adversarial subtask; workspace_automation requires a successfully committed workspace_schedule_create/update/cancel call. Do not downgrade or omit this contract in complete_turn.",
                 input.required_evidence.join(", ")
             )
         });
@@ -1299,7 +1303,7 @@ fn parent_reasoning_budget_for(
         || required_evidence.iter().any(|requirement| {
             matches!(
                 requirement.as_str(),
-                "code_change" | "data_execution" | "deep_research"
+                "code_change" | "data_execution" | "deep_research" | "workspace_automation"
             )
         });
     if specialist_or_execution {
@@ -3859,7 +3863,7 @@ fn launch_agent_team_worker(state: AppState, claims: Claims, child_thread_id: St
 
 pub(crate) fn start_agent_team_recovery(state: AppState) {
     tokio::spawn(async move {
-        let members = match crate::agent_team::reclaim_startup_workers(&state.db).await {
+        let members = match crate::agent_team::reclaim_startup_workers(state.control_db()).await {
             Ok(members) => members,
             Err(error) => {
                 tracing::error!(error = %error, "failed to reclaim durable agent team workers");
@@ -3910,7 +3914,7 @@ async fn run_agent_team_worker(
     child_thread_id: &str,
     lease: &crate::agent_team::WorkerLease,
 ) -> Result<()> {
-    let heartbeat_db = state.db.clone();
+    let heartbeat_db = state.control_db().clone();
     let heartbeat_tenant = claims.tenant_id.clone();
     let heartbeat_thread = child_thread_id.to_string();
     let heartbeat_owner = lease.owner.clone();
@@ -4553,6 +4557,12 @@ async fn resolve_parent_tool(
         "subtask_status" => subtask_status(state, claims, input, &tool.input).await,
         "subtask_read_artifact" => subtask_read_artifact(state, claims, input, &tool.input).await,
         "subtask_cancel" => subtask_cancel(state, claims, input, &tool.input).await,
+        "workspace_schedule_create"
+        | "workspace_schedule_list"
+        | "workspace_schedule_update"
+        | "workspace_schedule_cancel" => {
+            execute_parent_workspace_schedule_tool(state, claims, input, tool).await
+        }
         "spawn_agent" | "send_message" | "followup_task" | "list_agents" | "wait_agent"
         | "interrupt_agent" => {
             let result =
@@ -4610,6 +4620,113 @@ async fn resolve_parent_tool(
             is_error: true,
         },
     })
+}
+
+async fn execute_parent_workspace_schedule_tool(
+    state: &AppState,
+    claims: &Claims,
+    parent: &UnifiedParentTurnInput,
+    tool: &DeferredToolUse,
+) -> Result<Value> {
+    if !workspace_schedule_tool_allowed(&parent.required_evidence, &tool.tool_name) {
+        return Err(AppError::Forbidden);
+    }
+    let value = serde_json::from_str::<Value>(&tool.input).map_err(|error| {
+        AppError::ValidationError(format!("invalid {} input: {error}", tool.tool_name))
+    })?;
+    match tool.tool_name.as_str() {
+        "workspace_schedule_create" => {
+            let mut request = serde_json::from_value::<
+                super::workspace_automation::CreateWorkspaceScheduleInput,
+            >(value)
+            .map_err(|error| {
+                AppError::ValidationError(format!(
+                    "invalid workspace_schedule_create input: {error}"
+                ))
+            })?;
+            request.session_id = Some(parent.session_id.clone());
+            let schedule = super::workspace_automation::create_schedule_for_user(
+                state,
+                &claims.tenant_id,
+                &claims.sub,
+                request,
+            )
+            .await?;
+            serde_json::to_value(schedule).map_err(AppError::Json)
+        }
+        "workspace_schedule_list" => {
+            let schedules = super::workspace_automation::list_schedules_for_user(
+                state,
+                &claims.tenant_id,
+                &claims.sub,
+            )
+            .await?;
+            Ok(json!({ "schedules": schedules }))
+        }
+        "workspace_schedule_update" => {
+            let schedule_id = value
+                .get("scheduleId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    AppError::ValidationError(
+                        "workspace_schedule_update requires scheduleId".to_string(),
+                    )
+                })?;
+            let request = serde_json::from_value::<
+                super::workspace_automation::UpdateWorkspaceScheduleInput,
+            >(value.clone())
+            .map_err(|error| {
+                AppError::ValidationError(format!(
+                    "invalid workspace_schedule_update input: {error}"
+                ))
+            })?;
+            let schedule = super::workspace_automation::update_schedule_for_user(
+                state,
+                &claims.tenant_id,
+                &claims.sub,
+                schedule_id,
+                request,
+            )
+            .await?;
+            serde_json::to_value(schedule).map_err(AppError::Json)
+        }
+        "workspace_schedule_cancel" => {
+            let schedule_id = value
+                .get("scheduleId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    AppError::ValidationError(
+                        "workspace_schedule_cancel requires scheduleId".to_string(),
+                    )
+                })?;
+            let schedule = super::workspace_automation::cancel_schedule_for_user(
+                state,
+                &claims.tenant_id,
+                &claims.sub,
+                schedule_id,
+            )
+            .await?;
+            serde_json::to_value(schedule).map_err(AppError::Json)
+        }
+        _ => Err(AppError::ValidationError(
+            "unsupported workspace schedule tool".to_string(),
+        )),
+    }
+}
+
+fn workspace_schedule_tool_allowed(required_evidence: &[String], tool_name: &str) -> bool {
+    let mutating = matches!(
+        tool_name,
+        "workspace_schedule_create" | "workspace_schedule_update" | "workspace_schedule_cancel"
+    );
+    !mutating
+        || required_evidence
+            .iter()
+            .any(|requirement| requirement == "workspace_automation")
 }
 
 #[derive(Debug, Deserialize)]
@@ -8023,6 +8140,7 @@ async fn evaluate_server_completion(
                     | "data_execution"
                     | "deep_research"
                     | "super_adversarial"
+                    | "workspace_automation"
             )
         })
         .cloned()
@@ -8123,6 +8241,15 @@ async fn evaluate_server_completion(
         .any(|call| tool_call_confirms_successful_test(call))
     {
         checks.insert("tests_run".to_string());
+    }
+    if successful_tools.iter().any(|call| {
+        matches!(
+            call.tool_name.as_str(),
+            "workspace_schedule_create" | "workspace_schedule_update" | "workspace_schedule_cancel"
+        )
+    }) {
+        checks.insert("workspace_automation_committed".to_string());
+        tools_used.push("workspace_automation".to_string());
     }
     let risk_level = if !required_evidence.is_empty()
         || tools_used.iter().any(|tool| {
@@ -10148,8 +10275,9 @@ mod tests {
         suppress_repeated_native_web_search_options, tool_call_attempts_test,
         tool_call_confirms_successful_test, tool_call_effectively_succeeded,
         tool_call_modifies_code, tool_evidence_references, truncate,
-        unregister_nl2sql_cancellation, urls_match, verified_web_evidence_urls, ParentLoopFinal,
-        PersistedSubtask, UnifiedParentTurnInput, MAX_TOOL_RESULT_CHARS,
+        unregister_nl2sql_cancellation, urls_match, verified_web_evidence_urls,
+        workspace_schedule_tool_allowed, ParentLoopFinal, PersistedSubtask, UnifiedParentTurnInput,
+        MAX_TOOL_RESULT_CHARS,
     };
     use crate::routes::nl2sql::attribution::{
         AttributionAnalyzeResponse, AttributionEvidenceHealth, AttributionObservation,
@@ -10548,6 +10676,25 @@ mod tests {
             workspace_enabled: true,
             completion_gate_enabled: true,
             recovered_runtime_turn_id: None,
+        }
+    }
+
+    #[test]
+    fn workspace_schedule_side_effects_require_explicit_router_evidence() {
+        let no_evidence = Vec::new();
+        let automation = vec!["workspace_automation".to_string()];
+
+        assert!(workspace_schedule_tool_allowed(
+            &no_evidence,
+            "workspace_schedule_list"
+        ));
+        for tool in [
+            "workspace_schedule_create",
+            "workspace_schedule_update",
+            "workspace_schedule_cancel",
+        ] {
+            assert!(!workspace_schedule_tool_allowed(&no_evidence, tool));
+            assert!(workspace_schedule_tool_allowed(&automation, tool));
         }
     }
 

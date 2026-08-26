@@ -1787,7 +1787,7 @@ pub fn build_router(state: AppState) -> Router<()> {
     let app_state = if state.usage_writer.is_some() {
         state
     } else {
-        let usage_writer = crate::routes::chat::TokenUsageWriter::new(state.db.clone());
+        let usage_writer = crate::routes::chat::TokenUsageWriter::new(state.telemetry_db.clone());
         state.with_usage_writer(usage_writer)
     };
 
@@ -1961,7 +1961,7 @@ pub async fn init_pm_worker_state(
     log_startup_fingerprint();
     let started = Instant::now();
     let mut state = AppState::new(data_dir.clone(), default_model).await?;
-    let usage_writer = crate::routes::chat::TokenUsageWriter::new(state.db.clone());
+    let usage_writer = crate::routes::chat::TokenUsageWriter::new(state.telemetry_db.clone());
     state = state.with_usage_writer(usage_writer);
     let config_registry = Arc::new(agent_gateway::TenantConfigRegistry::new(state.db.clone()));
     state.config_registry = Some(config_registry.clone());
@@ -2100,7 +2100,7 @@ pub async fn serve_with_options(
     let mut state = AppState::new(data_dir.clone(), default_model)
         .await
         .expect("failed to init app state");
-    let usage_writer = crate::routes::chat::TokenUsageWriter::new(state.db.clone());
+    let usage_writer = crate::routes::chat::TokenUsageWriter::new(state.telemetry_db.clone());
     state = state.with_usage_writer(usage_writer);
     log_startup_phase(phase_started, "app_state");
 
@@ -2131,7 +2131,7 @@ pub async fn serve_with_options(
 
     #[cfg(feature = "nl2sql")]
     if let Some(registry) = embed_store.clone() {
-        crate::nl2sql::embedding_reindex_worker::start(state.db.clone(), registry);
+        crate::nl2sql::embedding_reindex_worker::start(state.control_db.clone(), registry);
         tracing::info!("NL2SQL embedding shadow-index worker started");
     }
 
@@ -2202,7 +2202,7 @@ pub async fn serve_with_options(
 
     let phase_started = Instant::now();
     let consumer_dir = telemetry_dir.unwrap_or_else(|| data_dir.clone());
-    telemetry::start_telemetry_consumer(consumer_dir, state.db.clone());
+    telemetry::start_telemetry_consumer(consumer_dir, state.telemetry_db.clone());
     log_startup_phase(phase_started, "telemetry_consumer_start");
 
     let config_registry = Arc::new(agent_gateway::TenantConfigRegistry::new(state.db.clone()));
@@ -2239,7 +2239,9 @@ pub async fn serve_with_options(
 
     // Start background periodic MCP server health checks
     let phase_started = Instant::now();
-    routes::mcp::start_periodic_mcp_checker(state.clone());
+    let mut mcp_worker_state = state.clone();
+    mcp_worker_state.db = state.control_db.clone();
+    routes::mcp::start_periodic_mcp_checker(mcp_worker_state);
     log_startup_phase(phase_started, "mcp_checker_start");
 
     let phase_started = Instant::now();
@@ -2249,13 +2251,17 @@ pub async fn serve_with_options(
     routes::task_control_worker::start_task_control_workers(state.clone());
     log_startup_phase(phase_started, "task_control_workers_start");
 
+    let phase_started = Instant::now();
+    routes::workspace_automation::start_workspace_schedule_worker(state.clone());
+    log_startup_phase(phase_started, "workspace_schedule_worker_start");
+
     // On startup, mark any tasks that were left in 'running'/'pending' by a
     // previous crash as 'failed'. This prevents them from blocking future
     // refreshes indefinitely. This is safe because no worker is executing
     // them — the process that owned them is gone.
     #[cfg(feature = "nl2sql")]
     {
-        let db = state.db.clone();
+        let db = state.control_db.clone();
         tokio::spawn(async move {
             let phase_started = Instant::now();
             let result = sqlx::query(
@@ -2282,8 +2288,11 @@ pub async fn serve_with_options(
     // the handle + shutdown sender so a Ctrl-C can stop the cycle cleanly
     // instead of having the task abort mid-refresh.
     #[cfg(feature = "nl2sql")]
-    let (scheduler_shutdown, scheduler_handle) =
-        routes::datasource_scheduler::start_periodic_schema_refresh(state.clone());
+    let (scheduler_shutdown, scheduler_handle) = {
+        let mut worker_state = state.clone();
+        worker_state.db = state.control_db.clone();
+        routes::datasource_scheduler::start_periodic_schema_refresh(worker_state)
+    };
     #[cfg(feature = "pm")]
     let (pm_scheduler_shutdown, pm_scheduler_handle) =
         routes::pm_scheduler::start_periodic_pm_scheduler(state.clone());
@@ -2303,8 +2312,11 @@ pub async fn serve_with_options(
         }
     }
     #[cfg(feature = "rd")]
-    let (rd_repository_scheduler_shutdown, rd_repository_scheduler_handle) =
-        routes::rd::start_periodic_repository_sync(state.clone());
+    let (rd_repository_scheduler_shutdown, rd_repository_scheduler_handle) = {
+        let mut worker_state = state.clone();
+        worker_state.db = state.control_db.clone();
+        routes::rd::start_periodic_repository_sync(worker_state)
+    };
     #[cfg(feature = "bot-agents")]
     let phase_started = Instant::now();
     #[cfg(feature = "bot-agents")]

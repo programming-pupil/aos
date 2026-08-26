@@ -54,21 +54,33 @@ fn acquire_platform_lifecycle(
     ))
 }
 
-fn start_database_pool_metrics(pool: SqlitePool) {
+fn pool_active(pool: &SqlitePool) -> usize {
+    usize::try_from(pool.size())
+        .unwrap_or(usize::MAX)
+        .saturating_sub(pool.num_idle())
+}
+
+fn start_database_pool_metrics(
+    interactive: SqlitePool,
+    control: SqlitePool,
+    telemetry: SqlitePool,
+) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(60));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            let size = pool.size();
-            let idle = pool.num_idle();
             tracing::info!(
-                size,
-                idle,
-                active = usize::try_from(size)
-                    .unwrap_or(usize::MAX)
-                    .saturating_sub(idle),
-                "SQLite pool health"
+                interactive_size = interactive.size(),
+                interactive_idle = interactive.num_idle(),
+                interactive_active = pool_active(&interactive),
+                control_size = control.size(),
+                control_idle = control.num_idle(),
+                control_active = pool_active(&control),
+                telemetry_size = telemetry.size(),
+                telemetry_idle = telemetry.num_idle(),
+                telemetry_active = pool_active(&telemetry),
+                "SQLite pool health by workload"
             );
         }
     });
@@ -203,10 +215,8 @@ impl AppState {
             acquire_platform_lifecycle(&data_dir)?;
         let database_path = data_dir.join("aos.db");
         let max_connections = env_u32("AOS_SQLITE_MAX_CONNECTIONS", 4).clamp(1, 8);
-        // Background governance, task, and encryption workers share this
-        // SQLite pool with interactive requests. Give short write
-        // transactions enough time to serialize instead of surfacing
-        // avoidable `database is locked` errors to worker loops.
+        // Interactive requests have a dedicated pool. Short writes still need
+        // time to serialize with the independent control/telemetry pools.
         let busy_timeout_ms = env_u64("AOS_SQLITE_BUSY_TIMEOUT_MS", 30_000).clamp(1_000, 60_000);
         let acquire_timeout_secs = env_u64("AOS_SQLITE_ACQUIRE_TIMEOUT_SECS", 30).clamp(1, 300);
         tracing::info!(
@@ -266,8 +276,9 @@ impl AppState {
             }
             tracing::warn!("previous AOS shutdown was unclean; SQLite quick_check passed");
         }
+        let control_max_connections = env_u32("AOS_SQLITE_CONTROL_MAX_CONNECTIONS", 4).clamp(1, 8);
         let control_db = SqlitePoolOptions::new()
-            .max_connections(max_connections.clamp(1, 2))
+            .max_connections(control_max_connections)
             .min_connections(1)
             .acquire_timeout(Duration::from_secs(acquire_timeout_secs))
             .connect_with(connect_options.clone())
@@ -285,7 +296,7 @@ impl AppState {
             );
             crate::semantic_memory_worker::start_memory_governance_worker(control_db.clone());
         }
-        start_database_pool_metrics(db.clone());
+        start_database_pool_metrics(db.clone(), control_db.clone(), telemetry_db.clone());
 
         let default_model = default_model.unwrap_or_else(|| {
             std::env::var("DEFAULT_MODEL")
@@ -482,6 +493,14 @@ mod tests {
             ("chat_turn_artifacts", "idx_chat_artifact_keyset"),
             ("agent_workspace_entries", "idx_workspace_shared_keyset"),
             ("agent_event_ledger", "idx_agent_event_ledger_checkpoint"),
+            (
+                "workspace_scheduled_jobs",
+                "idx_workspace_scheduled_jobs_due",
+            ),
+            (
+                "workspace_scheduled_jobs",
+                "idx_workspace_scheduled_jobs_owner",
+            ),
         ] {
             let count = sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM sqlite_schema \

@@ -17,6 +17,7 @@ pub(super) struct EvidenceRequest {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct ConsensusVote {
     pub(super) accept_consensus: bool,
+    pub(super) consensus_reason: Option<String>,
     pub(super) preferred_winner_model: Option<String>,
     pub(super) remaining_objections: Vec<String>,
     pub(super) evidence_queries: Vec<String>,
@@ -170,12 +171,13 @@ pub(super) fn format_peer_answers(answers: &[ModelAnswer]) -> String {
                             vote.remaining_objections.join("；")
                         };
                         format!(
-                            "\n\n一致认可票：{}；偏好胜出模型：{}；重大未决异议：{}；建议补证据查询：{}",
+                            "\n\n一致认可票：{}；认可/认输理由：{}；偏好胜出模型：{}；重大未决异议：{}；建议补证据查询：{}",
                             if vote.accept_consensus {
                                 "认可"
                             } else {
                                 "不认可"
                             },
+                            vote.consensus_reason.as_deref().unwrap_or("未提供"),
                             vote.preferred_winner_model.as_deref().unwrap_or("未指定"),
                             objections,
                             if vote.evidence_queries.is_empty() {
@@ -285,6 +287,7 @@ pub(super) fn participant_consensus_to_json(consensus: &ParticipantConsensus) ->
 fn consensus_vote_to_json(vote: &ConsensusVote) -> serde_json::Value {
     serde_json::json!({
         "acceptConsensus": vote.accept_consensus,
+        "consensusReason": vote.consensus_reason,
         "preferredWinnerModel": vote.preferred_winner_model,
         "remainingObjections": vote.remaining_objections,
         "evidenceQueries": vote.evidence_queries,
@@ -354,6 +357,13 @@ pub(super) fn parse_review_answer(raw: &str) -> (String, Option<ConsensusVote>) 
             .map(str::trim)
             .filter(|model| !model.is_empty())
             .map(ToString::to_string);
+        let consensus_reason = value
+            .get("consensusReason")
+            .or_else(|| value.get("consensus_reason"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+            .map(|reason| truncate_chars(reason, 600));
         let remaining_objections = value
             .get("remainingObjections")
             .or_else(|| value.get("remaining_objections"))
@@ -377,6 +387,7 @@ pub(super) fn parse_review_answer(raw: &str) -> (String, Option<ConsensusVote>) 
         );
         Some(ConsensusVote {
             accept_consensus,
+            consensus_reason,
             preferred_winner_model,
             remaining_objections,
             evidence_queries,
@@ -427,8 +438,16 @@ pub(super) fn evaluate_participant_consensus(
             consensus.missing_or_rejected_models.push(model.clone());
             continue;
         };
-        if !vote.accept_consensus || !vote.remaining_objections.is_empty() {
+        if !vote.accept_consensus
+            || vote.consensus_reason.is_none()
+            || !vote.remaining_objections.is_empty()
+        {
             consensus.missing_or_rejected_models.push(model.clone());
+            if vote.accept_consensus && vote.consensus_reason.is_none() {
+                consensus
+                    .remaining_objections
+                    .push(format!("{model}: 未说明认可共同结论或放弃原观点的具体理由"));
+            }
             consensus.remaining_objections.extend(
                 vote.remaining_objections
                     .iter()
@@ -445,12 +464,11 @@ pub(super) fn evaluate_participant_consensus(
             consensus.preferred_winner_models.push(winner.to_string());
         }
     }
-    let healthy_count = configured_models
-        .len()
-        .saturating_sub(consensus.missing_or_rejected_models.len());
-    consensus.degraded_quorum = healthy_count >= 2 && healthy_count < configured_models.len();
-    consensus.reached = healthy_count >= 2
-        && consensus.accepted_models.len() == healthy_count
+    consensus.degraded_quorum = consensus.accepted_models.len() >= 2
+        && consensus.accepted_models.len() < configured_models.len();
+    consensus.reached = configured_models.len() >= 2
+        && consensus.accepted_models.len() == configured_models.len()
+        && consensus.missing_or_rejected_models.is_empty()
         && consensus.remaining_objections.is_empty();
     consensus
 }
@@ -534,9 +552,9 @@ pub(super) fn parse_final_decision(raw: &str) -> JudgeDecision {
         .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok());
     let Some(value) = value else {
         return JudgeDecision {
-            resolved: true,
-            claim_audit_complete: true,
-            critical_conflicts: Vec::new(),
+            resolved: false,
+            claim_audit_complete: false,
+            critical_conflicts: vec!["final response was not valid JSON".to_string()],
             winner_model: None,
             winner_reason: Some("final response was not valid JSON".to_string()),
             raw: raw.to_string(),
@@ -601,7 +619,7 @@ mod tests {
     #[test]
     fn review_vote_is_removed_from_visible_answer_and_parsed() {
         let raw = format!(
-            "Revised answer.\n{}{{\"acceptConsensus\":true,\"preferredWinnerModel\":\"B\",\"remainingObjections\":[]}}{}",
+            "Revised answer.\n{}{{\"acceptConsensus\":true,\"consensusReason\":\"B 的证据纠正了我的成本假设\",\"preferredWinnerModel\":\"B\",\"remainingObjections\":[]}}{}",
             CHAT_ADV_CONSENSUS_VOTE_START, CHAT_ADV_CONSENSUS_VOTE_END
         );
         let (answer, vote) = parse_review_answer(&raw);
@@ -610,6 +628,7 @@ mod tests {
             vote.unwrap(),
             ConsensusVote {
                 accept_consensus: true,
+                consensus_reason: Some("B 的证据纠正了我的成本假设".to_string()),
                 preferred_winner_model: Some("B".to_string()),
                 remaining_objections: Vec::new(),
                 evidence_queries: Vec::new(),
@@ -622,6 +641,7 @@ mod tests {
         let mut peer = answer("B", "The evidence is incomplete.");
         peer.consensus_vote = Some(ConsensusVote {
             accept_consensus: false,
+            consensus_reason: Some("成本异议尚未解决".to_string()),
             preferred_winner_model: None,
             remaining_objections: vec!["缺少成本数据".to_string()],
             evidence_queries: vec!["项目成本基准".to_string()],
@@ -652,6 +672,7 @@ mod tests {
         for answer in &mut answers {
             answer.consensus_vote = Some(ConsensusVote {
                 accept_consensus: true,
+                consensus_reason: Some("关键结论与证据已经一致".to_string()),
                 preferred_winner_model: Some("B".to_string()),
                 remaining_objections: Vec::new(),
                 evidence_queries: Vec::new(),
@@ -666,6 +687,7 @@ mod tests {
 
         answers[2].consensus_vote = Some(ConsensusVote {
             accept_consensus: false,
+            consensus_reason: Some("关键事实仍未验证".to_string()),
             preferred_winner_model: None,
             remaining_objections: vec!["关键事实仍未验证".to_string()],
             evidence_queries: vec!["关键事实的权威来源".to_string()],
@@ -674,6 +696,37 @@ mod tests {
         assert!(!rejected.reached);
         assert_eq!(rejected.missing_or_rejected_models, vec!["C"]);
         assert!(rejected.remaining_objections[0].contains("关键事实仍未验证"));
+    }
+
+    #[test]
+    fn consensus_rejects_an_unexplained_acceptance_and_a_failed_model() {
+        let models = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let mut answers = models
+            .iter()
+            .map(|model| answer(model, "revised"))
+            .collect::<Vec<_>>();
+        for answer in &mut answers {
+            answer.consensus_vote = Some(ConsensusVote {
+                accept_consensus: true,
+                consensus_reason: Some("逐项审查后认可共同结论".to_string()),
+                preferred_winner_model: Some("A".to_string()),
+                remaining_objections: Vec::new(),
+                evidence_queries: Vec::new(),
+            });
+        }
+
+        answers[1].consensus_vote.as_mut().unwrap().consensus_reason = None;
+        let unexplained = evaluate_participant_consensus(&models, &answers);
+        assert!(!unexplained.reached);
+        assert_eq!(unexplained.missing_or_rejected_models, vec!["B"]);
+
+        answers[1].consensus_vote.as_mut().unwrap().consensus_reason =
+            Some("已被 A 的证据说服".to_string());
+        answers[2].error = Some("provider unavailable".to_string());
+        let degraded = evaluate_participant_consensus(&models, &answers);
+        assert!(!degraded.reached);
+        assert!(degraded.degraded_quorum);
+        assert_eq!(degraded.missing_or_rejected_models, vec!["C"]);
     }
 
     #[test]
@@ -752,5 +805,15 @@ mod tests {
 
         let final_prompt = build_final_system_prompt();
         assert!(final_prompt.contains("最终答案整理者"));
+    }
+
+    #[test]
+    fn invalid_final_decision_is_preserved_but_never_marked_resolved() {
+        let decision = parse_final_decision("plain fallback answer");
+
+        assert!(!decision.resolved);
+        assert!(!decision.claim_audit_complete);
+        assert_eq!(decision.raw, "plain fallback answer");
+        assert!(!decision.critical_conflicts.is_empty());
     }
 }

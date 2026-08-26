@@ -30,13 +30,14 @@ pub struct AosRouterIntent {
     pub rewritten_prompt: Option<String>,
 }
 
-const ALLOWED_EVIDENCE_REQUIREMENTS: [&str; 6] = [
+const ALLOWED_EVIDENCE_REQUIREMENTS: [&str; 7] = [
     "web",
     "workspace",
     "code_change",
     "data_execution",
     "deep_research",
     "super_adversarial",
+    "workspace_automation",
 ];
 
 /// Normalize the LLM policy output into a small server-owned evidence

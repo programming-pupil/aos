@@ -6149,7 +6149,7 @@ fn workspace_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "required": ["command"],
                 "additionalProperties": false
             }),
-            required_permission: runtime::PermissionMode::DangerFullAccess,
+            required_permission: runtime::PermissionMode::WorkspaceWrite,
         },
     ];
     if !crate::workspace_sandbox::isolation_available() {
@@ -6158,7 +6158,7 @@ fn workspace_tool_definitions() -> Vec<RuntimeToolDefinition> {
     definitions
 }
 
-const DEFERRED_PARENT_TOOL_NAMES: [&str; 32] = [
+const DEFERRED_PARENT_TOOL_NAMES: [&str; 36] = [
     "web_search",
     "deep_research_start",
     "super_adversarial_start",
@@ -6167,6 +6167,10 @@ const DEFERRED_PARENT_TOOL_NAMES: [&str; 32] = [
     "subtask_status",
     "subtask_read_artifact",
     "subtask_cancel",
+    "workspace_schedule_create",
+    "workspace_schedule_list",
+    "workspace_schedule_update",
+    "workspace_schedule_cancel",
     "task_list",
     "task_get",
     "task_timeline",
@@ -6216,6 +6220,7 @@ fn expose_deferred_parent_tools(
 
 fn deferred_parent_tool_definitions() -> Vec<RuntimeToolDefinition> {
     let read_only = runtime::PermissionMode::ReadOnly;
+    let command_execution = runtime::PermissionMode::WorkspaceWrite;
     let mut definitions = vec![
         RuntimeToolDefinition {
             name: "web_search".to_string(),
@@ -6339,6 +6344,67 @@ fn deferred_parent_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "additionalProperties": false
             }),
             required_permission: read_only,
+        },
+        RuntimeToolDefinition {
+            name: "workspace_schedule_create".to_string(),
+            description: Some("Create a durable command schedule in the authenticated user's isolated workspace. Use this instead of system crontab; the schedule remains manageable after server restart.".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "minLength": 1, "maxLength": 160 },
+                    "command": { "type": "string", "minLength": 1, "maxLength": 32000 },
+                    "cwd": { "type": "string", "default": "/projects/session" },
+                    "cronExpression": { "type": "string", "description": "Standard 5-field minute hour day month weekday expression" },
+                    "timezone": { "type": "string", "description": "IANA timezone such as Asia/Shanghai" },
+                    "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 600 },
+                    "scriptPath": { "type": "string", "description": "Optional existing /projects/session file shown in Workspace task controls" }
+                },
+                "required": ["name", "command", "cronExpression", "timezone"],
+                "additionalProperties": false
+            }),
+            required_permission: command_execution,
+        },
+        RuntimeToolDefinition {
+            name: "workspace_schedule_list".to_string(),
+            description: Some("List the authenticated user's durable workspace schedules, including next/last run, status, command and retained output.".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            required_permission: read_only,
+        },
+        RuntimeToolDefinition {
+            name: "workspace_schedule_update".to_string(),
+            description: Some("Update the command, timing, timezone, script link or enabled state of an owned durable workspace schedule.".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "scheduleId": { "type": "string" },
+                    "name": { "type": "string", "minLength": 1, "maxLength": 160 },
+                    "command": { "type": "string", "minLength": 1, "maxLength": 32000 },
+                    "cwd": { "type": "string" },
+                    "cronExpression": { "type": "string" },
+                    "timezone": { "type": "string" },
+                    "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 600 },
+                    "scriptPath": { "type": ["string", "null"] },
+                    "enabled": { "type": "boolean" }
+                },
+                "required": ["scheduleId"],
+                "additionalProperties": false
+            }),
+            required_permission: command_execution,
+        },
+        RuntimeToolDefinition {
+            name: "workspace_schedule_cancel".to_string(),
+            description: Some("Cancel an owned durable workspace schedule and terminate its current confined execution, if any.".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "scheduleId": { "type": "string" } },
+                "required": ["scheduleId"],
+                "additionalProperties": false
+            }),
+            required_permission: command_execution,
         },
         RuntimeToolDefinition {
             name: "spawn_agent".to_string(),
@@ -12821,6 +12887,30 @@ mod tests {
     }
 
     #[test]
+    fn workspace_schedule_mutations_require_command_execution_permission() {
+        let definitions = deferred_parent_tool_definitions();
+        for tool_name in [
+            "workspace_schedule_create",
+            "workspace_schedule_update",
+            "workspace_schedule_cancel",
+        ] {
+            let tool = definitions
+                .iter()
+                .find(|definition| definition.name == tool_name)
+                .unwrap_or_else(|| panic!("missing schedule tool {tool_name}"));
+            assert_eq!(
+                tool.required_permission,
+                runtime::PermissionMode::WorkspaceWrite
+            );
+        }
+        let list = definitions
+            .iter()
+            .find(|definition| definition.name == "workspace_schedule_list")
+            .expect("schedule list tool");
+        assert_eq!(list.required_permission, runtime::PermissionMode::ReadOnly);
+    }
+
+    #[test]
     fn tool_search_activates_only_authorized_tools_for_one_turn() {
         let config = UserRuntimeConfig {
             db: None,
@@ -15173,7 +15263,9 @@ mod tests {
 
     #[test]
     fn gateway_permission_policy_matches_tool_registry_requirements() {
-        let registry = GlobalToolRegistry::builtin();
+        let registry = GlobalToolRegistry::builtin()
+            .with_runtime_tools(workspace_tool_definitions())
+            .expect("workspace tools should register in the policy fixture");
         let feature_config = runtime::RuntimeFeatureConfig::default();
 
         let policy = gateway_permission_policy(
@@ -15198,6 +15290,10 @@ mod tests {
         assert_eq!(
             policy.required_mode_for("bash"),
             runtime::PermissionMode::DangerFullAccess
+        );
+        assert_eq!(
+            policy.required_mode_for("workspace_execute"),
+            runtime::PermissionMode::WorkspaceWrite
         );
     }
 
@@ -15349,9 +15445,9 @@ mod tests {
         assert!(!transcript.contains("internal draft"));
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
-    fn workspace_execute_is_not_registered_without_linux_isolation() {
+    fn workspace_execute_is_not_registered_without_supported_os_isolation() {
         assert!(
             workspace_tool_definitions()
                 .iter()

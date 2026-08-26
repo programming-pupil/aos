@@ -1,15 +1,18 @@
 use std::path::{Component, Path, PathBuf};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::{Command, Stdio};
 use std::sync::{atomic::AtomicBool, Arc, OnceLock};
 use std::time::Duration;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::Instant;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_CAPTURE_BYTES: usize = 2 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const MEMORY_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const FILE_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const PROCESS_LIMIT: u64 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,9 +43,54 @@ pub fn capability() -> EnforcementCapability {
     *CAPABILITY.get_or_init(probe)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn probe() -> EnforcementCapability {
     EnforcementCapability::Unavailable
+}
+
+#[cfg(target_os = "macos")]
+fn probe() -> EnforcementCapability {
+    if !Path::new("/usr/bin/sandbox-exec").is_file() {
+        return EnforcementCapability::Unavailable;
+    }
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos())
+    );
+    let root = std::env::temp_dir().join(format!("aos-seatbelt-probe-{nonce}"));
+    // macOS exposes the process temp directory below /private/var/folders,
+    // which is not a stable privacy boundary. Probe a path covered by the
+    // explicit external-temp deny rule instead.
+    let outside = PathBuf::from("/private/tmp").join(format!("aos-seatbelt-outside-{nonce}"));
+    if std::fs::create_dir_all(root.join("generated")).is_err()
+        || std::fs::create_dir_all(&outside).is_err()
+        || std::fs::write(outside.join("private.txt"), b"secret").is_err()
+    {
+        return EnforcementCapability::Unavailable;
+    }
+    let outside_path = shell_single_quote(&outside.join("private.txt").to_string_lossy());
+    let result = execute_internal(
+        &root,
+        Path::new("/workspace"),
+        &format!(
+            "test ! -r {outside_path} && test ! -w /tmp && \
+             test ! -r /Users/Shared && touch generated/ok"
+        ),
+        Duration::from_secs(5),
+        Arc::new(AtomicBool::new(false)),
+        false,
+        &[PathBuf::from("generated")],
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+    if result.is_ok_and(|output| !output.timed_out && output.exit_code == Some(0)) {
+        EnforcementCapability::Full
+    } else {
+        EnforcementCapability::Unavailable
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -101,7 +149,7 @@ pub fn build_launcher(
     writable_workspace: bool,
     writable_paths: &[PathBuf],
 ) -> Option<SandboxLauncher> {
-    if !cfg!(target_os = "linux") || capability() != EnforcementCapability::Full {
+    if capability() != EnforcementCapability::Full {
         return None;
     }
     build_launcher_unchecked(
@@ -133,6 +181,25 @@ fn validate_relative_mount(path: &Path) -> Result<(), String> {
 }
 
 fn build_launcher_unchecked(
+    workspace_root: &Path,
+    sandbox_cwd: &Path,
+    command: &str,
+    timeout: Duration,
+    writable_workspace: bool,
+    writable_paths: &[PathBuf],
+) -> Result<SandboxLauncher, String> {
+    build_platform_launcher(
+        workspace_root,
+        sandbox_cwd,
+        command,
+        timeout,
+        writable_workspace,
+        writable_paths,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn build_platform_launcher(
     workspace_root: &Path,
     sandbox_cwd: &Path,
     command: &str,
@@ -214,6 +281,94 @@ fn build_launcher_unchecked(
     })
 }
 
+#[cfg(target_os = "macos")]
+fn build_platform_launcher(
+    workspace_root: &Path,
+    sandbox_cwd: &Path,
+    command: &str,
+    _timeout: Duration,
+    writable_workspace: bool,
+    writable_paths: &[PathBuf],
+) -> Result<SandboxLauncher, String> {
+    let canonical_root = workspace_root
+        .canonicalize()
+        .map_err(|error| format!("sandbox workspace is unavailable: {error}"))?;
+    let relative_cwd = sandbox_cwd
+        .strip_prefix("/workspace")
+        .map_err(|_| "sandbox cwd must stay inside /workspace".to_string())?;
+    validate_relative_mount(relative_cwd)?;
+    let host_cwd = canonical_root.join(relative_cwd);
+    let canonical_cwd = host_cwd
+        .canonicalize()
+        .map_err(|error| format!("sandbox cwd is unavailable: {error}"))?;
+    if !canonical_cwd.starts_with(&canonical_root) {
+        return Err("sandbox cwd escapes the workspace".into());
+    }
+
+    let sandbox_home = canonical_root.join(".sandbox-home");
+    let sandbox_tmp = canonical_root.join(".sandbox-tmp");
+    std::fs::create_dir_all(&sandbox_home)
+        .and_then(|()| std::fs::create_dir_all(&sandbox_tmp))
+        .map_err(|error| format!("failed to initialize sandbox private directories: {error}"))?;
+
+    let mut writable_roots = vec![sandbox_home.clone(), sandbox_tmp.clone()];
+    if writable_workspace {
+        writable_roots.push(canonical_root.clone());
+    } else {
+        for relative in writable_paths {
+            validate_relative_mount(relative)?;
+            let host = canonical_root.join(relative);
+            let canonical_host = host
+                .canonicalize()
+                .map_err(|error| format!("sandbox writable path is unavailable: {error}"))?;
+            if !canonical_host.starts_with(&canonical_root) {
+                return Err("sandbox writable path escapes the workspace".into());
+            }
+            writable_roots.push(canonical_host);
+        }
+    }
+
+    let canonical_root = seatbelt_string(&canonical_root.to_string_lossy());
+    let mut profile = format!(
+        "(version 1)\n\
+         (allow default)\n\
+         (deny network*)\n\
+         (deny file-read* (subpath \"/Users\") (subpath \"/private/tmp\") (subpath \"/private/var/folders\") (subpath \"/Volumes\"))\n\
+         (deny file-write*)\n\
+         (deny signal (target others))\n\
+         (allow file-read* (subpath \"{canonical_root}\"))\n\
+         (allow file-write* (literal \"/dev/null\"))\n"
+    );
+    for writable_root in writable_roots {
+        let writable_root = seatbelt_string(&writable_root.to_string_lossy());
+        profile.push_str(&format!(
+            "(allow file-write* (subpath \"{writable_root}\"))\n"
+        ));
+    }
+    let command = format!(
+        "export HOME={} TMPDIR={}; exec /bin/sh -lc {}",
+        shell_single_quote(&sandbox_home.to_string_lossy()),
+        shell_single_quote(&sandbox_tmp.to_string_lossy()),
+        shell_single_quote(command),
+    );
+    Ok(SandboxLauncher {
+        program: "/usr/bin/sandbox-exec".into(),
+        args: vec!["-p".into(), profile, "/bin/sh".into(), "-c".into(), command],
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn build_platform_launcher(
+    _workspace_root: &Path,
+    _sandbox_cwd: &Path,
+    _command: &str,
+    _timeout: Duration,
+    _writable_workspace: bool,
+    _writable_paths: &[PathBuf],
+) -> Result<SandboxLauncher, String> {
+    Err("sandbox backend is unavailable; command was not executed".into())
+}
+
 pub fn execute(
     workspace_root: &Path,
     sandbox_cwd: &Path,
@@ -237,7 +392,7 @@ pub fn execute(
     )
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn execute_internal(
     _workspace_root: &Path,
     _sandbox_cwd: &Path,
@@ -250,7 +405,7 @@ fn execute_internal(
     Err("sandbox backend is unavailable; command was not executed".into())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn execute_internal(
     workspace_root: &Path,
     sandbox_cwd: &Path,
@@ -273,13 +428,23 @@ fn execute_internal(
         writable_paths,
     )?;
     let started = Instant::now();
-    let mut child = Command::new(&launcher.program)
+    let mut prepared = Command::new(&launcher.program);
+    prepared
         .args(&launcher.args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        prepared.process_group(0);
+    }
+    #[cfg(target_os = "macos")]
+    prepared.current_dir(resolve_macos_host_cwd(workspace_root, sandbox_cwd)?);
+    let mut child = prepared
         .spawn()
         .map_err(|error| format!("sandbox runner failed before command dispatch: {error}"))?;
+    let process_group_id = child.id();
     let stdout = child
         .stdout
         .take()
@@ -301,12 +466,12 @@ fn execute_internal(
         }
         if started.elapsed() >= timeout {
             timed_out = true;
-            let _ = child.kill();
+            terminate_process_group(&mut child, process_group_id);
             break child.wait().ok();
         }
         if cancellation.load(Ordering::Acquire) {
             cancelled = true;
-            let _ = child.kill();
+            terminate_process_group(&mut child, process_group_id);
             break child.wait().ok();
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -338,12 +503,68 @@ fn command_exists(command: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "macos")]
+fn seatbelt_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_host_cwd(workspace_root: &Path, sandbox_cwd: &Path) -> Result<PathBuf, String> {
+    let canonical_root = workspace_root
+        .canonicalize()
+        .map_err(|error| format!("sandbox workspace is unavailable: {error}"))?;
+    let relative = sandbox_cwd
+        .strip_prefix("/workspace")
+        .map_err(|_| "sandbox cwd must stay inside /workspace".to_string())?;
+    validate_relative_mount(relative)?;
+    let canonical_cwd = canonical_root
+        .join(relative)
+        .canonicalize()
+        .map_err(|error| format!("sandbox cwd is unavailable: {error}"))?;
+    if !canonical_cwd.starts_with(&canonical_root) {
+        return Err("sandbox cwd escapes the workspace".into());
+    }
+    Ok(canonical_cwd)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn terminate_process_group(child: &mut std::process::Child, process_group_id: u32) {
+    use nix::errno::Errno;
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+
+    let Ok(process_group_id) = i32::try_from(process_group_id) else {
+        let _ = child.kill();
+        return;
+    };
+    let process_group = Pid::from_raw(process_group_id);
+    if let Err(error) = killpg(process_group, Signal::SIGTERM) {
+        if error != Errno::ESRCH {
+            let _ = child.kill();
+        }
+    }
+    let grace_started = Instant::now();
+    while grace_started.elapsed() < Duration::from_millis(250) {
+        if child.try_wait().ok().flatten().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The shell may exit before its descendants. Always signal the process
+    // group again so cancellation cannot leave a detached foreground child.
+    if let Err(error) = killpg(process_group, Signal::SIGKILL) {
+        if error != Errno::ESRCH {
+            let _ = child.kill();
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn drain_bounded<R: std::io::Read>(mut reader: R) -> Result<String, String> {
     let mut retained = Vec::new();
     let mut buffer = [0_u8; 16 * 1024];
@@ -358,4 +579,101 @@ fn drain_bounded<R: std::io::Read>(mut reader: R) -> Result<String, String> {
         retained.extend_from_slice(&buffer[..read.min(remaining)]);
     }
     Ok(String::from_utf8_lossy(&retained).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn test_workspace(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        std::env::temp_dir().join(format!(
+            "aos-sandbox-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn confined_command_writes_only_to_the_workspace() {
+        if capability() != EnforcementCapability::Full {
+            return;
+        }
+        let root = test_workspace("write");
+        std::fs::create_dir_all(&root).expect("create sandbox test workspace");
+        let outside_name = format!(
+            "{}-outside",
+            root.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .expect("test workspace name")
+        );
+        let outside = if cfg!(target_os = "macos") {
+            PathBuf::from("/private/tmp").join(&outside_name)
+        } else {
+            std::env::temp_dir().join(&outside_name)
+        };
+        let command = format!(
+            "printf inside > allowed.txt; printf outside > {} 2>/dev/null || true",
+            shell_single_quote(&outside.to_string_lossy())
+        );
+        let output = execute(
+            &root,
+            Path::new("/workspace"),
+            &command,
+            Duration::from_secs(5),
+            Arc::new(AtomicBool::new(false)),
+            true,
+            &[],
+        )
+        .expect("execute confined command");
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(
+            std::fs::read_to_string(root.join("allowed.txt")).expect("workspace output"),
+            "inside"
+        );
+        let outside_created = outside.exists();
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(root);
+        assert!(!outside_created, "sandbox wrote outside its workspace");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn cancellation_terminates_the_sandbox_process_group_promptly() {
+        if capability() != EnforcementCapability::Full {
+            return;
+        }
+        let root = test_workspace("cancel");
+        std::fs::create_dir_all(&root).expect("create sandbox test workspace");
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation);
+        let worker_root = root.clone();
+        let worker = std::thread::spawn(move || {
+            execute(
+                &worker_root,
+                Path::new("/workspace"),
+                "printf started > started; sleep 30",
+                Duration::from_secs(35),
+                worker_cancellation,
+                true,
+                &[],
+            )
+            .expect("execute cancellable confined command")
+        });
+        let marker = root.join("started");
+        let wait_started = Instant::now();
+        while !marker.exists() && wait_started.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(marker.exists(), "sandbox command should start");
+        let cancellation_started = Instant::now();
+        cancellation.store(true, Ordering::Release);
+        let output = worker.join().expect("sandbox worker should not panic");
+        assert!(output.cancelled);
+        assert!(cancellation_started.elapsed() < Duration::from_secs(2));
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

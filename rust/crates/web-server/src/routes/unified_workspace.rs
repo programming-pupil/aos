@@ -846,6 +846,11 @@ pub fn evaluate_completion(checklist: &CompletionChecklist) -> CompletionDecisio
     if required.contains("super_adversarial") && !checks.contains("adversarial_completed") {
         missing.push("required super adversarial analysis did not complete".into());
     }
+    if required.contains("workspace_automation")
+        && !checks.contains("workspace_automation_committed")
+    {
+        missing.push("required workspace schedule mutation was not durably committed".into());
+    }
     // File writes are not inherently code changes: reports and generated SQL
     // are legitimate deliverables. The parent server classifies real source
     // edits and adds `code_change` to required evidence before reaching here.

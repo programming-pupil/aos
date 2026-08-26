@@ -211,7 +211,7 @@ reason: 简短中文理由
 needsWebSearch: true/false；仅当回答依赖会随时间变化的外部事实，或需要公网证据/来源支撑时为 true
 webSearchQuery: needsWebSearch=true 时给一句简洁检索 query，否则 null
 webSearchReason: 联网判定的简短理由，否则 null
-requiredEvidence: 数组，只能包含 web | workspace | code_change | data_execution | deep_research | super_adversarial；不需要工具证据时为空数组
+requiredEvidence: 数组，只能包含 web | workspace | code_change | data_execution | deep_research | super_adversarial | workspace_automation；不需要工具证据时为空数组
 needsClarification: true/false
 clarificationQuestion: 需要澄清时给一个短问题，否则 null
 rewrittenPrompt: 可选，交给目标能力的改写请求；不需要改写则 null
@@ -232,6 +232,7 @@ rewrittenPrompt: 可选，交给目标能力的改写请求；不需要改写则
 - 用户要求从已配置数据源得到真实业务结果或实际执行 SQL 时，requiredEvidence 包含 data_execution；只解释或审阅 SQL 时不包含。
 - 用户明确要求完整、多来源、可追溯的深度调研或研究报告时，requiredEvidence 包含 deep_research；普通知识问答不包含。
 - 用户明确要求多方案交锋、正反论证或裁决时，requiredEvidence 包含 super_adversarial；普通问答不包含。
+- 用户要求实际创建、修改、启停或取消工作区定时任务时，requiredEvidence 包含 workspace_automation；只询问概念时不包含。
 - 如果最高置信度低于 {{threshold}}，needsClarification=true。
 - 不要选择未在候选能力里的能力。
 - 不要 Markdown，不要额外文本."#;
@@ -400,9 +401,9 @@ Plan 标题：
 
 const LEGACY_SUPER_ADVERSARIAL_INITIAL: &str = "你是超级对抗模式中的参赛模型 {{model}}。请立即独立回答用户问题，不要等待或假设系统已经完成联网检索。要求：事实优先；不知道就说不知道；不要编造来源；不要为了显得不同而反驳；给出清晰、可执行、完整的答案。如果结论确实依赖实时、外部或权威事实，正文后按调用方协议提出精确证据请求，后续轮次会获得共享证据；纯推理和已有上下文足够时不要请求检索。如果存在追问上下文，请继承仍然有效的信息，同时以用户新问题为最高优先级。";
 
-const LEGACY_SUPER_ADVERSARIAL_REVIEW: &str = "你是超级对抗模式中的参赛模型 {{model}}，当前第 {{round}} 轮。你会看到自己的上一轮完整答案、其他行业专家/模型的上一轮完整答案、历史观点轨迹以及按需取得的共享证据。请把其他答案当作外部专家评审意见来校准你的结论：正确的吸收，错误的纠正，不确定的标注。不要为了反驳而反驳，也不要因为面子保留错误观点。只有未决异议确实必须依赖新的外部事实时才请求定向补证；逻辑或已有材料足以解决时不要搜索。只有认可共同核心结论且没有重大未决异议时，才能投出一致认可票。";
+const LEGACY_SUPER_ADVERSARIAL_REVIEW: &str = "你是超级对抗模式中的参赛模型 {{model}}，当前第 {{round}} 轮。你会看到自己的上一轮完整答案、其他具名模型的上一轮完整答案、历史观点轨迹以及按需取得的共享证据。其他模型的不同结论代表对你对应 claim 的不认可，必须按模型名逐项回应：正确的吸收，错误的反驳，不确定的标注。若对方说服了你，必须说明放弃的原 claim、说服你的模型或证据和具体认输理由；不得因为面子保留错误观点，也不得用“都有道理”伪造一致。只有未决异议确实必须依赖新的外部事实时才请求定向补证。只有真正认可共同核心结论、给出具体认可或认输理由且没有重大未决异议时，才能投出一致认可票。";
 
-const LEGACY_SUPER_ADVERSARIAL_JUDGE: &str = "你是多模型对抗审查的中立裁判。你的目标是事实正确、逻辑严谨、承认不确定性。服务端只会在至少两个健康参赛模型明确认可共同结论后调用你；不要因为需要对抗而强行反驳。必须逐项审计数字、日期、因果、否定关系、适用边界和证据等关键 claim，并通过 claim_audit_complete 与 critical_conflicts 明确返回审计结果。只有完成审计、没有关键冲突且共同结论没有明显错误时，才判定 resolved=true，并从真实参赛模型中选择一个胜出者。请只返回 JSON。";
+const LEGACY_SUPER_ADVERSARIAL_JUDGE: &str = "你是多模型对抗审查的中立裁判。你的目标是事实正确、逻辑严谨、承认不确定性。独立首轮只有全部配置模型成功且核心结论实质一致时才可直接裁决，否则必须列出具名关键冲突供下一轮互相反驳；后续轮次只有参赛模型给出具体理由并明确认可共同结论后才进入收敛审查。不要因为需要对抗而强行反驳，也不要把多数投票当成事实。必须逐项审计数字、日期、因果、否定关系、适用边界和证据等关键 claim，并通过 claim_audit_complete 与 critical_conflicts 明确返回审计结果。只有完成审计、没有关键冲突且共同结论没有明显错误时，才判定 resolved=true，并从真实参赛模型中选择一个胜出者。请只返回 JSON。";
 
 const LEGACY_SUPER_ADVERSARIAL_FINAL: &str = "你是最终答案整理者。你需要基于多模型互审结果，输出一个标准答案。坚持事实优先、逻辑优先；错误就是错误，正确就承认正确；不要为了戏剧性而制造分歧。";
 
