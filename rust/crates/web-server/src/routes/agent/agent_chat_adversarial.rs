@@ -2978,6 +2978,7 @@ async fn run_chat_adversarial_job(
         },
         "hasParentContext": parent_context.as_deref().is_some_and(|text| !text.trim().is_empty()),
         "parentContextChars": parent_context.as_deref().map(|text| text.chars().count()).unwrap_or(0),
+        "questionChars": question.chars().count(),
         "hasParentDebateState": parent_debate_state.is_some(),
         "evidencePolicy": {
             "mode": "isolated_per_model_after_independent_first_round",
@@ -3124,8 +3125,34 @@ async fn run_chat_adversarial_job(
                 });
                 break;
             }
+            let failures = answers.iter().map(model_answer_to_json).collect::<Vec<_>>();
+            trace["failedRound"] = serde_json::json!({
+                "round": round,
+                "phase": if round == 1 { "initial" } else { "review" },
+                "questionChars": question.chars().count(),
+                "modelFailures": failures,
+            });
+            update_chat_adversarial_status(
+                &state,
+                &tenant_id,
+                &user_id,
+                &run_id,
+                "running",
+                i32::try_from(round).unwrap_or(i32::MAX),
+                Some(&trace),
+            )
+            .await?;
+            tracing::warn!(
+                tenant_id,
+                user_id,
+                run_id,
+                round,
+                question_chars = question.chars().count(),
+                failures = ?trace["failedRound"]["modelFailures"],
+                "all adversarial participant calls failed in the same round"
+            );
             return Err(AppError::Internal(
-                "all adversarial model calls failed".to_string(),
+                "超级对抗的所有参赛模型本轮均调用失败；请检查模型服务可用性后重试".to_string(),
             ));
         }
 

@@ -3851,6 +3851,12 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         )
         .await
         .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        // Establish and heal per-turn model capacity at the same durable
+        // boundary as turn creation. Waiting for the first provider manifest
+        // leaves legacy long-running sessions observably exhausted between
+        // start_turn and their first model call.
+        ensure_protected_model_budgets(&mut tx, &self.tenant_id, &self.session_id, &input.turn_id)
+            .await?;
         tx.commit()
             .await
             .map_err(|error| runtime::RuntimeError::new(error.to_string()))
@@ -3870,6 +3876,29 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         .ok_or_else(|| runtime::RuntimeError::new("canonical running turn was not found"))?;
         u64::try_from(revision)
             .map_err(|_| runtime::RuntimeError::new("canonical turn revision is negative"))
+    }
+
+    async fn latest_context_manifest_iteration(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<usize>, runtime::RuntimeError> {
+        let iteration = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT MAX(iteration) FROM context_packet_manifests
+             WHERE tenant_id = ? AND thread_id = ? AND turn_id = ?",
+        )
+        .bind(&self.tenant_id)
+        .bind(&self.session_id)
+        .bind(turn_id)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        iteration
+            .map(|value| {
+                usize::try_from(value).map_err(|_| {
+                    runtime::RuntimeError::new("stored context manifest iteration is invalid")
+                })
+            })
+            .transpose()
     }
 
     async fn load_context_supplement(
@@ -6869,12 +6898,13 @@ async fn release_turn_model_budgets_in_transaction(
         sqlx::query::<Sqlite>(
             "UPDATE resource_budget_accounts
              SET reserved = MAX(reserved - ?, 0),
-                 available = available + ?,
+                 available = available + ? + ?,
                  committed = committed + ?
              WHERE tenant_id = ? AND owner_scope = ? AND dimension = ?",
         )
         .bind(available.saturating_add(committed))
         .bind(available)
+        .bind(committed)
         .bind(committed)
         .bind(tenant_id)
         .bind(owner_scope)
@@ -6914,6 +6944,35 @@ async fn ensure_protected_model_budgets(
     ] {
         let reservation_id = protected_model_reservation_id(turn_id, stage);
         for (dimension, amount, initial) in protected_model_budget_amounts(stage) {
+            sqlx::query::<Sqlite>(
+                "INSERT INTO resource_budget_accounts
+                    (tenant_id, owner_scope, dimension, available, reserved, committed)
+                 VALUES (?, ?, ?, ?, 0, 0)
+                 ON CONFLICT(tenant_id, owner_scope, dimension) DO NOTHING",
+            )
+            .bind(tenant_id)
+            .bind(owner_scope)
+            .bind(dimension)
+            .bind(initial)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+            // Model budgets are concurrency capacity, while committed is
+            // cumulative usage telemetry. Rebuild capacity from active
+            // reservations to heal accounts written by older runtimes that
+            // incorrectly treated committed usage as a lifetime session quota.
+            sqlx::query::<Sqlite>(
+                "UPDATE resource_budget_accounts
+                 SET available = MAX(? - reserved, 0)
+                 WHERE tenant_id = ? AND owner_scope = ? AND dimension = ?",
+            )
+            .bind(initial)
+            .bind(tenant_id)
+            .bind(owner_scope)
+            .bind(dimension)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
             let exists: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM resource_budget_entries
                  WHERE tenant_id = ? AND owner_scope = ? AND reservation_id = ?
@@ -6929,19 +6988,6 @@ async fn ensure_protected_model_budgets(
             if exists > 0 {
                 continue;
             }
-            sqlx::query::<Sqlite>(
-                "INSERT INTO resource_budget_accounts
-                    (tenant_id, owner_scope, dimension, available, reserved, committed)
-                 VALUES (?, ?, ?, ?, 0, 0)
-                 ON CONFLICT(tenant_id, owner_scope, dimension) DO NOTHING",
-            )
-            .bind(tenant_id)
-            .bind(owner_scope)
-            .bind(dimension)
-            .bind(initial)
-            .execute(&mut **tx)
-            .await
-            .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
             let updated = sqlx::query::<Sqlite>(
                 "UPDATE resource_budget_accounts
                  SET available = available - ?, reserved = reserved + ?
@@ -7224,7 +7270,7 @@ async fn settle_model_budget_in_transaction(
             )
             .bind(reserved)
             .bind(actual)
-            .bind(reserved - actual)
+            .bind(reserved)
             .bind(tenant_id)
             .bind(owner_scope)
             .bind(&dimension)
@@ -16388,6 +16434,14 @@ mod tests {
             })
             .await
             .unwrap();
+        let turn_budget_baseline: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM resource_budget_entries
+             WHERE tenant_id = 'tenant' AND owner_scope = 'atomic-session'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(turn_budget_baseline, 6);
 
         let intent = runtime::RuntimeToolIntent::new(
             "atomic-turn",
@@ -16412,7 +16466,7 @@ mod tests {
         .fetch_one(&db)
         .await
         .unwrap();
-        assert_eq!(partial_authorization, (0, 0, 0));
+        assert_eq!(partial_authorization, (0, 0, turn_budget_baseline));
 
         allow_runtime_events(&db).await;
         kernel.authorize_tool(&intent).await.unwrap();
@@ -17187,6 +17241,14 @@ mod tests {
     async fn resource_budget_protects_final_and_conserves_concurrent_child_slots() {
         let db = db().await;
         let kernel = RuntimeExecutionKernel::new(db.clone(), "tenant", "user", "protected-session");
+        sqlx::query(
+            "INSERT INTO resource_budget_accounts
+                (tenant_id, owner_scope, dimension, available, reserved, committed)
+             VALUES ('tenant', 'protected-session', 'token_input', 435159, 0, 1564841)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
         kernel
             .start_turn(runtime::RuntimeTurnStart {
                 turn_id: "protected-turn".into(),
@@ -17194,6 +17256,15 @@ mod tests {
             })
             .await
             .unwrap();
+        let healed_available: i64 = sqlx::query_scalar(
+            "SELECT available FROM resource_budget_accounts
+             WHERE tenant_id = 'tenant' AND owner_scope = 'protected-session'
+               AND dimension = 'token_input'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(healed_available, 2_000_000 - 262_144 - 131_072 - 16_384);
         let manifest = |iteration, stage, estimated_tokens| runtime::RuntimeContextManifestInput {
             turn_id: "protected-turn".into(),
             iteration,
@@ -17246,11 +17317,14 @@ mod tests {
             .record_assistant_message("protected-turn", 2, &assistant)
             .await
             .unwrap();
-        let exhausted = kernel
+        kernel
             .record_context_manifest(manifest(3, runtime::RuntimeModelBudgetStage::General, 1))
             .await
-            .unwrap_err();
-        assert!(exhausted.to_string().contains("stage=general"));
+            .expect("settled provider usage must not become a session-lifetime quota");
+        kernel
+            .record_assistant_message("protected-turn", 3, &assistant)
+            .await
+            .unwrap();
 
         kernel
             .record_context_manifest(manifest(
@@ -17328,6 +17402,16 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(reserved, 0);
+        let input_account: (i64, i64) = sqlx::query_as(
+            "SELECT available, committed FROM resource_budget_accounts
+             WHERE tenant_id = 'tenant' AND owner_scope = 'protected-session'
+               AND dimension = 'token_input'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(input_account.0, 2_000_000);
+        assert!(input_account.1 > 0, "actual usage remains auditable");
 
         seed_agent_thread(&db, "tenant", "user", "budget-parent").await;
 

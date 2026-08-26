@@ -463,6 +463,169 @@ fn deterministic_web_search_requirement(text: &str) -> bool {
 }
 
 #[cfg(feature = "bot-agents")]
+fn deterministic_workspace_automation_requirement(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let asks_for_explanation = [
+        "如何",
+        "怎么",
+        "怎样",
+        "介绍",
+        "说明",
+        "是什么",
+        "what is",
+        "how to",
+        "explain",
+        "describe",
+    ]
+    .iter()
+    .any(|cue| lower.contains(cue));
+    let delegates_the_change = [
+        "给我",
+        "帮我",
+        "替我",
+        "直接",
+        "请新建",
+        "请创建",
+        "请添加",
+        "请配置",
+        "请设置",
+        "请安排",
+        "请修改",
+        "请更新",
+        "请改",
+        "请启用",
+        "请开启",
+        "请停用",
+        "请禁用",
+        "请取消",
+        "请删除",
+        "请停止",
+        "请执行",
+        "请运行",
+        "请生成",
+        "请产出",
+        "请写",
+        "please create",
+        "please add",
+        "please set",
+        "please schedule",
+        "please update",
+        "please change",
+        "please enable",
+        "please disable",
+        "please cancel",
+        "please delete",
+        "please run",
+        "please generate",
+        "please write",
+        "for me",
+    ]
+    .iter()
+    .any(|cue| lower.contains(cue));
+    if asks_for_explanation && !delegates_the_change {
+        return false;
+    }
+    let has_schedule_cue = [
+        "定时任务",
+        "计划任务",
+        "定时执行",
+        "每隔",
+        "每分钟",
+        "每小时",
+        "每天",
+        "每周",
+        "cron",
+        "crontab",
+        "scheduled task",
+        "recurring task",
+        "every minute",
+        "every hour",
+        "every day",
+        "every week",
+        "periodically",
+    ]
+    .iter()
+    .any(|cue| lower.contains(cue));
+    let has_mutation_cue = [
+        "新建",
+        "创建",
+        "添加",
+        "配置",
+        "设置",
+        "安排",
+        "修改",
+        "更新",
+        "改成",
+        "改为",
+        "启用",
+        "开启",
+        "停用",
+        "禁用",
+        "取消",
+        "删除",
+        "停止",
+        "执行",
+        "运行",
+        "生成",
+        "产出",
+        "写入",
+        "create",
+        "add",
+        "set up",
+        "setup",
+        "schedule",
+        "reschedule",
+        "update",
+        "change",
+        "enable",
+        "disable",
+        "cancel",
+        "delete",
+        "remove",
+        "stop",
+        "run",
+        "generate",
+        "write",
+    ]
+    .iter()
+    .any(|cue| lower.contains(cue));
+    has_schedule_cue && has_mutation_cue
+}
+
+#[cfg(feature = "bot-agents")]
+fn enforce_deterministic_workspace_automation_contract(
+    route: &mut SessionRouteOutcome,
+    text: &str,
+    turn_id: &str,
+    created_at: &str,
+) {
+    if !deterministic_workspace_automation_requirement(text)
+        || route
+            .decision
+            .required_evidence
+            .iter()
+            .any(|requirement| requirement == "workspace_automation")
+    {
+        return;
+    }
+    route
+        .decision
+        .required_evidence
+        .push("workspace_automation".to_string());
+    route.decision.required_evidence.sort();
+    route.decision.required_evidence.dedup();
+    route.decision.reason = Some(route.decision.reason.as_deref().map_or_else(
+        || "deterministic workspace automation mutation contract".to_string(),
+        |reason| format!("{reason}; deterministic workspace automation mutation contract"),
+    ));
+    route.event = RouteDecisionEvent::from_decision(&route.decision, turn_id, created_at);
+}
+
+#[cfg(feature = "bot-agents")]
 fn ordinary_chat_fast_path_allowed(text: &str, available: &[&BotAgentCapabilityInfo]) -> bool {
     let trimmed = text.trim();
     !trimmed.is_empty()
@@ -1137,11 +1300,11 @@ pub async fn route_message_in_session(
     .await;
     let event = RouteDecisionEvent::from_decision(&decision, turn_id, created_at);
     let persisted_events = 0;
-    // Route-time extraction has the full AppState and therefore uses both the
-    // semantic model channel and the deterministic fallback.  The compaction
-    // hook later persists the already-established state rather than trying to
-    // infer facts from a summary.
-    let newly_established = extract_key_info_dual_channel(state, tenant_id, new_messages).await;
+    // Routing must not wait on a second provider call after capability
+    // selection. Deterministic extraction preserves immediate continuity;
+    // semantic enrichment remains owned by memory/compaction workers outside
+    // this latency-critical preflight.
+    let newly_established = extract_key_info(new_messages);
     let context = prior_context.switch_capability(&decision.target_capability, &newly_established);
     SessionRouteOutcome {
         decision,
@@ -12709,7 +12872,8 @@ impl UnifiedAssistantFeatureModes {
 #[cfg(all(test, feature = "bot-agents"))]
 mod unified_feature_mode_tests {
     use super::{
-        apply_skill_route_override, explicitly_requests_super_adversarial,
+        apply_skill_route_override, deterministic_workspace_automation_requirement,
+        enforce_deterministic_workspace_automation_contract, explicitly_requests_super_adversarial,
         parse_super_assistant_slash_command, skill_directive_name, RouteDecision,
         RouteDecisionEvent, RouteSource, SessionContextSnapshot, SessionRouteOutcome,
         SuperAssistantSlashMode, UnifiedAssistantFeatureModes,
@@ -12827,6 +12991,68 @@ mod unified_feature_mode_tests {
         )));
         assert!(!explicitly_requests_super_adversarial(Some("pm_assistant")));
         assert!(!explicitly_requests_super_adversarial(None));
+    }
+
+    #[test]
+    fn workspace_schedule_mutations_keep_their_contract_without_semantic_routing() {
+        for request in [
+            "给我新建个定时任务，每隔一分钟产出一份文件",
+            "请把这个计划任务改成每天执行",
+            "cancel this scheduled task",
+        ] {
+            assert!(
+                deterministic_workspace_automation_requirement(request),
+                "{request}"
+            );
+        }
+        for question in [
+            "定时任务是什么？",
+            "如何创建定时任务？",
+            "请介绍如何创建定时任务",
+            "explain scheduled tasks",
+        ] {
+            assert!(
+                !deterministic_workspace_automation_requirement(question),
+                "{question}"
+            );
+        }
+
+        let decision = RouteDecision {
+            target_capability: "ai_chat".to_string(),
+            source: RouteSource::RuleFallback,
+            confidence: None,
+            threshold: 0.8,
+            bypass_threshold: false,
+            reason: Some("router unavailable".to_string()),
+            needs_web_search: Some(false),
+            web_search_query: None,
+            web_search_reason: None,
+            required_evidence: Vec::new(),
+        };
+        let mut route = SessionRouteOutcome {
+            event: RouteDecisionEvent::from_decision(
+                &decision,
+                "turn-automation",
+                "2026-08-26T00:00:00Z",
+            ),
+            decision,
+            persisted_events: 0,
+            context: SessionContextSnapshot::new(),
+        };
+        enforce_deterministic_workspace_automation_contract(
+            &mut route,
+            "给我新建个定时任务，每隔一分钟产出一份文件",
+            "turn-automation",
+            "2026-08-26T00:00:00Z",
+        );
+        assert_eq!(
+            route.decision.required_evidence,
+            vec!["workspace_automation".to_string()]
+        );
+        assert_eq!(
+            route.event.required_evidence,
+            route.decision.required_evidence
+        );
     }
 }
 
@@ -13005,12 +13231,25 @@ async fn prepare_and_start_super_assistant_stream_turn(
     let newly_established = extract_key_info(&new_messages);
     let threshold = bot_router_confidence_threshold(router_config.as_ref());
     let current_turn_has_attachments = has_current_turn_attachments(input_context.as_ref());
+    let current_turn_requires_workspace_automation =
+        deterministic_workspace_automation_requirement(&text);
     let route_future = async {
-        if current_turn_has_attachments {
-            // Attachment identity and authorization were already validated by
-            // the request adapter. Route directly into the shared parent loop;
-            // a model-backed classifier/key-info extraction in this critical
-            // gate adds latency but cannot improve that deterministic choice.
+        if current_turn_has_attachments
+            || current_turn_requires_workspace_automation
+            || matches!(
+                effective_explicit_capability.map(str::trim),
+                Some(
+                    "super_adversarial"
+                        | "super-adversarial"
+                        | "data_attribution"
+                        | "data-attribution"
+                )
+            )
+        {
+            // Attachment identity, explicit specialist modes and concrete
+            // workspace automation mutations are already deterministic. Route
+            // directly into the shared parent loop; a model-backed classifier
+            // in this critical gate cannot improve those choices.
             return fallback_super_assistant_route_outcome(
                 effective_explicit_capability,
                 &enabled,
@@ -13019,7 +13258,7 @@ async fn prepare_and_start_super_assistant_stream_turn(
                 &created_at,
                 &SessionContextSnapshot::new(),
                 &newly_established,
-                "current-turn attachments use the deterministic parent route",
+                "explicit specialist mode, workspace automation mutation, or current-turn attachments use the deterministic parent route",
             );
         }
         route_message_with_evidence_contract(
@@ -13110,6 +13349,12 @@ async fn prepare_and_start_super_assistant_stream_turn(
     };
     let skill_directive =
         apply_skill_route_override(&mut route_outcome, &text, &turn_id, &created_at);
+    enforce_deterministic_workspace_automation_contract(
+        &mut route_outcome,
+        &text,
+        &turn_id,
+        &created_at,
+    );
     let injection = match injection_result {
         Ok(injection) => injection,
         Err(reason) => {

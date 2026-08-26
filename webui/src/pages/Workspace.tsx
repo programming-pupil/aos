@@ -61,22 +61,18 @@ type DialogState =
 interface ScheduleDraft {
   name: string;
   command: string;
-  cwd: string;
   cronExpression: string;
   timezone: string;
   timeoutSeconds: number;
-  scriptPath: string;
 }
 
 function emptyScheduleDraft(): ScheduleDraft {
   return {
     name: '',
     command: '',
-    cwd: ROOT_PATH,
     cronExpression: '* * * * *',
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
     timeoutSeconds: 120,
-    scriptPath: '',
   };
 }
 
@@ -138,7 +134,6 @@ export default function Workspace() {
   const [editorSaving, setEditorSaving] = useState(false);
   const [commandOpen, setCommandOpen] = useState(false);
   const [command, setCommand] = useState('');
-  const [commandCwd, setCommandCwd] = useState(ROOT_PATH);
   const [commandTimeout, setCommandTimeout] = useState(120);
   const [commandRunning, setCommandRunning] = useState(false);
   const [commandResult, setCommandResult] = useState<Awaited<ReturnType<typeof personalWorkspaceApi.executeCommand>> | null>(null);
@@ -209,7 +204,6 @@ export default function Workspace() {
     try {
       setCommandResult(await personalWorkspaceApi.executeCommand({
         command,
-        cwd: commandCwd,
         timeoutSeconds: commandTimeout,
       }, controller.signal));
       await invalidateFiles();
@@ -228,9 +222,9 @@ export default function Workspace() {
     setCommandOpen(false);
   };
 
-  const openNewSchedule = (scriptPath = '') => {
+  const openNewSchedule = () => {
     setEditingScheduleId(null);
-    setScheduleDraft({ ...emptyScheduleDraft(), scriptPath });
+    setScheduleDraft(emptyScheduleDraft());
     setScheduleEditorOpen(true);
   };
 
@@ -239,11 +233,9 @@ export default function Workspace() {
     setScheduleDraft({
       name: schedule.name,
       command: schedule.command,
-      cwd: schedule.cwd,
       cronExpression: schedule.cronExpression,
       timezone: schedule.timezone,
       timeoutSeconds: schedule.timeoutSeconds,
-      scriptPath: schedule.scriptPath ?? '',
     });
     setScheduleEditorOpen(true);
   };
@@ -252,7 +244,7 @@ export default function Workspace() {
     if (!scheduleDraft.name.trim() || !scheduleDraft.command.trim() || !scheduleDraft.cronExpression.trim()) return;
     setScheduleSaving(true);
     try {
-      const payload = { ...scheduleDraft, scriptPath: scheduleDraft.scriptPath.trim() || null };
+      const payload = { ...scheduleDraft };
       if (editingScheduleId) await personalWorkspaceApi.updateSchedule(editingScheduleId, payload);
       else await personalWorkspaceApi.createSchedule(payload);
       setScheduleEditorOpen(false);
@@ -421,25 +413,13 @@ export default function Workspace() {
     { title: t('common.updatedAt'), dataIndex: 'updatedAt', width: 180, render: formatTime },
     {
       title: t('common.actions'),
-      width: 220,
+      width: 170,
       align: 'right',
       render: (_, item) => (
         <Space size={2}>
           {item.kind === 'file' && item.editable && (
             <Tooltip title={t('common.edit')}><Button type="text" icon={<EditOutlined />} onClick={() => void openEditor(item)} /></Tooltip>
           )}
-          {item.kind === 'file' && (() => {
-            const schedule = schedulesQuery.data?.find((candidate) => candidate.scriptPath === item.path);
-            return schedule ? (
-              <Tooltip title={t('workspace.manageSchedule', 'Manage schedule')}>
-                <Button type="text" icon={<ClockCircleOutlined />} onClick={() => { setSchedulesOpen(true); openScheduleEditor(schedule); }} />
-              </Tooltip>
-            ) : (
-              <Tooltip title={t('workspace.createSchedule', 'Create schedule')}>
-                <Button type="text" icon={<ClockCircleOutlined />} onClick={() => { setSchedulesOpen(true); openNewSchedule(item.path); }} />
-              </Tooltip>
-            );
-          })()}
           {item.kind === 'file' && (
             <Tooltip title={t('workspace.download', 'Download')}><Button type="text" icon={<DownloadOutlined />} onClick={() => void downloadFileItem(item)} /></Tooltip>
           )}
@@ -473,6 +453,7 @@ export default function Workspace() {
     {
       title: t('common.name'),
       dataIndex: 'name',
+      width: 180,
       ellipsis: true,
       render: (name, schedule) => (
         <button type="button" onClick={() => openScheduleEditor(schedule)} style={{ border: 0, padding: 0, background: 'transparent', cursor: 'pointer', color: 'var(--text-primary)' }}>
@@ -485,7 +466,7 @@ export default function Workspace() {
     { title: t('workspace.lastRun', 'Last run'), dataIndex: 'lastFinishedAt', width: 180, render: formatTime },
     { title: t('common.status'), dataIndex: 'status', width: 110, render: (status) => <Tag color={status === 'failed' ? 'red' : status === 'running' ? 'blue' : status === 'cancelled' ? 'default' : 'green'}>{String(t(`workspace.scheduleStatus.${status}`, status))}</Tag> },
     {
-      title: t('common.actions'), width: 170, align: 'right', render: (_, schedule) => (
+      title: t('common.actions'), width: 150, fixed: 'right', align: 'right', render: (_, schedule) => (
         <Space size={2}>
           <Tooltip title={schedule.enabled ? t('workspace.disableSchedule', 'Disable') : t('workspace.enableSchedule', 'Enable')}>
             <Switch size="small" checked={schedule.enabled} onChange={(enabled) => void setScheduleEnabled(schedule, enabled)} />
@@ -533,7 +514,7 @@ export default function Workspace() {
             {mode === 'files' && path !== ROOT_PATH && <Button onClick={() => setPath(parentPath(path))}>{t('common.back')}</Button>}
             {mode === 'files' && <Button icon={<FolderAddOutlined />} onClick={() => setDialog({ kind: 'new-folder', value: '' })}>{t('workspace.newFolder', 'New folder')}</Button>}
             {mode === 'files' && <Button icon={<FileAddOutlined />} onClick={() => setDialog({ kind: 'new-file', value: '' })}>{t('workspace.newFile', 'New file')}</Button>}
-            {mode === 'files' && <Button icon={<CodeOutlined />} onClick={() => { setCommandCwd(path); setCommandOpen(true); }}>{t('workspace.command', 'CMD')}</Button>}
+            {mode === 'files' && <Button icon={<CodeOutlined />} onClick={() => setCommandOpen(true)}>{t('workspace.command', 'CMD')}</Button>}
             {mode === 'files' && <Button icon={<ClockCircleOutlined />} onClick={() => setSchedulesOpen(true)}>{t('workspace.schedules', 'Schedules')}</Button>}
             <Button icon={<UploadOutlined />} loading={uploading} onClick={() => fileInputRef.current?.click()}>{t('workspace.upload', 'Upload')}</Button>
             <Tooltip title={t('common.refresh')}><Button icon={<ReloadOutlined />} onClick={() => mode === 'files' ? void filesQuery.refetch() : void uploadsQuery.refetch()} /></Tooltip>
@@ -627,10 +608,7 @@ export default function Workspace() {
         <Alert type="info" showIcon message={t('workspace.commandIsolation', 'The command can use system tools and this personal workspace. Other user data, network access, and workspace-external writes are blocked.')} style={{ marginBottom: 16 }} />
         <Space direction="vertical" size={12} style={{ width: '100%' }}>
           <div><Text strong>{t('workspace.command', 'Command')}</Text><Input.TextArea autoFocus rows={5} value={command} onChange={(event) => setCommand(event.target.value)} placeholder="sh scripts/report.sh" /></div>
-          <Space wrap>
-            <div><Text strong>{t('workspace.cwd', 'Working directory')}</Text><Input value={commandCwd} onChange={(event) => setCommandCwd(event.target.value)} style={{ width: 360, display: 'block' }} /></div>
-            <div><Text strong>{t('workspace.timeoutSeconds', 'Timeout (seconds)')}</Text><InputNumber min={1} max={600} value={commandTimeout} onChange={(value) => setCommandTimeout(value ?? 120)} style={{ width: 160, display: 'block' }} /></div>
-          </Space>
+          <div><Text strong>{t('workspace.timeoutSeconds', 'Timeout (seconds)')}</Text><InputNumber min={1} max={600} value={commandTimeout} onChange={(value) => setCommandTimeout(value ?? 120)} style={{ width: 160, display: 'block' }} /></div>
           {commandResult && (
             <div>
               <Space style={{ marginBottom: 8 }}><Tag color={commandResult.status === 'succeeded' ? 'green' : 'red'}>{String(t(`workspace.scheduleStatus.${commandResult.status}`, commandResult.status))}</Tag><Text type="secondary">exit {commandResult.exitCode ?? '-'} · {commandResult.durationMs}ms</Text></Space>
@@ -643,7 +621,7 @@ export default function Workspace() {
       <Drawer
         title={t('workspace.schedules', 'Schedules')}
         open={schedulesOpen}
-        width="min(980px, 96vw)"
+        width="min(1040px, 100vw)"
         onClose={() => setSchedulesOpen(false)}
         extra={<Button type="primary" icon={<PlusOutlined />} onClick={() => openNewSchedule()}>{t('workspace.createSchedule', 'Create schedule')}</Button>}
       >
@@ -653,12 +631,13 @@ export default function Workspace() {
           dataSource={schedulesQuery.data ?? []}
           loading={schedulesQuery.isLoading}
           pagination={false}
-          scroll={{ x: 960 }}
+          tableLayout="fixed"
+          scroll={{ x: 968 }}
           expandable={{
             expandedRowRender: (schedule) => (
               <Space direction="vertical" size={6} style={{ width: '100%' }}>
                 <Text code>{schedule.command}</Text>
-                <Text type="secondary">{schedule.timezone} · {schedule.cwd} · {t('workspace.runCount', 'Runs')}: {schedule.runCount}</Text>
+                <Text type="secondary">{schedule.timezone} · {t('workspace.runCount', 'Runs')}: {schedule.runCount}</Text>
                 {(schedule.lastStdout || schedule.lastStderr) && <pre style={{ maxHeight: 200, overflow: 'auto', margin: 0, padding: 10, background: 'var(--bg-elevated)', whiteSpace: 'pre-wrap' }}>{schedule.lastStdout}{schedule.lastStderr ? `${schedule.lastStdout ? '\n' : ''}${schedule.lastStderr}` : ''}</pre>}
               </Space>
             ),
@@ -678,8 +657,6 @@ export default function Workspace() {
         <Space direction="vertical" size={12} style={{ width: '100%' }}>
           <div><Text strong>{t('common.name')}</Text><Input value={scheduleDraft.name} onChange={(event) => setScheduleDraft((value) => ({ ...value, name: event.target.value }))} /></div>
           <div><Text strong>{t('workspace.command', 'Command')}</Text><Input.TextArea rows={4} value={scheduleDraft.command} onChange={(event) => setScheduleDraft((value) => ({ ...value, command: event.target.value }))} /></div>
-          <div><Text strong>{t('workspace.scriptPath', 'Script path')}</Text><Input value={scheduleDraft.scriptPath} onChange={(event) => setScheduleDraft((value) => ({ ...value, scriptPath: event.target.value }))} placeholder="/projects/session/scripts/report.sh" /></div>
-          <div><Text strong>{t('workspace.cwd', 'Working directory')}</Text><Input value={scheduleDraft.cwd} onChange={(event) => setScheduleDraft((value) => ({ ...value, cwd: event.target.value }))} /></div>
           <Space wrap>
             <div><Text strong>{t('workspace.cron', 'Cron')}</Text><Input value={scheduleDraft.cronExpression} onChange={(event) => setScheduleDraft((value) => ({ ...value, cronExpression: event.target.value }))} placeholder="* * * * *" style={{ width: 150, display: 'block' }} /></div>
             <div><Text strong>{t('workspace.timezone', 'Timezone')}</Text><Input value={scheduleDraft.timezone} onChange={(event) => setScheduleDraft((value) => ({ ...value, timezone: event.target.value }))} style={{ width: 200, display: 'block' }} /></div>

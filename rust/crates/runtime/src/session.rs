@@ -218,6 +218,8 @@ pub struct SessionTurn {
     pub start_message_count: usize,
     pub end_message_count: Option<usize>,
     pub status: SessionTurnStatus,
+    /// Greatest provider/model iteration started for this turn.
+    pub iteration_cursor: usize,
     pub runtime_context: Option<SessionRuntimeContext>,
     pub context_baseline: Option<SessionContextBaseline>,
 }
@@ -288,6 +290,7 @@ enum SessionReplayRecord {
         turn_id: String,
         end_message_count: usize,
         status: SessionTurnStatus,
+        iteration_cursor: usize,
     },
     RollbackTo {
         message_count: usize,
@@ -830,6 +833,7 @@ impl Session {
             start_message_count: self.messages.len(),
             end_message_count: None,
             status: SessionTurnStatus::Running,
+            iteration_cursor: 0,
             runtime_context,
             context_baseline,
         };
@@ -860,6 +864,7 @@ impl Session {
             start_message_count,
             end_message_count,
             status,
+            iteration_cursor: 0,
             runtime_context: self.runtime_context.clone(),
             context_baseline: self.context_baseline.clone(),
         });
@@ -872,7 +877,7 @@ impl Session {
     ) -> Result<(), SessionError> {
         self.touch();
         let end_message_count = self.messages.len();
-        if let Some(turn) = self
+        let iteration_cursor = if let Some(turn) = self
             .turns
             .iter_mut()
             .rev()
@@ -880,8 +885,26 @@ impl Session {
         {
             turn.end_message_count = Some(end_message_count);
             turn.status = status;
-        }
-        self.append_persisted_turn_completed(turn_id, end_message_count, status)
+            turn.iteration_cursor
+        } else {
+            0
+        };
+        self.append_persisted_turn_completed(turn_id, end_message_count, status, iteration_cursor)
+    }
+
+    pub fn advance_turn_iteration(
+        &mut self,
+        turn_id: &str,
+        iteration: usize,
+    ) -> Result<(), SessionError> {
+        let turn = self
+            .turns
+            .iter_mut()
+            .rev()
+            .find(|turn| turn.turn_id == turn_id)
+            .ok_or_else(|| SessionError::Format(format!("turn `{turn_id}` was not found")))?;
+        turn.iteration_cursor = turn.iteration_cursor.max(iteration);
+        Ok(())
     }
 
     #[must_use]
@@ -1355,9 +1378,14 @@ impl Session {
                     .transpose()?
                     .unwrap_or(SessionTurnStatus::Completed);
                 replay_records.push(SessionReplayRecord::TurnCompleted {
-                    turn_id: turn_id.clone(),
+                    turn_id,
                     end_message_count,
                     status,
+                    iteration_cursor: object
+                        .get("iteration_cursor")
+                        .map(|_| required_usize(object, "iteration_cursor"))
+                        .transpose()?
+                        .unwrap_or(0),
                 });
             }
             "turn_rollback" => {
@@ -1611,6 +1639,7 @@ impl Session {
         turn_id: &str,
         end_message_count: usize,
         status: SessionTurnStatus,
+        iteration_cursor: usize,
     ) -> Result<(), SessionError> {
         let Some(path) = self.persistence_path() else {
             return Ok(());
@@ -1623,7 +1652,7 @@ impl Session {
         let mut file = OpenOptions::new().append(true).open(path)?;
         write_protected_jsonl_record(
             &mut file,
-            &turn_completion_record(turn_id, end_message_count, status)?.render(),
+            &turn_completion_record(turn_id, end_message_count, status, iteration_cursor)?.render(),
         )?;
         Ok(())
     }
@@ -2665,6 +2694,10 @@ impl SessionTurn {
             "status".to_string(),
             JsonValue::String(self.status.as_str().to_string()),
         );
+        object.insert(
+            "iteration_cursor".to_string(),
+            JsonValue::Number(i64::try_from(self.iteration_cursor).unwrap_or(i64::MAX)),
+        );
         if let Some(runtime_context) = &self.runtime_context {
             if let Ok(value) = runtime_context.to_json() {
                 object.insert("runtime_context".to_string(), value);
@@ -2698,7 +2731,13 @@ impl SessionTurn {
 
     fn to_jsonl_completion(&self) -> Option<JsonValue> {
         let end_message_count = self.end_message_count?;
-        turn_completion_record(&self.turn_id, end_message_count, self.status).ok()
+        turn_completion_record(
+            &self.turn_id,
+            end_message_count,
+            self.status,
+            self.iteration_cursor,
+        )
+        .ok()
     }
 
     fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
@@ -2719,6 +2758,11 @@ impl SessionTurn {
                 .map(SessionTurnStatus::from_str)
                 .transpose()?
                 .unwrap_or(SessionTurnStatus::Running),
+            iteration_cursor: object
+                .get("iteration_cursor")
+                .map(|_| required_usize(object, "iteration_cursor"))
+                .transpose()?
+                .unwrap_or(0),
             runtime_context: object
                 .get("runtime_context")
                 .or_else(|| object.get("turn_context"))
@@ -2755,6 +2799,7 @@ fn turn_completion_record(
     turn_id: &str,
     end_message_count: usize,
     status: SessionTurnStatus,
+    iteration_cursor: usize,
 ) -> Result<JsonValue, SessionError> {
     let mut object = BTreeMap::new();
     object.insert(
@@ -2772,6 +2817,10 @@ fn turn_completion_record(
     object.insert(
         "status".to_string(),
         JsonValue::String(status.as_str().to_string()),
+    );
+    object.insert(
+        "iteration_cursor".to_string(),
+        JsonValue::Number(i64_from_usize(iteration_cursor, "iteration_cursor")?),
     );
     Ok(JsonValue::Object(object))
 }
@@ -2898,7 +2947,14 @@ fn replay_records_from(
                 turn_id,
                 end_message_count,
                 status,
-            } => apply_turn_completion(&mut turns, turn_id, *end_message_count, *status),
+                iteration_cursor,
+            } => apply_turn_completion(
+                &mut turns,
+                turn_id,
+                *end_message_count,
+                *status,
+                *iteration_cursor,
+            ),
         }
     }
     messages
@@ -2918,8 +2974,15 @@ fn replay_turns_from(
                 turn_id,
                 end_message_count,
                 status,
+                iteration_cursor,
             } => {
-                apply_turn_completion(&mut turns, turn_id, *end_message_count, *status);
+                apply_turn_completion(
+                    &mut turns,
+                    turn_id,
+                    *end_message_count,
+                    *status,
+                    *iteration_cursor,
+                );
             }
             SessionReplayRecord::RollbackTo { message_count } => {
                 for turn in &mut turns {
@@ -2973,7 +3036,14 @@ fn replay_runtime_context_from(records: &[SessionReplayRecord]) -> Option<Sessio
                 turn_id,
                 end_message_count,
                 status,
-            } => apply_turn_completion(&mut turns, turn_id, *end_message_count, *status),
+                iteration_cursor,
+            } => apply_turn_completion(
+                &mut turns,
+                turn_id,
+                *end_message_count,
+                *status,
+                *iteration_cursor,
+            ),
             SessionReplayRecord::RollbackTo { message_count } => {
                 for turn in &mut turns {
                     if turn.start_message_count >= *message_count
@@ -3024,7 +3094,14 @@ fn replay_context_baseline_from(records: &[SessionReplayRecord]) -> Option<Sessi
                 turn_id,
                 end_message_count,
                 status,
-            } => apply_turn_completion(&mut turns, turn_id, *end_message_count, *status),
+                iteration_cursor,
+            } => apply_turn_completion(
+                &mut turns,
+                turn_id,
+                *end_message_count,
+                *status,
+                *iteration_cursor,
+            ),
             SessionReplayRecord::RollbackTo { message_count } => {
                 for turn in &mut turns {
                     if turn.start_message_count >= *message_count
@@ -3060,10 +3137,12 @@ fn apply_turn_completion(
     turn_id: &str,
     end_message_count: usize,
     status: SessionTurnStatus,
+    iteration_cursor: usize,
 ) {
     if let Some(turn) = turns.iter_mut().rev().find(|turn| turn.turn_id == turn_id) {
         turn.end_message_count = Some(end_message_count);
         turn.status = status;
+        turn.iteration_cursor = turn.iteration_cursor.max(iteration_cursor);
     }
 }
 
@@ -3758,6 +3837,9 @@ mod tests {
             }]))
             .expect("assistant append");
         session
+            .advance_turn_iteration(&turn_id, 3)
+            .expect("iteration cursor");
+        session
             .complete_turn(&turn_id, SessionTurnStatus::Completed)
             .expect("turn complete");
 
@@ -3770,6 +3852,7 @@ mod tests {
         assert_eq!(restored.turns[0].start_message_count, 0);
         assert_eq!(restored.turns[0].end_message_count, Some(2));
         assert_eq!(restored.turns[0].status, SessionTurnStatus::Completed);
+        assert_eq!(restored.turns[0].iteration_cursor, 3);
     }
 
     #[test]

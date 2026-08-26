@@ -1009,6 +1009,34 @@ struct TurnAccumulator {
     failure_blocked_tools: BTreeSet<String>,
 }
 
+impl TurnAccumulator {
+    fn from_suspended_turn(session: &Session, turn: &crate::session::SessionTurn) -> Self {
+        let turn_messages = session
+            .messages
+            .get(turn.start_message_count..)
+            .unwrap_or_default();
+        Self {
+            assistant_messages: turn_messages
+                .iter()
+                .filter(|message| message.role == MessageRole::Assistant)
+                .cloned()
+                .collect(),
+            tool_results: turn_messages
+                .iter()
+                .filter(|message| {
+                    message
+                        .blocks
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+                })
+                .cloned()
+                .collect(),
+            iterations: turn.iteration_cursor,
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreparedToolUse {
     tool_use_id: String,
@@ -1667,7 +1695,12 @@ where
             ));
         }
 
-        let mut accumulator = TurnAccumulator::default();
+        let mut accumulator = TurnAccumulator::from_suspended_turn(&self.session, &turn);
+        accumulator.iterations = self
+            .resume_iteration_cursor(&turn)
+            .await?
+            .max(accumulator.iterations);
+        let suspended_iteration = accumulator.iterations;
         for (tool_use_id, tool_name, input) in pending {
             let result = by_id
                 .remove(&tool_use_id)
@@ -1679,7 +1712,7 @@ where
                     tool_name: tool_name.clone(),
                     input: input.clone(),
                     output: result.output,
-                    iteration: 0,
+                    iteration: suspended_iteration,
                     outcome: if result.is_error {
                         RuntimeToolOutcomeKind::Failed
                     } else {
@@ -1700,7 +1733,7 @@ where
                 .map_err(|error| {
                     RuntimeError::new(format!("failed to persist deferred tool result: {error}"))
                 })?;
-            self.record_tool_finished(0, &message);
+            self.record_tool_finished(suspended_iteration, &message);
             accumulator.tool_results.push(message);
         }
         self.complete_session_turn(&turn.turn_id, SessionTurnStatus::Running);
@@ -1743,7 +1776,12 @@ where
             ));
         }
 
-        let mut accumulator = TurnAccumulator::default();
+        let mut accumulator = TurnAccumulator::from_suspended_turn(&self.session, &turn);
+        accumulator.iterations = self
+            .resume_iteration_cursor(&turn)
+            .await?
+            .max(accumulator.iterations);
+        let suspended_iteration = accumulator.iterations;
         let mut deferred_tools = Vec::new();
         for (tool_use_id, tool_name, input) in pending {
             let Some(decision) = by_id.remove(&tool_use_id) else {
@@ -1821,7 +1859,12 @@ where
                 contract,
             };
             match self
-                .execute_prepared_tool_use_outcome(&turn.turn_id, 0, &prepared, &mut reporter)
+                .execute_prepared_tool_use_outcome(
+                    &turn.turn_id,
+                    suspended_iteration,
+                    &prepared,
+                    &mut reporter,
+                )
                 .await?
             {
                 PreparedToolExecution::Completed(message) => {
@@ -1832,7 +1875,7 @@ where
                                 "failed to persist approved tool result: {error}"
                             ))
                         })?;
-                    self.record_tool_finished(0, &message);
+                    self.record_tool_finished(suspended_iteration, &message);
                     self.activate_tools_from_search_result(&message);
                     accumulator.tool_results.push(message);
                 }
@@ -1896,6 +1939,7 @@ where
             ));
         }
 
+        let suspended_iteration = self.resume_iteration_cursor(&turn).await?;
         let mut tool_results = Vec::with_capacity(pending.len());
         for (tool_use_id, tool_name, input) in pending {
             let result = by_id
@@ -1908,7 +1952,7 @@ where
                     tool_name: tool_name.clone(),
                     input,
                     output: result.output,
-                    iteration: 0,
+                    iteration: suspended_iteration,
                     outcome: if result.is_error {
                         RuntimeToolOutcomeKind::Failed
                     } else {
@@ -1927,7 +1971,7 @@ where
                 .map_err(|error| {
                     RuntimeError::new(format!("failed to persist terminal tool result: {error}"))
                 })?;
-            self.record_tool_finished(0, &message);
+            self.record_tool_finished(suspended_iteration, &message);
             tool_results.push(message);
         }
         let final_text = final_text.into();
@@ -1949,7 +1993,7 @@ where
             assistant_messages,
             tool_results,
             prompt_cache_events: Vec::new(),
-            iterations: 0,
+            iterations: suspended_iteration,
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction: None,
         };
@@ -2009,7 +2053,7 @@ where
                 assistant_messages,
                 tool_results,
                 prompt_cache_events: Vec::new(),
-                iterations: 0,
+                iterations: turn.iteration_cursor,
                 usage: self.usage_tracker.cumulative_usage(),
                 auto_compaction: None,
             },
@@ -2111,6 +2155,9 @@ where
                 self.complete_session_turn(turn_id, SessionTurnStatus::Failed);
                 return Err(error);
             }
+            self.session
+                .advance_turn_iteration(turn_id, accumulator.iterations)
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
 
             let (request_messages, context_report) = self.request_messages();
             if let Some(report) = context_report.as_ref() {
@@ -3933,6 +3980,20 @@ where
         }
     }
 
+    async fn resume_iteration_cursor(
+        &self,
+        turn: &crate::session::SessionTurn,
+    ) -> Result<usize, RuntimeError> {
+        let durable = match self.execution_kernel.clone() {
+            Some(kernel) => kernel
+                .latest_context_manifest_iteration(&turn.turn_id)
+                .await?
+                .unwrap_or(0),
+            None => 0,
+        };
+        Ok(turn.iteration_cursor.max(durable))
+    }
+
     pub async fn checkpoint_session_in_kernel(&self, reason: &str) -> Result<(), RuntimeError> {
         match self.execution_kernel.clone() {
             Some(kernel) => kernel.checkpoint_session(reason, &self.session).await,
@@ -4877,15 +4938,19 @@ mod tests {
         ) -> Result<Vec<AssistantEvent>, RuntimeError> {
             self.call_count += 1;
             match self.call_count {
-                1 => Ok(vec![
-                    AssistantEvent::ToolUse {
-                        id: "approval-tool-1".to_string(),
-                        name: "write_external".to_string(),
-                        input: r#"{"value":"durable"}"#.to_string(),
-                    },
-                    AssistantEvent::MessageStop,
-                ]),
+                1 => {
+                    assert_eq!(request.trace.iteration, Some(1));
+                    Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "approval-tool-1".to_string(),
+                            name: "write_external".to_string(),
+                            input: r#"{"value":"durable"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ])
+                }
                 2 => {
+                    assert_eq!(request.trace.iteration, Some(2));
                     assert!(matches!(
                         request.messages.last().and_then(|message| message.blocks.first()),
                         Some(ContentBlock::ToolResult { tool_use_id, .. })
@@ -4926,6 +4991,7 @@ mod tests {
         visible_attempt_ids: Vec<String>,
         reject_visible_message: bool,
         terminal_checkpoints: Vec<(RuntimeTurnTerminalStatus, SessionTurnStatus)>,
+        manifest_iterations: Vec<usize>,
     }
 
     struct ApprovalTestKernel {
@@ -4999,10 +5065,29 @@ mod tests {
             Ok(0)
         }
 
+        async fn latest_context_manifest_iteration(
+            &self,
+            _turn_id: &str,
+        ) -> Result<Option<usize>, RuntimeError> {
+            Ok(self
+                .state
+                .lock()
+                .unwrap()
+                .manifest_iterations
+                .iter()
+                .copied()
+                .max())
+        }
+
         async fn record_context_manifest(
             &self,
             input: RuntimeContextManifestInput,
         ) -> Result<RuntimeManifestLineage, RuntimeError> {
+            self.state
+                .lock()
+                .unwrap()
+                .manifest_iterations
+                .push(input.iteration);
             Ok(RuntimeManifestLineage {
                 context_manifest_id: format!("context:{}:{}", input.turn_id, input.iteration),
                 prompt_manifest_id: input
@@ -5417,6 +5502,15 @@ mod tests {
         assert_eq!(suspended.deferred_tools.len(), 1);
         assert_eq!(executions.load(Ordering::SeqCst), 0);
         assert_eq!(kernel.state.lock().unwrap().approval_requests.len(), 1);
+
+        // Simulate a legacy recovery checkpoint that did not persist the
+        // cursor. The durable manifest still prevents iteration 1 reuse.
+        runtime
+            .session_mut()
+            .turns
+            .last_mut()
+            .unwrap()
+            .iteration_cursor = 0;
 
         let outcome = runtime
             .resume_turn_with_approval_decisions(
@@ -6015,20 +6109,24 @@ mod tests {
         ) -> Result<Vec<AssistantEvent>, RuntimeError> {
             self.call_count += 1;
             match self.call_count {
-                1 => Ok(vec![
-                    AssistantEvent::ToolUse {
-                        id: "deferred-a".to_string(),
-                        name: "deep_research_start".to_string(),
-                        input: r#"{"question":"market"}"#.to_string(),
-                    },
-                    AssistantEvent::ToolUse {
-                        id: "deferred-b".to_string(),
-                        name: "nl2sql_analyze".to_string(),
-                        input: r#"{"question":"revenue"}"#.to_string(),
-                    },
-                    AssistantEvent::MessageStop,
-                ]),
+                1 => {
+                    assert_eq!(request.trace.iteration, Some(1));
+                    Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "deferred-a".to_string(),
+                            name: "deep_research_start".to_string(),
+                            input: r#"{"question":"market"}"#.to_string(),
+                        },
+                        AssistantEvent::ToolUse {
+                            id: "deferred-b".to_string(),
+                            name: "nl2sql_analyze".to_string(),
+                            input: r#"{"question":"revenue"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ])
+                }
                 2 => {
+                    assert_eq!(request.trace.iteration, Some(2));
                     let results = request
                         .messages
                         .iter()

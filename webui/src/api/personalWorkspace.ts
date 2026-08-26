@@ -72,7 +72,7 @@ export interface WorkspaceSchedule {
 export interface WorkspaceScheduleInput {
   name: string;
   command: string;
-  cwd: string;
+  cwd?: string;
   cronExpression: string;
   timezone: string;
   timeoutSeconds: number;
@@ -138,7 +138,7 @@ export const personalWorkspaceApi = {
   },
 
   executeCommand: (
-    data: { command: string; cwd: string; timeoutSeconds: number },
+    data: { command: string; cwd?: string; timeoutSeconds: number },
     signal?: AbortSignal,
   ) =>
     client.post<WorkspaceCommandResult>('/workspace/commands', data, { signal }).then((response) => response.data),

@@ -6348,17 +6348,15 @@ fn deferred_parent_tool_definitions() -> Vec<RuntimeToolDefinition> {
         },
         RuntimeToolDefinition {
             name: "workspace_schedule_create".to_string(),
-            description: Some("Create a durable command schedule in the authenticated user's isolated workspace. Use this instead of system crontab; the schedule remains manageable after server restart.".to_string()),
+            description: Some("Create a durable command schedule rooted in the authenticated user's isolated workspace. For recurring file generation or code, first create the script with write_file, then schedule a command that invokes that relative script. Use this instead of system crontab; the schedule remains manageable after server restart.".to_string()),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "minLength": 1, "maxLength": 160 },
                     "command": { "type": "string", "minLength": 1, "maxLength": 32000 },
-                    "cwd": { "type": "string", "default": "/projects/session" },
                     "cronExpression": { "type": "string", "description": "Standard 5-field minute hour day month weekday expression" },
                     "timezone": { "type": "string", "description": "IANA timezone such as Asia/Shanghai" },
-                    "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 600 },
-                    "scriptPath": { "type": "string", "description": "Optional existing /projects/session file shown in Workspace task controls" }
+                    "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 600 }
                 },
                 "required": ["name", "command", "cronExpression", "timezone"],
                 "additionalProperties": false
@@ -6377,18 +6375,16 @@ fn deferred_parent_tool_definitions() -> Vec<RuntimeToolDefinition> {
         },
         RuntimeToolDefinition {
             name: "workspace_schedule_update".to_string(),
-            description: Some("Update the command, timing, timezone, script link or enabled state of an owned durable workspace schedule.".to_string()),
+            description: Some("Update the command, timing, timezone or enabled state of an owned durable workspace schedule.".to_string()),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "scheduleId": { "type": "string" },
                     "name": { "type": "string", "minLength": 1, "maxLength": 160 },
                     "command": { "type": "string", "minLength": 1, "maxLength": 32000 },
-                    "cwd": { "type": "string" },
                     "cronExpression": { "type": "string" },
                     "timezone": { "type": "string" },
                     "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 600 },
-                    "scriptPath": { "type": ["string", "null"] },
                     "enabled": { "type": "boolean" }
                 },
                 "required": ["scheduleId"],
@@ -13150,6 +13146,20 @@ mod tests {
             .find(|definition| definition.name == "workspace_schedule_list")
             .expect("schedule list tool");
         assert_eq!(list.required_permission, runtime::PermissionMode::ReadOnly);
+
+        let create = definitions
+            .iter()
+            .find(|definition| definition.name == "workspace_schedule_create")
+            .expect("schedule create tool");
+        let properties = create.input_schema["properties"]
+            .as_object()
+            .expect("schedule create properties");
+        assert!(!properties.contains_key("cwd"));
+        assert!(!properties.contains_key("scriptPath"));
+        assert!(create
+            .description
+            .as_deref()
+            .is_some_and(|description| description.contains("write_file")));
     }
 
     #[test]

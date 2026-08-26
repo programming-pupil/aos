@@ -619,6 +619,16 @@ pub trait AgentExecutionKernel: Send + Sync {
     /// suspend or resume a turn after another writer has advanced it.
     async fn current_turn_revision(&self, turn_id: &str) -> Result<u64, RuntimeError>;
 
+    /// Return the greatest model iteration durably committed for this turn.
+    /// Resume paths use this as a recovery cursor when loading checkpoints
+    /// written by older runtimes or after a crash between provider steps.
+    async fn latest_context_manifest_iteration(
+        &self,
+        _turn_id: &str,
+    ) -> Result<Option<usize>, RuntimeError> {
+        Ok(None)
+    }
+
     /// Load the governed semantic state that must be considered by the real
     /// provider request. Durable adapters may retrieve/rank data here, but the
     /// generic runtime remains responsible for final token-budget selection.

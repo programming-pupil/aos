@@ -1182,7 +1182,7 @@ fn parent_turn_options(input: &UnifiedParentTurnInput) -> AgentTurnOptions {
         ]);
     } else {
         options.system_instructions.push(
-            "Authenticated workspace protocol: this session has an isolated per-user workspace. When the user asks you to create, update, or repair a code/document file, use the authorized write_file or edit_file tool directly inside that workspace; do not claim that file-writing tools are unavailable. Keep every path relative to the workspace or otherwise prove it stays inside the workspace. Use read_file/grep_search first when existing content must be preserved, and report the exact files changed after the write. Do not write outside the authenticated workspace or use host paths. For recurring commands, create and maintain an AOS durable workspace schedule with workspace_schedule_create/list/update/cancel; never claim that system crontab is required."
+            "Authenticated workspace protocol: this session has an isolated per-user workspace. When the user asks you to create, update, or repair a code/document file, use the authorized write_file or edit_file tool directly inside that workspace; do not claim that file-writing tools are unavailable. Keep every path relative to the workspace or otherwise prove it stays inside the workspace. Use read_file/grep_search first when existing content must be preserved, and report the exact files changed after the write. Do not write outside the authenticated workspace or use host paths. For recurring behavior, first create a maintainable script in the workspace with write_file, then call workspace_schedule_create with a relative command that runs it. Maintain schedules with workspace_schedule_list/update/cancel; never claim that system crontab is required."
                 .to_string(),
         );
     }
@@ -4789,6 +4789,10 @@ async fn execute_parent_web_search(
     serde_json::to_value(result).map_err(AppError::from)
 }
 
+fn adversarial_child_question(question: &str) -> String {
+    question.trim().to_string()
+}
+
 async fn execute_or_join_subtask(
     state: &AppState,
     claims: &Claims,
@@ -5008,14 +5012,10 @@ async fn execute_or_join_subtask(
                     let selected = models.remove(index);
                     models.insert(0, selected);
                 }
-                let adversarial_question = format!(
-                    "{question}\n\nParent session context (background evidence; latest question remains authoritative):\n{}",
-                    truncate(&parent.composed_context, 50_000)
-                );
                 let started = super::super_assistant_capabilities::start_adversarial_deep_analysis(
                     state.clone(),
                     claims.clone(),
-                    adversarial_question,
+                    adversarial_child_question(question),
                     models,
                     None,
                     None,
@@ -10251,7 +10251,7 @@ mod tests {
     use super::super::super_assistant::{RouteDecisionEvent, RouteDecisionEventTag, RouteSource};
     use super::super::unified_workspace::{valid_turn_transition, TurnState};
     use super::{
-        answer_structure_issues, append_verified_attribution_sql,
+        adversarial_child_question, answer_structure_issues, append_verified_attribution_sql,
         attribution_progress_heartbeat_from_event, attribution_progress_payload,
         attribution_source_status_is_success, attribution_source_status_is_terminal,
         attribution_verification_summary, attribution_worker_is_stale,
@@ -10300,6 +10300,15 @@ mod tests {
         assert!(is_terminal("cancelled"));
         assert!(!is_terminal("running"));
         assert!(!is_terminal("cancelling"));
+    }
+
+    #[test]
+    fn adversarial_child_receives_only_the_current_user_question() {
+        let question = "  current user question  ";
+        let composed_context = "older session history that must use a governed side channel";
+        let child_question = adversarial_child_question(question);
+        assert_eq!(child_question, "current user question");
+        assert!(!child_question.contains(composed_context));
     }
 
     #[test]
