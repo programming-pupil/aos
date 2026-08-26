@@ -26,12 +26,12 @@ use uuid::Uuid;
 /// Named process fault points used by the black-box persistence TCK. They are
 /// compiled out of release builds and require an explicit internal TCK flag,
 /// so an accidental environment variable cannot terminate a production node.
-pub(crate) fn process_fault_point(name: &str) {
+pub(crate) fn process_fault_point(_name: &str) {
     #[cfg(debug_assertions)]
     if std::env::var("AOS_INTERNAL_PROCESS_TCK").as_deref() == Ok("1")
-        && std::env::var("AOS_PROCESS_FAULT_POINT").as_deref() == Ok(name)
+        && std::env::var("AOS_PROCESS_FAULT_POINT").as_deref() == Ok(_name)
     {
-        eprintln!("AOS_PROCESS_FAULT\t{name}\tpid={}", std::process::id());
+        eprintln!("AOS_PROCESS_FAULT\t{_name}\tpid={}", std::process::id());
         std::process::abort();
     }
 }
@@ -4071,34 +4071,6 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             )
         });
         let model_reservation_id = format!("model:{}:{}", input.turn_id, input.iteration);
-        let semantic_snapshot_version = match input.semantic_snapshot_version {
-            Some(version) => version,
-            None => {
-                let mut snapshot_tx = self
-                    .db
-                    .begin()
-                    .await
-                    .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
-                acquire_sqlite_write_lock(&mut snapshot_tx)
-                    .await
-                    .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
-                let version = ensure_current_semantic_snapshot(
-                    &mut snapshot_tx,
-                    &self.tenant_id,
-                    &self.user_id,
-                    &self.session_id,
-                )
-                .await
-                .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
-                snapshot_tx
-                    .commit()
-                    .await
-                    .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
-                version
-            }
-        };
-        context_packet.manifest.snapshot_version = Some(semantic_snapshot_version);
-        let context_packet_hash = semantic_core::ContextCompiler::hash(&context_packet);
         let raw_messages = input
             .messages
             .iter()
@@ -4113,6 +4085,39 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                 })
             })
             .collect::<Vec<_>>();
+        let configured_output_reserve = std::env::var("AOS_MODEL_OUTPUT_RESERVE_TOKENS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(16_384)
+            .clamp(256, 131_072);
+        let output_reserve =
+            model_output_reserve_for_stage(input.budget_stage, configured_output_reserve);
+
+        // The snapshot is immutable lineage for this manifest. Materializing it,
+        // reserving budget, writing the manifest and appending its ledger event
+        // must commit or roll back together. Keep message serialization above
+        // the write lock so the atomic boundary remains short for large turns.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+        acquire_sqlite_write_lock(&mut tx)
+            .await
+            .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
+        let semantic_snapshot_version = match input.semantic_snapshot_version {
+            Some(version) => version,
+            None => ensure_current_semantic_snapshot(
+                &mut tx,
+                &self.tenant_id,
+                &self.user_id,
+                &self.session_id,
+            )
+            .await
+            .map_err(|e| runtime::RuntimeError::new(e.to_string()))?,
+        };
+        context_packet.manifest.snapshot_version = Some(semantic_snapshot_version);
+        let context_packet_hash = semantic_core::ContextCompiler::hash(&context_packet);
         let raw_manifest_value = serde_json::json!({
             "schemaVersion":"context-manifest-v2",
             "turnId":input.turn_id,
@@ -4144,25 +4149,6 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
             runtime::configured_data_protection_mode(),
         )
         .0;
-        let configured_output_reserve = std::env::var("AOS_MODEL_OUTPUT_RESERVE_TOKENS")
-            .ok()
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(16_384)
-            .clamp(256, 131_072);
-        let output_reserve =
-            model_output_reserve_for_stage(input.budget_stage, configured_output_reserve);
-        // All large serialization, protection and encryption above happens
-        // before acquiring SQLite's single writer. Keep the transaction below
-        // limited to immutable lineage rows, budget accounting and one ledger
-        // append.
-        let mut tx = self
-            .db
-            .begin()
-            .await
-            .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
-        acquire_sqlite_write_lock(&mut tx)
-            .await
-            .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
         ensure_protected_model_budgets(&mut tx, &self.tenant_id, &self.session_id, &input.turn_id)
             .await?;
         for (dimension, amount, initial) in [

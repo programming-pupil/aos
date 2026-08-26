@@ -6,12 +6,12 @@ use thiserror::Error;
 
 use crate::MemoryEngine;
 
-fn process_fault_point(name: &str) {
+fn process_fault_point(_name: &str) {
     #[cfg(debug_assertions)]
     if std::env::var("AOS_INTERNAL_PROCESS_TCK").as_deref() == Ok("1")
-        && std::env::var("AOS_PROCESS_FAULT_POINT").as_deref() == Ok(name)
+        && std::env::var("AOS_PROCESS_FAULT_POINT").as_deref() == Ok(_name)
     {
-        eprintln!("AOS_PROCESS_FAULT\t{name}\tpid={}", std::process::id());
+        eprintln!("AOS_PROCESS_FAULT\t{_name}\tpid={}", std::process::id());
         std::process::abort();
     }
 }
