@@ -1820,6 +1820,14 @@ Column definition: {table_name}.{col_name}: {data_type}{nullable}{comment_hint}{
                             &api_profile.id,
                         )
                         .await?;
+                        let _ =
+                            crate::nl2sql::embedding_failover::resolve_embedding_fallback_alert(
+                                &self.db,
+                                tenant_id,
+                                "nl2sql",
+                                &api_profile.config,
+                            )
+                            .await;
                         usage = api_usage;
                     }
                     Err(error) => {
@@ -1836,6 +1844,14 @@ Column definition: {table_name}.{col_name}: {data_type}{nullable}{comment_hint}{
                             api_profile,
                         )
                         .await?;
+                        let _ = crate::nl2sql::embedding_failover::record_embedding_fallback_alert(
+                            &self.db,
+                            tenant_id,
+                            "nl2sql",
+                            &api_profile.config,
+                            &error.to_string(),
+                        )
+                        .await;
                         tracing::warn!(
                             tenant_id,
                             datasource_id,

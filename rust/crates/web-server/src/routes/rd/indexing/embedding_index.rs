@@ -98,6 +98,7 @@ async fn run_rd_repository_embedding_index(
     }
 
     let mut errors = Vec::new();
+    let mut failed_api: Option<(RdEmbeddingApiKey, String)> = None;
     let mut successful_models = Vec::new();
     let mut aggregate = RdEmbeddingIndexStats::default();
     for candidate in candidates {
@@ -138,6 +139,21 @@ async fn run_rd_repository_embedding_index(
                     .saturating_add(count.estimated_tokens_saved);
                 successful_models.push(candidate.model.clone());
                 if candidate.is_local {
+                    if let Some((failed, error)) = failed_api.as_ref() {
+                        if let Err(alert_error) = crate::nl2sql::embedding_failover::record_embedding_fallback_alert_for_profile(
+                            &state.db,
+                            tenant_id,
+                            RD_SCENARIO,
+                            &failed.vector_space_id,
+                            &failed.provider,
+                            &failed.model,
+                            error,
+                        )
+                        .await
+                        {
+                            tracing::warn!(tenant_id, error = %alert_error, "failed to persist RD embedding fallback alert");
+                        }
+                    }
                     update_rd_file_summary_embedding_cache(
                         &state.db,
                         tenant_id,
@@ -146,7 +162,18 @@ async fn run_rd_repository_embedding_index(
                         &chunks,
                     )
                     .await?;
+                } else if let Err(error) =
+                    crate::nl2sql::embedding_failover::resolve_embedding_fallback_alert_for_profile(
+                        &state.db,
+                        tenant_id,
+                        RD_SCENARIO,
+                        &candidate.vector_space_id,
+                    )
+                    .await
+                {
+                    tracing::warn!(tenant_id, error = %error, "failed to resolve RD embedding fallback alert");
                 }
+                break;
             }
             Err(error) => {
                 tracing::warn!(
@@ -156,6 +183,10 @@ async fn run_rd_repository_embedding_index(
                     error = %error,
                     "RD embedding candidate failed during repository indexing; trying next candidate"
                 );
+                let error = error.to_string();
+                if !candidate.is_local {
+                    failed_api = Some((candidate.clone(), error.clone()));
+                }
                 errors.push(format!("{}: {error}", candidate.model));
             }
         }
@@ -694,6 +725,7 @@ async fn run_rd_task_embedding_index(
 
     let mut errors = Vec::new();
     let mut indexed = 0usize;
+    let mut failed_api: Option<(RdEmbeddingApiKey, String)> = None;
     for candidate in candidates {
         let output = match timeout(
             Duration::from_secs(RD_EMBEDDING_INDEX_BATCH_TIMEOUT_SECS),
@@ -703,14 +735,22 @@ async fn run_rd_task_embedding_index(
         {
             Ok(Ok(output)) => output,
             Ok(Err(error)) => {
+                let error = error.to_string();
+                if !candidate.is_local {
+                    failed_api = Some((candidate.clone(), error.clone()));
+                }
                 errors.push(format!("{}: {error}", candidate.model));
                 continue;
             }
             Err(_) => {
-                errors.push(format!(
+                let error = format!(
                     "RD task embedding timed out after {}s",
                     RD_EMBEDDING_INDEX_BATCH_TIMEOUT_SECS
-                ));
+                );
+                if !candidate.is_local {
+                    failed_api = Some((candidate.clone(), error.clone()));
+                }
+                errors.push(error);
                 continue;
             }
         };
@@ -754,6 +794,35 @@ async fn run_rd_task_embedding_index(
         })?
         .map_err(|error| AppError::Internal(format!("RD task embedding write failed: {error}")))?;
         indexed = indexed.saturating_add(1);
+        if candidate.is_local {
+            if let Some((failed, error)) = failed_api.as_ref() {
+                if let Err(alert_error) =
+                    crate::nl2sql::embedding_failover::record_embedding_fallback_alert_for_profile(
+                        &state.db,
+                        tenant_id,
+                        RD_SCENARIO,
+                        &failed.vector_space_id,
+                        &failed.provider,
+                        &failed.model,
+                        error,
+                    )
+                    .await
+                {
+                    tracing::warn!(tenant_id, error = %alert_error, "failed to persist RD embedding fallback alert");
+                }
+            }
+        } else if let Err(error) =
+            crate::nl2sql::embedding_failover::resolve_embedding_fallback_alert_for_profile(
+                &state.db,
+                tenant_id,
+                RD_SCENARIO,
+                &candidate.vector_space_id,
+            )
+            .await
+        {
+            tracing::warn!(tenant_id, error = %error, "failed to resolve RD embedding fallback alert");
+        }
+        break;
     }
 
     if indexed > 0 {

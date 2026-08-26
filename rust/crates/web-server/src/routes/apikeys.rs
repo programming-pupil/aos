@@ -904,6 +904,25 @@ async fn reconcile_embedding_profiles(state: &AppState, tenant_id: &str) {
 #[cfg(not(feature = "nl2sql"))]
 async fn reconcile_embedding_profiles(_state: &AppState, _tenant_id: &str) {}
 
+async fn schedule_embedding_projection_rebuilds(state: &AppState, tenant_id: &str) {
+    match crate::semantic_memory_worker::enqueue_tenant_embedding_rebuilds(&state.db, tenant_id)
+        .await
+    {
+        Ok(queued) => tracing::info!(
+            tenant_id,
+            queued,
+            "queued memory embeddings after provider change"
+        ),
+        Err(error) => {
+            tracing::warn!(tenant_id, error = %error, "failed to queue memory embeddings after provider change")
+        }
+    }
+    crate::routes::chat_intelligence::schedule_tenant_chat_embedding_rebuild(
+        state.clone(),
+        tenant_id.to_string(),
+    );
+}
+
 fn effective_provider_base_url(provider: &str, base_url: Option<&str>) -> Result<String> {
     if let Some(base_url) = base_url.map(str::trim).filter(|value| !value.is_empty()) {
         return Ok(base_url.trim_end_matches('/').to_string());
@@ -2344,6 +2363,9 @@ async fn create(
         registry.invalidate_tenant_cache(&claims.tenant_id).await;
     }
     reconcile_embedding_profiles(&state, &claims.tenant_id).await;
+    if model_type == "embedding" {
+        schedule_embedding_projection_rebuilds(&state, &claims.tenant_id).await;
+    }
 
     Ok(Json(ApiKeyCreatedResponse {
         id,
@@ -2359,15 +2381,17 @@ async fn delete(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
     require_apikey_permission(&state, &claims, "apikeys:delete").await?;
-    let result = sqlx::query("DELETE FROM api_keys WHERE id = ? AND tenant_id = ?")
-        .bind(&id)
-        .bind(&claims.tenant_id)
-        .execute(&state.db)
-        .await?;
+    let deleted_model_type = sqlx::query_scalar::<_, String>(
+        "DELETE FROM api_keys WHERE id = ? AND tenant_id = ? RETURNING model_type",
+    )
+    .bind(&id)
+    .bind(&claims.tenant_id)
+    .fetch_optional(&state.db)
+    .await?;
 
-    if result.rows_affected() == 0 {
+    let Some(deleted_model_type) = deleted_model_type else {
         return Err(AppError::NotFound("api key not found".into()));
-    }
+    };
 
     // Increment the tenant's api_keys_version so existing sessions detect the change
     // on their next turn and hot-reload with the fresh key set.
@@ -2379,6 +2403,9 @@ async fn delete(
         registry.invalidate_tenant_cache(&claims.tenant_id).await;
     }
     reconcile_embedding_profiles(&state, &claims.tenant_id).await;
+    if deleted_model_type == "embedding" {
+        schedule_embedding_projection_rebuilds(&state, &claims.tenant_id).await;
+    }
 
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
@@ -2473,13 +2500,22 @@ async fn update(
     };
 
     let normalized_model_type = req.model_type.clone();
+    let was_embedding = existing_model_type.as_deref() == Some("embedding");
     let target_model_type = normalized_model_type
         .as_deref()
         .map(str::to_string)
-        .or(existing_model_type);
+        .or(existing_model_type.clone());
     let target_model_type_value = target_model_type.as_deref().unwrap_or("chat");
     let target_is_audio = target_model_type.as_deref() == Some("audio");
     let target_is_embedding = target_model_type.as_deref() == Some("embedding");
+    let embedding_configuration_changed = (was_embedding || target_is_embedding)
+        && (req.model_type.is_some()
+            || req.model.is_some()
+            || req.base_url.is_some()
+            || req.dimensions.is_some()
+            || req.key_value.is_some()
+            || req.enabled.is_some()
+            || req.priority.is_some());
     if req
         .dimensions
         .is_some_and(|value| !(1..=32_768).contains(&value))
@@ -2792,6 +2828,9 @@ async fn update(
         registry.invalidate_tenant_cache(&claims.tenant_id).await;
     }
     reconcile_embedding_profiles(&state, &claims.tenant_id).await;
+    if embedding_configuration_changed {
+        schedule_embedding_projection_rebuilds(&state, &claims.tenant_id).await;
+    }
 
     // Fetch updated record
     let key = sqlx::query(

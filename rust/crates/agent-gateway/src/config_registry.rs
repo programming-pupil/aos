@@ -82,6 +82,8 @@ pub struct UserRuntimeConfig {
     pub tenant_id: String,
     /// API keys for the LLM provider (resolved from user's `api_keys`), ordered by priority.
     pub api_keys: Vec<ApiKeyEntry>,
+    /// Tenant embedding keys, ordered by priority and scoped to this scenario.
+    pub embedding_api_keys: Vec<ApiKeyEntry>,
     /// Provider name (anthropic / openai / xai).
     pub provider: String,
     /// Default model for this user.
@@ -136,6 +138,8 @@ pub struct ApiKeyEntry {
     pub output_price_per_million: Option<f64>,
     /// Explicit model/key capabilities declared by operators.
     pub capabilities_json: Option<serde_json::Value>,
+    /// Requested embedding vector dimensions. Unused for non-embedding keys.
+    pub dimensions: Option<usize>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -451,6 +455,9 @@ impl TenantConfigRegistry {
 
         // Load API keys (ordered by priority for failover), scoped to the requested scenario.
         let api_keys = self.resolve_api_keys(tenant_id, scenario).await?;
+        let embedding_api_keys = self
+            .resolve_api_keys_by_model_type(tenant_id, scenario, "embedding")
+            .await?;
 
         // Load MCP servers
         let mcp_servers = self.load_mcp_servers(tenant_id, user_id).await?;
@@ -495,6 +502,7 @@ impl TenantConfigRegistry {
             user_id: user_id.to_string(),
             tenant_id: tenant_id.to_string(),
             api_keys,
+            embedding_api_keys,
             provider,
             model,
             permission_mode,
@@ -573,7 +581,8 @@ impl TenantConfigRegistry {
                             CAST(k.input_price_per_million AS DOUBLE),
                             CAST(k.output_price_per_million AS DOUBLE),
                             CAST(k.capabilities_json AS TEXT),
-                            CAST(p.capabilities_json AS TEXT)
+                            CAST(p.capabilities_json AS TEXT),
+                            CAST(k.dimensions AS INTEGER)
                      FROM api_keys k
                      LEFT JOIN model_capability_profiles p
                        ON p.id = k.model_profile_id AND p.tenant_id = k.tenant_id
@@ -605,7 +614,8 @@ impl TenantConfigRegistry {
                                     CAST(k.input_price_per_million AS DOUBLE),
                                     CAST(k.output_price_per_million AS DOUBLE),
                                     CAST(k.capabilities_json AS TEXT),
-                                    CAST(p.capabilities_json AS TEXT)
+                                    CAST(p.capabilities_json AS TEXT),
+                                    CAST(k.dimensions AS INTEGER)
                              FROM api_keys k
                              LEFT JOIN model_capability_profiles p
                                ON p.id = k.model_profile_id AND p.tenant_id = k.tenant_id
@@ -625,7 +635,8 @@ impl TenantConfigRegistry {
                                     CAST(k.input_price_per_million AS DOUBLE),
                                     CAST(k.output_price_per_million AS DOUBLE),
                                     CAST(k.capabilities_json AS TEXT),
-                                    CAST(p.capabilities_json AS TEXT)
+                                    CAST(p.capabilities_json AS TEXT),
+                                    CAST(k.dimensions AS INTEGER)
                              FROM api_keys k
                              LEFT JOIN model_capability_profiles p
                                ON p.id = k.model_profile_id AND p.tenant_id = k.tenant_id
@@ -655,7 +666,8 @@ impl TenantConfigRegistry {
                             CAST(k.input_price_per_million AS DOUBLE),
                             CAST(k.output_price_per_million AS DOUBLE),
                             CAST(k.capabilities_json AS TEXT),
-                            CAST(p.capabilities_json AS TEXT)
+                            CAST(p.capabilities_json AS TEXT),
+                            CAST(k.dimensions AS INTEGER)
                      FROM api_keys k
                      LEFT JOIN model_capability_profiles p
                        ON p.id = k.model_profile_id AND p.tenant_id = k.tenant_id
@@ -698,6 +710,9 @@ impl TenantConfigRegistry {
                                 .runtime_capabilities()
                         })
                     });
+            let dimensions = sqlx::Row::get::<Option<i64>, _>(&row, 13)
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| *value > 0);
             let capabilities_json =
                 merge_model_capabilities(profile_capabilities, explicit_capabilities);
 
@@ -744,6 +759,7 @@ impl TenantConfigRegistry {
                     input_price_per_million,
                     output_price_per_million,
                     capabilities_json,
+                    dimensions,
                 });
             }
         }
@@ -780,6 +796,7 @@ impl TenantConfigRegistry {
                     input_price_per_million: None,
                     output_price_per_million: None,
                     capabilities_json: None,
+                    dimensions: None,
                 });
             }
         }

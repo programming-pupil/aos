@@ -5491,8 +5491,10 @@ mod tests {
                     input_price_per_million: None,
                     output_price_per_million: None,
                     capabilities_json: None,
+                    dimensions: None,
                 })
                 .collect(),
+            embedding_api_keys: Vec::new(),
             provider: "openai".to_string(),
             model: "default-model".to_string(),
             permission_mode: runtime::PermissionMode::ReadOnly,

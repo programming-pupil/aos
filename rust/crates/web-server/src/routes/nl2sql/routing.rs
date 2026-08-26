@@ -1675,6 +1675,7 @@ pub(crate) async fn route(
 
     let mut selected_profile = profiles.local.clone();
     let mut question_vec = None;
+    let mut api_fallback_error = None;
     if let Some(api_profile) = &profiles.api {
         let api_ready = crate::nl2sql::embedding_profiles::active_profile_ready_for_datasources(
             &state.db,
@@ -1708,6 +1709,14 @@ pub(crate) async fn route(
                             &api_profile.id,
                         )
                         .await;
+                        let _ =
+                            crate::nl2sql::embedding_failover::resolve_embedding_fallback_alert(
+                                &state.db,
+                                &claims.tenant_id,
+                                "nl2sql",
+                                &api_profile.config,
+                            )
+                            .await;
                     } else {
                         let error = format!(
                             "API query embedding returned an incompatible batch/dimension (remaining={}, dimensions={}, expected={})",
@@ -1721,6 +1730,7 @@ pub(crate) async fn route(
                             &error,
                         )
                         .await;
+                        api_fallback_error = Some(error.clone());
                         tracing::warn!(
                             tenant_id = %claims.tenant_id,
                             profile_id = %api_profile.id,
@@ -1736,6 +1746,7 @@ pub(crate) async fn route(
                         &error.to_string(),
                     )
                     .await;
+                    api_fallback_error = Some(error.to_string());
                     tracing::warn!(
                         tenant_id = %claims.tenant_id,
                         profile_id = %api_profile.id,
@@ -1778,6 +1789,18 @@ pub(crate) async fn route(
             &profiles.local.id,
         )
         .await;
+        if let (Some(api_profile), Some(error)) =
+            (profiles.api.as_ref(), api_fallback_error.as_deref())
+        {
+            let _ = crate::nl2sql::embedding_failover::record_embedding_fallback_alert(
+                &state.db,
+                &claims.tenant_id,
+                "nl2sql",
+                &api_profile.config,
+                error,
+            )
+            .await;
+        }
     }
     let question_vec = question_vec.unwrap_or_default();
     let selected_store = embed_store

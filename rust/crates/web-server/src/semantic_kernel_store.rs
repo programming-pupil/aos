@@ -3184,10 +3184,12 @@ pub(crate) async fn append_agent_team_domain_in_transaction(
     .await
 }
 
-/// Settle turns that were left `running` when a previous server process ended.
+/// Mark turns that were left `running` when a previous server process ended.
 /// Suspended turns are durable resumable work and are intentionally excluded.
-/// Recovery appends the same terminal ledger fact used by live cancellation and
-/// releases every model/protected reservation in the same transaction.
+/// A process loss is not a user cancellation and must not manufacture a
+/// terminal outcome. Recovery releases process-owned reservations and records
+/// a durable non-terminal marker so the execution kernel can reconcile or
+/// explicitly retry the turn.
 pub(crate) async fn recover_abandoned_runtime_turns(
     db: &SqlitePool,
 ) -> Result<usize, SemanticStoreError> {
@@ -3214,8 +3216,8 @@ pub(crate) async fn recover_abandoned_runtime_turns(
             .map_err(|error| SemanticStoreError::InvalidEvent(error.to_string()))?;
         let updated = sqlx::query::<Sqlite>(
             "UPDATE agent_turns
-             SET status = 'cancelled', ended_at = CURRENT_TIMESTAMP,
-                 terminal_outcome = 'process_restart', revision = revision + 1
+             SET status = 'recovery_required', ended_at = NULL,
+                 terminal_outcome = NULL, revision = revision + 1
              WHERE tenant_id = ? AND thread_id = ? AND id = ? AND status = 'running'",
         )
         .bind(tenant_id)
@@ -3234,13 +3236,13 @@ pub(crate) async fn recover_abandoned_runtime_turns(
             owner_user_id,
             thread_id,
             Some(turn_id),
-            &format!("turn-terminal:{turn_id}:cancelled"),
-            "turn_terminal",
+            &format!("turn-recovery-required:{turn_id}"),
+            "turn_recovery_required",
             serde_json::json!({
-                "status": "cancelled",
-                "detail": "server restart recovered an abandoned running turn",
+                "status": "recovery_required",
+                "reason": "process_restart_without_atomic_terminal_checkpoint",
             }),
-            format!("turn-terminal:{turn_id}:cancelled"),
+            format!("turn-recovery-required:{turn_id}"),
             None,
         )
         .await?;
@@ -12160,7 +12162,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_recovery_cancels_abandoned_turn_and_releases_protected_budgets() {
+    async fn startup_recovery_marks_abandoned_turn_and_releases_protected_budgets() {
         let db = db().await;
         seed_agent_thread(&db, "tenant", "user", "abandoned-session").await;
         sqlx::query(
@@ -12195,7 +12197,7 @@ mod tests {
                 .fetch_one(&db)
                 .await
                 .unwrap();
-        assert_eq!(status, "cancelled");
+        assert_eq!(status, "recovery_required");
         let active_entries: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM resource_budget_entries
              WHERE owner_scope = 'abandoned-session' AND state IN ('reserved', 'protected')",
@@ -12214,6 +12216,15 @@ mod tests {
         .unwrap();
         assert_eq!(account.1, 0);
         assert_eq!(account.0, 2_000_000);
+        let recovery_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_event_ledger
+             WHERE thread_id = 'abandoned-session'
+               AND event_type = 'runtime.turn_recovery_required'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(recovery_events, 1);
         let terminal_events: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_event_ledger
              WHERE thread_id = 'abandoned-session'
@@ -12222,7 +12233,7 @@ mod tests {
         .fetch_one(&db)
         .await
         .unwrap();
-        assert_eq!(terminal_events, 1);
+        assert_eq!(terminal_events, 0);
     }
 
     async fn seed_compaction_test_source(

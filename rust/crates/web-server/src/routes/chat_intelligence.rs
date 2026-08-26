@@ -6,6 +6,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::Row;
+#[cfg(feature = "nl2sql")]
+use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path as FsPath, PathBuf};
 use zip::ZipArchive;
@@ -13,9 +15,11 @@ use zip::ZipArchive;
 use crate::auth::Claims;
 use crate::error::AppError;
 #[cfg(feature = "nl2sql")]
-use crate::nl2sql::embedding::EmbeddingModel;
+use crate::nl2sql::embedding_failover::{
+    embed_batch_for_config, embed_batch_with_failover, record_embedding_fallback_alert,
+};
 #[cfg(feature = "nl2sql")]
-use crate::nl2sql::resolve_embedding_config;
+use crate::nl2sql::{EmbeddingProfileKind, EmbeddingTenantConfig};
 // Task 20.3: `/chat/memories` is a thin view/wrapper over the single source of
 // truth (`/memory/items` in `memory_continuity`). All chat-memory reads and
 // writes converge onto the unified `agent_memory_items` store instead of the
@@ -989,69 +993,181 @@ async fn embed_chat_file_chunks_best_effort(
     if chunk_ids.is_empty() {
         return;
     }
-    let Some(cfg) = resolve_embedding_config(&state.db, tenant_id, Some("chat")).await else {
-        tracing::debug!(
-            tenant_id,
-            file_id,
-            "chat file semantic indexing skipped because no chat embedding config is available"
-        );
-        return;
-    };
-    let model = EmbeddingModel::new_with_dimensions(
-        &cfg.model,
-        cfg.base_url.clone(),
-        Some(cfg.api_key.clone()),
-        cfg.dimensions,
-    );
+    let mut selected_config = None::<EmbeddingTenantConfig>;
     for batch in chunk_ids.chunks(CHAT_FILE_EMBED_BATCH_SIZE) {
         let texts = batch
             .iter()
             .map(|(_, content)| content.clone())
             .collect::<Vec<_>>();
-        let vectors: Vec<Vec<f32>> = match model.embed_batch(&texts).await {
-            Ok(vectors) => vectors,
+        let result = if let Some(config) = selected_config.as_ref() {
+            embed_batch_for_config(config, &texts, true, None)
+                .await
+                .map(|(vectors, _)| (config.clone(), vectors))
+        } else {
+            embed_batch_with_failover(&state.db, tenant_id, "chat", &texts, true, None)
+                .await
+                .map(|outcome| (outcome.config, outcome.vectors))
+        };
+        let (config, vectors) = match result {
+            Ok(result) => result,
             Err(error) => {
-                tracing::warn!(
-                    tenant_id,
-                    file_id,
-                    error = %error,
-                    "chat file semantic indexing failed; keyword retrieval remains available"
-                );
+                if let Some(config) = selected_config
+                    .as_ref()
+                    .filter(|config| config.profile_kind == EmbeddingProfileKind::Api)
+                {
+                    let _ = record_embedding_fallback_alert(
+                        &state.db,
+                        tenant_id,
+                        "chat",
+                        config,
+                        &error.to_string(),
+                    )
+                    .await;
+                    let local = crate::nl2sql::resolve_embedding_profiles(
+                        &state.db,
+                        tenant_id,
+                        Some("chat"),
+                    )
+                    .await
+                    .local;
+                    if let Err(local_error) = embed_chat_file_chunks_with_config(
+                        state, tenant_id, user_id, file_id, chunk_ids, &local,
+                    )
+                    .await
+                    {
+                        tracing::warn!(tenant_id, file_id, error = %local_error, "chat file local embedding rebuild failed; keyword retrieval remains available");
+                    }
+                } else {
+                    tracing::warn!(
+                        tenant_id,
+                        file_id,
+                        error = %error,
+                        "chat file semantic indexing failed; keyword retrieval remains available"
+                    );
+                }
                 return;
             }
         };
-        for ((chunk_id, _), vector) in batch.iter().zip(vectors.iter()) {
-            let Some(raw_vector) = serialize_embedding_vector(vector) else {
-                continue;
-            };
-            if let Err(error) = sqlx::query::<sqlx::Sqlite>(
-                r#"
-                UPDATE chat_file_workspace_chunks
-                SET embedding_model = ?, embedding_dimensions = ?, embedding_json = ?
-                WHERE tenant_id = ? AND user_id = ? AND file_id = ? AND id = ?
-                "#,
-            )
-            .bind(&cfg.model)
-            .bind(i32::try_from(vector.len()).unwrap_or(i32::MAX))
-            .bind(raw_vector)
-            .bind(tenant_id)
-            .bind(user_id)
-            .bind(file_id)
-            .bind(chunk_id)
-            .execute(&state.db)
-            .await
-            {
-                tracing::warn!(
-                    tenant_id,
-                    file_id,
-                    chunk_id,
-                    error = %error,
-                    "failed to persist chat file chunk embedding"
-                );
-            }
+        selected_config.get_or_insert_with(|| config.clone());
+        if let Err(error) = persist_chat_file_embedding_batch(
+            state,
+            tenant_id,
+            user_id,
+            file_id,
+            batch,
+            &config.model,
+            &vectors,
+        )
+        .await
+        {
+            tracing::warn!(tenant_id, file_id, error = %error, "failed to persist chat file embedding batch");
+            return;
         }
     }
 }
+
+#[cfg(feature = "nl2sql")]
+async fn embed_chat_file_chunks_with_config(
+    state: &AppState,
+    tenant_id: &str,
+    user_id: &str,
+    file_id: &str,
+    chunk_ids: &[(String, String)],
+    config: &EmbeddingTenantConfig,
+) -> anyhow::Result<()> {
+    for batch in chunk_ids.chunks(CHAT_FILE_EMBED_BATCH_SIZE) {
+        let texts = batch
+            .iter()
+            .map(|(_, content)| content.clone())
+            .collect::<Vec<_>>();
+        let (vectors, _) = embed_batch_for_config(config, &texts, true, None).await?;
+        persist_chat_file_embedding_batch(
+            state,
+            tenant_id,
+            user_id,
+            file_id,
+            batch,
+            &config.model,
+            &vectors,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "nl2sql")]
+async fn persist_chat_file_embedding_batch(
+    state: &AppState,
+    tenant_id: &str,
+    user_id: &str,
+    file_id: &str,
+    batch: &[(String, String)],
+    model: &str,
+    vectors: &[Vec<f32>],
+) -> anyhow::Result<()> {
+    for ((chunk_id, _), vector) in batch.iter().zip(vectors) {
+        let Some(raw_vector) = serialize_embedding_vector(vector) else {
+            continue;
+        };
+        sqlx::query::<sqlx::Sqlite>(
+            r#"
+            UPDATE chat_file_workspace_chunks
+            SET embedding_model = ?, embedding_dimensions = ?, embedding_json = ?
+            WHERE tenant_id = ? AND user_id = ? AND file_id = ? AND id = ?
+            "#,
+        )
+        .bind(model)
+        .bind(i32::try_from(vector.len()).unwrap_or(i32::MAX))
+        .bind(raw_vector)
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(file_id)
+        .bind(chunk_id)
+        .execute(&state.db)
+        .await?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "nl2sql")]
+pub(crate) fn schedule_tenant_chat_embedding_rebuild(state: AppState, tenant_id: String) {
+    tokio::spawn(async move {
+        let rows = match sqlx::query(
+            "SELECT c.user_id, c.file_id, c.id, c.content
+             FROM chat_file_workspace_chunks AS c
+             JOIN chat_file_workspace_files AS f
+               ON f.tenant_id = c.tenant_id AND f.user_id = c.user_id
+              AND f.file_id = c.file_id
+             WHERE c.tenant_id = ? AND f.status = 'indexed'
+             ORDER BY c.user_id, c.file_id, c.chunk_index",
+        )
+        .bind(&tenant_id)
+        .fetch_all(&state.db)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(tenant_id, error = %error, "failed to load chat embeddings for provider migration");
+                return;
+            }
+        };
+        let mut files = BTreeMap::<(String, String), Vec<(String, String)>>::new();
+        for row in rows {
+            files
+                .entry((row.get("user_id"), row.get("file_id")))
+                .or_default()
+                .push((row.get("id"), row.get("content")));
+        }
+        for ((user_id, file_id), chunks) in files {
+            embed_chat_file_chunks_best_effort(&state, &tenant_id, &user_id, &file_id, &chunks)
+                .await;
+            tokio::task::yield_now().await;
+        }
+    });
+}
+
+#[cfg(not(feature = "nl2sql"))]
+pub(crate) fn schedule_tenant_chat_embedding_rebuild(_state: AppState, _tenant_id: String) {}
 
 #[cfg(not(feature = "nl2sql"))]
 async fn embed_chat_file_chunks_best_effort(
@@ -1069,16 +1185,20 @@ async fn embed_chat_file_query(
     tenant_id: &str,
     query: &str,
 ) -> Option<(String, Vec<f32>)> {
-    let cfg = resolve_embedding_config(&state.db, tenant_id, Some("chat")).await?;
-    let model_name = cfg.model.clone();
-    let model = EmbeddingModel::new_with_dimensions(
-        &model_name,
-        cfg.base_url.clone(),
-        Some(cfg.api_key),
-        cfg.dimensions,
-    );
-    match model.embed_batch(&[query.to_string()]).await {
-        Ok(mut vectors) => vectors.pop().map(|vector: Vec<f32>| (model_name, vector)),
+    match embed_batch_with_failover(
+        &state.db,
+        tenant_id,
+        "chat",
+        &[query.to_string()],
+        false,
+        None,
+    )
+    .await
+    {
+        Ok(mut outcome) => outcome
+            .vectors
+            .pop()
+            .map(|vector: Vec<f32>| (outcome.config.model, vector)),
         Err(error) => {
             tracing::debug!(
                 tenant_id,

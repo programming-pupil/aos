@@ -39,7 +39,7 @@ pub(super) async fn rd_semantic_repository_search(
     }
 
     let mut backfill_scheduled = false;
-    let mut ranked_hit_sets = Vec::new();
+    let mut api_failure: Option<(RdEmbeddingApiKey, String)> = None;
     for candidate in candidates {
         let model = candidate.vector_space_id.clone();
         let tenant_id = claims.tenant_id.clone();
@@ -83,6 +83,9 @@ pub(super) async fn rd_semantic_repository_search(
                     error = %error,
                     "RD semantic query embedding failed; falling back to lexical retrieval"
                 );
+                if !candidate.is_local {
+                    api_failure = Some((candidate.clone(), error.to_string()));
+                }
                 continue;
             }
             Err(_) => {
@@ -93,9 +96,45 @@ pub(super) async fn rd_semantic_repository_search(
                     timeout_secs = RD_EMBEDDING_QUERY_TIMEOUT_SECS,
                     "RD semantic query embedding timed out; falling back to lexical retrieval"
                 );
+                if !candidate.is_local {
+                    api_failure = Some((
+                        candidate.clone(),
+                        format!(
+                            "RD semantic query embedding timed out after {RD_EMBEDDING_QUERY_TIMEOUT_SECS}s"
+                        ),
+                    ));
+                }
                 continue;
             }
         };
+        if candidate.is_local {
+            if let Some((failed, error)) = api_failure.as_ref() {
+                if let Err(alert_error) =
+                    crate::nl2sql::embedding_failover::record_embedding_fallback_alert_for_profile(
+                        &state.db,
+                        &claims.tenant_id,
+                        RD_SCENARIO,
+                        &failed.vector_space_id,
+                        &failed.provider,
+                        &failed.model,
+                        error,
+                    )
+                    .await
+                {
+                    tracing::warn!(tenant_id = %claims.tenant_id, error = %alert_error, "failed to persist RD embedding fallback alert");
+                }
+            }
+        } else if let Err(error) =
+            crate::nl2sql::embedding_failover::resolve_embedding_fallback_alert_for_profile(
+                &state.db,
+                &claims.tenant_id,
+                RD_SCENARIO,
+                &candidate.vector_space_id,
+            )
+            .await
+        {
+            tracing::warn!(tenant_id = %claims.tenant_id, error = %error, "failed to resolve RD embedding fallback alert");
+        }
         record_rd_embedding_usage(
             state,
             &claims.tenant_id,
@@ -128,12 +167,10 @@ pub(super) async fn rd_semantic_repository_search(
         .ok()
         .and_then(Result::ok)
         .unwrap_or_else(Vec::new);
-        if !hits.is_empty() {
-            ranked_hit_sets.push(hits);
-        }
+        return fuse_rd_semantic_hits(vec![hits], top_k);
     }
 
-    fuse_rd_semantic_hits(ranked_hit_sets, top_k)
+    Vec::new()
 }
 
 fn fuse_rd_semantic_hits(
@@ -197,10 +234,11 @@ pub(in crate::routes::rd) async fn resolve_rd_embedding_candidates(
         let profiles =
             crate::nl2sql::resolve_embedding_profiles(&state.db, tenant_id, Some(RD_SCENARIO))
                 .await;
-        let mut configs = vec![profiles.local];
+        let mut configs = Vec::with_capacity(2);
         if let Some(api) = profiles.api {
             configs.push(api);
         }
+        configs.push(profiles.local);
         configs
             .into_iter()
             .map(|config| {

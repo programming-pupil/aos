@@ -44,7 +44,7 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::{timeout, Duration};
 use tools::{canonical_allowed_tool_name, GlobalToolRegistry, RuntimeToolDefinition};
 
-use crate::config_registry::UserRuntimeConfig;
+use crate::config_registry::{ApiKeyEntry, UserRuntimeConfig};
 use crate::error::{GatewayError, Result};
 use crate::path_safety::PathValidator;
 use crate::session_manager::InternalReasoningBudget;
@@ -5702,6 +5702,7 @@ pub(crate) struct GatewayMemoryContext {
     session_id: String,
     app: String,
     session_path: PathBuf,
+    embedding_api_keys: Vec<ApiKeyEntry>,
 }
 
 impl GatewayMemoryContext {
@@ -8359,16 +8360,43 @@ async fn gateway_embed_memory_text_best_effort(
         return None;
     }
     let input = gateway_compact_text(text, 2_000);
+    let mut remote_failure = None;
+    if let Some(key) = context.embedding_api_keys.first() {
+        let profile_id = gateway_embedding_profile_id(&context.tenant_id, key);
+        if gateway_embedding_circuit_allows(context, &profile_id).await {
+            match gateway_embed_remote(key, &input).await {
+                Ok(embedding) => {
+                    gateway_resolve_embedding_alert(context, &profile_id).await;
+                    return Some(embedding);
+                }
+                Err(error) => remote_failure = Some((profile_id, key, error)),
+            }
+        } else {
+            remote_failure = Some((
+                profile_id,
+                key,
+                "external embedding circuit is cooling down after a recent failure".to_string(),
+            ));
+        }
+    }
     let result = tokio::task::spawn_blocking(move || {
         let texts = vec![input];
         runtime::local_embedding::embed(&texts)
     })
     .await;
     match result {
-        Ok(Ok(mut vectors)) => vectors.pop().map(|vector| GatewayMemoryEmbedding {
-            model: runtime::local_embedding::MODEL.to_string(),
-            vector,
-        }),
+        Ok(Ok(mut vectors)) => {
+            let embedding = vectors.pop().map(|vector| GatewayMemoryEmbedding {
+                model: runtime::local_embedding::MODEL.to_string(),
+                vector,
+            });
+            if embedding.is_some() {
+                if let Some((profile_id, key, error)) = remote_failure {
+                    gateway_record_embedding_alert(context, &profile_id, key, &error).await;
+                }
+            }
+            embedding
+        }
         Ok(Err(error)) => {
             tracing::debug!(
                 tenant_id = %context.tenant_id,
@@ -8385,6 +8413,217 @@ async fn gateway_embed_memory_text_best_effort(
             );
             None
         }
+    }
+}
+
+fn gateway_default_embedding_dimensions(model: &str) -> usize {
+    match model {
+        "text-embedding-3-large" => 3_072,
+        "text-embedding-5-large" => 4_096,
+        _ => 1_536,
+    }
+}
+
+fn gateway_embedding_profile_id(tenant_id: &str, key: &ApiKeyEntry) -> String {
+    let provider = key.provider.trim().to_ascii_lowercase();
+    let base_url = key
+        .base_url
+        .as_deref()
+        .unwrap_or("https://api.openai.com")
+        .trim()
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    let model = key
+        .model
+        .as_deref()
+        .unwrap_or("text-embedding-3-small")
+        .trim();
+    let dimensions = key
+        .dimensions
+        .unwrap_or_else(|| gateway_default_embedding_dimensions(model));
+    let vector_contract =
+        format!("api-vector-contract-v1\0{provider}\0{base_url}\0{model}\0{dimensions}");
+    let vector_signature = format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(vector_contract.as_bytes()))
+    );
+    let profile_contract = format!(
+        "v1\0{tenant_id}\0api\0{provider}\0{base_url}\0{model}\0{dimensions}\0provider-managed-v1\0{vector_signature}"
+    );
+    format!(
+        "ep_{}",
+        hex::encode(Sha256::digest(profile_contract.as_bytes()))
+    )
+}
+
+async fn gateway_embed_remote(
+    key: &ApiKeyEntry,
+    input: &str,
+) -> std::result::Result<GatewayMemoryEmbedding, String> {
+    let model = key
+        .model
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("text-embedding-3-small")
+        .to_string();
+    let protected =
+        runtime::protect_sensitive_text(input, runtime::configured_data_protection_mode());
+    let mut body = serde_json::json!({"model": model, "input": [protected.value]});
+    if let Some(dimensions) = key.dimensions {
+        body["dimensions"] = serde_json::json!(dimensions);
+    }
+    let base_url = key.base_url.as_deref().unwrap_or("https://api.openai.com");
+    let endpoint = api::embeddings_endpoint(base_url);
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| format!("failed to build embedding client: {error}"))?
+        .post(endpoint)
+        .bearer_auth(&key.key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| format!("embedding API request failed: {error}"))?;
+    let status = response.status();
+    let response_body = response
+        .text()
+        .await
+        .map_err(|error| format!("failed to read embedding response: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "embedding API returned {status}: {}",
+            gateway_compact_text(&response_body, 500)
+        ));
+    }
+    let parsed: Value = serde_json::from_str(&response_body)
+        .map_err(|error| format!("invalid embedding response JSON: {error}"))?;
+    let vector = parsed
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("embedding"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "embedding response is missing data[0].embedding".to_string())?
+        .iter()
+        .map(|value| {
+            value
+                .as_f64()
+                .map(|value| value as f32)
+                .ok_or_else(|| "embedding response contains a non-numeric value".to_string())
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if vector.is_empty() {
+        return Err("embedding response returned an empty vector".to_string());
+    }
+    if let Some(expected) = key.dimensions {
+        if vector.len() != expected {
+            return Err(format!(
+                "embedding response returned {} dimensions; expected {expected}",
+                vector.len()
+            ));
+        }
+    }
+    Ok(GatewayMemoryEmbedding { model, vector })
+}
+
+async fn gateway_embedding_circuit_allows(
+    context: &GatewayMemoryContext,
+    profile_id: &str,
+) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT CASE WHEN NOT EXISTS (
+           SELECT 1 FROM embedding_provider_alerts
+           WHERE tenant_id = ? AND profile_id = ? AND scenario = ?
+             AND status = 'active' AND last_failed_at > datetime(CURRENT_TIMESTAMP, '-30 seconds')
+         ) THEN 1 ELSE 0 END",
+    )
+    .bind(&context.tenant_id)
+    .bind(profile_id)
+    .bind(&context.app)
+    .fetch_one(&context.db)
+    .await
+    .map_or(true, |allowed| allowed == 1)
+}
+
+async fn gateway_record_embedding_alert(
+    context: &GatewayMemoryContext,
+    profile_id: &str,
+    key: &ApiKeyEntry,
+    error: &str,
+) {
+    let alert_hash = hex::encode(Sha256::digest(
+        format!("{}\0{}\0{}", context.tenant_id, profile_id, context.app).as_bytes(),
+    ));
+    let id = format!("embedding-alert-{alert_hash}");
+    let error = gateway_compact_text(error, 1_000);
+    let result = sqlx::query(
+        "INSERT INTO embedding_provider_alerts
+           (id, tenant_id, profile_id, scenario, provider, model, last_error)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(tenant_id, profile_id, scenario) DO UPDATE SET
+           status = 'active', failure_count = failure_count + 1,
+           notification_version = CASE
+             WHEN status = 'resolved' OR last_notified_at <= datetime(CURRENT_TIMESTAMP, '-30 minutes')
+             THEN notification_version + 1 ELSE notification_version END,
+           last_failed_at = CURRENT_TIMESTAMP, last_error = excluded.last_error,
+           last_notified_at = CASE
+             WHEN status = 'resolved' OR last_notified_at <= datetime(CURRENT_TIMESTAMP, '-30 minutes')
+             THEN CURRENT_TIMESTAMP ELSE last_notified_at END,
+           resolved_at = NULL, updated_at = CURRENT_TIMESTAMP
+         RETURNING id, notification_version",
+    )
+    .bind(&id)
+    .bind(&context.tenant_id)
+    .bind(profile_id)
+    .bind(&context.app)
+    .bind(&key.provider)
+    .bind(key.model.as_deref().unwrap_or("text-embedding-3-small"))
+    .bind(&error)
+    .fetch_one(&context.db)
+    .await;
+    let Ok(row) = result else {
+        tracing::warn!(tenant_id = %context.tenant_id, "failed to persist gateway embedding fallback alert");
+        return;
+    };
+    let persisted_id: String = row.get("id");
+    let version: i64 = row.get("notification_version");
+    let notification_id = format!("{persisted_id}:{version}");
+    let body = format!(
+        "场景 {} 的外部 Embedding（{}/{}）不可用，AOS 已自动降级到内置本地模型。最近错误：{}",
+        context.app,
+        key.provider,
+        key.model.as_deref().unwrap_or("text-embedding-3-small"),
+        gateway_compact_text(&error, 320),
+    );
+    if let Err(alert_error) = sqlx::query(
+        "INSERT OR IGNORE INTO notifications
+           (id, tenant_id, user_id, title, body, level)
+         VALUES (?, ?, NULL, 'Embedding 已降级到本地模型', ?, 'warning')",
+    )
+    .bind(notification_id)
+    .bind(&context.tenant_id)
+    .bind(body)
+    .execute(&context.db)
+    .await
+    {
+        tracing::warn!(tenant_id = %context.tenant_id, error = %alert_error, "failed to persist gateway embedding fallback notification");
+    }
+}
+
+async fn gateway_resolve_embedding_alert(context: &GatewayMemoryContext, profile_id: &str) {
+    if let Err(error) = sqlx::query(
+        "UPDATE embedding_provider_alerts
+         SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE tenant_id = ? AND profile_id = ? AND scenario = ? AND status = 'active'",
+    )
+    .bind(&context.tenant_id)
+    .bind(profile_id)
+    .bind(&context.app)
+    .execute(&context.db)
+    .await
+    {
+        tracing::debug!(tenant_id = %context.tenant_id, error = %error, "failed to resolve gateway embedding fallback alert");
     }
 }
 
@@ -10859,6 +11098,7 @@ impl RuntimeBuilder {
                     .scenario
                     .clone()
                     .unwrap_or_else(|| "chat".to_string()),
+                embedding_api_keys: self.config.embedding_api_keys.clone(),
             }),
             self.config.db.clone().map(|db| GatewayFileContext {
                 db,
@@ -11136,6 +11376,7 @@ impl RuntimeBuilder {
                     .scenario
                     .clone()
                     .unwrap_or_else(|| "chat".to_string()),
+                embedding_api_keys: self.config.embedding_api_keys.clone(),
             };
             if let Some(memory_instructions) =
                 build_gateway_memory_developer_instructions(&context).await
@@ -12708,6 +12949,7 @@ mod tests {
             session_id: "session-test".to_string(),
             app: "chat".to_string(),
             session_path: PathBuf::from("/tmp/aos-gateway-memory-test.jsonl"),
+            embedding_api_keys: Vec::new(),
         }
     }
 
@@ -12929,7 +13171,9 @@ mod tests {
                 input_price_per_million: None,
                 output_price_per_million: None,
                 capabilities_json: None,
+                dimensions: None,
             }],
+            embedding_api_keys: Vec::new(),
             provider: "openai".to_string(),
             model: "gpt-test".to_string(),
             permission_mode: runtime::PermissionMode::ReadOnly,
@@ -13036,7 +13280,9 @@ mod tests {
                 input_price_per_million: None,
                 output_price_per_million: None,
                 capabilities_json: None,
+                dimensions: None,
             }],
+            embedding_api_keys: Vec::new(),
             provider: "openai".to_string(),
             model: "gpt-test".to_string(),
             permission_mode: runtime::PermissionMode::ReadOnly,
@@ -13317,7 +13563,9 @@ mod tests {
                 input_price_per_million: None,
                 output_price_per_million: None,
                 capabilities_json: None,
+                dimensions: None,
             }],
+            embedding_api_keys: Vec::new(),
             provider: "openai".to_string(),
             model: "gpt-lineage".to_string(),
             permission_mode: runtime::PermissionMode::ReadOnly,
@@ -13686,7 +13934,9 @@ mod tests {
                 input_price_per_million: None,
                 output_price_per_million: None,
                 capabilities_json: None,
+                dimensions: None,
             }],
+            embedding_api_keys: Vec::new(),
             provider: "openai".to_string(),
             model: "gpt-test".to_string(),
             permission_mode: runtime::PermissionMode::ReadOnly,
@@ -13827,6 +14077,7 @@ mod tests {
             session_id: "session-test".to_string(),
             app: "chat".to_string(),
             session_path: path,
+            embedding_api_keys: Vec::new(),
         }
     }
 
@@ -13965,6 +14216,7 @@ mod tests {
             user_id: "user-restore".to_string(),
             tenant_id: "tenant-restore".to_string(),
             api_keys: Vec::new(),
+            embedding_api_keys: Vec::new(),
             provider: "openai".to_string(),
             model: "gpt-test".to_string(),
             permission_mode: runtime::PermissionMode::ReadOnly,
@@ -15291,9 +15543,17 @@ mod tests {
             policy.required_mode_for("bash"),
             runtime::PermissionMode::DangerFullAccess
         );
+        let execute_registered = registry
+            .definitions(None)
+            .iter()
+            .any(|tool| tool.name == "workspace_execute");
         assert_eq!(
             policy.required_mode_for("workspace_execute"),
-            runtime::PermissionMode::WorkspaceWrite
+            if execute_registered {
+                runtime::PermissionMode::WorkspaceWrite
+            } else {
+                runtime::PermissionMode::DangerFullAccess
+            }
         );
     }
 

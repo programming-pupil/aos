@@ -203,6 +203,46 @@ pub(crate) async fn run_memory_maintenance_once(
     Ok(stats)
 }
 
+pub(crate) async fn enqueue_tenant_embedding_rebuilds(
+    db: &SqlitePool,
+    tenant_id: &str,
+) -> Result<u64, MemoryWorkerError> {
+    let mut tx = db.begin().await?;
+    crate::acquire_sqlite_write_lock(&mut tx).await?;
+    let reset = sqlx::query(
+        "UPDATE memory_embedding_rebuild_outbox
+         SET status = 'pending', attempts = 0, available_at = CURRENT_TIMESTAMP,
+             lease_owner = NULL, lease_expires_at = NULL, last_error = NULL,
+             processed_at = NULL
+         WHERE tenant_id = ? AND fact_id IN (
+           SELECT id FROM structured_memory_facts
+           WHERE tenant_id = ? AND lifecycle = 'confirmed'
+             AND projection_memory_id IS NOT NULL
+         )",
+    )
+    .bind(tenant_id)
+    .bind(tenant_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    let inserted = sqlx::query(
+        "INSERT OR IGNORE INTO memory_embedding_rebuild_outbox
+           (id, tenant_id, user_id, fact_id, projection_memory_id, source_hash)
+         SELECT 'memory-embedding-rebuild:' || fact.id,
+                fact.tenant_id, fact.user_id, fact.id,
+                fact.projection_memory_id, fact.evidence_hash
+         FROM structured_memory_facts AS fact
+         WHERE fact.tenant_id = ? AND fact.lifecycle = 'confirmed'
+           AND fact.projection_memory_id IS NOT NULL",
+    )
+    .bind(tenant_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(reset.saturating_add(inserted))
+}
+
 async fn claim_embedding_rebuild_job(
     db: &SqlitePool,
     worker_id: &str,

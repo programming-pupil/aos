@@ -15,9 +15,7 @@ use std::time::Duration;
 use crate::auth::Claims;
 use crate::error::AppError;
 #[cfg(feature = "nl2sql")]
-use crate::nl2sql::embedding::EmbeddingModel;
-#[cfg(feature = "nl2sql")]
-use crate::nl2sql::resolve_embedding_config;
+use crate::nl2sql::embedding_failover::embed_batch_with_failover;
 use crate::state::AppState;
 
 const MEMORY_SEARCH_LIMIT_DEFAULT: usize = 12;
@@ -3589,40 +3587,10 @@ async fn embed_memory_text_with_timeout(
     if text.trim().is_empty() {
         return None;
     }
-    let cfg = if let Some(cfg) = resolve_embedding_config(db, tenant_id, Some(app)).await {
-        cfg
-    } else if let Some(cfg) = resolve_embedding_config(db, tenant_id, Some("chat")).await {
-        cfg
-    } else {
-        resolve_embedding_config(db, tenant_id, None).await?
-    };
-    let model_name = cfg.model.clone();
-    let model = EmbeddingModel::new_with_dimensions(
-        &model_name,
-        cfg.base_url.clone(),
-        Some(cfg.api_key),
-        cfg.dimensions,
-    );
     let inputs = [compact_text(text, 2_000)];
-    let result = if let Some(timeout) = request_timeout {
-        match tokio::time::timeout(timeout, model.embed_batch(&inputs)).await {
-            Ok(result) => result,
-            Err(_) => {
-                tracing::debug!(
-                    tenant_id,
-                    app,
-                    timeout_ms = timeout.as_millis(),
-                    "memory recall embedding timed out; using keyword recall"
-                );
-                return None;
-            }
-        }
-    } else {
-        model.embed_batch(&inputs).await
-    };
-    match result {
-        Ok(mut vectors) => vectors.pop().map(|vector| MemoryEmbedding {
-            model: model_name,
+    match embed_batch_with_failover(db, tenant_id, app, &inputs, false, request_timeout).await {
+        Ok(mut outcome) => outcome.vectors.pop().map(|vector| MemoryEmbedding {
+            model: outcome.config.model,
             vector,
         }),
         Err(error) => {

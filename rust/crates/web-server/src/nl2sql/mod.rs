@@ -13,6 +13,7 @@
 
 pub mod domain_discoverer;
 pub mod embedding;
+pub mod embedding_failover;
 pub mod embedding_profiles;
 pub mod embedding_reindex_worker;
 pub mod query_understanding;

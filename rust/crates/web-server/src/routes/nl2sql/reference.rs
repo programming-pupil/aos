@@ -5256,6 +5256,14 @@ async fn embed_reference_batch(
                             error = %error,
                             "SQL knowledge API embedding returned incomplete batch"
                         );
+                        let _ = crate::nl2sql::embedding_failover::record_embedding_fallback_alert(
+                            &state.db,
+                            tenant_id,
+                            "nl2sql",
+                            &api_profile.config,
+                            &error,
+                        )
+                        .await;
                         return Ok(ReferenceEmbeddingBatch {
                             local: ReferenceProfileVectors {
                                 profile: profiles.local,
@@ -5293,6 +5301,14 @@ async fn embed_reference_batch(
                             error = %error,
                             "SQL knowledge API embedding returned incompatible dimensions"
                         );
+                        let _ = crate::nl2sql::embedding_failover::record_embedding_fallback_alert(
+                            &state.db,
+                            tenant_id,
+                            "nl2sql",
+                            &api_profile.config,
+                            &error,
+                        )
+                        .await;
                         return Ok(ReferenceEmbeddingBatch {
                             local: ReferenceProfileVectors {
                                 profile: profiles.local,
@@ -5304,6 +5320,13 @@ async fn embed_reference_batch(
                     let _ = crate::nl2sql::embedding_profiles::record_profile_success(
                         &state.db,
                         &api_profile.id,
+                    )
+                    .await;
+                    let _ = crate::nl2sql::embedding_failover::resolve_embedding_fallback_alert(
+                        &state.db,
+                        tenant_id,
+                        "nl2sql",
+                        &api_profile.config,
                     )
                     .await;
                     api_vectors = Some(ReferenceProfileVectors {
@@ -5323,6 +5346,14 @@ async fn embed_reference_batch(
                         tenant_id,
                         datasource_id,
                         api_profile,
+                    )
+                    .await;
+                    let _ = crate::nl2sql::embedding_failover::record_embedding_fallback_alert(
+                        &state.db,
+                        tenant_id,
+                        "nl2sql",
+                        &api_profile.config,
+                        &error.to_string(),
                     )
                     .await;
                     tracing::warn!(
@@ -5503,6 +5534,7 @@ async fn embed_reference_query(
                 AppError::Internal(format!("failed to resolve embedding profiles: {error}"))
             })?;
 
+    let mut api_fallback_error = None;
     if let Some(api_profile) = &profiles.api {
         let circuit_allows =
             crate::nl2sql::embedding_profiles::circuit_allows_request(&state.db, &api_profile.id)
@@ -5555,6 +5587,14 @@ async fn embed_reference_query(
                             &api_profile.id,
                         )
                         .await;
+                        let _ =
+                            crate::nl2sql::embedding_failover::resolve_embedding_fallback_alert(
+                                &state.db,
+                                tenant_id,
+                                "nl2sql",
+                                &api_profile.config,
+                            )
+                            .await;
                         return Ok(ReferenceQueryEmbedding {
                             profile_id: api_profile.id.clone(),
                             vector,
@@ -5572,6 +5612,7 @@ async fn embed_reference_query(
                         &error,
                     )
                     .await;
+                    api_fallback_error = Some(error);
                 }
                 Err(error) => {
                     let _ = crate::nl2sql::embedding_profiles::record_profile_failure(
@@ -5580,6 +5621,7 @@ async fn embed_reference_query(
                         &error.to_string(),
                     )
                     .await;
+                    api_fallback_error = Some(error.to_string());
                 }
             }
         }
@@ -5605,6 +5647,17 @@ async fn embed_reference_query(
             vector.len(),
             profiles.local.config.effective_dimensions()
         )));
+    }
+    if let (Some(api_profile), Some(error)) = (profiles.api.as_ref(), api_fallback_error.as_deref())
+    {
+        let _ = crate::nl2sql::embedding_failover::record_embedding_fallback_alert(
+            &state.db,
+            tenant_id,
+            "nl2sql",
+            &api_profile.config,
+            error,
+        )
+        .await;
     }
     Ok(ReferenceQueryEmbedding {
         profile_id: profiles.local.id,
