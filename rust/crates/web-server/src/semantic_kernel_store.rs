@@ -3851,6 +3851,14 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         )
         .await
         .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+        // Reserve the protected final/domain-error capacity at turn creation
+        // so a long-running turn cannot consume the session's entire model
+        // budget before it reaches a user-visible completion path. Actual
+        // model input/output is still charged only when a manifest is
+        // committed; unused protected slots are released on pre-dispatch
+        // cancellation below.
+        ensure_protected_model_budgets(&mut tx, &self.tenant_id, &self.session_id, &input.turn_id)
+            .await?;
         tx.commit()
             .await
             .map_err(|error| runtime::RuntimeError::new(error.to_string()))
@@ -6329,6 +6337,15 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
                     .map_err(|e| runtime::RuntimeError::new(e.to_string()))?;
             }
         }
+        if cancelled_before_dispatch {
+            release_unmaterialized_model_budgets(
+                &mut tx,
+                &self.tenant_id,
+                &self.session_id,
+                &outcome.turn_id,
+            )
+            .await?;
+        }
         if let Some(artifact_id) = artifact_id.as_deref() {
             let artifact_bytes = i64::try_from(protected.value.len()).unwrap_or(i64::MAX);
             sqlx::query::<Sqlite>("INSERT INTO resource_budget_accounts (tenant_id, owner_scope, dimension, available, reserved, committed) VALUES (?, ?, 'artifact_bytes', 1073741824, 0, 0) ON CONFLICT(tenant_id, owner_scope, dimension) DO NOTHING")
@@ -6903,6 +6920,106 @@ fn model_output_reserve_for_stage(stage: runtime::RuntimeModelBudgetStage, confi
         .find_map(|(dimension, amount, _)| (dimension == "token_output").then_some(amount))
         .unwrap_or(configured);
     configured.min(protected_output)
+}
+
+/// Drop protected model reservations that were created for a turn which was
+/// cancelled before its first model-visible context manifest. This keeps the
+/// start-turn safety guarantee without leaking capacity when a tool is
+/// cancelled before dispatch. Account rows are removed only when they have no
+/// committed usage or other active reservations; historical usage therefore
+/// remains auditable and concurrent turns remain isolated.
+async fn release_unmaterialized_model_budgets(
+    tx: &mut Transaction<'_, Sqlite>,
+    tenant_id: &str,
+    owner_scope: &str,
+    turn_id: &str,
+) -> Result<(), runtime::RuntimeError> {
+    let manifests: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM context_packet_manifests
+         WHERE tenant_id = ? AND thread_id = ? AND turn_id = ?",
+    )
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .bind(turn_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+    if manifests > 0 {
+        return Ok(());
+    }
+
+    let protected_prefix = format!("model-protected:{turn_id}:");
+    let rows = sqlx::query_as::<Sqlite, (String, i64)>(
+        "SELECT dimension, amount
+         FROM resource_budget_entries
+         WHERE tenant_id = ? AND owner_scope = ?
+           AND substr(reservation_id, 1, length(?)) = ?
+           AND state = 'protected'",
+    )
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .bind(&protected_prefix)
+    .bind(&protected_prefix)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    sqlx::query::<Sqlite>(
+        "UPDATE resource_budget_entries
+         SET state = 'released'
+         WHERE tenant_id = ? AND owner_scope = ?
+           AND substr(reservation_id, 1, length(?)) = ?
+           AND state = 'protected'",
+    )
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .bind(&protected_prefix)
+    .bind(&protected_prefix)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+
+    for (dimension, amount) in rows {
+        sqlx::query::<Sqlite>(
+            "UPDATE resource_budget_accounts
+             SET reserved = MAX(reserved - ?, 0), available = available + ?
+             WHERE tenant_id = ? AND owner_scope = ? AND dimension = ?",
+        )
+        .bind(amount)
+        .bind(amount)
+        .bind(tenant_id)
+        .bind(owner_scope)
+        .bind(&dimension)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+    }
+
+    // A fresh turn may be the only owner of these accounts. Removing empty
+    // rows keeps compatibility consumers from interpreting an unused model
+    // budget as lifetime usage, while committed/active rows are preserved.
+    sqlx::query::<Sqlite>(
+        "DELETE FROM resource_budget_accounts
+         WHERE tenant_id = ? AND owner_scope = ?
+           AND dimension IN ('token_input', 'token_output')
+           AND reserved = 0 AND committed = 0
+           AND NOT EXISTS (
+               SELECT 1 FROM resource_budget_entries entry
+               WHERE entry.tenant_id = resource_budget_accounts.tenant_id
+                 AND entry.owner_scope = resource_budget_accounts.owner_scope
+                 AND entry.dimension = resource_budget_accounts.dimension
+                 AND entry.state IN ('reserved', 'protected')
+           )",
+    )
+    .bind(tenant_id)
+    .bind(owner_scope)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
+    Ok(())
 }
 
 async fn release_turn_model_budgets_in_transaction(
