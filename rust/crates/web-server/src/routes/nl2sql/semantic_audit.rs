@@ -148,6 +148,15 @@ pub(crate) fn apply_query_understanding(
             .map(|table| table.trim())
             .find(|table| !table.is_empty())
             .map(str::to_string)
+            .or_else(|| {
+                let columns = subject
+                    .columns
+                    .iter()
+                    .map(|column| column.trim())
+                    .filter(|column| !column.is_empty())
+                    .collect::<Vec<_>>();
+                (columns.len() == 1).then(|| columns[0].to_string())
+            })
             .or_else(|| (!subject.raw.trim().is_empty()).then(|| subject.raw.trim().to_string()));
         if intent.population.subject == "query_rows" {
             if let Some(subject) = proposed_subject {
@@ -401,18 +410,40 @@ pub(crate) fn bind_schema_dimensions(
     explicit_columns: &[String],
 ) {
     crate::behavior_trace("SQL-005");
-    let mut relations = schema_tables
+    let relation_profiles = schema_tables
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|table| {
-            table
+            let relation = table
                 .get("name")
                 .or_else(|| table.get("table_name"))
-                .and_then(Value::as_str)
+                .and_then(Value::as_str)?
+                .trim()
+                .to_string();
+            if relation.is_empty() {
+                return None;
+            }
+            let columns = table
+                .get("columns")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|column| {
+                    column
+                        .get("name")
+                        .or_else(|| column.get("column_name"))
+                        .and_then(Value::as_str)
+                })
+                .map(|column| column.trim().to_string())
+                .filter(|column| !column.is_empty())
+                .collect::<Vec<_>>();
+            Some((relation, columns))
         })
-        .map(|relation| relation.trim().to_string())
-        .filter(|relation| !relation.is_empty())
+        .collect::<Vec<_>>();
+    let mut relations = relation_profiles
+        .iter()
+        .map(|(relation, _)| relation.clone())
         .collect::<Vec<_>>();
     relations.sort_unstable_by_key(|relation| relation.to_ascii_lowercase());
     relations.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
@@ -445,17 +476,77 @@ pub(crate) fn bind_schema_dimensions(
     columns.sort_unstable_by_key(|column| column.to_ascii_lowercase());
     columns.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
     // Query-understanding models can still return a raw human label when no
-    // table candidate was available. Bind it only when the governed schema
-    // proves one relation. Ambiguous multi-table packets remain fail-closed.
+    // table candidate was available. Resolve that label against the governed
+    // relation and column evidence. A unique highest-scoring relation is
+    // deterministic; ties remain unresolved instead of silently selecting a
+    // table that merely happens to contain a similarly named column.
     if matches!(intent.objective, AnalyticObjective::Lookup)
         && intent.population.subject != "query_rows"
     {
-        if let Some(relation) = relations
+        let subject = intent.population.subject.trim();
+        let subject_columns = schema_tables
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find_map(|table| {
+                let table_name = table
+                    .get("name")
+                    .or_else(|| table.get("table_name"))
+                    .and_then(Value::as_str)?;
+                if !table_name.eq_ignore_ascii_case(subject) {
+                    return None;
+                }
+                Some(
+                    table
+                        .get("columns")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|column| {
+                            column
+                                .get("name")
+                                .or_else(|| column.get("column_name"))
+                                .and_then(Value::as_str)
+                        })
+                        .map(str::to_string)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .unwrap_or_default();
+        let subject_column_hints = intent
+            .dimensions
             .iter()
-            .find(|relation| relation.eq_ignore_ascii_case(&intent.population.subject))
-            .or_else(|| (relations.len() == 1).then(|| &relations[0]))
-        {
-            intent.population.subject.clone_from(relation);
+            .map(|dimension| dimension.column.as_str())
+            .chain(explicit_columns.iter().map(String::as_str))
+            .chain(subject_columns.iter().map(String::as_str))
+            .collect::<Vec<_>>();
+        let scored_relations = relation_profiles
+            .iter()
+            .filter_map(|(relation, table_columns)| {
+                let score = population_relation_score(
+                    subject,
+                    relation,
+                    table_columns,
+                    &subject_column_hints,
+                );
+                (score > 0).then(|| (relation, score))
+            })
+            .collect::<Vec<_>>();
+        if let Some(max_score) = scored_relations.iter().map(|(_, score)| *score).max() {
+            let winners = scored_relations
+                .into_iter()
+                .filter(|(_, score)| *score == max_score)
+                .map(|(relation, _)| relation.clone())
+                .collect::<Vec<_>>();
+            if let [relation] = winners.as_slice() {
+                intent.population.subject.clone_from(relation);
+            } else {
+                intent.unresolved.push(SemanticAmbiguity {
+                    field: "population:physical_relation".into(),
+                    candidates: winners,
+                    impact: "multiple schema relations are equally plausible for the requested population".into(),
+                });
+            }
         }
     }
     if columns.is_empty() {
@@ -649,6 +740,83 @@ fn filter_field(filter: &SemanticFilter) -> Option<&str> {
         | SemanticFilter::Compare { field, .. } => Some(field),
         SemanticFilter::RawBounded { .. } => None,
     }
+}
+
+fn compact_identifier(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Score a schema relation against a human population label. This is kept
+/// deliberately conservative: only strong relation/column evidence earns a
+/// score, and callers require a unique maximum before mutating the IR.
+fn population_relation_score(
+    subject: &str,
+    relation: &str,
+    table_columns: &[String],
+    subject_column_hints: &[&str],
+) -> u32 {
+    let subject_key = compact_identifier(subject);
+    let relation_key = compact_identifier(relation);
+    if subject_key.is_empty() || relation_key.is_empty() {
+        return 0;
+    }
+    if subject_key == relation_key
+        || subject_key.strip_suffix('s') == Some(relation_key.as_str())
+        || relation_key.strip_suffix('s') == Some(subject_key.as_str())
+    {
+        return 10_000;
+    }
+
+    let column_keys = table_columns
+        .iter()
+        .map(|column| compact_identifier(column))
+        .chain(
+            subject_column_hints
+                .iter()
+                .map(|column| compact_identifier(column)),
+        )
+        .filter(|column| !column.is_empty())
+        .collect::<Vec<_>>();
+    let has_exact_hint = subject_column_hints.iter().any(|hint| {
+        let hint_key = compact_identifier(hint);
+        !hint_key.is_empty()
+            && table_columns
+                .iter()
+                .any(|column| compact_identifier(column) == hint_key)
+    });
+    let has_invite_code = column_keys.iter().any(|column| {
+        matches!(
+            column.as_str(),
+            "invitecode" | "invitationcode" | "referralcode"
+        ) || (column.contains("invite") && column.contains("code"))
+    });
+    let invite_label = subject.contains("邀请码")
+        || subject_key.contains("invitecode")
+        || subject_key.contains("invitationcode")
+        || subject_key.contains("referralcode");
+    if invite_label {
+        let relation_has_invite = relation_key.contains("invite")
+            || relation_key.contains("invitation")
+            || relation_key.contains("referral");
+        if has_invite_code && relation_has_invite {
+            return if has_exact_hint { 9_500 } else { 9_000 };
+        }
+    }
+
+    // A structured QU subject column is reliable evidence even when the
+    // relation uses a domain-specific name. It still cannot beat an exact
+    // relation match or an explicit semantic alias above.
+    if has_exact_hint {
+        return 7_000;
+    }
+    if column_keys.iter().any(|column| column == &subject_key) {
+        return 6_000;
+    }
+    0
 }
 
 /// Compile the user's request before SQL generation. Providers may enrich this
@@ -1240,6 +1408,90 @@ mod tests {
             &[],
         );
         assert_eq!(ambiguous.population.subject, "邀请码");
+    }
+
+    #[test]
+    fn lookup_query_understanding_binds_invite_code_label_to_unique_relation() {
+        use crate::nl2sql::query_understanding::{
+            Intent, QueryEntities, QueryUnderstandingResult, SubjectEntity, TimeEntity,
+        };
+
+        let mut intent =
+            compile_question_intent("tenant", "ds", "查一下北京时间今天的全部邀请码", &[]);
+        let understanding = QueryUnderstandingResult {
+            rewritten_question: "查询今天的 invite_code 列表".into(),
+            intent: Intent::List,
+            entities: QueryEntities {
+                subject: Some(SubjectEntity {
+                    tables: vec![],
+                    columns: vec!["invite_code".into()],
+                    raw: "邀请码".into(),
+                }),
+                time: Some(TimeEntity {
+                    raw: "北京时间今天".into(),
+                    resolved_type: "relative".into(),
+                    granularity: "day".into(),
+                    ranges: vec![("2026-08-27".into(), "2026-08-28".into())],
+                }),
+                filters: vec![],
+                aggregations: vec![],
+                comparisons: vec![],
+            },
+            confidence: 0.98,
+        };
+        apply_query_understanding(&mut intent, &understanding);
+        bind_schema_dimensions(
+            &mut intent,
+            &serde_json::json!([
+                {
+                    "table_name": "orders",
+                    "columns": [{"name": "order_id"}, {"name": "created_at"}]
+                },
+                {
+                    "table_name": "invite_codes",
+                    "columns": [{"name": "invite_code"}, {"name": "created_at"}]
+                },
+                {
+                    "table_name": "users",
+                    "columns": [{"name": "user_id"}, {"name": "created_at"}]
+                }
+            ]),
+            &[],
+        );
+        assert_eq!(intent.population.subject, "invite_codes");
+        assert_eq!(intent.time.as_ref().unwrap().column, "created_at");
+        assert!(!intent
+            .unresolved
+            .iter()
+            .any(|ambiguity| ambiguity.field == "population:physical_relation"));
+
+        let sql = "SELECT invite_code FROM invite_codes WHERE (created_at AT TIME ZONE 'Asia/Shanghai') >= DATE '2026-08-27' AND (created_at AT TIME ZONE 'Asia/Shanghai') < DATE '2026-08-28' LIMIT 100";
+        let audit = compile_canonical_intent_with_contracts_and_joins(&intent, sql, &[], &[])
+            .expect("semantic audit");
+        assert_eq!(
+            audit.verification.release_decision,
+            nl2sql_core::semantic_ir::QueryReleaseDecision::Release
+        );
+    }
+
+    #[test]
+    fn lookup_population_relation_tie_remains_unresolved() {
+        let mut intent =
+            compile_question_intent("tenant", "ds", "查一下北京时间今天的全部邀请码", &[]);
+        intent.population.subject = "邀请码".into();
+        bind_schema_dimensions(
+            &mut intent,
+            &serde_json::json!([
+                {"table_name": "invite_codes", "columns": [{"name": "invite_code"}]},
+                {"table_name": "invite_events", "columns": [{"name": "invite_code"}]}
+            ]),
+            &[],
+        );
+        assert_eq!(intent.population.subject, "邀请码");
+        assert!(intent
+            .unresolved
+            .iter()
+            .any(|ambiguity| ambiguity.field == "population:physical_relation"));
     }
 
     #[test]

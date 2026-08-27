@@ -3947,26 +3947,70 @@ export function attachPmFinalDeliveryArtifacts(
   return next;
 }
 
-function attachSuperAssistantTurnMetadata(
+function historyUserIdentity(content: unknown): string {
+  const text = historyContentToPlain(content).trim();
+  const parsed = parseSuperAssistantSlashCommand(text);
+  return parsed ? parsed.prompt.trim() : text;
+}
+
+export function attachSuperAssistantTurnMetadata(
   messages: DisplayMessage[],
   metadata: SuperAssistantTurnMessageMetadata[] | null | undefined,
 ): DisplayMessage[] {
   if (!metadata?.length) return messages;
-  const byAnswer = new Map<string, SuperAssistantTurnMessageMetadata[]>();
-  for (const item of metadata) {
-    const key = item.final_text.trim();
-    if (!key) continue;
-    const bucket = byAnswer.get(key) ?? [];
-    bucket.push(item);
-    byAnswer.set(key, bucket);
+  const available = metadata
+    .map((item) => ({ item }))
+    .filter(({ item }) => item.final_text.trim().length > 0);
+  const matched = new Map<number, SuperAssistantTurnMessageMetadata>();
+  const matchedUsers = new Map<number, SuperAssistantTurnMessageMetadata>();
+  const usedUserIndices = new Set<number>();
+
+  const precedingUserIndex = (assistantIndex: number): number | undefined => {
+    for (let index = assistantIndex - 1; index >= 0; index -= 1) {
+      if (messages[index]?.role === "user") return index;
+    }
+    return undefined;
+  };
+
+  // Metadata is chronologically ordered by the API. Match each durable turn
+  // to both sides of the visible pair. A final answer is not a unique key:
+  // retries and different turns can legitimately produce identical text.
+  for (const candidate of available) {
+    const item = candidate.item;
+    const answer = item.final_text.trim();
+    const expectedUser = historyUserIdentity(item.user_message ?? "");
+    const candidates = messages
+      .map((message, index) => ({ message, index }))
+      .filter(
+        ({ message, index }) =>
+          message.role === "assistant" &&
+          !matched.has(index) &&
+          historyContentToPlain(message.content).trim() === answer &&
+          (!usedUserIndices.has(precedingUserIndex(index) ?? -1)),
+      );
+    if (candidates.length === 0) continue;
+    const withUserMatch = candidates.find(({ index }) => {
+      const userIndex = precedingUserIndex(index);
+      return (
+        userIndex !== undefined &&
+        expectedUser.length > 0 &&
+        historyUserIdentity(messages[userIndex].content) === expectedUser
+      );
+    });
+    const chosen = withUserMatch ??
+      (item.route_capability === "super_adversarial" ? undefined : candidates[0]);
+    if (!chosen) continue;
+    const userIndex = precedingUserIndex(chosen.index);
+    matched.set(chosen.index, item);
+    if (userIndex !== undefined) {
+      usedUserIndices.add(userIndex);
+      matchedUsers.set(userIndex, item);
+    }
   }
-  const adversarialAssistantIndices = new Set<number>();
+
   const next = messages.map((message, index) => {
-    if (message.role !== "assistant") return message;
-    const key = historyContentToPlain(message.content).trim();
-    const bucket = byAnswer.get(key);
-    const item = bucket?.shift();
-    if (!item) return message;
+    const item = matched.get(index);
+    if (message.role !== "assistant" || !item) return message;
     const persistedNl2sqlCalls = nl2sqlAuditToolCallsFromHistory(
       item.nl2sql_audits,
     );
@@ -3990,34 +4034,32 @@ function attachSuperAssistantTurnMetadata(
       attributionTaskId: item.attribution_task_id?.trim() || undefined,
       superAssistantTurnId: item.turn_id?.trim() || undefined,
     };
-    // The slash command is display metadata, not execution input. Restore a
-    // canonical visible prefix on the preceding user bubble when old clients
-    // persisted only the normalized prompt.
-    if (item.route_capability === "super_adversarial") {
-      adversarialAssistantIndices.add(index);
-    }
     return enriched;
   });
-  const adversarialUserIndices = new Set<number>();
-  for (const assistantIndex of adversarialAssistantIndices) {
-    for (let cursor = assistantIndex - 1; cursor >= 0; cursor -= 1) {
-      if (messages[cursor]?.role === "user") {
-        adversarialUserIndices.add(cursor);
-        break;
-      }
-    }
-  }
   return next.map((message, index) => {
     if (message.role !== "user") return message;
-    if (!adversarialUserIndices.has(index)) return message;
+    const item = matchedUsers.get(index);
+    if (!item || item.route_capability !== "super_adversarial") return message;
+    const persistedDisplay = item.user_message?.trim();
+    const canonicalPersistedDisplay = persistedDisplay
+      ? parseSuperAssistantSlashCommand(persistedDisplay)?.mode ===
+          "super_adversarial"
+        ? persistedDisplay
+        : `/超级对抗 ${historyUserIdentity(persistedDisplay)}`
+      : "";
     const text = historyContentToPlain(message.content).trim();
     if (
       !text ||
       parseSuperAssistantSlashCommand(text)?.mode === "super_adversarial"
     ) {
-      return message;
+      return canonicalPersistedDisplay && text !== canonicalPersistedDisplay
+        ? { ...message, content: canonicalPersistedDisplay }
+        : message;
     }
-    return { ...message, content: `/超级对抗 ${text}` };
+    return {
+      ...message,
+      content: canonicalPersistedDisplay || `/超级对抗 ${text}`,
+    };
   });
 }
 
@@ -4294,17 +4336,33 @@ export function ChatCore({
         ? (record.result as Record<string, unknown>)
         : record;
     const judgeModel =
-      typeof result.judgeModel === "string" ? result.judgeModel.trim() : "";
+      typeof result.judgeModel === "string"
+        ? result.judgeModel.trim()
+        : typeof result.judge_model === "string"
+          ? result.judge_model.trim()
+          : "";
     const winnerModel =
-      typeof result.winnerModel === "string" ? result.winnerModel.trim() : "";
+      typeof result.winnerModel === "string"
+        ? result.winnerModel.trim()
+        : typeof result.winner_model === "string"
+          ? result.winner_model.trim()
+          : "";
     const winnerReason =
-      typeof result.winnerReason === "string" ? result.winnerReason.trim() : "";
+      typeof result.winnerReason === "string"
+        ? result.winnerReason.trim()
+        : typeof result.winner_reason === "string"
+          ? result.winner_reason.trim()
+          : "";
     const adversarialRunId =
       typeof record.externalTaskId === "string"
         ? record.externalTaskId.trim()
+        : typeof record.external_task_id === "string"
+          ? record.external_task_id.trim()
         : typeof result.runId === "string"
           ? result.runId.trim()
-          : "";
+          : typeof result.run_id === "string"
+            ? result.run_id.trim()
+            : "";
     if (!judgeModel && !winnerModel && !winnerReason && !adversarialRunId)
       return;
     const next = {
@@ -4618,6 +4676,11 @@ export function ChatCore({
   const pmQueuedUserMessageIdsRef = useRef<Set<string>>(new Set());
   const pmUserMessageIdByTaskIdRef = useRef<Record<string, string>>({});
   const pmPanelReplayAbortRef = useRef<(() => void) | null>(null);
+  const adversarialStreamRunRef = useRef<{
+    runId: string;
+    abort: () => void;
+  } | null>(null);
+  const adversarialStreamGenerationRef = useRef(0);
   const pmInlineSegmentsRef = useRef<PmInlineSegment[]>([]);
   const pmActiveInlineSegmentIdRef = useRef<string | null>(null);
   const pmInlineActionByToolKeyRef = useRef<Record<string, string>>({});
@@ -4702,6 +4765,9 @@ export function ChatCore({
   }, []);
 
   const resetPmResearchState = useCallback(() => {
+    adversarialStreamGenerationRef.current += 1;
+    adversarialStreamRunRef.current?.abort();
+    adversarialStreamRunRef.current = null;
     if (pmBackgroundTaskAbortRef.current) {
       pmBackgroundTaskAbortRef.current();
       pmBackgroundTaskAbortRef.current = null;
@@ -5846,9 +5912,29 @@ export function ChatCore({
 
   const streamSuperAssistantAdversarialRun = useCallback(
     (runId: string) => {
+      const normalizedRunId = runId.trim();
+      if (!normalizedRunId) return () => undefined;
+      const existing = adversarialStreamRunRef.current;
+      if (existing?.runId === normalizedRunId) {
+        return existing.abort;
+      }
+      existing?.abort();
+      const generation = ++adversarialStreamGenerationRef.current;
+      let streamAbort: (() => void) | null = null;
+      let aborted = false;
+      const abort = () => {
+        if (aborted) return;
+        aborted = true;
+        streamAbort?.();
+        if (adversarialStreamRunRef.current?.runId === normalizedRunId) {
+          adversarialStreamRunRef.current = null;
+        }
+      };
+      adversarialStreamRunRef.current = { runId: normalizedRunId, abort };
       let finalText = "";
-      return streamChatAdversarialRunEvents(runId, {
+      streamAbort = streamChatAdversarialRunEvents(normalizedRunId, {
         onEvent: (event) => {
+          if (aborted || generation !== adversarialStreamGenerationRef.current) return;
           markStreamActivity();
           if (event.event === "final_delta" && event.delta) {
             finalText += event.delta;
@@ -5864,9 +5950,17 @@ export function ChatCore({
           applyAdversarialRunEvent(event);
         },
         onEnd: () => {
+          if (aborted || generation !== adversarialStreamGenerationRef.current) return;
+          if (adversarialStreamRunRef.current?.runId === normalizedRunId) {
+            adversarialStreamRunRef.current = null;
+          }
+          if (pmBackgroundTaskAbortRef.current === abort) {
+            pmBackgroundTaskAbortRef.current = null;
+          }
           void agentApi
-            .getChatAdversarialRun(runId)
+            .getChatAdversarialRun(normalizedRunId)
             .then((run) => {
+              if (aborted || generation !== adversarialStreamGenerationRef.current) return;
               const doneStatus = normalizeAdversarialRunStatus(run.status);
               setPmBackgroundTaskStatus(doneStatus);
               setPmPanelTaskStatus(doneStatus);
@@ -5895,6 +5989,10 @@ export function ChatCore({
             });
         },
         onError: (err) => {
+          if (aborted || generation !== adversarialStreamGenerationRef.current) return;
+          if (adversarialStreamRunRef.current?.runId === normalizedRunId) {
+            adversarialStreamRunRef.current = null;
+          }
           setPmBackgroundTaskStatus("failed");
           setPmPanelTaskStatus("failed");
           pmBackgroundTaskAbortRef.current = null;
@@ -5904,6 +6002,7 @@ export function ChatCore({
           message.error(`${t("chat.streamError")}: ${err}`);
         },
       });
+      return abort;
     },
     [
       appendAdversarialTerminalMessageIfNeeded,
@@ -5913,6 +6012,32 @@ export function ChatCore({
       t,
     ],
   );
+
+  // The parent loop publishes the specialist task handle before its
+  // `super_assistant_answer` event is necessarily consumed by the browser.
+  // Subscribe as soon as the durable run id appears so model deltas are
+  // visible during execution, while the stream helper keeps this idempotent.
+  useEffect(() => {
+    if (!superAssistantEndpoint) return;
+    const runId = activeAdversarialMeta.adversarialRunId?.trim();
+    if (!runId) return;
+    const current = adversarialStreamRunRef.current;
+    if (current?.runId === runId) return;
+    setPmBackgroundTaskId(runId);
+    setPmPanelTaskId(runId);
+    setPmBackgroundTaskStatus((status) => status ?? "running");
+    setPmPanelTaskStatus((status) => status ?? "running");
+    setPmSuppressExecutionUi(false);
+    setIsStreaming(true);
+    onStreamingChange?.(true);
+    const abort = streamSuperAssistantAdversarialRun(runId);
+    pmBackgroundTaskAbortRef.current = abort;
+  }, [
+    activeAdversarialMeta.adversarialRunId,
+    onStreamingChange,
+    streamSuperAssistantAdversarialRun,
+    superAssistantEndpoint,
+  ]);
 
   // ── Queries ──────────────────────────────────────────────────────────────────────────────────
   const runtimeSessionSource = superAssistantEndpoint

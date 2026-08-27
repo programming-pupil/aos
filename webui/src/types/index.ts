@@ -1615,6 +1615,8 @@ export interface AgentSessionHistory {
 export interface SuperAssistantTurnMessageMetadata {
   turn_id: string;
   model: string;
+  /** Exact user-visible text persisted for the durable parent turn. */
+  user_message?: string | null;
   final_text: string;
   route_capability?: string | null;
   adversarial_run_id?: string | null;

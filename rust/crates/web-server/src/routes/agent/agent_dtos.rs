@@ -73,6 +73,11 @@ pub struct SessionHistoryResponse {
 pub struct SuperAssistantTurnMessageMetadataDto {
     pub turn_id: String,
     pub model: String,
+    /// Exact user-visible text persisted for this durable turn. Runtime
+    /// messages may contain a normalized execution prompt, so history
+    /// consumers must use this field to associate metadata with its user
+    /// message instead of guessing from assistant text alone.
+    pub user_message: String,
     pub final_text: String,
     pub route_capability: Option<String>,
     pub adversarial_run_id: Option<String>,

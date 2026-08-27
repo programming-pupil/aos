@@ -144,6 +144,9 @@ pub(crate) fn extract_sql_from_llm_output(text: &str) -> String {
 mod generate_sql_tests {
     use super::{build_nl2sql_prompt, extract_sql_from_llm_output};
     use crate::routes::nl2sql::is_safe_sql;
+    use nl2sql_core::query_understanding::{
+        Intent, QueryEntities, QueryUnderstandingResult, TimeEntity,
+    };
 
     #[test]
     fn strips_markdown_fences() {
@@ -249,6 +252,39 @@ mod generate_sql_tests {
 
         assert!(prompt.contains("SQL examples are parameterized evidence"));
         assert!(prompt.contains("remove example-specific entity filters"));
+    }
+
+    #[test]
+    fn generation_prompt_does_not_reask_for_a_resolved_beijing_time_window() {
+        let qu = QueryUnderstandingResult {
+            rewritten_question: "查询今天的邀请码".into(),
+            intent: Intent::List,
+            entities: QueryEntities {
+                time: Some(TimeEntity {
+                    raw: "北京时间今天".into(),
+                    resolved_type: "relative".into(),
+                    granularity: "day".into(),
+                    ranges: vec![("2026-08-27".into(), "2026-08-28".into())],
+                }),
+                ..QueryEntities::default()
+            },
+            confidence: 0.99,
+        };
+        let prompt = build_nl2sql_prompt(
+            &serde_json::json!([]),
+            &[],
+            &[],
+            None,
+            None,
+            Some(&qu),
+            "trino",
+            false,
+            &[],
+            None,
+            &[],
+        );
+        assert!(prompt.contains("already been resolved from the user question"));
+        assert!(prompt.contains("Do not ask the user to reconfirm the range or timezone"));
     }
 }
 
@@ -564,6 +600,10 @@ pub(crate) fn build_nl2sql_prompt(
                 "MANDATORY: Apply time filter — detected time range: {} ({})",
                 range_str, t.raw
             ));
+            parts.push(
+                "MANDATORY: The time window and timezone have already been resolved from the user question (canonical timezone: Asia/Shanghai for Beijing time). Do not ask the user to reconfirm the range or timezone; apply the supplied half-open bounds directly."
+                    .to_string(),
+            );
             parts.push(
                 "MANDATORY: If a normalized time range is provided above, do NOT add extra/fallback relative-time filters from raw wording (e.g., '最近N天', DATE_SUB(NOW(), INTERVAL N DAY)) in parallel."
                     .to_string(),

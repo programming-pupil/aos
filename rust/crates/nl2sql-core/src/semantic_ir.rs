@@ -3026,7 +3026,21 @@ impl SemanticVerifier {
             )
         };
         let comparison_consistency = verify_comparison(ir, normalized_plan.as_ref());
-        let null_semantics = verify_null_semantics(ir, normalized_plan.as_ref());
+        let null_semantics = if matches!(ir.objective, AnalyticObjective::Lookup)
+            && matches!(ir.null_policy, NullPolicy::Ignore)
+        {
+            // `Ignore` is the compiler's neutral default. For row/detail
+            // lookups it does not impose an aggregate null-handling contract;
+            // requiring COUNT/IS NOT NULL here would reject valid list
+            // queries such as "return today's invite codes". Explicit Zero,
+            // SeparateBucket, or Fail policies remain strictly verified below.
+            pass(
+                "null_semantics_not_required",
+                "row lookup uses the neutral null policy without an aggregate obligation",
+            )
+        } else {
+            verify_null_semantics(ir, normalized_plan.as_ref())
+        };
         let ordering_consistency = verify_ordering(ir, normalized_plan.as_ref());
         let limit_consistency = verify_limit(ir, normalized_plan.as_ref());
         let policy_compliance = if ir.security_scope.tenant_id.trim().is_empty()
@@ -3594,6 +3608,29 @@ mod tests {
         assert_eq!(result.null_semantics.status, CheckStatus::Pass);
         assert_eq!(result.ordering_consistency.status, CheckStatus::Pass);
         assert_eq!(result.limit_consistency.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn row_lookup_neutral_null_policy_does_not_block_a_valid_list_query() {
+        let mut input = ir();
+        input.objective = AnalyticObjective::Lookup;
+        input.metrics.clear();
+        input.dimensions.clear();
+        input.grain = Grain::Row;
+        input.population.subject = "invite_codes".into();
+        input.population.dedup_key = None;
+        input.time = None;
+        input.null_policy = NullPolicy::Ignore;
+        input.limit = Some(100);
+        let result = SemanticVerifier::default().verify(
+            &input,
+            &["invite_code".into()],
+            &[],
+            &[],
+            "SELECT invite_code FROM invite_codes LIMIT 100",
+        );
+        assert_eq!(result.null_semantics.status, CheckStatus::Pass);
+        assert_eq!(result.release_decision, QueryReleaseDecision::Release);
     }
 
     #[test]

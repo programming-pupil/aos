@@ -97,7 +97,8 @@ async fn load_super_assistant_turn_message_metadata(
     }
 
     let mut turn_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-        "SELECT t.turn_id, COALESCE(t.model, '') AS model, t.final_text, t.route_capability,
+        "SELECT t.turn_id, COALESCE(t.model, '') AS model,
+                COALESCE(t.user_message, '') AS user_message, t.final_text, t.route_capability,
                 s.external_task_id AS adversarial_run_id,
                 r.judge_model, r.winner_model, r.winner_reason,
                 (SELECT sa.external_task_id
@@ -266,6 +267,7 @@ async fn load_super_assistant_turn_message_metadata(
         items.push(SuperAssistantTurnMessageMetadataDto {
             turn_id,
             model: row.try_get::<String, _>("model")?,
+            user_message: row.try_get::<String, _>("user_message")?,
             final_text: row.try_get::<String, _>("final_text")?,
             route_capability: row.try_get::<Option<String>, _>("route_capability")?,
             adversarial_run_id: row.try_get::<Option<String>, _>("adversarial_run_id")?,
