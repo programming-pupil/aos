@@ -4351,7 +4351,9 @@ export function ChatCore({
   const [slashFilter, setSlashFilter] = useState("");
   const [slashSelected, setSlashSelected] = useState(0);
   const [thinkingText, setThinkingText] = useState("");
-  const [thinkingExpanded, setThinkingExpanded] = useState(false);
+  // Reasoning is visible by default so a long-running turn is visibly active.
+  // Users can still collapse an individual thinking block from the bubble.
+  const [thinkingExpanded, setThinkingExpanded] = useState(true);
   const [thinkingLoading, setThinkingLoading] = useState(false);
   /**
    * Wall-clock duration of the current reasoning stream. Driven by
@@ -4661,7 +4663,7 @@ export function ChatCore({
   const resetThinkingState = useCallback(() => {
     setThinkingText("");
     thinkingTextRef.current = "";
-    setThinkingExpanded(false);
+    setThinkingExpanded(true);
     setThinkingLoading(false);
     thinkingLoadingRef.current = false;
     setThinkingDurationMs(undefined);

@@ -587,6 +587,30 @@ mod pm_history_tests {
     }
 
     #[test]
+    fn runtime_assistant_iterations_are_collapsed_per_user_turn() {
+        let mut messages = vec![
+            history_message("user", "北京海淀天气预报"),
+            history_message("assistant", "正在检索天气来源"),
+            history_message("assistant", "经多模型核验后的最终天气结论"),
+            history_message("user", "第二个问题"),
+            history_message("assistant", "第二个答案"),
+        ];
+        collapse_runtime_assistant_iterations(&mut messages);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| (message.role.as_str(), message.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("user", "北京海淀天气预报"),
+                ("assistant", "经多模型核验后的最终天气结论"),
+                ("user", "第二个问题"),
+                ("assistant", "第二个答案"),
+            ]
+        );
+    }
+
+    #[test]
     fn extract_pm_orch_visible_user_message_supports_retrieve_prompt() {
         let message = format!(
             "{PM_ORCH_INTERNAL_BEGIN}\ninternal\n{PM_ORCH_INTERNAL_END}\n\nUser question: 抓 Linux 社区难点\nQuery variants: 难点 | 痛点"
@@ -1053,6 +1077,7 @@ pub(super) async fn get_session_history(
                 &mut pending_pm_question,
                 &mut pending_pm_assistant,
             );
+            collapse_runtime_assistant_iterations(&mut messages);
 
             if has_durable_visible_history {
                 let runtime_user_count = messages
@@ -1146,6 +1171,7 @@ pub(super) async fn get_session_history(
                     Ok(bindings) => {
                         reconcile_pm_task_history_turns(&mut messages, &bindings);
                         assign_pm_task_bindings_to_history_messages(&mut messages, &bindings);
+                        collapse_runtime_assistant_iterations(&mut messages);
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -1227,6 +1253,8 @@ pub(super) async fn get_session_history(
             let durable_visible =
                 load_durable_visible_history(&state, &claims.tenant_id, &claims.sub, &session_id);
             if !durable_visible.is_empty() {
+                let mut durable_visible = durable_visible;
+                collapse_runtime_assistant_iterations(&mut durable_visible);
                 let (messages, page) = paginate_history_messages(
                     &durable_visible,
                     query.before_turn_cursor,

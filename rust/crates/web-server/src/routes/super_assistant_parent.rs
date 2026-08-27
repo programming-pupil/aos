@@ -1610,6 +1610,77 @@ async fn run_parent_loop(
     claims: &Claims,
     input: &UnifiedParentTurnInput,
 ) -> Result<ParentLoopFinal> {
+    // A slash-selected specialist is a hard execution contract.  Models are
+    // allowed to be imperfect at emitting function calls, so do not let a
+    // missing `super_adversarial_start` call turn into an ordinary answer.
+    // Start the same durable subtask used by the model tool path and publish
+    // its handle/progress through the normal parent event stream.
+    if input.route_hint == "super_adversarial" {
+        transition_parent_state(state, claims, input, "waiting_subagent").await?;
+        let tool = DeferredToolUse {
+            tool_use_id: format!("server-super-adversarial:{}", input.turn_id),
+            tool_name: "super_adversarial_start".to_string(),
+            input: serde_json::json!({"question": input.user_message}).to_string(),
+            metadata: "server_forced_specialist".to_string(),
+        };
+        let output = execute_or_join_subtask(state, claims, input, &tool).await?;
+        transition_parent_state(state, claims, input, "resuming_model").await?;
+        let summary = output
+            .get("summary")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                AppError::Internal(
+                    "super adversarial subtask completed without a final adjudicated answer"
+                        .to_string(),
+                )
+            })?;
+        let tool_call = ToolCallRecord {
+            index: 1,
+            tool_name: tool.tool_name,
+            source: "server".to_string(),
+            source_name: "required_specialist".to_string(),
+            input: tool.input,
+            output: output.to_string(),
+            is_error: false,
+            duration_ms: 0,
+        };
+        let submission = CompleteTurnSubmission {
+            final_answer: summary.clone(),
+            claims: Vec::new(),
+            evidence_refs: extract_urls(&summary),
+            checks_performed: vec!["server-verified multi-model adversarial subtask".to_string()],
+            remaining_uncertainty: Vec::new(),
+            risk_level: "high".to_string(),
+        };
+        let (allowed, mut completion_json) =
+            evaluate_server_completion(state, claims, input, &[tool_call.clone()], &submission)
+                .await?;
+        if !allowed {
+            return Err(AppError::Conflict(format!(
+                "super adversarial result failed completion verification: {}",
+                completion_json
+                    .get("verificationRequired")
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            )));
+        }
+        if let Some(object) = completion_json.as_object_mut() {
+            object.insert(
+                "completionSource".to_string(),
+                Value::String("server_verified_super_adversarial".to_string()),
+            );
+        }
+        transition_parent_state(state, claims, input, "verifying").await?;
+        return Ok(ParentLoopFinal {
+            answer: summary,
+            tool_calls: vec![tool_call],
+            iterations: 1,
+            completion_json,
+        });
+    }
     let manager = state.agent_manager().clone();
     let base_options = parent_turn_options(input);
     let mut active_options = base_options.clone();

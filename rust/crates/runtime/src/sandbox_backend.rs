@@ -328,17 +328,19 @@ fn build_platform_launcher(
         }
     }
 
+    let canonical_root_path = canonical_root.clone();
     let canonical_root = seatbelt_string(&canonical_root.to_string_lossy());
     let mut profile = format!(
         "(version 1)\n\
          (allow default)\n\
          (deny network*)\n\
-         (deny file-read* (subpath \"/Users\") (subpath \"/private/tmp\") (subpath \"/private/var/folders\") (subpath \"/Volumes\"))\n\
+         (deny file-read* (subpath \"/private/tmp\") (subpath \"/Volumes\"))\n\
          (deny file-write*)\n\
          (deny signal (target others))\n\
          (allow file-read* (subpath \"{canonical_root}\"))\n\
          (allow file-write* (literal \"/dev/null\"))\n"
     );
+    append_macos_workspace_path_policy(&mut profile, &canonical_root_path)?;
     for writable_root in writable_roots {
         let writable_root = seatbelt_string(&writable_root.to_string_lossy());
         profile.push_str(&format!(
@@ -355,6 +357,37 @@ fn build_platform_launcher(
         program: "/usr/bin/sandbox-exec".into(),
         args: vec!["-p".into(), profile, "/bin/sh".into(), "-c".into(), command],
     })
+}
+
+#[cfg(target_os = "macos")]
+fn append_macos_workspace_path_policy(
+    profile: &mut String,
+    workspace_root: &Path,
+) -> Result<(), String> {
+    // Seatbelt denies take precedence over descendant allows. A blanket deny
+    // on /Users or /private/var/folders therefore makes an otherwise allowed
+    // workspace look like a non-directory when a shell tries to `cd` into a
+    // child. Keep the parent chain traversable and deny every sibling at each
+    // level, so the command can reach only this authenticated workspace.
+    let mut child = workspace_root.to_path_buf();
+    while let Some(parent) = child.parent() {
+        let child_name = child
+            .file_name()
+            .ok_or_else(|| "sandbox workspace has an invalid path component".to_string())?;
+        let entries = std::fs::read_dir(parent)
+            .map_err(|error| format!("sandbox workspace parent is unavailable: {error}"))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("sandbox workspace parent read failed: {error}"))?;
+            if entry.file_name() == child_name {
+                continue;
+            }
+            let sibling = seatbelt_string(&entry.path().to_string_lossy());
+            profile.push_str(&format!("(deny file-read* (subpath \"{sibling}\"))\n"));
+        }
+        child = parent.to_path_buf();
+    }
+    Ok(())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

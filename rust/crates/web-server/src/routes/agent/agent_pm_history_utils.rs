@@ -24,6 +24,72 @@ pub(super) fn push_history_message_dedup(messages: &mut Vec<MessageDto>, candida
     messages.push(candidate);
 }
 
+/// Collapse model iterations that belong to one visible user turn.  The
+/// runtime ledger intentionally records every assistant iteration for exact
+/// recovery, but chat history should expose one assistant answer rather than
+/// intermediate drafts.  The newest textual candidate wins while useful
+/// metadata from an earlier iteration is retained.
+pub(super) fn collapse_runtime_assistant_iterations(messages: &mut Vec<MessageDto>) {
+    let mut current_user_seen = false;
+    let mut assistant_index: Option<usize> = None;
+    let mut collapsed = Vec::with_capacity(messages.len());
+    for candidate in messages.drain(..) {
+        if candidate.role == "user" {
+            current_user_seen = true;
+            assistant_index = None;
+            collapsed.push(candidate);
+            continue;
+        }
+        if candidate.role != "assistant" || !current_user_seen {
+            collapsed.push(candidate);
+            continue;
+        }
+        if let Some(index) = assistant_index {
+            let existing = &mut collapsed[index];
+            let candidate_has_text = !candidate.content.trim().is_empty();
+            if candidate_has_text {
+                let mut replacement = candidate;
+                if replacement.tool_calls.is_none() {
+                    replacement.tool_calls = existing.tool_calls.take();
+                }
+                if replacement.usage.is_none() {
+                    replacement.usage = existing.usage.take();
+                }
+                if replacement.thinking.is_none() {
+                    replacement.thinking = existing.thinking.take();
+                }
+                if replacement.pm_task_id.is_none() {
+                    replacement.pm_task_id = existing.pm_task_id.take();
+                }
+                if replacement.pm_task_status.is_none() {
+                    replacement.pm_task_status = existing.pm_task_status.take();
+                }
+                *existing = replacement;
+            } else {
+                if existing.tool_calls.is_none() {
+                    existing.tool_calls = candidate.tool_calls;
+                }
+                if existing.usage.is_none() {
+                    existing.usage = candidate.usage;
+                }
+                if existing.thinking.is_none() {
+                    existing.thinking = candidate.thinking;
+                }
+                if existing.pm_task_id.is_none() {
+                    existing.pm_task_id = candidate.pm_task_id;
+                }
+                if existing.pm_task_status.is_none() {
+                    existing.pm_task_status = candidate.pm_task_status;
+                }
+            }
+        } else {
+            assistant_index = Some(collapsed.len());
+            collapsed.push(candidate);
+        }
+    }
+    *messages = collapsed;
+}
+
 const HISTORY_DEFAULT_LIMIT_TURNS: usize = 8;
 const HISTORY_MAX_LIMIT_TURNS: usize = 30;
 const HISTORY_DEFAULT_MAX_BYTES: usize = 256 * 1024;

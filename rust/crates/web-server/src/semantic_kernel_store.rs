@@ -3851,12 +3851,6 @@ impl runtime::AgentExecutionKernel for RuntimeExecutionKernel {
         )
         .await
         .map_err(|error| runtime::RuntimeError::new(error.to_string()))?;
-        // Establish and heal per-turn model capacity at the same durable
-        // boundary as turn creation. Waiting for the first provider manifest
-        // leaves legacy long-running sessions observably exhausted between
-        // start_turn and their first model call.
-        ensure_protected_model_budgets(&mut tx, &self.tenant_id, &self.session_id, &input.turn_id)
-            .await?;
         tx.commit()
             .await
             .map_err(|error| runtime::RuntimeError::new(error.to_string()))
@@ -17262,7 +17256,9 @@ mod tests {
         .into_iter()
         .map(|stage| protected_model_budget_amounts(stage)[0].1)
         .sum::<i64>();
-        let initial_input = 1_500_000 + protected_input;
+        let initial_input =
+            protected_model_budget_amounts(runtime::RuntimeModelBudgetStage::General)[0].2;
+        let general_input = initial_input - protected_input;
         sqlx::query(
             "INSERT INTO resource_budget_accounts
                 (tenant_id, owner_scope, dimension, available, reserved, committed)
@@ -17299,12 +17295,15 @@ mod tests {
                     budget_stage: runtime::RuntimeModelBudgetStage::General,
                     system_sections: vec!["system".to_string()],
                     messages: vec![runtime::ConversationMessage::user_text("query")],
-                    estimated_tokens: 1_500_000,
+                    estimated_tokens: usize::try_from(general_input).unwrap(),
                     max_input_tokens: 2_000_000,
                     model_version: Some("test-model".to_string()),
                     active_tools: vec!["ToolSearch".to_string()],
                     semantic_snapshot_version: None,
-                    context_packet: test_context_packet(2_000_000, 1_500_000),
+                    context_packet: test_context_packet(
+                        u64::try_from(initial_input).unwrap(),
+                        u64::try_from(general_input).unwrap(),
+                    ),
                     prompt_manifest: None,
                 })
                 .await

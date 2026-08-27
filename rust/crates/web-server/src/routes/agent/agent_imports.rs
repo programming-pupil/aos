@@ -129,8 +129,8 @@ pub(super) use super::agent_pm_contract::{
     validate_exec_constraints_contract,
 };
 pub(super) use super::agent_pm_history_utils::{
-    flush_pending_pm_internal_history, merge_pending_pm_assistant, paginate_history_messages,
-    push_history_message_dedup,
+    collapse_runtime_assistant_iterations, flush_pending_pm_internal_history,
+    merge_pending_pm_assistant, paginate_history_messages, push_history_message_dedup,
 };
 pub(super) use super::agent_pm_live_retrieve::run_pm_retrieve_turn_with_live_events;
 pub(super) use super::agent_pm_llm_review::{

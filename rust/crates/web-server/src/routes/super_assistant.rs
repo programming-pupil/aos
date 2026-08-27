@@ -10669,19 +10669,27 @@ async fn legacy_super_assistant_message_handler(
     Extension(claims): Extension<crate::auth::Claims>,
     Json(req): Json<SuperAssistantMessageRequest>,
 ) -> crate::error::Result<Json<SuperAssistantMessageResponse>> {
-    let text = req.text.trim().to_string();
-    if text.is_empty() {
-        return Err(crate::error::AppError::ValidationError(
-            "message text is required".to_string(),
-        ));
-    }
-    let display_text = req
+    let raw_text = req.text.trim().to_string();
+    let display_text_candidate = req
         .display_text
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(&text)
-        .to_string();
+        .filter(|value| !value.is_empty());
+    let slash_command = parse_super_assistant_slash_command(&raw_text)
+        .or_else(|| display_text_candidate.and_then(parse_super_assistant_slash_command));
+    let text = slash_command
+        .as_ref()
+        .map_or_else(|| raw_text.clone(), |command| command.prompt.clone());
+    if text.is_empty() {
+        return Err(crate::error::AppError::ValidationError(
+            if slash_command.is_some() {
+                "slash command requires a task description".to_string()
+            } else {
+                "message text is required".to_string()
+            },
+        ));
+    }
+    let display_text = display_text_candidate.unwrap_or(&raw_text).to_string();
     let session_id = req.session_id.trim().to_string();
     if session_id.is_empty() {
         return Err(crate::error::AppError::ValidationError(
@@ -10723,10 +10731,15 @@ async fn legacy_super_assistant_message_handler(
             )));
         }
     }
-    let explicit_capability = req.explicit_capability.and_then(|value| {
+    let mut explicit_capability = req.explicit_capability.and_then(|value| {
         let trimmed = value.trim().to_string();
         (!trimmed.is_empty()).then_some(trimmed)
     });
+    let mut data_attribution = req.data_attribution;
+    if let Some(command) = slash_command {
+        explicit_capability = command.mode.explicit_capability().map(str::to_string);
+        data_attribution = command.mode == SuperAssistantSlashMode::DataAttribution;
+    }
     let data_source_id = req.data_source_id.and_then(|value| {
         let trimmed = value.trim().to_string();
         (!trimmed.is_empty()).then_some(trimmed)
@@ -10745,7 +10758,7 @@ async fn legacy_super_assistant_message_handler(
         app,
         model,
         data_source_id,
-        data_attribution: req.data_attribution,
+        data_attribution,
         router_config: req.router_config,
         new_messages: vec![ConversationMessage {
             role: MessageRole::User,
@@ -13556,7 +13569,16 @@ async fn super_assistant_message_stream_response(
     req: SuperAssistantMessageRequest,
 ) -> crate::error::Result<axum::response::Response> {
     let raw_text = req.text.trim().to_string();
-    let slash_command = parse_super_assistant_slash_command(&raw_text);
+    // Older clients send the normalized execution text in `text` and keep
+    // the original slash command only in `displayText`.  Capability selection
+    // must remain server-authoritative across both payload shapes.
+    let display_text_candidate = req
+        .display_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let slash_command = parse_super_assistant_slash_command(&raw_text)
+        .or_else(|| display_text_candidate.and_then(parse_super_assistant_slash_command));
     let dispatched_skill = if slash_command.is_none() {
         crate::routes::agent::maybe_dispatch_skill_command(&raw_text, &claims.tenant_id, &state.db)
             .await
@@ -13576,13 +13598,7 @@ async fn super_assistant_message_stream_response(
             },
         ));
     }
-    let display_text = req
-        .display_text
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(&raw_text)
-        .to_string();
+    let display_text = display_text_candidate.unwrap_or(&raw_text).to_string();
     let session_id = req.session_id.trim().to_string();
     if session_id.is_empty() {
         return Err(crate::error::AppError::ValidationError(

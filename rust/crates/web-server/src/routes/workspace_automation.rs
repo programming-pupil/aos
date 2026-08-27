@@ -1108,6 +1108,30 @@ mod tests {
             &state, "tenant-a", "user-a",
         )
         .expect("create workspace");
+        std::fs::create_dir(workspace.join("shareit-activity-main"))
+            .expect("create directory fixture");
+        let command_result = execute_workspace_command(
+            &state,
+            "tenant-a",
+            "user-a",
+            WorkspaceCommandInput {
+                command: "ls && cd -- shareit-activity-main && pwd".to_string(),
+                cwd: DEFAULT_CWD.to_string(),
+                timeout_seconds: 10,
+            },
+            None,
+        )
+        .await
+        .expect("workspace command should resolve a directory listed by ls");
+        assert_eq!(command_result.status, "succeeded", "{command_result:?}");
+        assert!(command_result
+            .stdout
+            .lines()
+            .any(|line| line.trim() == "shareit-activity-main"));
+        assert!(command_result
+            .stdout
+            .lines()
+            .any(|line| line.ends_with("/workspace/shareit-activity-main")));
 
         let created = create_schedule_for_user(
             &state,
