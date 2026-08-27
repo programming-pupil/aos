@@ -17375,7 +17375,11 @@ mod tests {
         .sum::<i64>();
         let initial_input =
             protected_model_budget_amounts(runtime::RuntimeModelBudgetStage::General)[0].2;
-        let general_input = initial_input - protected_input;
+        // Each active turn owns its protected final/domain/error slots. The
+        // two concurrent turns therefore leave this amount for ordinary
+        // model context; using only one protected allocation makes both
+        // manifests fail before the oversell check can run.
+        let general_input = initial_input - protected_input * 2;
         sqlx::query(
             "INSERT INTO resource_budget_accounts
                 (tenant_id, owner_scope, dimension, available, reserved, committed)

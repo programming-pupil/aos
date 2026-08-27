@@ -528,7 +528,7 @@ export default function Workspace() {
             {mode === 'files' && <Button icon={<FolderAddOutlined />} onClick={() => setDialog({ kind: 'new-folder', value: '' })}>{t('workspace.newFolder', 'New folder')}</Button>}
             {mode === 'files' && <Button icon={<FileAddOutlined />} onClick={() => setDialog({ kind: 'new-file', value: '' })}>{t('workspace.newFile', 'New file')}</Button>}
             {mode === 'files' && <Button icon={<CodeOutlined />} onClick={() => setCommandOpen(true)}>{t('workspace.command', 'CMD')}</Button>}
-            {mode === 'files' && <Button icon={<ClockCircleOutlined />} onClick={() => setSchedulesOpen(true)}>{t('workspace.schedules', 'Schedules')}</Button>}
+            {mode === 'files' && <Button icon={<ClockCircleOutlined />} onClick={() => { setSchedulesOpen(true); void schedulesQuery.refetch(); }}>{t('workspace.schedules', 'Schedules')}</Button>}
             <Button icon={<UploadOutlined />} loading={uploading} onClick={() => fileInputRef.current?.click()}>{t('workspace.upload', 'Upload')}</Button>
             <Tooltip title={t('common.refresh')}><Button icon={<ReloadOutlined />} onClick={() => mode === 'files' ? void filesQuery.refetch() : void uploadsQuery.refetch()} /></Tooltip>
           </Space>

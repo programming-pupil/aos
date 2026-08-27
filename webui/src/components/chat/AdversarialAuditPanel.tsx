@@ -108,7 +108,7 @@ function AdversarialAuditPanelImpl({
   const persistedTranscript = useMemo(
     () => run
       ? buildRunTimeline(run, t).filter(
-          (item) => item.role === "model" || item.role === "judge",
+          (item) => item.role === "model" || item.role === "judge" || item.role === "final",
         )
       : [],
     [run, t],
@@ -161,6 +161,8 @@ function AdversarialAuditPanelImpl({
             ? "model"
             : event.event.startsWith("judge_")
               ? "judge"
+              : event.event.startsWith("final_")
+                ? "final"
               : null;
           if (!role || !event.messageId) return;
           const isDelta = event.event.endsWith("_delta");
@@ -178,7 +180,9 @@ function AdversarialAuditPanelImpl({
             const model = event.model || existing?.model || t("chat.adversarialUnknownModel");
             const title = role === "judge"
               ? t("chat.adversarialJudgeWithModel", { model })
-              : model;
+              : role === "final"
+                ? t("chat.adversarialFinalWithModel", { model })
+                : model;
             const content = visibleAdversarialText(nextRaw)
               || (isStarted ? "" : event.error || existing?.content || t("chat.adversarialNoTrace"));
             return {
@@ -189,7 +193,9 @@ function AdversarialAuditPanelImpl({
                 title,
                 subtitle: role === "judge"
                   ? t("chat.adversarialRoundJudge", { round: event.round || "?" })
-                  : t("chat.adversarialRoundSpeech", { round: event.round || "?" }),
+                  : role === "final"
+                    ? t("chat.adversarialFinal")
+                    : t("chat.adversarialRoundSpeech", { round: event.round || "?" }),
                 content,
                 model,
                 round: event.round ?? existing?.round,

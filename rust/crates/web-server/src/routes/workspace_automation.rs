@@ -276,6 +276,14 @@ fn normalize_schedule_workspace_path(
             "workspace path is required".to_string(),
         ));
     }
+    // The command/schedule API accepts the conventional shell cwd spellings
+    // as aliases for the authenticated workspace root. Normalize them before
+    // adding the virtual prefix so `.` is never treated as a path component.
+    let raw = if matches!(raw, "." | "./") {
+        DEFAULT_CWD
+    } else {
+        raw
+    };
     let root =
         super::personal_workspace::ensure_workspace_root_for_user(state, tenant_id, user_id)?;
     let root_display = root.to_string_lossy();
@@ -1108,6 +1116,16 @@ mod tests {
             &state, "tenant-a", "user-a",
         )
         .expect("create workspace");
+        assert_eq!(
+            normalize_schedule_workspace_path(&state, "tenant-a", "user-a", ".", false)
+                .expect("dot cwd should resolve to workspace root"),
+            DEFAULT_CWD
+        );
+        assert_eq!(
+            normalize_schedule_workspace_path(&state, "tenant-a", "user-a", "./", false)
+                .expect("dot-slash cwd should resolve to workspace root"),
+            DEFAULT_CWD
+        );
         std::fs::create_dir(workspace.join("shareit-activity-main"))
             .expect("create directory fixture");
         let command_result = execute_workspace_command(

@@ -3960,7 +3960,8 @@ function attachSuperAssistantTurnMetadata(
     bucket.push(item);
     byAnswer.set(key, bucket);
   }
-  return messages.map((message) => {
+  const adversarialAssistantIndices = new Set<number>();
+  const next = messages.map((message, index) => {
     if (message.role !== "assistant") return message;
     const key = historyContentToPlain(message.content).trim();
     const bucket = byAnswer.get(key);
@@ -3978,7 +3979,7 @@ function attachSuperAssistantTurnMetadata(
             ...persistedNl2sqlCalls,
           ]
         : message.toolCalls;
-    return {
+    const enriched = {
       ...message,
       toolCalls,
       modelName: item.model?.trim() || message.modelName,
@@ -3989,6 +3990,34 @@ function attachSuperAssistantTurnMetadata(
       attributionTaskId: item.attribution_task_id?.trim() || undefined,
       superAssistantTurnId: item.turn_id?.trim() || undefined,
     };
+    // The slash command is display metadata, not execution input. Restore a
+    // canonical visible prefix on the preceding user bubble when old clients
+    // persisted only the normalized prompt.
+    if (item.route_capability === "super_adversarial") {
+      adversarialAssistantIndices.add(index);
+    }
+    return enriched;
+  });
+  const adversarialUserIndices = new Set<number>();
+  for (const assistantIndex of adversarialAssistantIndices) {
+    for (let cursor = assistantIndex - 1; cursor >= 0; cursor -= 1) {
+      if (messages[cursor]?.role === "user") {
+        adversarialUserIndices.add(cursor);
+        break;
+      }
+    }
+  }
+  return next.map((message, index) => {
+    if (message.role !== "user") return message;
+    if (!adversarialUserIndices.has(index)) return message;
+    const text = historyContentToPlain(message.content).trim();
+    if (
+      !text ||
+      parseSuperAssistantSlashCommand(text)?.mode === "super_adversarial"
+    ) {
+      return message;
+    }
+    return { ...message, content: `/超级对抗 ${text}` };
   });
 }
 
@@ -5758,33 +5787,9 @@ export function ChatCore({
       if (!isAdversarialRunTerminalStatus(nextStatus)) {
         pmActiveInlineSegmentIdRef.current = segmentId;
       }
-      const isReplyEvent =
-        event.event.startsWith("model_") ||
-        event.event.startsWith("judge_") ||
-        event.event.startsWith("final_");
-      const isReplyDelta = event.event.endsWith("_delta");
-      if (isReplyEvent && !isReplyDelta) {
-        const roleLabel = event.event.startsWith("judge_")
-          ? "裁判模型"
-          : event.event.startsWith("final_")
-            ? "汇总模型"
-            : "参与模型";
-        const model = event.model?.trim() || "未知模型";
-        const status: PmInlineAction["status"] = event.event.endsWith("_failed")
-          ? "error"
-          : event.event.endsWith("_completed")
-            ? "success"
-            : "running";
-        const response = (event.text || event.error || "").trim();
-        upsertPmInlineAction(event.messageId, event.round ?? 0, {
-          name: model,
-          source: "builtin",
-          status,
-          detail: response
-            ? `${roleLabel} ${model}：${shortHumanText(response, 520)}`
-            : `${roleLabel} ${model}${status === "running" ? "正在回复" : "已完成回复"}`,
-        });
-      }
+      // Model, judge and final transcripts belong to the dedicated
+      // AdversarialAuditPanel. Duplicating them into the generic PM action
+      // trail produced a different live layout from the restored history.
       if (isAdversarialRunTerminalStatus(nextStatus)) {
         pmActiveInlineSegmentIdRef.current = null;
         setIsStreaming(false);
@@ -5795,7 +5800,6 @@ export function ChatCore({
       ensurePmInlineSegment,
       onStreamingChange,
       superAssistantEndpoint,
-      upsertPmInlineAction,
     ],
   );
 
@@ -12365,7 +12369,7 @@ export function ChatCore({
                 extraPanel={
                   superAssistantEndpoint ? (
                     <>
-                      {pmInlineNarrativePanel}
+                      {!liveAdversarialRunId ? pmInlineNarrativePanel : null}
                       {liveAdversarialRunId ? (
                         <AdversarialAuditPanel
                           runId={liveAdversarialRunId}

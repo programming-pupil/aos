@@ -10168,6 +10168,14 @@ pub(crate) enum SuperAssistantSlashMode {
 
 #[cfg(feature = "bot-agents")]
 impl SuperAssistantSlashMode {
+    pub(crate) const fn visible_prefix(self) -> &'static str {
+        match self {
+            Self::DataAttribution => "/数据归因",
+            Self::DeepResearch => "/深度研究",
+            Self::SuperAdversarial => "/超级对抗",
+        }
+    }
+
     pub(crate) const fn explicit_capability(self) -> Option<&'static str> {
         match self {
             Self::DataAttribution => None,
@@ -10208,6 +10216,24 @@ pub(crate) fn parse_super_assistant_slash_command(
         _ => return None,
     };
     Some(ParsedSuperAssistantSlashCommand { mode, prompt })
+}
+
+#[cfg(feature = "bot-agents")]
+fn canonical_super_assistant_display_text(
+    raw_text: &str,
+    display_text_candidate: Option<&str>,
+    slash_command: Option<&ParsedSuperAssistantSlashCommand>,
+) -> String {
+    match (slash_command, display_text_candidate) {
+        // Some clients send the normalized prompt in both fields. Preserve a
+        // canonical visible mode prefix in durable history.
+        (Some(command), Some(candidate)) if !candidate.trim_start().starts_with('/') => {
+            format!("{} {}", command.mode.visible_prefix(), command.prompt)
+        }
+        (Some(command), None) => format!("{} {}", command.mode.visible_prefix(), command.prompt),
+        (_, Some(candidate)) => candidate.to_string(),
+        (_, None) => raw_text.to_string(),
+    }
 }
 
 #[cfg(feature = "bot-agents")]
@@ -10689,7 +10715,11 @@ async fn legacy_super_assistant_message_handler(
             },
         ));
     }
-    let display_text = display_text_candidate.unwrap_or(&raw_text).to_string();
+    let display_text = canonical_super_assistant_display_text(
+        &raw_text,
+        display_text_candidate,
+        slash_command.as_ref(),
+    );
     let session_id = req.session_id.trim().to_string();
     if session_id.is_empty() {
         return Err(crate::error::AppError::ValidationError(
@@ -12864,6 +12894,15 @@ fn explicitly_requests_super_adversarial(explicit_capability: Option<&str>) -> b
 }
 
 #[cfg(feature = "bot-agents")]
+fn route_requires_unified_parent(route: &SessionRouteOutcome) -> bool {
+    route
+        .decision
+        .required_evidence
+        .iter()
+        .any(|requirement| requirement == "workspace_automation")
+}
+
+#[cfg(feature = "bot-agents")]
 impl UnifiedAssistantFeatureModes {
     fn execution_mode(&self) -> &'static str {
         if self.parent_loop == "shadow" {
@@ -12885,11 +12924,12 @@ impl UnifiedAssistantFeatureModes {
 #[cfg(all(test, feature = "bot-agents"))]
 mod unified_feature_mode_tests {
     use super::{
-        apply_skill_route_override, deterministic_workspace_automation_requirement,
+        apply_skill_route_override, canonical_super_assistant_display_text,
+        deterministic_workspace_automation_requirement,
         enforce_deterministic_workspace_automation_contract, explicitly_requests_super_adversarial,
-        parse_super_assistant_slash_command, skill_directive_name, RouteDecision,
-        RouteDecisionEvent, RouteSource, SessionContextSnapshot, SessionRouteOutcome,
-        SuperAssistantSlashMode, UnifiedAssistantFeatureModes,
+        parse_super_assistant_slash_command, route_requires_unified_parent, skill_directive_name,
+        RouteDecision, RouteDecisionEvent, RouteSource, SessionContextSnapshot,
+        SessionRouteOutcome, SuperAssistantSlashMode, UnifiedAssistantFeatureModes,
     };
 
     #[test]
@@ -12913,6 +12953,20 @@ mod unified_feature_mode_tests {
             assert!(!parsed.prompt.is_empty());
             assert!(!parsed.prompt.starts_with('/'));
         }
+    }
+
+    #[test]
+    fn normalized_slash_payload_keeps_its_visible_mode_after_reload() {
+        let parsed = parse_super_assistant_slash_command("/超级对抗 北京海淀天气")
+            .expect("parse adversarial command");
+        assert_eq!(
+            canonical_super_assistant_display_text(
+                "北京海淀天气",
+                Some("北京海淀天气"),
+                Some(&parsed),
+            ),
+            "/超级对抗 北京海淀天气"
+        );
     }
 
     #[test]
@@ -13066,6 +13120,7 @@ mod unified_feature_mode_tests {
             route.event.required_evidence,
             route.decision.required_evidence
         );
+        assert!(route_requires_unified_parent(&route));
     }
 }
 
@@ -13478,7 +13533,12 @@ async fn prepare_and_start_super_assistant_stream_turn(
     )
     .await;
 
-    if feature_modes.parent_loop == "off" {
+    // Workspace automation has a durable, user-visible schedule contract. It
+    // must use the unified parent even while the general parent-loop rollout
+    // is disabled; the legacy chat-stream path cannot run the server-side
+    // schedule commit fallback and would leave a script without a schedule.
+    let force_unified_parent = route_requires_unified_parent(&route_outcome);
+    if feature_modes.parent_loop == "off" && !force_unified_parent {
         let route_capability = route_outcome.decision.target_capability.clone();
         if matches!(
             route_capability.as_str(),
@@ -13598,7 +13658,11 @@ async fn super_assistant_message_stream_response(
             },
         ));
     }
-    let display_text = display_text_candidate.unwrap_or(&raw_text).to_string();
+    let display_text = canonical_super_assistant_display_text(
+        &raw_text,
+        display_text_candidate,
+        slash_command.as_ref(),
+    );
     let session_id = req.session_id.trim().to_string();
     if session_id.is_empty() {
         return Err(crate::error::AppError::ValidationError(

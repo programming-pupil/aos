@@ -3918,19 +3918,50 @@ async fn call_adversarial_model(
                 Duration::from_secs(timeout_secs),
                 provider.send_message(&fallback_request),
             )
-            .await
-            .map_err(|_| {
-                AppError::Internal(format!(
-                    "model {} timed out after {}s",
-                    runtime.model, timeout_secs
-                ))
-            })?
-            .map_err(|e| {
-                AppError::Internal(format!(
-                    "model {} stream init failed ({stream_error}); non-stream fallback failed: {e}",
-                    runtime.model
-                ))
-            })?;
+            .await;
+            let response = match response {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    let message = format!(
+                        "model {} stream init failed ({stream_error}); non-stream fallback failed: {error}",
+                        runtime.model
+                    );
+                    emit_chat_adversarial_event(
+                        run_id,
+                        Some(thread_id),
+                        &context,
+                        &format!("{}_failed", context.event_prefix),
+                        None,
+                        None,
+                        Some(message.clone()),
+                        Some("failed".to_string()),
+                        Some(&runtime.model),
+                        true,
+                        None,
+                    )
+                    .await;
+                    return Err(AppError::Internal(message));
+                }
+                Err(_) => {
+                    let message =
+                        format!("model {} timed out after {}s", runtime.model, timeout_secs);
+                    emit_chat_adversarial_event(
+                        run_id,
+                        Some(thread_id),
+                        &context,
+                        &format!("{}_failed", context.event_prefix),
+                        None,
+                        None,
+                        Some(message.clone()),
+                        Some("failed".to_string()),
+                        Some(&runtime.model),
+                        true,
+                        None,
+                    )
+                    .await;
+                    return Err(AppError::Internal(message));
+                }
+            };
             let raw_answer = extract_response_text(&response);
             let (answer, consensus_vote, evidence_request) = if context.phase == "review" {
                 let (answer, vote) = parse_review_answer(&raw_answer);
@@ -3994,9 +4025,28 @@ async fn call_adversarial_model(
                 return Err(AppError::Internal(error));
             }
             next = stream.next_event() => {
-                let event = next.map_err(|e| {
-                    AppError::Internal(format!("model {} stream failed: {e}", runtime.model))
-                })?;
+                let event = match next {
+                    Ok(event) => event,
+                    Err(error) => {
+                        let message = format!("model {} stream failed: {error}", runtime.model);
+                        let failed_event = format!("{}_failed", context.event_prefix);
+                        emit_chat_adversarial_event(
+                            run_id,
+                            Some(thread_id),
+                            &context,
+                            &failed_event,
+                            None,
+                            Some(answer.clone()),
+                            Some(message.clone()),
+                            Some("failed".to_string()),
+                            Some(&runtime.model),
+                            true,
+                            None,
+                        )
+                        .await;
+                        return Err(AppError::Internal(message));
+                    }
+                };
                 let Some(event) = event else {
                     break;
                 };

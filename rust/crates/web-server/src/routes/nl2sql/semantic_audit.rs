@@ -139,9 +139,16 @@ pub(crate) fn apply_query_understanding(
     }
 
     if let Some(subject) = understanding.entities.subject.as_ref() {
-        let proposed_subject = (!subject.raw.trim().is_empty())
-            .then(|| subject.raw.trim().to_string())
-            .or_else(|| subject.tables.first().cloned());
+        // A governed physical relation is stronger than the raw human entity
+        // label. Using the label first (for example "邀请码") makes later SQL
+        // verification look for a table literally named after that label.
+        let proposed_subject = subject
+            .tables
+            .iter()
+            .map(|table| table.trim())
+            .find(|table| !table.is_empty())
+            .map(str::to_string)
+            .or_else(|| (!subject.raw.trim().is_empty()).then(|| subject.raw.trim().to_string()));
         if intent.population.subject == "query_rows" {
             if let Some(subject) = proposed_subject {
                 intent.population.subject = subject;
@@ -394,6 +401,21 @@ pub(crate) fn bind_schema_dimensions(
     explicit_columns: &[String],
 ) {
     crate::behavior_trace("SQL-005");
+    let mut relations = schema_tables
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|table| {
+            table
+                .get("name")
+                .or_else(|| table.get("table_name"))
+                .and_then(Value::as_str)
+        })
+        .map(|relation| relation.trim().to_string())
+        .filter(|relation| !relation.is_empty())
+        .collect::<Vec<_>>();
+    relations.sort_unstable_by_key(|relation| relation.to_ascii_lowercase());
+    relations.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
     let mut columns = schema_tables
         .as_array()
         .into_iter()
@@ -422,6 +444,20 @@ pub(crate) fn bind_schema_dimensions(
     );
     columns.sort_unstable_by_key(|column| column.to_ascii_lowercase());
     columns.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    // Query-understanding models can still return a raw human label when no
+    // table candidate was available. Bind it only when the governed schema
+    // proves one relation. Ambiguous multi-table packets remain fail-closed.
+    if matches!(intent.objective, AnalyticObjective::Lookup)
+        && intent.population.subject != "query_rows"
+    {
+        if let Some(relation) = relations
+            .iter()
+            .find(|relation| relation.eq_ignore_ascii_case(&intent.population.subject))
+            .or_else(|| (relations.len() == 1).then(|| &relations[0]))
+        {
+            intent.population.subject.clone_from(relation);
+        }
+    }
     if columns.is_empty() {
         for dimension in &intent.dimensions {
             intent.unresolved.push(SemanticAmbiguity {
@@ -1172,6 +1208,38 @@ mod tests {
         );
         assert_eq!(explicit.dimensions[0].column, "created_date");
         assert!(explicit.unresolved.is_empty());
+    }
+
+    #[test]
+    fn lookup_entity_label_is_not_treated_as_a_physical_table_name() {
+        let mut lookup =
+            compile_question_intent("tenant", "ds", "查一下北京时间今天的全部邀请码", &[]);
+        lookup.objective = AnalyticObjective::Lookup;
+        lookup.population.subject = "邀请码".to_string();
+        bind_schema_dimensions(
+            &mut lookup,
+            &serde_json::json!([{
+                "table_name": "invite_codes",
+                "columns": [{"name": "invite_code"}, {"name": "created_at"}]
+            }]),
+            &[],
+        );
+
+        assert_eq!(lookup.population.subject, "invite_codes");
+
+        let mut ambiguous =
+            compile_question_intent("tenant", "ds", "查一下北京时间今天的全部邀请码", &[]);
+        ambiguous.objective = AnalyticObjective::Lookup;
+        ambiguous.population.subject = "邀请码".to_string();
+        bind_schema_dimensions(
+            &mut ambiguous,
+            &serde_json::json!([
+                {"table_name": "invite_codes", "columns": [{"name": "invite_code"}]},
+                {"table_name": "invite_events", "columns": [{"name": "invite_code"}]}
+            ]),
+            &[],
+        );
+        assert_eq!(ambiguous.population.subject, "邀请码");
     }
 
     #[test]

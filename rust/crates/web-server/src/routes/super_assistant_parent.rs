@@ -1182,6 +1182,14 @@ fn parent_turn_options(input: &UnifiedParentTurnInput) -> AgentTurnOptions {
             "workspace_schedule_cancel".to_string(),
         ]);
     } else {
+        // Legacy Cron* tools use a process-local registry and cannot be shown
+        // or managed by the durable workspace schedule panel. Force all
+        // workspace automation through the tenant-scoped persistent tools.
+        options.blocked_tools.extend([
+            "CronCreate".to_string(),
+            "CronDelete".to_string(),
+            "CronList".to_string(),
+        ]);
         options.system_instructions.push(
             "Authenticated workspace protocol: this session has an isolated per-user workspace. When the user asks you to create, update, or repair a code/document file, use the authorized write_file or edit_file tool directly inside that workspace; do not claim that file-writing tools are unavailable. Keep every path relative to the workspace or otherwise prove it stays inside the workspace. Use read_file/grep_search first when existing content must be preserved, and report the exact files changed after the write. Do not write outside the authenticated workspace or use host paths. For recurring behavior, first create a maintainable script in the workspace with write_file, then call workspace_schedule_create with a relative command that runs it. Maintain schedules with workspace_schedule_list/update/cancel; never claim that system crontab is required."
                 .to_string(),
@@ -1923,8 +1931,32 @@ async fn run_parent_loop(
 /// A model can successfully write the requested script and still stop before
 /// issuing the deferred schedule tool.  For an explicit automation contract,
 /// commit the schedule server-side from that successful write.  This is
-/// idempotent per parent session and keeps the operation usable for people who
-/// do not know the internal tool protocol.
+/// Idempotency is scoped to the same session and schedule identity, so retries
+/// cannot duplicate one job while later turns can still create different jobs.
+fn fallback_schedule_identity_matches(
+    schedule_session_id: Option<&str>,
+    schedule_script_path: Option<&str>,
+    schedule_command: &str,
+    schedule_cron_expression: &str,
+    schedule_timezone: &str,
+    parent_session_id: &str,
+    script_path: &str,
+    command: &str,
+    cron_expression: &str,
+    timezone: &str,
+) -> bool {
+    schedule_session_id == Some(parent_session_id)
+        && schedule_script_path.is_some_and(|path| {
+            path == script_path
+                || path
+                    .strip_prefix("/projects/session/")
+                    .is_some_and(|relative| relative == script_path)
+        })
+        && schedule_command == command
+        && schedule_cron_expression == cron_expression
+        && schedule_timezone == timezone
+}
+
 async fn ensure_workspace_schedule_commit(
     state: &AppState,
     claims: &Claims,
@@ -1946,16 +1978,6 @@ async fn ensure_workspace_schedule_commit(
     {
         return Ok(None);
     }
-    let existing =
-        super::workspace_automation::list_schedules_for_user(state, &claims.tenant_id, &claims.sub)
-            .await?;
-    if existing
-        .iter()
-        .any(|schedule| schedule.session_id.as_deref() == Some(parent.session_id.as_str()))
-    {
-        return Ok(None);
-    }
-
     let mut script: Option<(String, String)> = None;
     for call in tool_calls.iter().filter(|call| {
         call.tool_name.eq_ignore_ascii_case("write_file") && tool_call_effectively_succeeded(call)
@@ -2005,9 +2027,29 @@ async fn ensure_workspace_schedule_commit(
         _ => "bash",
     };
     let quoted_script_path = format!("'{}'", script_path.replace('\'', "'\\''"));
+    let command = format!("{interpreter} ./{quoted_script_path}");
+    let existing =
+        super::workspace_automation::list_schedules_for_user(state, &claims.tenant_id, &claims.sub)
+            .await?;
+    if existing.iter().any(|schedule| {
+        fallback_schedule_identity_matches(
+            schedule.session_id.as_deref(),
+            schedule.script_path.as_deref(),
+            &schedule.command,
+            &schedule.cron_expression,
+            &schedule.timezone,
+            &parent.session_id,
+            &script_path,
+            &command,
+            &cron_expression,
+            &timezone,
+        )
+    }) {
+        return Ok(None);
+    }
     let request = super::workspace_automation::CreateWorkspaceScheduleInput {
         name: format!("AOS recurring task: {}", script_path),
-        command: format!("{interpreter} ./{quoted_script_path}"),
+        command,
         cwd: "/projects/session".to_string(),
         cron_expression,
         timezone,
@@ -10503,8 +10545,9 @@ mod tests {
         attribution_verification_summary, attribution_worker_is_stale,
         build_parent_terminal_events, completion_repair_instruction, completion_repair_options,
         degraded_completion_answer, direct_response_can_finalize, extract_urls,
-        extract_workspace_paths, final_delta_checkpoint_payload, has_multiple_completion_calls,
-        is_terminal, load_parent_cancellation_state, merge_json, model_completion_issues,
+        extract_workspace_paths, fallback_schedule_identity_matches,
+        final_delta_checkpoint_payload, has_multiple_completion_calls, is_terminal,
+        load_parent_cancellation_state, merge_json, model_completion_issues,
         native_child_control_is_supported, nl2sql_execution_is_usable, ordered_deferred_results,
         ordinary_live_lookup_tool_budget, ordinary_web_failure_fallback_answer,
         ordinary_web_fallback_allowed, ordinary_web_rejection_reason,
@@ -11869,6 +11912,34 @@ mod tests {
         };
 
         assert!(!tool_call_effectively_succeeded(&incomplete));
+    }
+
+    #[test]
+    fn schedule_fallback_deduplicates_only_the_same_schedule_identity() {
+        assert!(fallback_schedule_identity_matches(
+            Some("session-a"),
+            Some("/projects/session/gen_hello.sh"),
+            "bash ./'gen_hello.sh'",
+            "* * * * *",
+            "Asia/Shanghai",
+            "session-a",
+            "gen_hello.sh",
+            "bash ./'gen_hello.sh'",
+            "* * * * *",
+            "Asia/Shanghai",
+        ));
+        assert!(!fallback_schedule_identity_matches(
+            Some("session-a"),
+            Some("/projects/session/gen_report.sh"),
+            "bash ./'gen_report.sh'",
+            "* * * * *",
+            "Asia/Shanghai",
+            "session-a",
+            "gen_hello.sh",
+            "bash ./'gen_hello.sh'",
+            "* * * * *",
+            "Asia/Shanghai",
+        ));
     }
 
     #[test]

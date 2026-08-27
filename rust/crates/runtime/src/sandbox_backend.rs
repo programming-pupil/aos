@@ -334,7 +334,7 @@ fn build_platform_launcher(
         "(version 1)\n\
          (allow default)\n\
          (deny network*)\n\
-         (deny file-read* (subpath \"/private/tmp\") (subpath \"/Volumes\"))\n\
+         (deny file-read* (subpath \"/private/tmp\") (subpath \"/Volumes\") (subpath \"/Users/Shared\"))\n\
          (deny file-write*)\n\
          (deny signal (target others))\n\
          (allow file-read* (subpath \"{canonical_root}\"))\n\
@@ -348,14 +348,23 @@ fn build_platform_launcher(
         ));
     }
     let command = format!(
-        "export HOME={} TMPDIR={}; exec /bin/sh -lc {}",
+        // Login shells read host `/etc/profile`, which is intentionally not
+        // part of the Seatbelt workspace policy and can hang or fail closed.
+        // The launcher already supplies a bounded PATH and private HOME/TMPDIR.
+        "export HOME={} TMPDIR={}; exec /bin/bash -c {}",
         shell_single_quote(&sandbox_home.to_string_lossy()),
         shell_single_quote(&sandbox_tmp.to_string_lossy()),
         shell_single_quote(command),
     );
     Ok(SandboxLauncher {
         program: "/usr/bin/sandbox-exec".into(),
-        args: vec!["-p".into(), profile, "/bin/sh".into(), "-c".into(), command],
+        args: vec![
+            "-p".into(),
+            profile,
+            "/bin/bash".into(),
+            "-c".into(),
+            command,
+        ],
     })
 }
 
@@ -371,6 +380,12 @@ fn append_macos_workspace_path_policy(
     // level, so the command can reach only this authenticated workspace.
     let mut child = workspace_root.to_path_buf();
     while let Some(parent) = child.parent() {
+        // Keep system roots traversable. Denying every sibling of `/Users`
+        // also denies `/bin` and the `/private` target of macOS system
+        // symlinks, preventing the sandboxed shell from starting at all.
+        if parent == Path::new("/") {
+            break;
+        }
         let child_name = child
             .file_name()
             .ok_or_else(|| "sandbox workspace has an invalid path component".to_string())?;

@@ -101,7 +101,6 @@ const { TextArea } = Input;
 const { Panel } = Collapse;
 
 const LazyChartPanel = lazy(() => import('@/components/nl2sql/ChartPanel').then((mod) => ({ default: mod.ChartPanel as ComponentType<ChartPanelProps> })));
-const EMPTY_REFERENCE_PACKS: Nl2sqlReferencePack[] = [];
 
 function dataSourceTables(dataSource?: DataSourceInfo | null) {
   const schema = dataSource?.schema_info as unknown;
@@ -1986,12 +1985,6 @@ export default function Nl2sql() {
   const [schemaDrawerOpen, setSchemaDrawerOpen] = useState(false);
   const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(false);
   const [feedbackReasonByTurn, setFeedbackReasonByTurn] = useState<Record<string, string | null>>({});
-  const [advancedSettingsOpen, setAdvancedSettingsOpen] = useState(false);
-  const [referencePopoverOpen, setReferencePopoverOpen] = useState(false);
-  const [selectedReferencePackIds, setSelectedReferencePackIds] = useState<string[]>([]);
-  const [selectedReferenceFileIds, setSelectedReferenceFileIds] = useState<string[]>([]);
-  const [includeAllReferences, setIncludeAllReferences] = useState(false);
-  const [uploadingReferencePackId, setUploadingReferencePackId] = useState<string | null>(null);
   const [savingKnowledgeTurnIds, setSavingKnowledgeTurnIds] = useState<Record<string, boolean>>({});
 
   const SLASH_COMMANDS: Array<{
@@ -2126,138 +2119,9 @@ export default function Nl2sql() {
     staleTime: 60_000,
   });
 
-  const { data: referencePacks = EMPTY_REFERENCE_PACKS, isLoading: referencePacksLoading } = useQuery({
-    queryKey: queryKeys.nl2sql.referencePacks(selectedDataSourceId ?? ''),
-    queryFn: () => nl2sqlApi.listReferencePacks(selectedDataSourceId!),
-    enabled: !!selectedDataSourceId,
-    staleTime: 30_000,
-  });
-
-  useEffect(() => {
-    setSelectedReferencePackIds([]);
-    setSelectedReferenceFileIds([]);
-    setIncludeAllReferences(false);
-    setReferencePopoverOpen(false);
-  }, [selectedDataSourceId]);
-
-  useEffect(() => {
-    const enabledPackIds = new Set(referencePacks.filter((pack) => pack.enabled).map((pack) => pack.id));
-    const enabledFileIds = new Set(
-      referencePacks
-        .filter((pack) => pack.enabled)
-        .flatMap((pack) => pack.files.map((file) => file.id)),
-    );
-    setSelectedReferencePackIds((prev) => prev.filter((id) => enabledPackIds.has(id)));
-    setSelectedReferenceFileIds((prev) => prev.filter((id) => enabledFileIds.has(id)));
-  }, [referencePacks]);
-
-  const referencePackNameById = useMemo(() => {
-    const map = new Map<string, string>();
-    referencePacks.forEach((pack) => map.set(pack.id, pack.name));
-    return map;
-  }, [referencePacks]);
-
-  const referenceFileNameById = useMemo(() => {
-    const map = new Map<string, string>();
-    referencePacks.forEach((pack) => pack.files.forEach((file) => map.set(file.id, file.filename)));
-    return map;
-  }, [referencePacks]);
-
-  const selectedReferenceSummary = useMemo(() => {
-    if (includeAllReferences) return t('nl2sql.references.allSelected');
-    const count = selectedReferencePackIds.length + selectedReferenceFileIds.length;
-    if (count === 0) return t('nl2sql.references.noneSelected');
-    return t('nl2sql.references.selectedCount', { count });
-  }, [includeAllReferences, selectedReferenceFileIds.length, selectedReferencePackIds.length, t]);
-  const referenceOverrideActive =
-    includeAllReferences || selectedReferencePackIds.length > 0 || selectedReferenceFileIds.length > 0;
-
   const buildReferenceBindings = useCallback((): Nl2sqlReferenceBindings | undefined => {
     return { includeAll: true, packIds: [], fileIds: [] };
   }, []);
-
-  const createReferencePackMutation = useMutation({
-    mutationFn: (name: string) => {
-      if (!selectedDataSourceId) throw new Error(t('nl2sql.selectDataSourceFirst'));
-      return nl2sqlApi.createReferencePack({ datasourceId: selectedDataSourceId, name });
-    },
-    onSuccess: () => {
-      if (selectedDataSourceId) {
-        qc.invalidateQueries({ queryKey: queryKeys.nl2sql.referencePacks(selectedDataSourceId) });
-      }
-      message.success(t('nl2sql.references.packCreated'));
-    },
-    onError: (err: unknown) => {
-      message.error(err instanceof Error ? err.message : t('nl2sql.references.packCreateFailed'));
-    },
-  });
-
-  const uploadReferenceMutation = useMutation({
-    mutationFn: ({ packId, file }: { packId: string; file: File }) =>
-      nl2sqlApi.uploadReferenceFile(packId, file),
-    onMutate: ({ packId }) => {
-      setUploadingReferencePackId(packId);
-    },
-    onSuccess: () => {
-      if (selectedDataSourceId) {
-        qc.invalidateQueries({ queryKey: queryKeys.nl2sql.referencePacks(selectedDataSourceId) });
-      }
-      message.success(t('nl2sql.references.fileUploaded'));
-    },
-    onError: (err: unknown) => {
-      message.error(err instanceof Error ? err.message : t('nl2sql.references.fileUploadFailed'));
-    },
-    onSettled: () => {
-      setUploadingReferencePackId(null);
-    },
-  });
-
-  const updateReferencePackMutation = useMutation({
-    mutationFn: ({ pack, enabled }: { pack: Nl2sqlReferencePack; enabled: boolean }) =>
-      nl2sqlApi.updateReferencePack(pack.id, { enabled }),
-    onSuccess: (pack) => {
-      if (selectedDataSourceId) {
-        qc.invalidateQueries({ queryKey: queryKeys.nl2sql.referencePacks(selectedDataSourceId) });
-      }
-      if (!pack.enabled) {
-        setSelectedReferencePackIds((prev) => prev.filter((id) => id !== pack.id));
-        setSelectedReferenceFileIds((prev) => prev.filter((id) => !pack.files.some((file) => file.id === id)));
-      }
-      message.success(pack.enabled ? t('nl2sql.references.packEnabled') : t('nl2sql.references.packDisabled'));
-    },
-    onError: (err: unknown) => {
-      message.error(err instanceof Error ? err.message : t('nl2sql.references.packUpdateFailed'));
-    },
-  });
-
-  const deleteReferencePackMutation = useMutation({
-    mutationFn: (pack: Nl2sqlReferencePack) => nl2sqlApi.deleteReferencePack(pack.id).then(() => pack),
-    onSuccess: (pack) => {
-      if (selectedDataSourceId) {
-        qc.invalidateQueries({ queryKey: queryKeys.nl2sql.referencePacks(selectedDataSourceId) });
-      }
-      setSelectedReferencePackIds((prev) => prev.filter((id) => id !== pack.id));
-      setSelectedReferenceFileIds((prev) => prev.filter((id) => !pack.files.some((file) => file.id === id)));
-      message.success(t('nl2sql.references.packDeleted'));
-    },
-    onError: (err: unknown) => {
-      message.error(err instanceof Error ? err.message : t('nl2sql.references.packDeleteFailed'));
-    },
-  });
-
-  const deleteReferenceFileMutation = useMutation({
-    mutationFn: (fileId: string) => nl2sqlApi.deleteReferenceFile(fileId).then(() => fileId),
-    onSuccess: (fileId) => {
-      if (selectedDataSourceId) {
-        qc.invalidateQueries({ queryKey: queryKeys.nl2sql.referencePacks(selectedDataSourceId) });
-      }
-      setSelectedReferenceFileIds((prev) => prev.filter((id) => id !== fileId));
-      message.success(t('nl2sql.references.fileDeleted'));
-    },
-    onError: (err: unknown) => {
-      message.error(err instanceof Error ? err.message : t('nl2sql.references.fileDeleteFailed'));
-    },
-  });
 
   // Sync auto-routing with embedding availability:
   // autoRouting is only meaningful when an embedding model is configured.
@@ -4901,41 +4765,6 @@ export default function Nl2sql() {
               />
             </div>
           )}
-
-          <div style={{ marginBottom: advancedSettingsOpen ? 8 : 6 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, minHeight: 24, flexWrap: 'wrap' }}>
-              <Button
-                size="small"
-                type="text"
-                icon={advancedSettingsOpen ? <UpOutlined /> : <DownOutlined />}
-                onClick={() => {
-                  setAdvancedSettingsOpen((open) => {
-                    if (open) setReferencePopoverOpen(false);
-                    return !open;
-                  });
-                }}
-                style={{ height: 24, paddingInline: 6, fontSize: 11, color: 'var(--text-secondary)' }}
-              >
-                {t('nl2sql.advancedSettings')}
-              </Button>
-            </div>
-
-            {advancedSettingsOpen && (
-              <div style={{
-                marginTop: 6,
-                padding: '8px 10px',
-                borderRadius: 8,
-                border: '1px solid var(--border-subtle)',
-                background: 'var(--bg-secondary)',
-                display: 'grid',
-                gap: 8,
-              }}>
-                <Text style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                  {t('nl2sql.references.autoBoundHint')}
-                </Text>
-              </div>
-            )}
-          </div>
 
           <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
             <TextArea
