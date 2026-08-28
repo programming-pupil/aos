@@ -95,7 +95,6 @@ async fn load_super_assistant_turn_message_metadata(
     if answer_texts.is_empty() {
         return Ok(Vec::new());
     }
-
     let mut turn_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
         "SELECT t.turn_id, COALESCE(t.model, '') AS model,
                 COALESCE(t.user_message, '') AS user_message, t.final_text, t.route_capability,
@@ -136,21 +135,31 @@ async fn load_super_assistant_turn_message_metadata(
             " AND t.status = 'completed'
               AND t.final_text IS NOT NULL
               AND LENGTH(TRIM(t.final_text)) > 0
-              AND t.final_text IN (",
+              AND t.id IN (
+                SELECT recent.id
+                  FROM super_assistant_turns recent
+                 WHERE recent.tenant_id = t.tenant_id
+                   AND recent.user_id = t.user_id
+                   AND recent.session_id = t.session_id
+                   AND recent.status = 'completed'
+                   AND recent.final_text IS NOT NULL
+                   AND LENGTH(TRIM(recent.final_text)) > 0
+                 ORDER BY recent.started_at DESC, recent.id DESC
+                 LIMIT 512
+              )
+            ",
         );
-    {
-        let mut separated = turn_query.separated(", ");
-        for answer in answer_texts {
-            separated.push_bind(answer);
-        }
-    }
-    // Repeated compact answers (for example, "OK") can occur in many turns.
-    // Keep the query bounded while allowing several matches per visible page
-    // answer. Results are matched to messages by exact final text in the UI.
-    let result_limit = answer_texts.len().saturating_mul(4).clamp(40, 120);
+    // The durable user message is the stable identity. Do not restrict this
+    // query by final_text: progress collapse, retries, and duplicate answers
+    // can make the visible assistant body differ from the persisted terminal
+    // body. The bounded per-session cap keeps metadata work predictable.
+    // Return the newest bounded set in chronological order. This is required
+    // when two turns have identical prompts and answers: the UI pairs them by
+    // occurrence, so newest-first metadata would attach the later run to the
+    // earlier message, while oldest-only metadata would miss recent turns.
     turn_query
-        .push(") ORDER BY t.started_at DESC, t.id DESC LIMIT ")
-        .push_bind(i64::try_from(result_limit).unwrap_or(120));
+        .push(" ORDER BY t.started_at ASC, t.id ASC LIMIT ")
+        .push_bind(512_i64);
     let rows = turn_query.build().fetch_all(db).await?;
 
     let turn_ids = rows
@@ -828,10 +837,21 @@ pub(super) async fn get_session_history(
     );
 
     match get_agent_manager(&state)
-        .get_session_history_messages(&session_id, Some(&claims.tenant_id), Some(&claims.sub))
+        .get_session_history_messages_window(
+            &session_id,
+            Some(&claims.tenant_id),
+            Some(&claims.sub),
+            query.before_turn_cursor,
+            query.limit_turns,
+            query.max_bytes,
+        )
         .await
     {
-        Some(session) => {
+        Some(window) => {
+            let total_turns = window.total_turns;
+            let before_turn_cursor = window.before_turn_cursor;
+            let loaded_start_turn = window.loaded_start_turn;
+            let session = window.session;
             // Build a lookup: tool_use_id -> ToolResultBlockDto.
             // This maps tool results to their corresponding tool calls by ID.
             let tool_results: std::collections::HashMap<String, ToolResultBlockDto> = session
@@ -1188,12 +1208,17 @@ pub(super) async fn get_session_history(
                 }
             }
 
-            let (messages, page) = paginate_history_messages(
-                &messages,
-                query.before_turn_cursor,
-                query.limit_turns,
-                query.max_bytes,
-            );
+            let (messages, mut page) =
+                paginate_history_messages(&messages, None, query.limit_turns, query.max_bytes);
+            // The loader supplied a suffix of the complete turn list. Translate
+            // the local page cursor back into the durable session cursor.
+            page.before_turn_cursor = before_turn_cursor;
+            page.total_turns = total_turns;
+            page.next_before_turn_cursor = page
+                .next_before_turn_cursor
+                .map(|cursor| loaded_start_turn.saturating_add(cursor))
+                .or_else(|| (loaded_start_turn > 0).then_some(loaded_start_turn));
+            page.has_more = page.next_before_turn_cursor.is_some();
             let metadata_answers = history_page_assistant_answer_texts(&messages);
             let super_assistant_turns = match load_super_assistant_turn_message_metadata(
                 &state.db,

@@ -3972,36 +3972,59 @@ export function attachSuperAssistantTurnMetadata(
     return undefined;
   };
 
-  // Metadata is chronologically ordered by the API. Match each durable turn
-  // to both sides of the visible pair. A final answer is not a unique key:
-  // retries and different turns can legitimately produce identical text.
+  const followingAssistantIndex = (userIndex: number): number | undefined => {
+    for (let index = userIndex + 1; index < messages.length; index += 1) {
+      if (messages[index]?.role === "user") return undefined;
+      if (messages[index]?.role === "assistant") return index;
+    }
+    return undefined;
+  };
+
+  // Metadata is chronologically ordered by the API. The durable user message
+  // is the turn identity; matching by final answer first is unsafe because
+  // retries and unrelated turns can legitimately produce identical text.
   for (const candidate of available) {
     const item = candidate.item;
     const answer = item.final_text.trim();
     const expectedUser = historyUserIdentity(item.user_message ?? "");
-    const candidates = messages
-      .map((message, index) => ({ message, index }))
-      .filter(
-        ({ message, index }) =>
+    let chosenIndex: number | undefined;
+    let userIndex: number | undefined;
+    if (expectedUser.length > 0) {
+      for (let index = 0; index < messages.length; index += 1) {
+        if (messages[index]?.role !== "user" || usedUserIndices.has(index)) {
+          continue;
+        }
+        if (historyUserIdentity(messages[index].content) !== expectedUser) {
+          continue;
+        }
+        const assistantIndex = followingAssistantIndex(index);
+        if (assistantIndex === undefined || matched.has(assistantIndex))
+          continue;
+        userIndex = index;
+        chosenIndex = assistantIndex;
+        break;
+      }
+    }
+    // Legacy non-adversarial rows may not have user_message. Keep the old
+    // answer fallback for those rows, but never guess an adversarial pair.
+    if (
+      chosenIndex === undefined &&
+      item.route_capability !== "super_adversarial"
+    ) {
+      const answerCandidate = messages.findIndex(
+        (message, index) =>
           message.role === "assistant" &&
           !matched.has(index) &&
           historyContentToPlain(message.content).trim() === answer &&
-          (!usedUserIndices.has(precedingUserIndex(index) ?? -1)),
+          !usedUserIndices.has(precedingUserIndex(index) ?? -1),
       );
-    if (candidates.length === 0) continue;
-    const withUserMatch = candidates.find(({ index }) => {
-      const userIndex = precedingUserIndex(index);
-      return (
-        userIndex !== undefined &&
-        expectedUser.length > 0 &&
-        historyUserIdentity(messages[userIndex].content) === expectedUser
-      );
-    });
-    const chosen = withUserMatch ??
-      (item.route_capability === "super_adversarial" ? undefined : candidates[0]);
-    if (!chosen) continue;
-    const userIndex = precedingUserIndex(chosen.index);
-    matched.set(chosen.index, item);
+      if (answerCandidate >= 0) {
+        chosenIndex = answerCandidate;
+        userIndex = precedingUserIndex(answerCandidate);
+      }
+    }
+    if (chosenIndex === undefined) continue;
+    matched.set(chosenIndex, item);
     if (userIndex !== undefined) {
       usedUserIndices.add(userIndex);
       matchedUsers.set(userIndex, item);
@@ -5900,6 +5923,10 @@ export function ChatCore({
         if (prev.some((msg) => msg.id === messageId)) return prev;
         return [...prev, assistantMsg];
       });
+      // Transfer ownership from the live panel to the durable assistant row
+      // once the run has a terminal answer, so the transcript is rendered once.
+      activeAdversarialMetaRef.current = {};
+      setActiveAdversarialMeta({});
       setTimeout(scrollToBottom, 30);
     },
     [
@@ -7125,6 +7152,7 @@ export function ChatCore({
                   pmBackgroundTaskAbortRef.current = null;
                 }
                 resetPmResearchState();
+                rememberAdversarialMeta({ externalTaskId: activeTurn.taskId });
                 setPmBackgroundTaskId(activeTurn.taskId);
                 setPmBackgroundTaskStatus(activeTurn.status || "running");
                 setPmPanelTaskId(activeTurn.taskId);
@@ -9206,8 +9234,16 @@ export function ChatCore({
           if (payload.kind !== "deepAnalysis") return;
           const { link, taskId, status } = payload.answer;
           if (!taskId) return;
-          resetPmResearchState();
+          // The parent route can acknowledge the same specialist more than once.
+          // Keep its stream and dedicated audit panel alive across duplicates.
+          const sameAdversarialRun =
+            link === "chatAdversarialRun" &&
+            activeAdversarialMetaRef.current.adversarialRunId === taskId;
+          if (!sameAdversarialRun) resetPmResearchState();
           superAssistantAsyncTaskStartedRef.current = true;
+          if (link === "chatAdversarialRun") {
+            rememberAdversarialMeta({ externalTaskId: taskId });
+          }
           setPmBackgroundTaskId(taskId);
           setPmBackgroundTaskStatus(status || "queued");
           setPmPanelTaskId(taskId);
@@ -12455,6 +12491,14 @@ export function ChatCore({
               </div>
             )}
 
+          {/* Keep the adversarial transcript outside the ephemeral streaming
+              bubble so it survives the parent route finishing first. */}
+          {liveAdversarialRunId ? (
+            <div key={`live-adversarial-${liveAdversarialRunId}`}>
+              <AdversarialAuditPanel runId={liveAdversarialRunId} live />
+            </div>
+          ) : null}
+
           {/* Streaming bubble */}
           {isStreaming && (
             <div>
@@ -12495,12 +12539,6 @@ export function ChatCore({
                   superAssistantEndpoint ? (
                     <>
                       {!liveAdversarialRunId ? pmInlineNarrativePanel : null}
-                      {liveAdversarialRunId ? (
-                        <AdversarialAuditPanel
-                          runId={liveAdversarialRunId}
-                          live
-                        />
-                      ) : null}
                       {liveAttributionTaskId ? (
                         <AttributionAuditPanel
                           taskId={liveAttributionTaskId}

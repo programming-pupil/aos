@@ -804,6 +804,9 @@ pub fn parse_requirements_from_question(
             &q,
             &[
                 "today",
+                "今天",
+                "当天",
+                "本日",
                 "yesterday",
                 "last",
                 "week",
@@ -1159,6 +1162,21 @@ mod requirement_check_tests {
         let result =
             parse_requirements_from_question(question, Some(&qu), &serde_json::json!([]), &[]);
         assert!(result.missing.is_empty());
+    }
+
+    #[test]
+    fn beijing_today_is_a_complete_time_window_without_timezone_clarification() {
+        let result = parse_requirements_from_question(
+            "查一下北京时间今天的全部邀请码",
+            Some(&qu_with(Intent::List, None, vec![], vec![], vec![])),
+            &serde_json::json!([]),
+            &[],
+        );
+        assert!(
+            !result.missing.iter().any(|item| item.contains("时间范围")),
+            "北京时间今天 must resolve the complete local-day window: {:?}",
+            result.missing
+        );
     }
 
     #[test]

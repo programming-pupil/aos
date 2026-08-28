@@ -431,6 +431,17 @@ async fn load_durable_visible_ledger_session(
         ))
     })
     .collect::<std::result::Result<Vec<_>, sqlx::Error>>()?;
+    rebuild_visible_ledger_session(session_id, tenant_id, user_id, rows)
+}
+
+type VisibleLedgerRow = (i64, String, String, String, Option<String>);
+
+fn rebuild_visible_ledger_session(
+    session_id: &str,
+    tenant_id: &str,
+    user_id: &str,
+    rows: Vec<VisibleLedgerRow>,
+) -> Result<Option<runtime::Session>> {
     if rows.is_empty() {
         return Ok(None);
     }
@@ -578,6 +589,208 @@ async fn load_durable_visible_ledger_session(
         }
     }
     Ok(Some(session))
+}
+
+/// A bounded, turn-aligned history projection. `loaded_start_turn` maps the
+/// first loaded turn back into the full session cursor so the HTTP layer can
+/// preserve pagination semantics without materializing older encrypted rows.
+#[derive(Debug)]
+pub struct SessionHistoryWindow {
+    pub session: runtime::Session,
+    pub total_turns: usize,
+    pub before_turn_cursor: usize,
+    pub loaded_start_turn: usize,
+}
+
+/// Load only the turns needed by a history page. Turn boundaries and payload
+/// sizes are read as cheap metadata first; encrypted recovery payloads are
+/// fetched and validated only for the selected range. This keeps history
+/// latency proportional to the requested page instead of the session age.
+async fn load_durable_visible_ledger_session_window(
+    db: &sqlx::SqlitePool,
+    session_id: &str,
+    tenant_id: &str,
+    user_id: &str,
+    before_turn_cursor: Option<usize>,
+    limit_turns: Option<usize>,
+    max_bytes: Option<usize>,
+) -> Result<Option<SessionHistoryWindow>> {
+    let limit = limit_turns.unwrap_or(8).clamp(1, 30);
+    let byte_limit = max_bytes
+        .unwrap_or(256 * 1024)
+        .clamp(32 * 1024, 2 * 1024 * 1024);
+    // Count, boundaries, and payload rows must come from one SQLite snapshot.
+    // Otherwise a turn appended between these queries can shift OFFSET and
+    // make a valid page appear incomplete or attach the wrong global cursor.
+    let mut transaction = db.begin().await?;
+    let total_turns = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)
+           FROM agent_event_ledger
+          WHERE tenant_id = ? AND thread_id = ? AND durable = 1
+            AND event_type = 'runtime.turn_started'",
+    )
+    .bind(tenant_id)
+    .bind(session_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let total_turns = usize::try_from(total_turns)
+        .map_err(|_| GatewayError::RuntimeBuild("negative turn count".into()))?;
+    if total_turns == 0 {
+        transaction.commit().await?;
+        return Ok(None);
+    }
+    let before = before_turn_cursor.unwrap_or(total_turns).min(total_turns);
+    if before == 0 {
+        transaction.commit().await?;
+        return Ok(Some(SessionHistoryWindow {
+            session: runtime::Session::new(),
+            total_turns,
+            before_turn_cursor: 0,
+            loaded_start_turn: 0,
+        }));
+    }
+
+    // Fetch only the candidate page boundaries plus one boundary after the
+    // page. `COUNT(*)` preserves the global cursor while LIMIT/OFFSET avoids
+    // materializing every turn in a long-lived session.
+    let candidate_start = before.saturating_sub(limit);
+    let boundary_rows = sqlx::query(
+        "SELECT sequence, payload_json
+           FROM agent_event_ledger
+          WHERE tenant_id = ? AND thread_id = ? AND durable = 1
+            AND event_type = 'runtime.turn_started'
+          ORDER BY sequence ASC
+          LIMIT ? OFFSET ?",
+    )
+    .bind(tenant_id)
+    .bind(session_id)
+    .bind(i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX))
+    .bind(i64::try_from(candidate_start).unwrap_or(i64::MAX))
+    .fetch_all(&mut *transaction)
+    .await?;
+    let mut turns = Vec::with_capacity(boundary_rows.len());
+    for row in boundary_rows {
+        let sequence = row.try_get::<i64, _>(0)?;
+        let raw = row.try_get::<String, _>(1)?;
+        let envelope =
+            serde_json::from_str::<agent_protocol::AgentEventEnvelope>(&raw).map_err(|error| {
+                GatewayError::RuntimeBuild(format!("invalid turn boundary: {error}"))
+            })?;
+        let Some(turn_id) = envelope.turn_id else {
+            return Err(GatewayError::RuntimeBuild(
+                "turn boundary is missing turn id".into(),
+            ));
+        };
+        turns.push((sequence, turn_id));
+    }
+    let page_turn_count = before.saturating_sub(candidate_start);
+    if turns.len() < page_turn_count {
+        return Err(GatewayError::RuntimeBuild(
+            "turn boundary page is incomplete".into(),
+        ));
+    }
+
+    // Read only ciphertext/JSON lengths for the candidate page. The previous
+    // implementation scanned every visible row in the session here, which
+    // made a large session slow even though only the newest page was needed.
+    // Restrict the metadata scan to at most `limit` turns; older pages are
+    // handled by the durable cursor on the next request.
+    let candidate_start_sequence = turns[0].0;
+    let candidate_end_sequence = turns.get(page_turn_count).map(|turn| turn.0);
+    let size_rows = sqlx::query(
+        "SELECT sequence,
+                LENGTH(payload_json) + COALESCE(LENGTH(raw_payload_ciphertext), 0)
+          FROM agent_event_ledger
+         WHERE tenant_id = ? AND thread_id = ? AND durable = 1
+           AND event_type IN (
+             'runtime.turn_started', 'runtime.assistant_message',
+             'runtime.visible_message', 'runtime.tool_outcome'
+           )
+           AND sequence >= ?
+           AND (? IS NULL OR sequence < ?)
+         ORDER BY sequence ASC",
+    )
+    .bind(tenant_id)
+    .bind(session_id)
+    .bind(candidate_start_sequence)
+    .bind(candidate_end_sequence)
+    .bind(candidate_end_sequence)
+    .fetch_all(&mut *transaction)
+    .await?;
+    let sizes = size_rows
+        .into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<i64, _>(0)?,
+                row.try_get::<Option<i64>, _>(1)?.unwrap_or(0),
+            ))
+        })
+        .collect::<std::result::Result<Vec<_>, sqlx::Error>>()?;
+    let estimate_for_turn = |index: usize| {
+        let start = turns[index].0;
+        let end = turns.get(index + 1).map(|turn| turn.0).unwrap_or(i64::MAX);
+        sizes
+            .iter()
+            .filter(|(sequence, _)| *sequence >= start && *sequence < end)
+            .map(|(_, bytes)| usize::try_from(*bytes).unwrap_or(usize::MAX))
+            .fold(0usize, usize::saturating_add)
+    };
+
+    let mut loaded_start = page_turn_count.saturating_sub(1);
+    let mut selected = 0usize;
+    let mut estimated = 0usize;
+    for index in (0..page_turn_count).rev() {
+        let turn_size = estimate_for_turn(index);
+        if selected > 0 && (selected >= limit || estimated.saturating_add(turn_size) > byte_limit) {
+            break;
+        }
+        loaded_start = index;
+        selected += 1;
+        estimated = estimated.saturating_add(turn_size);
+    }
+    let start_sequence = turns[loaded_start].0;
+    let end_sequence = turns.get(page_turn_count).map(|turn| turn.0);
+    let rows = sqlx::query(
+        "SELECT sequence, event_type, payload_json, payload_hash, raw_payload_ciphertext
+         FROM agent_event_ledger
+         WHERE tenant_id = ? AND thread_id = ? AND durable = 1
+           AND sequence >= ?
+           AND (? IS NULL OR sequence < ?)
+           AND event_type IN (
+             'runtime.turn_started', 'runtime.assistant_message',
+             'runtime.visible_message', 'runtime.tool_outcome'
+           )
+         ORDER BY sequence ASC",
+    )
+    .bind(tenant_id)
+    .bind(session_id)
+    .bind(start_sequence)
+    .bind(end_sequence)
+    .bind(end_sequence)
+    .fetch_all(&mut *transaction)
+    .await?
+    .into_iter()
+    .map(|row| {
+        Ok((
+            row.try_get::<i64, _>(0)?,
+            row.try_get::<String, _>(1)?,
+            row.try_get::<String, _>(2)?,
+            row.try_get::<String, _>(3)?,
+            row.try_get::<Option<String>, _>(4)?,
+        ))
+    })
+    .collect::<std::result::Result<Vec<_>, sqlx::Error>>()?;
+    transaction.commit().await?;
+    let Some(session) = rebuild_visible_ledger_session(session_id, tenant_id, user_id, rows)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(SessionHistoryWindow {
+        session,
+        total_turns,
+        before_turn_cursor: before,
+        loaded_start_turn: candidate_start.saturating_add(loaded_start),
+    }))
 }
 
 fn token_usage_delta(after: RuntimeTokenUsage, before: RuntimeTokenUsage) -> RuntimeTokenUsage {
@@ -4112,6 +4325,62 @@ impl AgentSessionManager {
         }
     }
 
+    /// Get only the requested history window. Legacy callers can continue to
+    /// use `get_session_history_messages`; the web API uses this bounded path
+    /// so a large session never blocks on older encrypted payloads.
+    pub async fn get_session_history_messages_window(
+        &self,
+        session_id: &str,
+        tenant_id: Option<&str>,
+        user_id: Option<&str>,
+        before_turn_cursor: Option<usize>,
+        limit_turns: Option<usize>,
+        max_bytes: Option<usize>,
+    ) -> Option<SessionHistoryWindow> {
+        let record = self
+            .config_registry
+            .get_agent_session_record(session_id)
+            .await
+            .ok()
+            .flatten()?;
+        if !session_owner_matches(&record.tenant_id, &record.user_id, tenant_id, user_id) {
+            return None;
+        }
+        match load_durable_visible_ledger_session_window(
+            &self.config_registry.database(),
+            session_id,
+            &record.tenant_id,
+            &record.user_id,
+            before_turn_cursor,
+            limit_turns,
+            max_bytes,
+        )
+        .await
+        {
+            Ok(Some(window)) => Some(window),
+            Ok(None) => self
+                .get_session_history_messages(session_id, tenant_id, user_id)
+                .await
+                .map(|session| SessionHistoryWindow {
+                    total_turns: session.turns.len(),
+                    before_turn_cursor: before_turn_cursor
+                        .unwrap_or(session.turns.len())
+                        .min(session.turns.len()),
+                    loaded_start_turn: 0,
+                    session,
+                }),
+            Err(error) => {
+                tracing::error!(
+                    session_id,
+                    tenant_id = record.tenant_id,
+                    error = %error,
+                    "bounded durable visible history projection failed validation"
+                );
+                None
+            }
+        }
+    }
+
     /// Returns a reference to the per-tenant MCP managers map.
     /// Each tenant gets its own isolated manager to prevent cross-tenant state leakage.
     #[must_use]
@@ -5082,6 +5351,139 @@ mod tests {
             }
             _ => "agent.event".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn bounded_history_loader_keeps_global_cursor_without_recovering_old_rows() {
+        let db = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE agent_event_ledger (
+                tenant_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                raw_payload_ciphertext TEXT,
+                durable INTEGER NOT NULL
+            )",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        for turn_index in 0_u64..5 {
+            let turn_id = format!("turn-{turn_index}");
+            let sequence = turn_index.saturating_mul(2).saturating_add(1);
+            let assistant =
+                runtime::ConversationMessage::assistant(vec![runtime::ContentBlock::Text {
+                    text: format!("answer {turn_index}"),
+                }]);
+            let events = [
+                (
+                    "turn_started",
+                    serde_json::json!({
+                        "userInput": format!("question {turn_index}")
+                    }),
+                    sequence,
+                ),
+                (
+                    "assistant_message",
+                    serde_json::json!({
+                        "message": {"message": serde_json::to_value(&assistant).unwrap()}
+                    }),
+                    sequence.saturating_add(1),
+                ),
+            ];
+            for (kind, recovery_payload, event_sequence) in events {
+                let recovery_payload_raw = recovery_payload.to_string();
+                let recovery_payload_hash = format!(
+                    "{:x}",
+                    sha2::Sha256::digest(recovery_payload_raw.as_bytes())
+                );
+                let mut event = runtime_ledger_envelope(
+                    "session",
+                    kind,
+                    serde_json::json!({"_recoveryPayloadHash": recovery_payload_hash}),
+                    event_sequence,
+                );
+                event.turn_id = Some(turn_id.clone());
+                event.payload_hash = event.compute_payload_hash().unwrap();
+                sqlx::query(
+                    "INSERT INTO agent_event_ledger
+                     (tenant_id, thread_id, sequence, event_type, payload_json, payload_hash,
+                      raw_payload_ciphertext, durable)
+                     VALUES ('tenant', 'session', ?, ?, ?, ?, ?, 1)",
+                )
+                .bind(i64::try_from(event_sequence).unwrap())
+                .bind(ledger_event_type(&event))
+                .bind(serde_json::to_string(&event).unwrap())
+                .bind(&event.payload_hash)
+                .bind(crate::crypto::encrypt(&recovery_payload_raw).unwrap())
+                .execute(&db)
+                .await
+                .unwrap();
+            }
+        }
+
+        // The bounded loader must not decrypt or materialize this old turn.
+        sqlx::query(
+            "UPDATE agent_event_ledger
+                SET raw_payload_ciphertext = 'corrupted-old-payload'
+              WHERE sequence < 3",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let latest = load_durable_visible_ledger_session_window(
+            &db,
+            "session",
+            "tenant",
+            "user",
+            None,
+            Some(2),
+            Some(128 * 1024),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(latest.total_turns, 5);
+        assert_eq!(latest.before_turn_cursor, 5);
+        assert_eq!(latest.loaded_start_turn, 3);
+        assert_eq!(latest.session.messages.len(), 4);
+        assert_eq!(
+            latest.session.messages[0],
+            runtime::ConversationMessage::user_text("question 3")
+        );
+        assert_eq!(
+            latest.session.messages[2],
+            runtime::ConversationMessage::user_text("question 4")
+        );
+
+        let previous = load_durable_visible_ledger_session_window(
+            &db,
+            "session",
+            "tenant",
+            "user",
+            Some(3),
+            Some(2),
+            Some(128 * 1024),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(previous.total_turns, 5);
+        assert_eq!(previous.before_turn_cursor, 3);
+        assert_eq!(previous.loaded_start_turn, 1);
+        assert_eq!(
+            previous.session.messages[0],
+            runtime::ConversationMessage::user_text("question 1")
+        );
+        assert_eq!(
+            previous.session.messages[2],
+            runtime::ConversationMessage::user_text("question 2")
+        );
     }
 
     #[test]

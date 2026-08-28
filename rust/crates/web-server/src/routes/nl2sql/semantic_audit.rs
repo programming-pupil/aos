@@ -16,7 +16,7 @@ use nl2sql_core::semantic_ir::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlparser::ast::{
-    GroupByExpr, JoinOperator, Query, SelectItem, SetExpr, Statement, TableFactor,
+    GroupByExpr, JoinOperator, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -1044,10 +1044,34 @@ pub(crate) fn compile_canonical_intent_with_contracts_and_joins(
 /// matching contract is represented as a conservative fanout risk and is
 /// rejected by the verifier.
 fn bind_query_join_contracts(query: &Query, contracts: &[JoinContract]) -> Vec<JoinContract> {
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return vec![unverified_join_contract()];
-    };
     let mut result = Vec::new();
+    collect_set_expr_join_contracts(query.body.as_ref(), contracts, &mut result);
+    result
+}
+
+fn collect_set_expr_join_contracts(
+    expression: &SetExpr,
+    contracts: &[JoinContract],
+    result: &mut Vec<JoinContract>,
+) {
+    match expression {
+        SetExpr::Select(select) => collect_select_join_contracts(select, contracts, result),
+        SetExpr::Query(query) => {
+            collect_set_expr_join_contracts(query.body.as_ref(), contracts, result)
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_set_expr_join_contracts(left.as_ref(), contracts, result);
+            collect_set_expr_join_contracts(right.as_ref(), contracts, result);
+        }
+        _ => result.push(unverified_join_contract()),
+    }
+}
+
+fn collect_select_join_contracts(
+    select: &Select,
+    contracts: &[JoinContract],
+    result: &mut Vec<JoinContract>,
+) {
     for table in &select.from {
         let mut seen = Vec::new();
         if let Some(base) = table_factor_name(&table.relation) {
@@ -1082,7 +1106,6 @@ fn bind_query_join_contracts(query: &Query, contracts: &[JoinContract]) -> Vec<J
             seen.push(right);
         }
     }
-    result
 }
 
 fn table_factor_name(factor: &TableFactor) -> Option<String> {
@@ -1131,8 +1154,20 @@ fn unverified_join_contract() -> JoinContract {
 }
 
 fn select_shape(query: &Query) -> Option<(Vec<String>, Vec<String>, bool)> {
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return None;
+    let select = match query.body.as_ref() {
+        SetExpr::Select(select) => select,
+        // A UNION/UNION ALL is still a read-only query. Verify the first
+        // branch's projection and grouping rather than failing closed at the
+        // parser adapter boundary; the relational safety validator handles
+        // unsupported set semantics separately.
+        SetExpr::SetOperation { left, .. } => {
+            let SetExpr::Select(select) = left.as_ref() else {
+                return None;
+            };
+            select
+        }
+        SetExpr::Query(inner) => return select_shape(inner),
+        _ => return None,
     };
     let mut selected = Vec::new();
     let mut has_aggregate = false;
@@ -1465,8 +1500,12 @@ mod tests {
             .iter()
             .any(|ambiguity| ambiguity.field == "population:physical_relation"));
 
-        let sql = "SELECT invite_code FROM invite_codes WHERE (created_at AT TIME ZONE 'Asia/Shanghai') >= DATE '2026-08-27' AND (created_at AT TIME ZONE 'Asia/Shanghai') < DATE '2026-08-28' LIMIT 100";
-        let audit = compile_canonical_intent_with_contracts_and_joins(&intent, sql, &[], &[])
+        let time = intent.time.as_ref().expect("time semantics");
+        let sql = format!(
+            "SELECT invite_code FROM invite_codes WHERE (created_at AT TIME ZONE 'Asia/Shanghai') >= DATE '{}' AND (created_at AT TIME ZONE 'Asia/Shanghai') < DATE '{}' LIMIT 100",
+            time.start_inclusive, time.end_exclusive
+        );
+        let audit = compile_canonical_intent_with_contracts_and_joins(&intent, &sql, &[], &[])
             .expect("semantic audit");
         assert_eq!(
             audit.verification.release_decision,

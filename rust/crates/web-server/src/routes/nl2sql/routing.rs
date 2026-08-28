@@ -5038,18 +5038,30 @@ pub(crate) async fn clarify(
             "clarification completed without a SQL candidate; retry the request".to_string(),
         )
     })?;
-    let audit = super::semantic_audit::compile_canonical_intent_with_contracts_and_joins(
+    let audit = match super::semantic_audit::compile_canonical_intent_with_contracts_and_joins(
         &durable_intent.intent,
         final_sql,
         &durable_intent.metric_contracts,
         &durable_intent.join_contracts,
-    )
-    .ok_or_else(|| {
-        AppError::ValidationError(
-            "clarification SQL could not be verified against the canonical analytic intent"
-                .to_string(),
-        )
-    })?;
+    ) {
+        Some(audit) => audit,
+        None => {
+            tracing::error!(
+                tenant_id,
+                user_id,
+                session_id,
+                conversation_id = %conv_id,
+                query_id = %query_id,
+                sql = %final_sql,
+                intent = ?durable_intent.intent,
+                "clarification SQL could not be parsed into a verifiable relational shape"
+            );
+            return Err(AppError::ValidationError(
+                "clarification SQL is not a verifiable read-only SELECT; please retry so AOS can regenerate it"
+                    .to_string(),
+            ));
+        }
+    };
     let release_decision = serde_json::to_string(&audit.verification.release_decision)
         .unwrap_or_else(|_| "\"NeedsClarification\"".to_string())
         .trim_matches('"')

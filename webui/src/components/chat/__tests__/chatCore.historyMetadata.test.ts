@@ -72,6 +72,36 @@ describe('super assistant history metadata', () => {
     expect(restored[0].content).toBe('普通问题');
   });
 
+  it('keeps duplicate adversarial turns paired in chronological order', () => {
+    const messages: DisplayMessage[] = [
+      { id: 'user-1', role: 'user', content: '/超级对抗 相同问题' },
+      { id: 'assistant-1', role: 'assistant', content: '相同答案' },
+      { id: 'user-2', role: 'user', content: '/超级对抗 相同问题' },
+      { id: 'assistant-2', role: 'assistant', content: '相同答案' },
+    ];
+    const restored = attachSuperAssistantTurnMetadata(messages, [
+      {
+        turn_id: 'first-turn',
+        model: 'model-a',
+        user_message: '/超级对抗 相同问题',
+        final_text: '相同答案',
+        route_capability: 'super_adversarial',
+        adversarial_run_id: 'run-first',
+      },
+      {
+        turn_id: 'second-turn',
+        model: 'model-b',
+        user_message: '/超级对抗 相同问题',
+        final_text: '相同答案',
+        route_capability: 'super_adversarial',
+        adversarial_run_id: 'run-second',
+      },
+    ]);
+
+    expect(restored[1].adversarialRunId).toBe('run-first');
+    expect(restored[3].adversarialRunId).toBe('run-second');
+  });
+
   it('restores the adversarial prefix for legacy rows that stored only the prompt', () => {
     const restored = attachSuperAssistantTurnMetadata(
       [
